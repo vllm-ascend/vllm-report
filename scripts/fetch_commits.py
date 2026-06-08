@@ -625,6 +625,7 @@ def main():
     parser.add_argument("--token", default=None, help="GitHub token (or set GITHUB_TOKEN env)")
     parser.add_argument("--local-repo", default=None, help="Path to local repo source code (auto-detected if not specified)")
     parser.add_argument("--refresh-date", default=None, help="Force re-fetch all commits on a specific date (YYYY-MM-DD) and overwrite existing data")
+    parser.add_argument("--api-only", action="store_true", help="Skip local repo discovery, use GitHub API only")
     args = parser.parse_args()
 
     token = args.token or os.environ.get("GITHUB_TOKEN")
@@ -632,7 +633,10 @@ def main():
         print("Warning: No GitHub token provided. API rate limit will be lower.")
 
     project_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    local_repo = ensure_repo(args.repo, args.local_repo, project_dir)
+    if args.api_only:
+        local_repo = None
+    else:
+        local_repo = ensure_repo(args.repo, args.local_repo, project_dir)
 
     if args.refresh_date:
         refresh_date_commits(local_repo, args.repo, args.refresh_date, args.data_dir, args.branch, token)

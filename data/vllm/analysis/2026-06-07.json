@@ -1,35 +1,31 @@
 {
   "date": "2026-06-07",
   "repo": "vllm-project/vllm",
-  "generated_at": "2026-06-08T19:10:02.991331+08:00",
-  "daily_summary": "当日变更多以平台特化支持（XPU sleep mode/offloading、ROCm RDNA3 MoE/MIA kernel、XPU MXFP4 MoE）和 DeepSeek V4 相关重构（KV cache layout 重构、Sparse MLA 元数据与 V3.2 解耦、MTP index share）为主。Scheduler 层修复了异步 KV 加载的死锁问题（引入 reservation-based 准入控制）。Cohere 模型注册更新（新增 North-Mini-Code），GLM-4.6V 视频加载器实现。入口层修复了多音频 OpenAI 路径的稳定性问题（用 partial + callable 替代 asyncio.Future）。整体以功能增强和 bugfix 为主，风险中等偏低。",
-  "ascend_impact_summary": "当日变更对 vllm-ascend 影响有限。核心 scheduler/KV cache 变更（DSV4 layout refactor、async KV load deadlock fix）被 scheduler 层直接使用，Ascend 侧若沿用 vllm 的 Scheduler 和 KVCacheManager 则自动受益。Entrypoints 层的多音频修复和 VLLMValidationError 变动为平台无关变更，Ascend API Server 同样受用。DSV4 Sparse MLA 解耦涉及注意力后端注册路径变更，若 Ascend 有自定义 DSV4 后端则需关注。其余变更均为 ROCm/CUDA/XPU 平台特化（kernel、memory allocator、offloading 等），不影响 Ascend。",
+  "generated_at": "2026-06-08T20:46:21.853466+08:00",
+  "daily_summary": "当日变更聚焦于四个方向：(1) KV Cache 布局重构——DeepSeek V4 的 KV cache tensor 规划逻辑从基于 layer-tuple 的迭代重写为基于 page_size 的分桶聚合，简化了实现并去除了对 full-MLA group 首位的依赖；(2) 多模态和推理增强——GLM-4.6V 视频后端新增动态 FPS 帧采样逻辑，多模态异步流水线稳定性修复（await-as-coroutine 替换 asyncio.Future），以及 DeepSeek V4 DSA MTP 投机解码的 index_share 机制（step 0 计算、后续步骤复用 top-k indices）；(3) 硬件平台扩展——XPU 透明睡眠模式（XpuMemAllocator + 平台无关 MemAllocator 接口）、XPU CPU KV offload 支持，以及 XPU MXFP4 MoE 量化路径；(4) ROCm RDNA3 性能优化——新增 fused MoE W4A16 HIP kernel (moe_q_gemm_rdna3.cu) 和完整的分发/编译守卫测试套件。另外修复了 Mooncake KV connector 中 per-group block_size/group_idx 错误导致的 KV 事件问题，以及异步 KV load 时多请求死锁（通过预留机制限制并发 async load 准入）。DeepSeek V4 Sparse MLA 元数据从 V3.2 FlashMLASparseMetadata 解耦为独立的 DeepseekV4FlashMLAMetadata，消除了两个架构之间的耦合。",
+  "ascend_impact_summary": "当日变更对 vllm-ascend 的整体影响为中等偏低。关键影响点：(1) KV Cache 布局重构（#44454）修改了 vllm/v1/core/kv_cache_utils.py 中的 _get_kv_cache_config_deepseek_v4 和 _pool_bytes_per_block，vllm-ascend 的 patch 层如果 patch 了这些函数需要同步更新；(2) XPU 睡眠模式（#37149）新增了平台无关的 MemAllocator 接口和 get_mem_allocator_instance()，vllm-ascend 可以考虑实现 NPU 版本的 MemAllocator 来支持类似功能；(3) DSA MTP index_share（#44420）修改了 deepseek_mtp.py、deepseek_v2.py 和 llm_base_proposer.py，vllm-ascend 有 DeepSeek V4 模型定义，需确认 MTP index_share 路径是否兼容；(4) DSV4 Sparse MLA 解耦（#44699）将稀疏 MLA 核心类从 V3.2 后端中抽出到 vllm/models/deepseek_v4/sparse_mla.py，vllm-ascend 的 ROCm AITER 后端引用了这些类，需要确认导入路径更新。其他变更（视频加载器、Mooncake bugfix、RDNA3 MoE、async kv load deadlock、XPU KV offload、XPU MXFP4 MoE）对 vllm-ascend 基本无影响。",
   "commits": [
     {
       "sha": "4dcd10eb0d223a3ec4b2c96deaf3a48a96c8dcaa",
-      "comment": "重构 DeepSeek V4 的 KV cache tensor 布局规划逻辑。引入 `_bucket_layers_by_page_size()` 统一函数，将原来分散在 `_pool_bytes_per_block` 和 `_get_kv_cache_config_deepseek_v4` 中的按 page_size 分桶逻辑集中管理。旧代码假设 kv_cache_groups[0] 是 full-MLA group 并通过 `get_num_layer_tuples()` 计算 slot 数量；新代码通过分桶结果直接迭代 `buckets.items()` 生成 KVCacheTensor。逻辑等价、可读性提升、消除了对 group 顺序的隐性依赖。",
+      "comment": "**[KV Cache 布局重构 - DSV4 配置简化]**\n\n**变更意图**: 重构 DeepSeek V4 的 KV cache tensor 布局规划逻辑。原实现假设 kv_cache_groups[0] 是 full-MLA group 并以它的 page_sizes 作为规范桶集合，其他 group 通过上游 padding 对齐。新实现通过 `_bucket_layers_by_page_size` 函数统一将各 group 的 layer 按 page_size_bytes 分桶聚合，同一 slot_idx 的不同 group layer 共享底层 tensor。\n\n**实现方式**: (1) 新增 `_bucket_layers_by_page_size()` 工具函数，遍历所有 kv_cache_groups，对每个 layer 按 page_size 分桶并分配 slot_idx；(2) 简化 `_get_kv_cache_config_deepseek_v4` 从 3 层嵌套循环（tuple_idx -> page_size -> groups）降为 2 层（page_size -> slots）；(3) 同步修改 `_pool_bytes_per_block` 复用同一分桶逻辑。\n\n**潜在风险**: 低风险。去除了对 full-MLA group 首位的假定，使代码更健壮。但 `_bucket_layers_by_page_size` 中 `slot_count[ps]` 的逻辑依赖 layer 注册顺序——不同 group 的 layer 按遍历顺序分配到 slot 中，如果上游对 layer 顺序有隐含依赖，可能出现与原实现不同的共享关系。建议确认所有调用方（特别是 HMA/mamba 场景）的行为一致性。",
       "tags": [
         "refactor",
         "low-risk",
-        "scheduler",
         "kv-cache"
       ],
       "ascend_impact": {
         "ascend_affected": true,
-        "functionality": "KVCacheConfig 的 tensor 布局规划在 vllm/v1/core/kv_cache_utils.py 中实现，是 scheduler 平台无关的一部分。若 Ascend 使用 vllm 的标准 Scheduler 和 KVCacheManager（而非自研调度器），则此变更自动生效，功能无影响。若 Ascend 维护了自有的 KV cache 布局逻辑（如在 AscendPlatform 中 override），则无需关注此变更。",
-        "testing": "无直接影响",
+        "functionality": "修改了 `vllm/v1/core/kv_cache_utils.py` 中的 `_get_kv_cache_config_deepseek_v4` 和 `_pool_bytes_per_block` 函数。vllm-ascend 通过 patch 层可能对这些函数有补丁或重写。如果 vllm-ascend 的 patch 层直接 patch 了这些函数（如 scheduler 级或 kv_cache 级 patch），则需要检查新逻辑是否兼容或需要更新 patch。vllm-ascend 的 DeepSeek V4 模型路径有自己的 attention 实现，但 KV cache tensor 规划走的是 vLLM 公共路径，因此功能上不受阻断，只需确认 patch 兼容。",
+        "testing": "无直接影响。vllm-ascend 的 KV cache 相关测试如果 mock 了这些函数，需要更新 mock 行为。",
         "needs_test_update": false,
         "suggested_test_areas": []
       }
     },
     {
       "sha": "228bcc436b0f09cf1824f00fd44f8f9c94060940",
-      "comment": "在 ROCm (AMD GPU) 平台上启用 `permute_cols` 算子。原来该算子被 `#ifndef USE_ROCM` 守卫排除在 ROCm 构建之外，此次移除了守卫，将编译和注册统一纳入 HIP 流程。同时将 `permute_cols.cu` 和两个 per_token_group_quant 文件从 CUDA-only 的 `${VLLM_CUDA_SRC}` 移到 HIP 和 CUDA 共享的编译列表。涉及 CMakeLists.txt、ops.h 和 torch_bindings.cpp 三处文件。",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
       "tags": [
-        "feature",
-        "performance",
-        "low-risk",
-        "rocm"
+        "chore"
       ],
       "ascend_impact": {
         "ascend_affected": false,
@@ -41,11 +37,9 @@
     },
     {
       "sha": "3d3ba460a20a7e313d278c2df710a9c0b4bcb00e",
-      "comment": "修改 XPU 平台 PyTorch 依赖版本字符串，从 `torch==2.11.0+xpu` 改为 `torch==2.11.0`（移除 +xpu 后缀）。这是因为 PyTorch 2.11.0 的 XPU 版本已不再需要特殊的后缀标识，标准 `2.11.0` 版本即可。",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
       "tags": [
-        "chore",
-        "low-risk",
-        "xpu"
+        "chore"
       ],
       "ascend_impact": {
         "ascend_affected": false,
@@ -57,11 +51,9 @@
     },
     {
       "sha": "66ecfd05681b1b5bf8c10ace9c8ed96cc5ac7659",
-      "comment": "移除了 `nvidia-cudnn-frontend` 依赖的上限约束 `<1.19.0`。旧版本 1.19.0 有 breaking changes，但现已修复（`>=1.19.1` 可用）。这是一个 dependency 清理，消除版本限制以避免与其他依赖冲突。",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
       "tags": [
-        "chore",
-        "low-risk",
-        "cuda"
+        "chore"
       ],
       "ascend_impact": {
         "ascend_affected": false,
@@ -73,26 +65,26 @@
     },
     {
       "sha": "f0f6805d8a0c38d676414f348f36ffe519dd895d",
-      "comment": "修复多音频（multi-audio）OpenAI API Server 路径的稳定性问题。核心改动：(1) 将 `AsyncMultiModalItemTracker` 从存储 `Awaitable` 改为存储 `Callable[[], Awaitable]`（通过 `functools.partial`），避免 asyncio.Future 提前创建导致状态不一致；(2) `BaseMultiModalItemTracker.add()` 提取 `_validate_add()` 方法分离校验逻辑；(3) `image_embeds`/`audio_embeds`/`image_pil` 从 `asyncio.Future` + `set_result` 改为直接同步计算后通过 `partial` 包装；(4) `api_server.py` 增加 `VLLMValidationError` 的 exception handler；(5) `BaseProcessingInfo.validate_num_items()` 改为抛出 `VLLMValidationError`（带 modality 参数）而非通用的 `ValueError`。降低竞态条件和异步状态不一致风险。",
+      "comment": "**[CI 稳定性 - 多模态异步流水线修复]**\n\n**变更意图**: 修复多模态异步流水线在处理多个音频/图像/视频时可能出现的竞态条件和稳定性问题。核心改动是将 `asyncio.Future` + `set_result` 的模式替换为 `functools.partial` 延迟求值 + 统一 await 的模式。\n\n**实现方式**: (1) 定义 `_AsyncMultiModalItem` 类型别名，统一为 `Callable[[], Awaitable[tuple[object, str | None]]]`；(2) `AsyncMultiModalItemTracker` 不再直接存储 coroutine，而是存储 partial 函数，在 `resolve_items` 中统一调用 `item()` 再 await；(3) `parse_image_embeds`、`parse_audio_embeds`、`parse_image_pil` 等同步返回数据的函数不再创建 `asyncio.Future` 并立即 `set_result`，而是通过 `_item_with_uuid_async` 包装为 async 函数；(4) `validate_add` 从 `add` 中提取为独立方法，增加可测试性；(5) 在 `api_server.py` 中注册 `VLLMValidationError` 的异常处理器；(6) 在 `context.py` 中将 `validate_num_items` 的异常从 `ValueError` 改为 `VLLMValidationError`，便于 API 层捕获。\n\n**潜在风险**: 低风险。`partial` 模式相比 `Future.set_result` 更防竞态（Future 在多个事件循环中可能被提前 resolve）。类型定义更严格，减少了隐式类型转换。影响范围集中在多模态异步路径。",
       "tags": [
         "bugfix",
-        "medium-risk",
-        "entrypoints",
-        "multimodal"
+        "low-risk",
+        "multimodal",
+        "entrypoint"
       ],
       "ascend_impact": {
-        "ascend_affected": true,
-        "functionality": "入口层（entrypoints）为平台无关代码。vllm-ascend 若使用同一套 OpenAI API Server 入口（继承自 vllm），则自动受益于多音频路径的稳定性修复。VLLMValidationError 的引入为 API 错误处理提供了更精确的异常类型（带 parameter 信息），不会破坏现有兼容性。",
-        "testing": "若 Ascend 有多模态测试用例（特别是涉及多个音频/image_embeds 输入的），建议确认异步路径行为一致。",
+        "ascend_affected": false,
+        "functionality": "无影响。变更集中在多模态异步输入处理和 OpenAI API server 的异常处理，vllm-ascend 不涉及这些模块。",
+        "testing": "无影响。",
         "needs_test_update": false,
         "suggested_test_areas": []
       }
     },
     {
-      "sha": "15652a6f703b059767d75e5a511c4a5accf969ad",
-      "comment": "文档修复：将 `docs/design/torch_compile_multimodal.md` 中已废弃的环境变量 `VLLM_TORCH_COMPILE_LEVEL=0` 替换为正确的 `--compilation-config='{\"mode\":0,...}'` 参数。纯文档变更。",
+      "sha": "15652a6b703f059767d75e5a511c4a5accf969ad",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
       "tags": [
-        "docs",
+        "bugfix",
         "low-risk"
       ],
       "ascend_impact": {
@@ -105,85 +97,79 @@
     },
     {
       "sha": "51ef6888315ad242e137fa02fb6500bcf643924c",
-      "comment": "修复 Mooncake KV connector store 中 KV 事件（KV Event）的 `block_size`/`block_hash` 和 `group_idx` 字段。主要问题：`ReqMeta.original_block_size` 字段未正确透传到 `KVCacheStoreSendingThread` 生成的 KV Event 中。修复方案：(1) 从 `ReqMeta` 中删除冗余的 `original_block_size` 字段；(2) `MooncakeStoreScheduler` 改用 `resolve_kv_cache_block_sizes()` 获取统一的 block_size/hash_block_size；(3) Worker 端改为从 `token_databases[g_idx].block_size` 读取每个 group 实际的 block_size；(4) KV Event 中传入正确的 `group_idx`。新增了 `test_store_sending_thread_kv_events_use_group_chunk_metadata` 端到端测试。",
+      "comment": "**[Bugfix][Mooncake] 修复 Mooncake Store KV 事件中 per-group block_size/block_hash 和 group_idx 的问题]**\n\n**变更意图**: 修复 Mooncake KV connector 在传输 KV 事件时使用了错误的 `block_size`（原始的 `original_block_size` 而非 per-group 的 `db.block_size`）和缺少 `group_idx` 字段的问题，导致下游消费端无法正确区分不同 KV cache group 的事件。\n\n**实现方式**: (1) 在 `ReqMeta` 中删除 `original_block_size` 字段，该字段存储引擎级的单一 block_size，在 multi-group HMA 场景下不正确；(2) `scheduler.py` 中不再传递 `original_block_size`；(3) `worker.py` 的 `_handle_request` 中，构建 KV 事件时使用 `db.block_size`（per-group 的 block_size）替代 `req_meta.original_block_size`，并添加 `group_idx=g_idx` 字段；(4) KV 事件中 `block_hashes` 改为从 key 的 chunk_hash 解析而非直接使用 req_meta 中的 block_hashes（因为不同 group 可能有不同的 hash 映射）；(5) 新增测试 `test_store_sending_thread_kv_events_use_group_chunk_metadata` 验证 multi-group 场景下 block_size 和 group_idx 的正确性。\n\n**潜在风险**: 中低风险。修复了明确的 bug，但修改了 KV 事件的构建逻辑——block_hashes 的来源从 `req_meta.block_hashes[chunk_idx]` 改为 `BlockHash(bytes.fromhex(key.chunk_hash))`，如果 key 和 req_meta 的 hash 计算不一致，可能导致事件中的 hash 与预期不符。测试覆盖了新的行为。",
       "tags": [
         "bugfix",
         "medium-risk",
-        "kv-cache",
-        "distributed"
+        "distributed",
+        "kv-cache"
       ],
       "ascend_impact": {
         "ascend_affected": false,
-        "functionality": "无影响。Mooncake 为特定分布式 KV 传输实现，Ascend 不使用此组件。",
-        "testing": "无影响",
+        "functionality": "无影响。Mooncake KV transfer 是独立的 KV connector 实现，vllm-ascend 有自己的 KV transfer 连接器（mooncake 的 Ascend 变体或自有的 UCM connector/AscendStore），不受此变更影响。",
+        "testing": "无影响。",
         "needs_test_update": false,
         "suggested_test_areas": []
       }
     },
     {
       "sha": "6ac69203e8eb8ec29a3cb67240ac7e7327d9e0b0",
-      "comment": "新增 GLM-4.6V 视频加载后端 `GLM46VVideoBackend`，注册在 `VIDEO_LOADER_REGISTRY` 中，关联 `Glm46VVideoProcessor`。核心逻辑在 `compute_frames_index_to_sample()` 中实现，忠实复现 transformers 库 `Glm46VVideoProcessor.sample_frames` 的动态 FPS 帧采样算法：根据视频时长选择目标 FPS（≤30s→3fps, ≤300s→1fps, >300s→0.5fps），乘以 `temporal_patch_size`（默认 2）计算抽取帧数，上限 640 帧，时长上限 2400 秒，强制偶数帧数。同时增加了完整的 parametrize 单元测试覆盖各种时长和 patch size 组合。",
+      "comment": "**[videoloader] 实现 GLM-4.6V 视频加载器后端]**\n\n**变更意图**: 为 GLM-4.6V 模型添加专门的视频帧采样后端。该后端实现动态 FPS 帧采样逻辑，根据视频时长选择不同的目标帧率（≤30s: 3fps, ≤300s: 1fps, >300s: 0.5fps），上限 640 帧，时长上限 2400s，并强制偶数帧数。\n\n**实现方式**: (1) 新增 `GLM46VVideoBackend` 类，装饰器注册为 `glm46v` 后端并关联 `Glm46VVideoProcessor`；(2) 实现 `compute_frames_index_to_sample` 方法，完整复现 transformers v5.9.0 中 `Glm46VVideoProcessor.sample_frames` 的逻辑；(3) 包含 duration 从帧数/fps 估算的回退逻辑、linspace 采样和去重、偶数帧数强制；(4) 新增 133 行测试覆盖各种时长阈值、temporal_patch_size 变化、duration 缺失估算和偶数帧数强制。\n\n**潜在风险**: 低风险。纯新增代码，不修改现有逻辑。测试覆盖了主要边界条件。依赖 numpy 的 linspace 和 triton JIT 功能，在无 Triton 平台上仅触发纯 Python 路径。",
       "tags": [
         "feature",
         "low-risk",
-        "multimodal",
-        "model"
+        "multimodal"
       ],
       "ascend_impact": {
-        "ascend_affected": true,
-        "functionality": "视频加载器为平台无关的纯 Python 实现（在 vllm/multimodal/video.py 中注册）。若 Ascend 支持 GLM-4.6V 模型，则该 backend 可被正常使用。",
-        "testing": "无直接影响",
+        "ascend_affected": false,
+        "functionality": "无影响。新增的 GLM-4.6V 视频后端是纯 Python 逻辑，不依赖特定硬件平台。vllm-ascend 不需要额外适配。",
+        "testing": "无影响。",
         "needs_test_update": false,
         "suggested_test_areas": []
       }
     },
     {
       "sha": "1505b3d8a1f31be16fc6ff37494c15651bbf1fa2",
-      "comment": "更新 Cohere 模型支持列表：将 `Cohere2MoeForCausalLM` 映射的示例模型从 `command-a-plus-05-2026` 改为 `North-Mini-Code`；将 `Cohere2VisionForConditionalGeneration` 的 Command A+ 模型作为 extras 注册（`command-a-plus-05-2026-bf16`）。同时更新了文档中 supported_models.md 的对应条目。这两个新模型需要 transformers >= 5.9.0。",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
       "tags": [
-        "feature",
-        "low-risk",
-        "model",
-        "test"
+        "chore"
       ],
       "ascend_impact": {
-        "ascend_affected": true,
-        "functionality": "模型注册表（ModelRegistry）和数据流为平台无关。若 Ascend 支持 Cohere2MoeForCausalLM 或 Cohere2VisionForConditionalGeneration 架构，则可使用这些模型。min_transformers_version=5.9.0 的约束对所有平台均等。",
-        "testing": "无直接影响",
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
         "needs_test_update": false,
         "suggested_test_areas": []
       }
     },
     {
       "sha": "32f34d393524d18c7ec9c4add0be7731cde372dc",
-      "comment": "为 DeepSeek MTP（Multi-Token Prediction, DSA 方案）添加 index share 功能。核心思路：MTP step 0 让每层 MLA 计算自己的 topk indices（`skip_topk=False`），step 1+ 复用 step 0 的 indices（`skip_topk=True`）。涉及 5 个文件的修改：(1) DeepSeekMTP 新增 `set_skip_topk()` 方法递归设置各 MTP layer 的 MLA 层的 skip_topk 标志；(2) DeepseekV2MLAAttention 引入 `index_skip_topk_offset` 配置参数（默认 2），调整 index cache 偏移逻辑；(3) ModelArchConfigConvertorBase 修复 transformers v5.4+ 的 `qk_rope_head_dim` attribute_map bug（从 raw config.json 读取真实值）；(4) SpecDecodeBaseProposer 实现 `_share_mtp_indices` 检测逻辑，在 step 0 前设置 skip_topk=False 让 MTP 计算自己的 indices，step 0 后改为 True，同时将 topk_indices_buffer 递归分享到所有子模块；(5) Eagle utils 的 load_eagle_model 也改为递归分享 topk_indices_buffer 到所有子模块。",
+      "comment": "**[Feature] DSA MTP 投机解码的 index_share 机制]**\n\n**变更意图**: 为 DeepSeek V4 的 DSA (Dynamic Sparse Attention) MTP (Multi-Token Prediction) 投机解码实现 index_share_for_mtp_iteration 机制：step 0 让 MTP 层自主计算 top-k indices（skip_topk=False），后续步骤（step 1+）跳过索引计算直接复用 step 0 的结果（skip_topk=True），减少冗余计算。\n\n**实现方式**: (1) `deepseek_mtp.py`：新增 `set_skip_topk()` 方法递归遍历 MTP 层找到 mla_attn 并设置 skip_topk 标志；(2) `deepseek_v2.py`：重构 IndexCache 的 skip_topk 计算逻辑，引入 `index_skip_topk_offset` 配置参数（默认 2）替换硬编码的 magin layer_id - 1；(3) `llm_base_proposer.py`：在 `execute_first_pass` 中 step 0 前设置 skip_topk=False，step 0 后设置 skip_topk=True；在 `_maybe_share_model` 中检测 `index_share_for_mtp_iteration` 配置并共享 topk_indices_buffer 到所有子模块；(4) `eagle/utils.py`：扩展 topk_indices_buffer 共享逻辑到 draft 模型的所有子模块；(5) `model_arch_config_convertor.py`：修复 `_get_qk_rope_head_dim` 的 transformers v5.4+ attribute_map bug（当 qk_rope_head_dim == qk_nope_head_dim 时从原始 config.json 读取正确值）。\n\n**潜在风险**: 中风险。修改了 DeepSeek V2/V3/V4 共享的 `DeepseekV2MLAAttention` 中的 skip_topk 计算逻辑——引入 `index_skip_topk_offset` 改变了默认行为（从 layer_id % freq != 0 变为 (layer_id - offset + 1) % freq != 0），可能影响 V3/V3.1/V3.2 等非 V4 模型的 IndexCache 行为。qk_rope_head_dim 修复涉及读取原始 config.json 的远程文件获取，在网络隔离环境中可能失败。MTP index_share 逻辑假设 draft model 有 `set_skip_topk` 方法，如果 draft model 类型不同会静默跳过。",
       "tags": [
         "feature",
         "medium-risk",
-        "model",
         "speculative-decoding",
-        "performance"
+        "attention",
+        "model-runner"
       ],
       "ascend_impact": {
         "ascend_affected": true,
-        "functionality": "DeepSeek 模型实现和 speculative decoding 为平台无关代码路径，但 topk_indices_buffer 的 share 机制依赖 CUDA 的 buffer 指针共享。若 Ascend 支持 DeepSeek MTP 和 index_share_for_mtp_iteration 功能，需确保 (1) 自有的 MLA attention 实现支持 skip_topk 标志 (2) buffer 指针共享机制在 Ascend 设备上有效。`qk_rope_head_dim` 修复在 ModelArchConfigConvertorBase 中，对 Ascend 同样生效。",
-        "testing": "若 Ascend 支持 DeepSeek MTP，建议测试 index share 功能的正确性（各 step 输出的 token 一致性）。",
+        "functionality": "修改了 DeepSeek V2/V3/V4 共享的 `DeepseekV2MLAAttention`（skip_topk 计算逻辑引入 index_skip_topk_offset）、`deepseek_mtp.py`（新增 set_skip_topk）和 `llm_base_proposer.py`（index_share 流程）。vllm-ascend 有自己的 DeepSeek V4 模型定义（vllm_ascend/models/deepseek_v4.py）和 MTP 实现（deepseek_v4_mtp.py），但 vllm-ascend 的 attention 后端是独立的（AscendAttentionBackend/MLAAttention），不直接使用 vLLM 的 DeepseekV2MLAAttention——vllm-ascend 的 DeepSeek V4 模型有自己的 attention layer 封装。因此 skip_topk 计算逻辑变更可能不直接影响 vllm-ascend，但 set_skip_topk 需要 vllm-ascend 的 MTP 模型实现该接口才能生效。另外 topk_indices_buffer 共享逻辑修改了 llm_base_proposer.py 和 eagle/utils.py，vllm-ascend 如果使用 vLLM 的 proposer 基类，则这些变更会自动生效。",
+        "testing": "如果 vllm-ascend 启用了 DSA MTP 投机解码测试，需要验证 index_share 机制在 Ascend 上的行为。",
         "needs_test_update": false,
         "suggested_test_areas": []
       }
     },
     {
       "sha": "9c7f7741d45154ca11455caa9875beb94e2e66b7",
-      "comment": "修复 `benchmark_moe.py`，移除了 MoE 算子调用中的 `inplace` 参数。该参数对应的 `disable_inplace()` 功能已在上游重构中移除，但 benchmark 脚本未被同步更新，导致报错。删除了 3 行引用。",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
       "tags": [
         "bugfix",
-        "low-risk",
-        "performance",
-        "test"
+        "low-risk"
       ],
       "ascend_impact": {
         "ascend_affected": false,
-        "functionality": "无影响。benchmark 脚本修复。",
+        "functionality": "无影响",
         "testing": "无影响",
         "needs_test_update": false,
         "suggested_test_areas": []
@@ -191,123 +177,126 @@
     },
     {
       "sha": "6181e80fe0c619c0f4fa256e0a37920c2e36f523",
-      "comment": "为 Intel XPU 平台添加 `compressed_tensors_moe_w4a4_mxfp4` 量化的 MoE kernel 支持。在 `CompressedTensorsW4A4Mxfp4MoEMethod` 的量化和 `process_weights_after_loading` 中添加 XPU 分支：选择 `XPUExpertsMXFp4` 作为 experts 实现类（而非 CUDA 的 Cutlass/Marlin），且权重后处理在 XPU 上不做 swizzle 转换（直接 pass）。同时添加了对应的 CI 测试（`INCModel/Qwen3-30B-A3B-Instruct-2507-MXFP4-LLMC` 模型）。",
+      "comment": "**[XPU] 为 compressed_tensors_moe_w4a4_mxfp4 添加 XPU 分支]**\n\n**变更意图**: 在 MXFP4 量化的 MoE 层中为 XPU 平台添加专用的 XPUExpertsMXFp4 专家实现路径，使 Intel XPU 设备能够运行 W4A4 MXFP4 量化的 MoE 模型。\n\n**实现方式**: (1) 在 `CompressedTensorsW4A4Mxfp4MoEMethod.__init__` 中，当 `current_platform.is_xpu()` 时设置 `self.mxfp4_backend = Mxfp4MoeBackend.XPU` 和 `self.experts_cls = XPUExpertsMXFp4`；(2) 在 `process_weights_after_loading` 中，XPU 分支直接 `pass` 跳过 Marlin 特有的 swizzled scales 转换；(3) 同步更新 CI 配置，添加 XPU 上的 MXFP4 模型测试（INCModel/Qwen3-30B-A3B-Instruct-2507-MXFP4-LLMC）。\n\n**潜在风险**: 低风险。加了平台条件分支，不影响现有 CUDA/ROCm 路径。XPU 分支跳过 swizzled scales 转换，需要确认 XPU kernel 是否能正确处理原始 weight layout。",
       "tags": [
         "feature",
         "low-risk",
-        "xpu",
-        "quantization"
+        "quantization",
+        "xpu"
       ],
       "ascend_impact": {
         "ascend_affected": false,
-        "functionality": "无影响。XPU 平台特化。",
-        "testing": "无影响",
+        "functionality": "无影响。XPU 专用的 MXFP4 MoE 实现，vllm-ascend 的 Ascend NPU 不涉及此变更。",
+        "testing": "无影响。",
         "needs_test_update": false,
         "suggested_test_areas": []
       }
     },
     {
       "sha": "3bb46975bd316bdd87e083758b86e2588cec8934",
-      "comment": "为 Intel XPU 平台实现 transparent sleep mode 支持。核心变更：(1) 新增 `vllm/device_allocator/xpumem.py`（295 行），实现 `XpuMemAllocator` 单例类——通过 `vllm_xpu_kernels` 扩展库的 `xpumem_allocator` 接口管理 XPU 设备内存，支持 sleep（offload 到 CPU 或直接释放物理内存）和 wake-up（重建映射并恢复数据）；(2) 新增 `vllm/device_allocator/__init__.py`，定义 `MemAllocator` Protocol 接口和 `get_mem_allocator_instance()` 工厂函数，根据平台分发到 `CuMemAllocator` 或 `XpuMemAllocator`；(3) 将 `cumem.py` 中的 `AllocationData` 和 `HandleType` 提取到 `__init__.py` 共享定义；(4) Platform 接口 `is_sleep_mode_available()` 添加 XPU 支持；(5) Worker 的 `_maybe_get_memory_pool_context()` 添加 XPU 分支（不依赖 `enable_cumem_allocator`，仅依赖 `enable_sleep_mode`）；(6) 测试文件 `test_cumem.py` 重命名为 `test_mem.py`，用 `current_platform.mem_get_info()` 替代 `torch.cuda.mem_get_info()` 实现平台无关；新增 XPU sleep mode CI 测试。",
+      "comment": "**[XPU] 透明睡眠模式支持]**\n\n**变更意图**: 为 Intel XPU 平台添加 transparent sleep mode 支持，允许将推理引擎暂时释放 GPU 内存（睡眠）并在后续恢复（唤醒），支持 level 1（offload weights 到 CPU）和 level 2（深度睡眠，不保留备份）两种级别。\n\n**实现方式**: (1) 新增 `vllm/device_allocator/__init__.py`，定义 `MemAllocator` 协议接口（use_memory_pool、sleep、wake_up、get_current_usage）和 `get_mem_allocator_instance()` 工厂函数，根据平台选择 `CuMemAllocator`（CUDA/ROCm）或 `XpuMemAllocator`（XPU）；(2) 新增 `vllm/device_allocator/xpumem.py`——`XpuMemAllocator` 单例类，基于 XPU 的 `MemPool` 机制实现内存池化，sleep 时通过 `_xpu_memcpy_sync` 将 tagged 数据备份到 CPU 并 `unmap_and_release` XPU 内存，wake_up 时重新 `create_and_allocate` 并从 CPU 恢复；(3) 将 `AllocationData` 和 `HandleType` 从 `cumem.py` 提取到 `__init__.py` 中共享；(4) 修改 `gpu_worker.py` 中的 `sleep`/`wake_up`/`_maybe_get_memory_pool_context` 使用平台无关的 `get_mem_allocator_instance()`；(5) 修改 `Platform.is_sleep_mode_available()` 返回 XPU 也为 True；(6) 在 `ModelConfig` 中，CUDA-alike 平台才检查 `enable_cumem_allocator`，XPU 只需要 `enable_sleep_mode`；(7) 重命名测试文件 `test_cumem.py` -> `test_mem.py`，适配平台无关调用。\n\n**潜在风险**: 低-中风险。平台无关化改造良好。`XpuMemAllocator` 依赖 `vllm_xpu_kernels` 扩展和 `torch.xpu.memory` API，这些在非 XPU 平台上不会访问，不影响现有平台。主要风险在 shutdown 时序——`_shutdown_singleton` 中 MemPool 和 allocator 的释放顺序（先释放 pool 再释放 allocator）的设计需要仔细验证。",
       "tags": [
         "feature",
         "medium-risk",
+        "device-allocator",
         "xpu",
-        "platform-abstraction"
+        "refactor"
       ],
       "ascend_impact": {
         "ascend_affected": true,
-        "functionality": "本变更涉及平台抽象层的两处扩展：(1) `MemAllocator` Protocol 接口定义在 `vllm/device_allocator/__init__.py` 中，Ascend 若需要 sleep mode 支持，可参考此接口实现 `AscendMemAllocator` 并通过 `get_mem_allocator_instance()` 工厂函数注册。(2) `Platform.is_sleep_mode_available()` 在 `interface.py` 中已包含 XPU，但 Ascend 有自己的 Platform 子类，需独立实现或继承默认行为（默认返回 False）。(3) `gpu_worker.py` 的 `_maybe_get_memory_pool_context` 添加了 XPU 条件分支，但 CUDA-alike 分支仍然只检查 `enable_cumem_allocator`——若 Ascend 使用 CUDA-alike 且需要 sleep mode，需在此处添加 Ascend 分支逻辑。(4) 测试文件 `test_cumem.py`→`test_mem.py` 的重命名和 `current_platform.mem_get_info()` 的引入提供了平台无关的测试模式。",
-        "testing": "建议 Ascend 关注 `test_mem.py` 中的平台无关测试模式，可用于编写 Ascend 版本的 sleep mode 测试。",
-        "needs_test_update": false,
-        "suggested_test_areas": []
+        "functionality": "新增了平台无关的 `MemAllocator` 协议接口和 `get_mem_allocator_instance()` 工厂函数。vllm-ascend 可以参照此模式实现 `NPUMemAllocator` 来支持 Ascend NPU 的睡眠模式。`Worker.sleep`/`wake_up`/`_maybe_get_memory_pool_context` 已改为使用 `get_mem_allocator_instance()` 替代直接引用 `CuMemAllocator`——如果 vllm-ascend 的 worker 继承或 patch 了这些方法，需要确保新路径兼容。另外 `Platform.is_sleep_mode_available()` 返回了 True for XPU，vllm-ascend 的 `NPUPlatform` 如果需要睡眠模式，也需要重写该方法。",
+        "testing": "测试文件 test_cumem.py 重命名为 test_mem.py 并改为使用平台无关调用。vllm-ascend 的 CI 测试中如果引用了 test_cumem.py，需要更新文件路径引用。",
+        "needs_test_update": true,
+        "suggested_test_areas": [
+          "vllm-ascend 的 CI 配置中如果直接引用了 tests/basic_correctness/test_cumem.py，需要更新为 test_mem.py",
+          "如果 vllm-ascend 实现了 NPU 睡眠模式，可以新增 NPU 版本的 MemAllocator 实现"
+        ]
       }
     },
     {
       "sha": "810966453a2576f45880c899db2af2e604207ed4",
-      "comment": "为 Intel XPU 平台启用 CPU KV offloading 和 tiering offloading 功能。涉及多文件改动：(1) `_custom_ops.py` 中 `swap_blocks_batch` 对 XPU 分支调用不带 `is_src_access_order_any` 参数的三参数版本；(2) `gpu_worker.py` 指针类型改为 `uint64`（XPU DMA 引擎要求）而非 CUDA 的 `int64`；stream 操作改为 `current_platform.Stream()` 和 `current_platform.current_stream()` 实现平台无关；(3) `shared_offload_region.py` 的 `cudaHostUnregister` 调用仅在 CUDA-alike 上执行；(4) `spec.py` 的 `CPUOffloadingSpec` 扩展支持条件到 `is_xpu()`；(5) 测试文件中的 device 类型从 `cuda:0` 改为 `{DEVICE_TYPE}:0` 适配 XPU。新增 XPU CPU offload CI 测试。",
+      "comment": "**[XPU] 支持 CPU KV offloading 和 tiering offloading]**\n\n**变更意图**: 将 CPU KV cache offload 功能从仅限 CUDA/ROCm 扩展到支持 XPU 平台。涉及 offload worker、shared offload region 管理、swap_blocks_batch 接口适配和测试用例。\n\n**实现方式**: (1) `gpu_worker.py`：`_select_swap_blocks_fn` 中，XPU 平台回退到 `ops.swap_blocks_batch` 而非使用 Triton kernel（因为 XPU 没有 CUDA 的 unified virtual address space，Triton 的 `tl.load(cpu_ptr)` 无效）；`compute_sub_block_ptrs` 从 int64 改为 uint64 适配 XPU DMA engine；pointer tensor 的 dtype 根据平台选择 torch.uint64（XPU）或 torch.int64（CUDA/ROCm）；stream 操作改为平台无关的 `current_platform.Stream()`/`current_platform.current_stream()`/`current_platform.stream()`；(2) `shared_offload_region.py`：`cleanup` 中 `cudaHostUnregister` 调用仅在 CUDA-alike 平台上执行；(3) `spec.py`：`CPUOffloadingSpec` 放宽平台限制，允许 XPU 和 CUDA-alike；(4) `_custom_ops.py`：`swap_blocks_batch` 对 XPU 平台调用时不传递 `is_src_access_order_any` 参数（XPU 版本不支持该参数）；(5) 测试适配：使用 `current_platform.device_type` 替代硬编码的 `cuda:0`；为 XPU 添加 `TRITON_ATTN` 和 `FLASH_ATTN` 后端选择；使用 `CPU_BLOCK_SIZES=64`（XPU）或 48（其他平台）。\n\n**潜在风险**: 低风险。平台条件分支清晰，不影响现有 CUDA/ROCm 路径。`compute_sub_block_ptrs` 改为 uint64 后，在 CUDA 上 int64 和 uint64 的指针运算是二进制兼容的，不会引入问题。XPU 上跳过 `cudaHostRegister` 是合理的（XPU 没有该 API）。",
       "tags": [
         "feature",
-        "medium-risk",
-        "xpu",
+        "low-risk",
         "kv-cache",
-        "offloading"
+        "xpu",
+        "kv-offload"
       ],
       "ascend_impact": {
-        "ascend_affected": true,
-        "functionality": "CPU KV offloading 在 `vllm/v1/kv_offload/cpu/` 中实现，其中 `spec.py` 将支持条件从 `is_cuda_alike()` 扩展为 `is_cuda_alike() or is_xpu()`。若 Ascend 支持 CPU offloading，需在此处类似地添加 `or current_platform.is_ascend()`（假设有 is_ascend 方法）。`_custom_ops.py` 中 `swap_blocks_batch` 的 XPU 分支（调用不带 is_src_access_order_any 参数的三参数版本）与 CUDA 路径不同，若 Ascend 使用自定义的 `_C_cache_ops`，需确保签名匹配。`gpu_worker.py` 中指针类型由 `current_platform.is_xpu()` 决定——Ascend 需要根据自己的 DMA 引擎决定使用 `int64` 还是 `uint64`。`current_platform.Stream()` 等调用为平台无关，Ascend 如有自有的 Stream 实现可自动适配。",
-        "testing": "若 Ascend 支持 CPU offloading，建议关注 test_offloading_connector.py 中的 platform 适配逻辑（CPU_BLOCK_SIZES 条件值、ATTN_BACKENDS 列表）。",
+        "ascend_affected": false,
+        "functionality": "无直接影响。CPU KV offload 功能扩展到了 XPU 平台，vllm-ascend 已有自己的 KV offload 实现（vllm_ascend/kv_offload/ 和 simple_kv_offload/），不依赖 vLLM 的 CPU offload 路径。但 `swap_blocks_batch` 的 XPU 条件分支（不传递 is_src_access_order_any）不影响 Ascend。",
+        "testing": "无影响。",
         "needs_test_update": false,
         "suggested_test_areas": []
       }
     },
     {
       "sha": "2a983c79acdbe78fa62e67eaa87ed4bbb7c8257e",
-      "comment": "将 DeepSeek V4 的 Sparse MLA 元数据和 backend 类从 V3.2 的共享代码 `vllm/v1/attention/backends/mla/flashmla_sparse.py` 中解耦，移到新的独立文件 `vllm/models/deepseek_v4/sparse_mla.py`。新文件包含 `DeepseekV4FlashMLABackend`、`DeepseekV4FlashMLAMetadata` 和 `DeepseekV4FlashMLAMetadataBuilder` 三个核心类，直接继承 `AttentionBackend` 而非 V3.2 的 `FlashMLASparseBackend`。同时也移动了 C128A topk 相关的 Triton kernel。注册表 `AttentionBackendEnum.FLASHMLA_SPARSE_DSV4` 的类路径相应更新。ROCm 和 FlashInfer 后端也改引用新的 sparse_mla 模块。注意：新的 `DeepseekV4FlashMLABackend.get_impl_cls()` 直接 `raise NotImplementedError`（因为 DSV4 使用 `DeepseekV4Attention` 而非通用 Attention/MLAAttention layer）。",
+      "comment": "**[DSV4] 解耦 DeepSeek V4 Sparse MLA 元数据与 V3.2 后端]**\n\n**变更意图**: 将 DeepSeek V4 的 sparse MLA 核心类（Backend、Metadata、MetadataBuilder、C128A topk 内核）从 V3.2 的 `FlashMLASparseBackend`/`FlashMLASparseMetadata` 中解耦出来，放入独立的 `vllm/models/deepseek_v4/sparse_mla.py`。消除两个架构之间的耦合，使 V4 不再继承 V3.2 的后端类。\n\n**实现方式**: (1) 新增 `vllm/models/deepseek_v4/sparse_mla.py`——`DeepseekV4FlashMLABackend` 直接继承 `AttentionBackend`（而非 V3.2 的 `FlashMLASparseBackend`），独立声明支持的 dtype、kv_cache_dtype、block_size、head_size、compute capability 等；`DeepseekV4FlashMLAMetadata` 和 `DeepseekV4FlashMLAMetadataBuilder` 独立实现（包括 C128A 元数据构建和压缩 slot mapping）；将 `build_c128a_topk_metadata` 和 `_build_c128a_topk_metadata_kernel` Triton kernel 从 `flashmla_sparse.py` 移入新文件；(2) `vllm/v1/attention/backends/mla/flashmla_sparse.py`：删除所有 V4 相关的代码（c128a 字段、`is_deepseek_v4` 条件、FP8 混合 batch 的跳过逻辑等），简化回纯 V3.2 实现；(3) `vllm/models/deepseek_v4/nvidia/flashmla.py`：`DeepseekV4FlashMLASparseBackend` 重命名为 `DeepseekV4FlashMLABackend`（引用新 sparse_mla.py 中的类）；(4) `vllm/models/deepseek_v4/nvidia/flashinfer_sparse.py` 和 `vllm/models/deepseek_v4/amd/rocm.py`：更新导入路径，引用 `DeepseekV4FlashMLABackend`/`DeepseekV4FlashMLAMetadata`；(5) `vllm/v1/attention/backends/registry.py`：更新 `FLASHMLA_SPARSE_DSV4` 的类路径。\n\n**潜在风险**: 中等风险。架构解耦是好的方向，但需要注意以下几点：(1) V3.2 的 `FlashMLASparseMetadataBuilder.build()` 中移除了 `compress_ratio > 1` 时的 slot_mapping 压缩和 FP8 混合 batch 中跳过 DSV4 的优化，这反过来说明了 V3.2 和 V4 的分离是合理的，但需要确认 V3.2 构建器中不再有 DSV4 的后门依赖；(2) `FlashMLASparseMetadata` 的 `fp8_use_mixed_batch` 计算从 `num_heads < MIN_HEADS_FOR_BF16_PREFILL and not self.is_deepseek_v4` 简化为 `num_heads < MIN_HEADS_FOR_BF16_PREFILL`，不影响 V3.2；(3) 所有导入路径变更需要确保没有遗漏。",
       "tags": [
         "refactor",
         "medium-risk",
         "attention",
-        "model"
+        "model-runner"
       ],
       "ascend_impact": {
         "ascend_affected": true,
-        "functionality": "本变更改变了注意力后端注册路径：`AttentionBackendEnum.FLASHMLA_SPARSE_DSV4` 从指向 `vllm.models.deepseek_v4.nvidia.flashmla` 改为指向 `vllm.models.deepseek_v4.sparse_mla`。若 Ascend 有自定义 DSV4 注意力后端实现或引用了 `FLASHMLA_SPARSE_DSV4` 枚举值，需确保路径更新正确。若 Ascend 不使用 DSV4 或 FlashMLA 后端，则无影响。`DeepseekV4FlashMLABackend` 直接继承 `AttentionBackend`（而非 `FlashMLASparseBackend`），这意味着 backend 的接口契约发生了变化（不再继承 V3.2 共享行为），第三方后端若依赖中间类继承链需关注。",
-        "testing": "无直接影响",
+        "functionality": "关键影响：`vllm/models/deepseek_v4/sparse_mla.py` 中的 `DeepseekV4FlashMLABackend`/`DeepseekV4FlashMLAMetadata` 是 V4 注意力的核心类。(1) vllm-ascend 的 ROCm AITER 后端（`vllm_ascend/models/deepseek_v4/` 关联的 `vllm/models/deepseek_v4/amd/rocm.py`）直接引用了 `DeepseekV4FlashMLASparseBackend` 和 `FlashMLASparseMetadata`——此变更已更新了 `rocm.py` 中的导入路径为 `DeepseekV4FlashMLABackend` 和 `DeepseekV4FlashMLAMetadata`，vllm-ascend 的 AMD 适配如果使用了类似的导入，需要同步更新；(2) vllm-ascend 的 MLA attention 后端（`vllm_ascend/attention/mla_v1.py`）不直接使用这些类——它有自己的 `AscendAttentionBackend` 实现，因此不受影响；(3) `registry.py` 中的 `FLASHMLA_SPARSE_DSV4` 路径更新后，通过策略选择机制获取的 attention backend 会自动指向新位置。",
+        "testing": "如果 vllm-ascend 有 DeepSeek V4 的集成测试，需要确认导入路径更新后测试通过。",
         "needs_test_update": false,
         "suggested_test_areas": []
       }
     },
     {
       "sha": "bc5745a00f58eb55b7c53078995edcfbefc02928",
-      "comment": "优化 ROCm (AMD) 的 sparse MLA 前向计算：将 `torch.cat(q, dim=-1)` 替换为融合的 `ops.concat_mla_q()` 算子。当 q 是 `(ql_nope, q_pe)` 元组时，原来用 `torch.cat` 在最后维度拼接（会产生额外的内存分配和拷贝），现在使用预分配的 `q_concat_buffer` 和融合的 `concat_mla_q` kernel 实现 zero-copy 拼接。需要从 `current_workspace_manager()` 获取 workspace buffer。同时清理了 `concat_mla_q.cuh` 中多余的 CUDA 头文件包含。",
+      "comment": "**[ROCm][MLA] 替换 Sparse-MLA forward_mqa 中的 torch.cat 为 fused concat_mla_q 算子]**\n\n**变更意图**: 在 ROCm AITER sparse MLA 的 forward 路径中，将原来拆分 q 为 (ql_nope, q_pe) 后用 `torch.cat` 拼接的方式，替换为使用 fused 的 `concat_mla_q` 自定义算子，减少内存操作和 kernel launch 开销。\n\n**实现方式**: (1) 在 `ROCMAiterMLASparseImpl` 的 `__init__` 中通过 `current_workspace_manager().get_simultaneous()` 预分配一块 `q_concat_buffer` 用于 CUDA 图地址稳定性；(2) 在 `_forward_mla` 中，当 q 是 tuple 时，使用 `self.q_concat_buffer[:ql_nope.shape[0]]` 切片 + `ops.concat_mla_q(ql_nope, q_pe, q)` 替代 `torch.cat(q, dim=-1)`；(3) 在 `concat_mla_q.cuh` 中移除不必要的 CUDA 头文件包含。\n\n**潜在风险**: 低风险。纯性能优化，不改变计算结果。`concat_mla_q` 算子已存在，功能与原 `torch.cat` 等价。Workspace buffer 的预分配确保了 CUDA graph capture 的地址稳定性。",
       "tags": [
         "performance",
         "low-risk",
-        "rocm",
-        "attention"
+        "attention",
+        "rocm"
       ],
       "ascend_impact": {
         "ascend_affected": false,
-        "functionality": "无影响。ROCm/AMD 平台特化的 MLA 优化。",
-        "testing": "无影响",
+        "functionality": "无影响。ROCm 专有的 MLA sparse attention 性能优化，vllm-ascend 不使用 ROCm 路径。",
+        "testing": "无影响。",
         "needs_test_update": false,
         "suggested_test_areas": []
       }
     },
     {
       "sha": "3b3d5287faee2d4cf84a93419fe28a1f65c93749",
-      "comment": "修复多个异步 KV 加载请求（async KV connector）时的调度器死锁问题。根因：当多个请求同时等待异步 KV 加载（WAITING_FOR_REMOTE_KVS）时，它们各自持有部分 blocks，但加起来的总 block 需求超过 pool 容量，导致谁也无法完成 prefill。修复方案：(1) 引入 `scheduler._inflight_prefills` 集合，跟踪所有仍在 prefilling 的请求（包括正在异步加载的和正在执行 prefill chunk 的）；(2) 新增 `_request_remaining_blocks()` 计算请求完成完整序列还需的 block 数；(3) 新增 `_inflight_prefill_reserved_blocks()` 汇总所有 in-flight prefills 的保留 block 数；(4) 在 `allocate_slots()` 中新增 `reserved_blocks` 参数，将候选 async 加载请求的初始分配限制在 `(free_blocks - reserved_blocks)` 内，防止新的加载请求消耗 in-flight 请求所需的 blocks。同时更新了 KVCacheManager.allocate_slots() 接口传递 reserved_blocks。新增了 e2e 和单元测试。",
+      "comment": "**[BugFix] 修复异步 KV load 时的多请求死锁]**\n\n**变更意图**: 修复当多个请求同时进行异步 KV cache 加载时可能出现的死锁：请求 A 和 B 都进行 async KV load，各自持有部分 prefix blocks，但两者都无法获取完成 full sequence 所需的 blocks，导致双方都无法 forward progress——经典的死锁场景。\n\n**实现方式**: (1) 在 `KVCacheManager.allocate_slots` 中添加 `reserved_blocks` 参数，用于在执行分配时预留一定数量的 free blocks 给其他 in-flight 序列；(2) 在 `Scheduler` 中添加 `_inflight_prefills` 集合跟踪正在 prefilling 的请求（包括正在运行 prefill 和 in-progress async KV load 的请求）；(3) 新增 `_request_remaining_blocks` 计算请求完成 full sequence 还需要的 blocks；(4) 新增 `_inflight_prefill_reserved_blocks` 计算所有 in-flight prefills 剩余需要的 block 总数；(5) 在调度 async KV load 时，`reserved_blocks = self._inflight_prefill_reserved_blocks()` 传递给 `allocate_slots`，如果剩余 free blocks 不足以满足预留需求，则拒绝 admit 新的 async load——请求 B 会保持在 WAITING 状态且不持有任何 blocks，不会楔住请求 A；(6) 在请求完成、被 preempt、或不再处于 prefill 阶段时，从 `_inflight_prefills` 中移除；(7) 新增完整的调度器单元测试验证 wedged 场景和正常流量场景。\n\n**潜在风险**: 低风险。本质上是增加了一个 admission control 机制，不会阻塞正常路径。`_request_remaining_blocks` 的计算与 `allocate_slots` 内部逻辑保持一致即可。如果 `full_sequence_must_fit` 已经限制了过大的请求，则 `reserved_blocks` 可能很少或为零。新增的数据结构 `_inflight_prefills` 在请求生命周期各阶段需要正确维护，否则可能导致过度限制或不足限制。",
       "tags": [
         "bugfix",
-        "high-risk",
+        "low-risk",
         "scheduler",
         "kv-cache",
         "distributed"
       ],
       "ascend_impact": {
-        "ascend_affected": true,
-        "functionality": "本变更为核心调度器（Scheduler）和 KV Cache Manager 的接口变更。`KVCacheManager.allocate_slots()` 新增 `reserved_blocks` 形参（默认 0，向后兼容）。Scheduler 新增 `_inflight_prefills` 状态跟踪集合。若 Ascend 使用 vllm 的标准 Scheduler 实现，则此修复自动生效，大幅降低多请求异步 KV 加载的死锁风险。若 Ascend 有自研 Scheduler 或 override 了 `allocate_slots()`，需同步更新接口签名以支持 reserved_blocks 参数。此变更对 `test_mamba_prefix_cache.py` 中的 mock 函数也添加了 `reserved_blocks` 形参，类似 mock 需要同步。",
-        "testing": "若 Ascend 使用了 KV connector（远程 KV 加载），建议验证多请求并发 KV 加载场景下不存在类似死锁。",
+        "ascend_affected": false,
+        "functionality": "无影响。死锁修复在 Scheduler 和 KVCacheManager 层面，vllm-ascend 的 NPUWorker/NPUModelRunner 使用 vLLM 的公共 Scheduler 和 KVCacheManager，因此修复会自动生效。vllm-ascend 未修改 scheduler 或 kv_cache_manager 的逻辑。",
+        "testing": "无影响。",
         "needs_test_update": false,
         "suggested_test_areas": []
       }
     },
     {
       "sha": "062b05ff3af405b8800f7c42fa3998cc03dd97eb",
-      "comment": "新增 AMD RDNA3 (gfx1100) 的 fused MoE W4A16 GPTQ HIP kernel。这是 11 个文件、1906 行新增的大变更。核心内容：(1) 新增 CUDA/HIP kernel `moe_q_gemm_rdna3.cu`（639 行），将 expert routing（sorted_token_ids/expert_ids）与 W4A16 反量化+点积融合为单个 kernel launch，支持 fp16 和 bf16，通过 64-bit packed CAS atomic-add 直接写入输出（无 FP32 scratch buffer），支持 `output_topk` 融合 reduce；(2) Python 层新增 `compressed_tensors_moe_wna16_rdna3.py`，封装 CompressedTensorsWNA16RDNA3MoEMethod——将权重 shuffle 至 exllama 格式、合成 zero points，通过 `moe_gptq_gemm_rdna3` 融合 kernel 实现 w1+activation+w2 的完整 MoE 前向；(3) 新增 `rocm_moe.py` 调度器，在 `is_rocm() && on_gfx1100()` 时优先选择 RDNA3 原生 kernel；(4) 在 `compressed_tensors_moe.py` 的主分支中添加 ROCm 优先检查路径；(5) 新增两个测试文件（compile guard 测试 + correctness 测试），覆盖各种 token 数、dtype、BLOCK_SIZE_M 组合和 e2e 场景；(6) CMakeLists.txt 和 torch_bindings.cpp 添加 gfx1100 条件的编译和注册。",
+      "comment": "**[ROCm][Perf] 新增 RDNA3 gfx1100 的 fused MoE W4A16 HIP kernel]**\n\n**变更意图**: 为 AMD RDNA3 (gfx1100) 架构实现 fused MoE W4A16 GPTQ HIP kernel，将 expert routing、4-bit 反量化、点积和 atomic output 融合到单个 kernel launch 中，避免多次 kernel 启动和中间 buffer 开销。\n\n**实现方式**: (1) 新增 `csrc/rocm/moe_q_gemm_rdna3.cu`——fused MoE kernel 实现。每个 block 处理 BLOCK_SIZE_M 个 token（支持 1/2/4/8），覆盖一个 N 列 tile 和 K 输入位置。支持 fp16 和 bf16 激活。bf16 M=1 时使用 v_dot2_f32_bf16 指令且跳过 LDS（直接从 global memory 读取），fp16 始终走 LDS。输出通过 64-bit packed CAS atomic-add 直接写入 pre-zeroed output（不经过 FP32 scratch buffer）；(2) CMakeLists.txt：在 gfx1100 条件块中添加 `moe_q_gemm_rdna3.cu`；(3) `ops.h` 和 `torch_bindings.cpp` 声明和注册 `moe_gptq_gemm_rdna3` 算子；(4) `_custom_ops.py`：添加 Python 包装和 register_fake；(5) 新增 `compressed_tensors_moe_wna16_rdna3.py`：`CompressedTensorsWNA16RDNA3MoEMethod`——使用 fused kernel 的 MoE 方法，处理权重 shuffle、synthesize qzeros、自动选择 BLOCK_SIZE_M（decode=1, prefill=4），支持 output_topk 融合 reduce；(6) 新增 `rocm_moe.py`：ROCm MoE 分发器——`is_supported()` 检查 gfx1100 + op 存在性，`make_method()` 返回对应实现；(7) `compressed_tensors_moe.py`：修改 dispatch 逻辑，在 ROCm 平台上优先检查 `rocm_moe.is_supported()`；(8) 新增两个测试文件：`test_rdna3_compile_guards.py`（编译守卫测试，验证非 gfx1100 上 ops 不存在）和 `test_rdna3_moe_w4a16.py`（数值正确性测试，与密集 gptq_gemm_rdna3 对比）；(9) `layer.py`：在 quant_method_name 列表中添加 `CompressedTensorsWNA16RDNA3MoEMethod` 以触发 weight transpose。\n\n**潜在风险**: 中风险。大规模新代码（~1906 行），但编译守卫系统完善（gfx1100 宏 + hasattr 运行时检查 + 静态源码分析测试），确保非 RDNA3 平台不会受到影响。CU 代码中的 `__builtin_amdgcn_fdot2` 等 intrinsic 是 gfx1100 特有的，编译条件 `#if defined(__HIPCC__) && defined(__gfx1100__)` 保证了可移植性。验证密集 kernel 对比的数值精度已足够（atol=0.5 for bf16, 0.1 for fp16）。",
       "tags": [
-        "feature",
         "performance",
-        "high-risk",
+        "medium-risk",
         "rocm",
         "quantization",
-        "kernel"
+        "fused-moe"
       ],
       "ascend_impact": {
         "ascend_affected": false,
-        "functionality": "无影响。ROCm RDNA3 平台特化的 MoE W4A16 kernel 和 dispatch 逻辑，不影响 Ascend 平台。",
-        "testing": "无影响",
+        "functionality": "无影响。ROCm RDNA3 专用的 fused MoE kernel，vllm-ascend 使用 Ascend NPU，不涉及 ROCm 路径。",
+        "testing": "无影响。",
         "needs_test_update": false,
         "suggested_test_areas": []
       }

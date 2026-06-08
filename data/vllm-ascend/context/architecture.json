@@ -1,13 +1,19 @@
 {
   "repo": "vllm-project/vllm-ascend",
-  "generated_at": "2026-06-08T15:01:31.626249+08:00",
-  "commit_sha": "8c1a8ba0bbe940db5433968ff6249418c9538ce9",
-  "overview": "vLLM Ascend 是 vLLM 推理引擎的 Ascend NPU 硬件插件。它通过 vLLM 的 pluggable hardware interface 机制，将 Ascend NPU（如 910B/910C）注册为 vLLM 的 OOT (Out-of-Tree) 平台，使 vLLM 能够在华为昇腾芯片上运行 LLM 推理。项目通过平台抽象层、自定义算子、计算图编译（ACL Graph）、注意力后端、量化方法、分布式通信（HCCL/PyHCCL）等模块，将 Ascend NPU 的能力完整对接到 vLLM 生态。",
+  "generated_at": "2026-06-08T20:40:49.080765+08:00",
+  "commit_sha": "595c6c77612994421675c1c4346054e638ed2bdd",
+  "overview": "vllm-ascend 是华为为 vLLM 提供的 Ascend NPU 后端适配插件。它通过扩展 vLLM 的 Platform、Worker、AttentionBackend、Sampler 等抽象接口，将 LLM 推理引擎无缝迁移到华为昇腾 NPU 上运行，支持 910 系列（含 310P）、A5 等多种昇腾芯片型号。项目覆盖了完整的推理流水线——从硬件平台检测、图编译优化（ACL Graph / NPU Graph）、自定义算子注册、分布式通信（HCCL / PyHCCL）、量化推理、MoE 路由、KV Cache 管理、投机解码到多模态模型适配，并深度集成了华为 CANN 软件栈的特性（如 NZ 格式、FlashAttention 变体 DSA/SFA/MLA）。",
   "modules": [
     {
+      "path": "vllm_ascend/",
+      "name": "顶层入口",
+      "description": "包入口。register() 返回 vllm_ascend.platform.NPUPlatform 的路径供 vLLM 插件系统加载；register_connector()/register_model_loader() 分别注册 KV transfer 连接器、NetLoader/RforkLoader 和 Ascend 模型定义。",
+      "key_classes": []
+    },
+    {
       "path": "vllm_ascend/platform.py",
-      "name": "平台注册层",
-      "description": "NPUPlatform 类继承 vLLM 的 Platform 抽象基类，将 Ascend NPU 注册为 vLLM 的可插拔硬件后端。负责设备管理、配置校验、注意力后端选择、编译后端注册、内存管理等全局平台能力。是整个插件的入口点。",
+      "name": "Platform 层",
+      "description": "扩展 vLLM 的 Platform 抽象。NPUPlatform 定义 device_name='npu'、dispatch_key='PrivateUse1'、supported_quantization、graph_pool 管理等。注册 AscendCompiler 自定义编译后端、GraphFusionPassManager 自定义编译 pass、适配量化方法参数。设置最大 CUDAGraph capture size 默认逻辑。",
       "key_classes": [
         "NPUPlatform"
       ]
@@ -15,327 +21,407 @@
     {
       "path": "vllm_ascend/worker/",
       "name": "Worker 层",
-      "description": "实现 vLLM 的 WorkerBase 接口，管理 NPU 设备生命周期、内存分配、模型加载、KV Cache 分配、分布式环境初始化（HCCL）、模型编译与预热。NPUWorker 是 NPU 设备上推理执行的核心调度单元。",
+      "description": "NPUWorker（继承 vLLM WorkerBase）是 Ascend 推理 worker 的核心。管理设备初始化、模型加载、自定义算子注册、ACL Graph 捕获/回放、profiler、sleep/wake 模式。包含 v1 和 v2 两种 model runner。v1 的 NPUModelRunner 管理前向传播、KV cache、attention metadata、投机解码、MoE、量化、CP（context parallelism）。",
       "key_classes": [
-        "NPUWorker"
-      ]
-    },
-    {
-      "path": "vllm_ascend/worker/model_runner_v1.py",
-      "name": "模型执行器 (V1)",
-      "description": "NPUModelRunner 继承并扩展 vLLM 的 GPUModelRunner，实现 Ascend NPU 上的模型前向传播逻辑，包括输入批处理组装、模型调用、KV Cache 管理、CUDA Graph/ACL Graph 捕获与回放、流水线并行支持等。",
-      "key_classes": [
-        "NPUModelRunner"
-      ]
-    },
-    {
-      "path": "vllm_ascend/worker/v2/",
-      "name": "模型执行器 (V2)",
-      "description": "适用于 vLLM V2 模型运行时的 NPU Model Runner，包含独立的注意力元数据处理、状态管理、ACL Graph 工具、采样逻辑等。目前仍处于开发阶段。",
-      "key_classes": [
-        "NPUModelRunner"
+        "NPUWorker",
+        "NPUModelRunner",
+        "NPUInputBatch"
       ]
     },
     {
       "path": "vllm_ascend/attention/",
-      "name": "注意力后端",
-      "description": "实现 vLLM AttentionBackend 接口，提供 Ascend NPU 上的多种注意力实现：标准注意力 (AscendAttentionBackend)、MLA 注意力 (AscendMLABackend)、稀疏注意力 (AscendSFABackend, AscendDSABackend)、Flash Attention v3 (AscendFABackend)。支持上下文并行、KV Cache 压缩、Batch Invariant 等特性。",
+      "name": "Attention 后端",
+      "description": "Ascend FlashAttention 后端实现。核心类 AscendAttentionBackend 注册为 CUSTOM 后端，管理 KV cache 生命周期（get_kv_cache_shape、swap_blocks、copy_blocks）。AccendAttentionBackendImpl 是实际的 attention 计算实现。支持 Prefill/Decode/ChunkedPrefill/SpecDecoding 等多种状态。metedata builder 构建 block_tables、slot_mapping 等元数据。",
       "key_classes": [
         "AscendAttentionBackend",
-        "AscendMLABackend",
-        "AscendSFABackend",
-        "AscendDSABackend",
-        "AscendFABackend"
+        "AscendAttentionBackendImpl",
+        "AscendAttentionMetadataBuilder",
+        "AscendMetadata",
+        "AscendAttentionState",
+        "AttentionMaskBuilder"
       ]
     },
     {
-      "path": "vllm_ascend/ops/",
-      "name": "自定义算子层",
-      "description": "Ascend NPU 专用的自定义算子集合，包括融合 MoE (fused_moe)、MLA 算子、激活函数、LayerNorm、旋转位置编码 (RoPE)、卷积算子、线性层、权重预取、Triton 算子封装等。通过 CANN 自定义算子 API 注册到 PyTorch 中。",
+      "path": "vllm_ascend/attention/dsa_v1.py",
+      "name": "DSA Attention 变体",
+      "description": "DSA（Dynamic Sparse Attention）——Ascend 上的稀疏 attention 实现。",
+      "key_classes": [
+        "AscendDSAMetadataBuilder"
+      ]
+    },
+    {
+      "path": "vllm_ascend/attention/sfa_v1.py",
+      "name": "SFA Attention 变体",
+      "description": "SFA（Selective Focus Attention）——Ascend 上的选择性聚焦 attention 实现。",
+      "key_classes": []
+    },
+    {
+      "path": "vllm_ascend/attention/mla_v1.py",
+      "name": "MLA Attention 变体",
+      "description": "MLA（Multi-head Latent Attention）——用于 DeepSeek V4 等模型的 MLA attention 后端。",
+      "key_classes": [
+        "AscendMLABackend"
+      ]
+    },
+    {
+      "path": "vllm_ascend/attention/fa3_v1.py",
+      "name": "FA3 Attention",
+      "description": "FlashAttention 3 在 Ascend 上的实现。",
+      "key_classes": []
+    },
+    {
+      "path": "vllm_ascend/attention/context_parallel/",
+      "name": "Context Parallel Attention",
+      "description": "Context parallelism 的 attention 实现。包含通用的 common_cp、DSACP、MLACP、SFACP 等变体，支持分布式 prefill 阶段的 context 并行。",
+      "key_classes": [
+        "AscendMetadataForDecode",
+        "AscendMetadataForPrefill"
+      ]
+    },
+    {
+      "path": "vllm_ascend/attention/kvcomp_attn/",
+      "name": "KV Cache 压缩 Attention",
+      "description": "KV cache 压缩（C8 稀疏化等）相关的 attention 工具函数，如 reshape_and_cache_kvcomp、hamming_sparse。",
       "key_classes": []
     },
     {
       "path": "vllm_ascend/compilation/",
-      "name": "编译与图捕获层",
-      "description": "实现 Ascend NPU 的静态图编译机制（ACL Graph，对标 CUDA Graph）。包含 ACLGraphWrapper 用于图捕获和回放、GraphFusionPassManager 用于 TorchDynamo 编译后图融合优化、以及各种图融合 pass（如 AllReduce+RMSNorm 融合、QKNorm+RoPE 融合等）。",
+      "name": "编译优化层",
+      "description": "ACL Graph（NPUGraph）捕获/回放、AscendCompiler 自定义编译后端、GraphFusionPassManager 编译 pass 管理器。包含多个 fusion pass：allreduce_rmsnorm_fusion、qknorm_rope_fusion、norm_quant_fusion、sequence_parallelism、muls_add 等。",
       "key_classes": [
         "ACLGraphWrapper",
-        "GraphFusionPassManager",
-        "AscendCompiler"
-      ]
-    },
-    {
-      "path": "vllm_ascend/patch/",
-      "name": "补丁层",
-      "description": "通过猴子补丁（monkey patch）修改上游 vLLM 的行为以适应 Ascend NPU。分为平台级补丁（调度器、分布式 executor、KV Cache 协调器、profiling chunk 等）和工作器级补丁（特定模型如 DeepSeek、Qwen、MiniMax、Mamba 的适配，以及 CUDA Graph、Triton、采样器、权重加载等）。",
-      "key_classes": []
-    },
-    {
-      "path": "vllm_ascend/quantization/",
-      "name": "量化层",
-      "description": "实现 Ascend NPU 上多种量化方法和配置。包含 FP8、W4A16、W4A4、W8A8、W8A16 等多种量化格式，以及 Compressed-Tensors 兼容配置、模型瘦身配置。同时提供量化方法适配器和自动检测逻辑。",
-      "key_classes": [
-        "AscendFp8Config",
-        "AscendCompressedTensorsConfig",
-        "AscendModelSlimConfig"
+        "ACLGraphEntry",
+        "AscendCompiler",
+        "GraphFusionPassManager"
       ]
     },
     {
       "path": "vllm_ascend/distributed/",
       "name": "分布式通信层",
-      "description": "基于 HCCL/PyHCCL 的分布式通信实现。包含 NPUCommunicator（设备通信器）、KV Transfer（跨节点 KV 缓存传输）、并行状态初始化、KV Pool 管理等。支持 TP、PP、CP、EP 等多种并行策略。",
+      "description": "基于 HCCL/PyHCCL 的 Ascend 分布式通信。NPUCommunicator（扩展 DeviceCommunicatorBase）实现 all_to_all 等集合通信。KV transfer 模块支持 mooncake 跨节点 KV cache 传输、AscendStore KV pool、CPU offload、UCM connector 等。parallel_state 管理 TP/PP/CP/DP 组。",
       "key_classes": [
         "NPUCommunicator",
-        "AscendMultiConnector"
+        "PyHcclCommunicator"
       ]
     },
     {
-      "path": "vllm_ascend/models/",
-      "name": "模型定义层",
-      "description": "在 Ascend NPU 上优化的特定模型实现。目前包含 DeepSeek V4 系列模型的 Ascend 适配版本（AscendDeepseekV4ForCausalLM、DeepSeekV4MTP），以及模型层级的注意力模块。",
-      "key_classes": [
-        "AscendDeepseekV4ForCausalLM",
-        "DeepSeekV4MTP"
-      ]
+      "path": "vllm_ascend/ops/",
+      "name": "自定义算子层",
+      "description": "Ascend 自定义算子集合。包含 fused_moe（MoE 路由、gate linear、token dispatch）、triton（基于 Triton-Ascend 的高性能 kernel：attention、rmsnorm、rope、spec decode 工具函数）、activation、conv、layernorm、linear、rotary_embedding、vocab_parallel_embedding、weight_prefetch 等。还包含 mla.py、dsa.py、gdn.py 等算子级封装。",
+      "key_classes": []
+    },
+    {
+      "path": "vllm_ascend/ops/triton/",
+      "name": "Triton-Ascend Kernel",
+      "description": "基于 Triton 的 Ascend 高性能 kernel：batch_invariant（matmul、rmsnorm、softmax、mean）、fla（linear attention 相关 kernel：chunk、delta_rule、wy_fast 等）、linearnorm（QKV rmsnorm + rope fusion）、mamba（causal_conv1d、lightning_attn）、activation、rope、penalty、layernorm_gated、spec_decode 等。",
+      "key_classes": []
+    },
+    {
+      "path": "vllm_ascend/ops/fused_moe/",
+      "name": "MoE 算子层",
+      "description": "MoE（Mixture of Experts）的完整实现：fused_moe kernel、token dispatcher、experts_selector、gate_linear、moe_mlp、通信方法选择（comm_utils）、stage 参数/合约管理、runtime args、prepare_finalize。支持 EP（expert parallelism）、SP（sequence parallelism）、flashcomm2 通信优化。",
+      "key_classes": []
+    },
+    {
+      "path": "vllm_ascend/quantization/",
+      "name": "量化层",
+      "description": "Ascend 量化推理支持。包含 W8A8（动态/静态）、W4A16、W4A4（FlatQuant、LaosDynamic、MXFP4）、W8A16、FP8、KV C8 稀疏量化等多种方法。quant_parser 解析量化配置，method_adapters 适配不同量化方法。",
+      "key_classes": []
     },
     {
       "path": "vllm_ascend/sample/",
       "name": "采样层",
-      "description": "实现 Ascend NPU 优化的采样器。包括 AscendSampler（继承 vLLM Sampler，支持 Triton-Ascend 的 penalty 计算）、拒绝采样器、以及避免 CPU-NPU 同步的随机采样函数。",
+      "description": "Ascend 采样器。AscendSampler（扩展 vLLM Sampler）覆盖 penalties（presence/frequency/repetition）、top-k/top-p、greedy 采样、async exponential（在独立流上计算指数分布与模型执行重叠）。支持 reduce_sample（TP reduce 后全局 argmax）。",
       "key_classes": [
-        "AscendSampler"
+        "AscendSampler",
+        "AscendTopKTopPSampler",
+        "AscendRejectionSampler"
       ]
     },
     {
-      "path": "vllm_ascend/ops/fused_moe/",
-      "name": "融合 MoE 层",
-      "description": "MoE（Mixture of Experts）层的 Ascend 优化实现，包含专家选择、Token 分发、门控线性层、MoE MLP、通信方法选择、MC2 融合算子（Matmul + AllReduce）等。",
-      "key_classes": []
-    },
-    {
-      "path": "vllm_ascend/envs.py",
-      "name": "环境变量配置",
-      "description": "集中的环境变量定义模块，统一管理 VLLM_ASCEND_* 前缀的所有配置项，包括编译选项、内存管理、量化控制、通信优化等。",
-      "key_classes": []
-    },
-    {
       "path": "vllm_ascend/spec_decode/",
-      "name": "推测解码层",
-      "description": "实现多种推测解码策略在 Ascend NPU 上的适配，包括 Eagle、Medusa、Mamba、NGram、Draft 模型、Suffix 等推测解码方式。",
+      "name": "投机解码层",
+      "description": "多种投机解码策略的 Ascend 实现：Eagle（含 ACLGraph）、Medusa、Ngram（GPU/NPU）、Draft proposer、Dflash、Suffix decoding、Extract hidden states proposer 等。",
+      "key_classes": []
+    },
+    {
+      "path": "vllm_ascend/_cann_ops_custom/",
+      "name": "CANN 自定义算子",
+      "description": "华为 CANN 软件栈的自定义算子集合，包含 attention 各类变体（DSA、SFA、MLA、FA3）、编译 pass 工具函数等。",
       "key_classes": []
     },
     {
       "path": "vllm_ascend/_310p/",
-      "name": "310P 芯片适配层",
-      "description": "针对 Ascend 310P 芯片的专用适配，包含独立的注意力后端、模型执行器、工作器、量化方法、采样器等。310P 是不支持图编译的推理芯片，因此有独立的简化实现。",
-      "key_classes": [
-        "NPUWorker310",
-        "AscendAttentionBackend310",
-        "NPUModelRunner310"
-      ]
-    },
-    {
-      "path": "vllm_ascend/xlite/",
-      "name": "Xlite 集成层",
-      "description": "openEuler Xlite 框架的集成支持。Xlite 是 openEuler 的轻量级虚拟化/容器化方案，提供独立的工作器和模型执行器实现。",
-      "key_classes": [
-        "XliteWorker",
-        "XliteModelRunner"
-      ]
-    },
-    {
-      "path": "vllm_ascend/eplb/",
-      "name": "负载均衡 (EPLB)",
-      "description": "Expert Parallel Load Balancing 实现，包含适应器和核心逻辑，用于在专家并行场景下动态调整 expert 分布以均衡 NPU 间的计算负载。",
-      "key_classes": []
-    },
-    {
-      "path": "vllm_ascend/kv_offload/",
-      "name": "KV Cache 卸载",
-      "description": "实现 KV Cache 的 CPU-NPU 卸载和 NPU 内卸载能力，支持大上下文场景下的显存优化。",
+      "name": "310P 专用层",
+      "description": "Ascend 310P 芯片的专用适配。包含独立的 attention（attention_mask、metadata_builder、attention_v1）、fused_moe、quantization（w8a8 系列）、ops（fla 相关 kernel）、sampler、block_table、model_runner、sharded_state_loader 等。通过 is_310p() 条件编译选择加载。",
       "key_classes": []
     },
     {
       "path": "vllm_ascend/lora/",
-      "name": "LoRA 支持",
-      "description": "LoRA（Low-Rank Adaptation）在 Ascend NPU 上的推理支持，包含 Punica 内核封装和 LoRA 算子。",
-      "key_classes": [
-        "PunicaWrapperNPU"
-      ]
-    },
-    {
-      "path": "vllm_ascend/ascend_config.py",
-      "name": "Ascend 配置层",
-      "description": "NPU 特有的配置对象，从 vLLM 的 additional_config 中解析 NPU 专属配置（编译配置、融合配置、图配置、EPLB 配置、权重预取配置、Profiling Chunk 配置等）。",
-      "key_classes": [
-        "AscendConfig"
-      ]
-    },
-    {
-      "path": "vllm_ascend/core/",
-      "name": "核心扩展层",
-      "description": "扩展 vLLM 核心调度逻辑的模块，包括动态批处理调度器 (SchedulerDynamicBatch)、基于 Profiling 的 Chunk 调度器 (ProfilingChunkScheduler)、重计算调度器 (RecomputeScheduler) 等。",
-      "key_classes": [
-        "SchedulerDynamicBatch",
-        "ProfilingChunkScheduler",
-        "RecomputeScheduler"
-      ]
-    },
-    {
-      "path": "vllm_ascend/compilation/passes/",
-      "name": "图融合 Pass 集合",
-      "description": "TorchDynamo 编译后的图融合优化 Pass，包括 AllReduce+RMSNorm 融合、QKNorm+RoPE 融合、序列并行 MoE 融合、Noop 消除、Norm+量化融合等，用于提升 NPU 上的计算效率。",
+      "name": "LoRA 适配层",
+      "description": "LoRA（Low-Rank Adaptation）在 Ascend 上的算子实现：lora_ops、punica_npu kernel。",
       "key_classes": []
     },
     {
-      "path": "vllm_ascend/quantization/methods/",
-      "name": "量化方法实现",
-      "description": "各种量化格式的具体实现，包括 FP8、W4A16、W4A4、W8A8 静态/动态/混合精度等多种格式的 Ascend 适配。",
+      "path": "vllm_ascend/kv_offload/",
+      "name": "KV Cache Offload",
+      "description": "KV cache CPU-NPU 间的 offload 机制。支持 NPU 到 CPU 内存的 KV cache 迁移以释放 NPU 显存。",
+      "key_classes": []
+    },
+    {
+      "path": "vllm_ascend/simple_kv_offload/",
+      "name": "简化 KV Offload",
+      "description": "简化的 KV cache offload 实现，包含 copy_backend、npu_mem_ops、worker。",
+      "key_classes": []
+    },
+    {
+      "path": "vllm_ascend/device/",
+      "name": "设备工具层",
+      "description": "Ascend 设备操作工具：device_op、mxfp_compat（MXFP4 格式兼容）。",
+      "key_classes": [
+        "DeviceOperator"
+      ]
+    },
+    {
+      "path": "vllm_ascend/device_allocator/",
+      "name": "设备内存分配器",
+      "description": "CaMem（Custom Allocator Memory）——Ascend 自定义内存分配器，优化显存使用。",
+      "key_classes": [
+        "CaMemAllocator"
+      ]
+    },
+    {
+      "path": "vllm_ascend/eplb/",
+      "name": "EPLB 负载均衡",
+      "description": "Expert Parallelism Load Balancing（EPLB）——MoE expert 并行下的负载均衡。包含多种调度策略：default_eplb、flashlb、random、swift_balancer。vllm_adaptor 适配 vLLM 接口，eplb_updator 动态更新路由。",
+      "key_classes": [
+        "VllmEplbAdaptor",
+        "EplbUpdator",
+        "EplbProcess"
+      ]
+    },
+    {
+      "path": "vllm_ascend/model_loader/",
+      "name": "模型加载层",
+      "description": "NetLoader（支持弹性/网络化权重加载，含 executor/elastic_load、netloader_pg）和 RforkLoader（远程 fork 权重加载，含 seed_protocol、seed_server、transfer_backend）。用于大规模分布式场景下的权重分发。",
+      "key_classes": []
+    },
+    {
+      "path": "vllm_ascend/models/",
+      "name": "模型定义层",
+      "description": "Ascend 上的模型定义。目前包含 DeepSeek V4 系列（deepseek_v4.py、deepseek_v4_mtp.py）以及 layer/attention/layer.py 的 attention layer 封装。",
+      "key_classes": []
+    },
+    {
+      "path": "vllm_ascend/patch/",
+      "name": "补丁层",
+      "description": "对 vLLM 运行时各模块的猴子补丁（monkey patch），分 platform 级（全局补丁：scheduler、kv_cache、分布式、Mamba、DeepSeek V4 thinking/tool_call、MiniMax 等）和 worker 级（局部补丁：triton、cudagraph、attention_utils、block_table、weight_utils、MTP、GQA、GDNAttn 等）。通过 adapt_patch() 统一加载。",
+      "key_classes": []
+    },
+    {
+      "path": "vllm_ascend/profiler/",
+      "name": "性能分析",
+      "description": "torch_npu.profiler 封装，支持 profiling 数据采集。",
+      "key_classes": [
+        "TorchNPUProfilerWrapper"
+      ]
+    },
+    {
+      "path": "vllm_ascend/xlite/",
+      "name": "XLite 轻量推理",
+      "description": "针对特定场景的轻量推理模式，包含 xlite.py、xlite_model_runner.py、xlite_worker.py。",
+      "key_classes": []
+    },
+    {
+      "path": "vllm_ascend/ascend_config.py",
+      "name": "Ascend 配置",
+      "description": "AscendConfig 统一管理所有 Ascend 专有配置项：xlite_graph_config、ascend_compilation_config（ACL Graph 相关）、ascend_fusion_config、finegrained_tp_config、eplb_config、weight_prefetch_config、profiling_chunk_config、PD 解耦配置（pd_tp_ratio/pd_head_ratio）、flashcomm/flashcomm2、matmul_allreduce、mlapo、多流重叠优化等。",
+      "key_classes": [
+        "AscendConfig",
+        "AscendCompilationConfig",
+        "AscendFusionConfig",
+        "FinegrainedTPConfig",
+        "EplbConfig",
+        "WeightPrefetchConfig",
+        "ProfilingChunkConfig",
+        "XliteGraphConfig"
+      ]
+    },
+    {
+      "path": "vllm_ascend/utils.py",
+      "name": "核心工具库",
+      "description": "公共工具函数和全局状态：设备类型检测（AscendDeviceType、get_ascend_device_type）、NZ 格式转换（nd_to_nz_2d、maybe_trans_nz）、自定义算子启用/注册（enable_custom_op、register_ascend_customop）、HCCL 库发现、流管理（current_stream、global_stream、prefetch_stream）、patch 加载（adapt_patch）、编译配置更新、DeepSeek V4 工具函数等。约 67KB 的核心工具文件。",
       "key_classes": []
     }
   ],
   "key_abstractions": [
     {
       "name": "NPUPlatform",
-      "description": "实现 vLLM 的 Platform 抽象基类，将 Ascend NPU 注册为 'npu' 类型硬件。负责平台级别的设备管理、配置校验、注意力/编译/通信后端的选择、量化方法注册和全局补丁应用。",
-      "location": "vllm_ascend/platform.py:106",
+      "description": "vllm.platforms.Platform 的 Ascend 实现。注册为 vLLM OOT 平台，提供 device_name='npu'、dispatch_key='PrivateUse1'、支持的量化方法列表、自定义编译后端（AscendCompiler）和编译 pass 管理器（GraphFusionPassManager）。控制 CUDAGraph capture size 默认逻辑和 sleep 模式。",
+      "location": "vllm_ascend/platform.py:NPUPlatform",
       "relationships": [
         "NPUWorker",
-        "AscendConfig",
-        "AscendAttentionBackend",
-        "ACLGraphWrapper",
-        "NPUCommunicator"
-      ]
-    },
-    {
-      "name": "NPUWorker",
-      "description": "实现 vLLM 的 WorkerBase 接口，管理 NPU 设备初始化、分布式环境、模型加载、KV Cache 分配、模型执行调度、profiling、编译预热和内存管理。是 vLLM Engine 与 NPU 设备之间的核心桥梁。",
-      "location": "vllm_ascend/worker/worker.py:81",
-      "relationships": [
-        "NPUModelRunner",
-        "NPUPlatform",
-        "CaMemAllocator"
-      ]
-    },
-    {
-      "name": "NPUModelRunner (V1)",
-      "description": "实现 GPUModelRunner 的 NPU 版本，负责模型的前向传播、输入批处理、注意力元数据构建、图捕获/回放、KV Cache 操作、采样和流水线并行等核心推理逻辑。",
-      "location": "vllm_ascend/worker/model_runner_v1.py",
-      "relationships": [
-        "NPUWorker",
-        "AscendAttentionBackend",
-        "ACLGraphWrapper",
-        "AscendSampler"
-      ]
-    },
-    {
-      "name": "AscendAttentionBackend",
-      "description": "实现 vLLM 的 AttentionBackend 接口，注册为 ASCEND 后端。管理注意力层的元数据构建和前向计算，支持 Paged Attention、MLA、SFA、DSA 等多种注意力变体，以及 Batch Invariant、上下文并行等优化。",
-      "location": "vllm_ascend/attention/attention_v1.py:74",
-      "relationships": [
-        "AttentionMetadataBuilder",
-        "AscendAttentionImpl",
-        "MLAAttentionImpl",
-        "AttentionMaskBuilder"
-      ]
-    },
-    {
-      "name": "ACLGraphWrapper",
-      "description": "Ascend NPU 上的计算图捕获/回放包装器（对标 CUDA Graph）。支持 FULL 和 PIECEWISE 两种模式，在推理时根据运行时模式选择直接执行或图回放。",
-      "location": "vllm_ascend/compilation/acl_graph.py:38",
-      "relationships": [
         "AscendCompiler",
         "GraphFusionPassManager",
         "NPUModelRunner"
       ]
     },
     {
-      "name": "AscendConfig",
-      "description": "从 vLLM 的 VllmConfig.additional_config 中解析 Ascend 专属配置，包括编译配置、图融合配置、EPLB 配置、权重预取、Profiling Chunk 等。",
-      "location": "vllm_ascend/ascend_config.py:27",
+      "name": "NPUWorker",
+      "description": "vllm.v1.worker.worker_base.WorkerBase 的 Ascend 实现。管理设备初始化、自定义算子注册、ACL Graph 生命周期、profiler、sleep/wake、PP send/recv、model runner 初始化。",
+      "location": "vllm_ascend/worker/worker.py:NPUWorker",
       "relationships": [
+        "NPUModelRunner",
         "NPUPlatform",
+        "AscendAttentionBackend",
+        "AscendSampler",
+        "CaMemAllocator"
+      ]
+    },
+    {
+      "name": "NPUModelRunner",
+      "description": "vllm.v1.worker.gpu_model_runner.GPUModelRunner 的 Ascend 适配。管理前向传播（execute_model）、KV cache 初始化、attention metadata 构建、MoE 路由、量化、spec decode 集成、ACL Graph 调度、CP 通信等。vllm-ascend 中最复杂的核心类之一。",
+      "location": "vllm_ascend/worker/model_runner_v1.py:NPUModelRunner",
+      "relationships": [
+        "AscendAttentionBackend",
+        "AscendSampler",
+        "ACLGraphWrapper",
+        "VllmEplbAdaptor",
+        "PCPManager",
+        "AscendConfig"
+      ]
+    },
+    {
+      "name": "AscendAttentionBackend",
+      "description": "vllm.v1.attention.backend.AttentionBackend 的 Ascend 实现。注册为 CUSTOM 后端（或 FLASH_ATTN 用于 v2 model runner）。管理 KV cache 形状（2, num_blocks, block_size, num_kv_heads, head_size）、swap_blocks、copy_blocks、get_supported_kernel_block_sizes。通过 get_impl_cls() 返回 AscendAttentionBackendImpl（或 CP 变体）。",
+      "location": "vllm_ascend/attention/attention_v1.py:AscendAttentionBackend",
+      "relationships": [
+        "AscendAttentionBackendImpl",
+        "AscendAttentionMetadataBuilder",
+        "AscendMetadata",
+        "AttentionMaskBuilder"
+      ]
+    },
+    {
+      "name": "AscendMetadata",
+      "description": "Per-layer attention metadata 数据类。包含 attn_mask、attn_state、seq_lens、block_tables、slot_mapping、query_start_loc 等所有 attention 计算所需的元数据。",
+      "location": "vllm_ascend/attention/attention_v1.py:AscendMetadata",
+      "relationships": [
+        "AscendAttentionBackendImpl",
+        "AscendAttentionState"
+      ]
+    },
+    {
+      "name": "AscendConfig",
+      "description": "统一管理所有 Ascend 专有配置项，包括：编译（acl graph、fusion passes）、分布式（flashcomm1/2、finegrained TP、CP）、MoE（EPLB、weight prefetch）、调度（balance scheduling、profiling chunk）、资源（sleep mode、CPU binding）、精度调试（dump config）。提供 get_ascend_config() 全局单例访问。",
+      "location": "vllm_ascend/ascend_config.py:AscendConfig",
+      "relationships": [
         "AscendCompilationConfig",
+        "AscendFusionConfig",
+        "FinegrainedTPConfig",
+        "EplbConfig",
+        "WeightPrefetchConfig",
+        "ProfilingChunkConfig",
         "XliteGraphConfig"
       ]
     },
     {
-      "name": "AscendSampler",
-      "description": "继承 vLLM Sampler，提供 NPU 优化的采样实现，使用 Triton-Ascend 进行 penalty 计算，避免 CPU-NPU 同步开销。",
-      "location": "vllm_ascend/sample/sampler.py:44",
+      "name": "ACLGraphWrapper",
+      "description": "ACL Graph（NPUGraph）捕获/回放的包装器。支持 FULL 和 PIECEWISE 两种 runtime mode。通过 batch_descriptor 作为 key 缓存已捕获的 graph entry。支持 weak_ref_output、gc_disable 等编译优化选项。",
+      "location": "vllm_ascend/compilation/acl_graph.py:ACLGraphWrapper",
       "relationships": [
         "NPUModelRunner",
-        "Sampler"
+        "ACLGraphEntry",
+        "AscendCompiler"
+      ]
+    },
+    {
+      "name": "AscendSampler",
+      "description": "vllm.v1.sample.sampler.Sampler 的 Ascend 实现。覆盖 penalties（Triton-Ascend 加速）、greedy_sample（支持 reduce 模式下 TP 全局 argmax）、top-k/top-p（支持 reduce 模式的跨 TP 组 topk）。支持 async_exponential 机制（独立流上计算指数分布与模型执行重叠）。",
+      "location": "vllm_ascend/sample/sampler.py:AscendSampler",
+      "relationships": [
+        "AscendTopKTopPSampler",
+        "AscendRejectionSampler"
       ]
     },
     {
       "name": "NPUCommunicator",
-      "description": "基于 PyHCCL/HCCL 的设备通信器实现，提供 vLLM 设备通信抽象层的 Ascend 版本。",
-      "location": "vllm_ascend/distributed/device_communicators/npu_communicator.py",
+      "description": "vllm.distributed.device_communicators.base_device_communicator.DeviceCommunicatorBase 的 Ascend 实现。基于 HCCL（PyHCCL）提供 all_to_all 等集合通信操作。",
+      "location": "vllm_ascend/distributed/device_communicators/npu_communicator.py:NPUCommunicator",
       "relationships": [
-        "NPUPlatform",
-        "NPUWorker"
+        "PyHcclCommunicator",
+        "PyHcclWrapper"
       ]
     },
     {
-      "name": "CaMemAllocator",
-      "description": "NPU 统一内存池分配器，支持权重和 KV Cache 的分级内存管理，用于 Sleep Mode（RL 场景中的进程级内存复用）。",
-      "location": "vllm_ascend/device_allocator/camem.py",
+      "name": "AscendCompiler",
+      "description": "自定义 torch.compile 后端。作为 NPUPlatform 注册的自定义编译后端（'vllm_ascend.compilation.compiler_interface.AscendCompiler'），取代默认的 eager 模式或 Inductor，用于支持 ACL Graph 捕获和编译优化。",
+      "location": "vllm_ascend/compilation/compiler_interface.py:AscendCompiler",
       "relationships": [
-        "NPUWorker"
+        "NPUPlatform",
+        "GraphFusionPassManager",
+        "ACLGraphWrapper"
       ]
     },
     {
       "name": "GraphFusionPassManager",
-      "description": "NPU 编译图融合 pass 管理器，在 TorchDynamo 编译后注册自定义图融合 pass（如 AllReduce+RMSNorm、QKNorm+RoPE等），优化 NPU 上的计算效率。",
-      "location": "vllm_ascend/compilation/graph_fusion_pass_manager.py",
+      "description": "编译 pass 管理器。管理所有 fusion pass 的注册和执行：allreduce_rmsnorm_fusion、qknorm_rope_fusion、norm_quant_fusion、sequence_parallelism、muls_add、allgather_chunk_noop、noop_elimination 等。注册在 NPUPlatform.pass_key 下。",
+      "location": "vllm_ascend/compilation/graph_fusion_pass_manager.py:GraphFusionPassManager",
       "relationships": [
-        "NPUPlatform",
-        "ACLGraphWrapper"
+        "AscendCompiler",
+        "NPUPlatform"
+      ]
+    },
+    {
+      "name": "VllmEplbAdaptor",
+      "description": "EPLB（Expert Parallelism Load Balancing）与 vLLM 的适配器。管理 MoE expert 在多个设备间的路由权重分配，与 NPUModelRunner 协同工作。",
+      "location": "vllm_ascend/eplb/adaptor/vllm_adaptor.py:VllmEplbAdaptor",
+      "relationships": [
+        "NPUModelRunner",
+        "EplbUpdator",
+        "EplbProcess"
+      ]
+    },
+    {
+      "name": "CaMemAllocator",
+      "description": "Ascend 自定义内存分配器。优化 NPU 显存分配策略，减少碎片，提高内存利用率。",
+      "location": "vllm_ascend/device_allocator/camem.py:CaMemAllocator",
+      "relationships": [
+        "NPUWorker"
       ]
     }
   ],
-  "module_dependencies": "vLLM Ascend 采用分层依赖架构。顶层是 **平台注册层** (platform.py)，通过 vLLM 的插件机制被 vLLM Engine 自动发现和加载。NPUPlatform 在注册时应用全局补丁（patch/platform/）并初始化 AscendConfig。vLLM Engine 通过 WorkerBase 接口创建 **NPUWorker**，NPUWorker 内部创建 **NPUModelRunner**（v1 或 v2）。在推理过程中，NPUModelRunner 调用 **注意力后端** (attention/) 执行注意力计算，通过 **采样层** (sample/) 进行 token 采样，通过 **编译层** (compilation/) 进行图捕获和回放，通过 **自定义算子层** (ops/) 调用 CANN 算子。分布式场景下，**NPUCommunicator** (distributed/) 通过 HCCL 实现跨 NPU 通信。**补丁层** (patch/) 在多个入口点被调用（全局补丁在平台注册时，局部补丁在 Worker 初始化时），通过猴子补丁修改上游 vLLM 行为。**_310p/** 和 **xlite/** 是特殊的 Worker+ModelRunner 替代实现，在特定设备或环境下替换默认的 NPUWorker。依赖方向为：platform -> (worker, patch, config) -> (model_runner, attention, ops, compilation, sample, distributed)。",
+  "module_dependencies": "vllm-ascend 整体作为 vLLM 的 OOT 插件加载，通过 vllm_ascend/__init__.py 的 register() 返回 NPUPlatform 路径注册。依赖流向为：顶层 __init__.py 初始化全局 patch（adapt_patch）→ platform.py（NPUPlatform）注册编译后端和量化方法 → worker/worker.py（NPUWorker）初始化设备、注册自定义算子、初始化 AscendConfig 和分布式环境 → worker/model_runner_v1.py（NPUModelRunner）选取 attention 后端（AscendAttentionBackend）、构建采样器（AscendSampler）、管理 model forward 和 ACL Graph → attention/attention_v1.py 提供 attention 计算后端和 metadata builder → ops/ 提供底层算子和 Triton kernel → compilation/acl_graph.py 提供图编译能力。distributed/ 依赖 parallel_state 和 device_communicators（NPUCommunicator/HCCL），eplb/ 依赖 ops/fused_moe/ 的调度。quantization/ 被 model runner 按需加载。patch/ 在初始化阶段通过 adapt_patch() 统一注入到 vLLM 运行时。模型定义（models/）和模型加载（model_loader/）分别负责模型结构和权重加载。",
   "hardware_abstraction": {
-    "description": "vLLM Ascend 通过多层次抽象将 Ascend NPU 对接到 vLLM 的通用推理框架中。最顶层是 Platform 抽象（继承 vLLM 的 Platform 基类），通过 vLLM 的 pluggable hardware interface 机制注册。在 Platform 之下，通过实现 vLLM 定义的 AttentionBackend、AttentionImpl、Sampler、WorkerBase、DeviceCommunicator 等接口来适配 NPU 硬件。同时，通过自定义算子（CANN Custom Op）、Triton-Ascend 内核、ACL Graph 编译等技术充分利用 NPU 硬件特性。补丁层用于处理上游 vLLM 中硬编码的 CUDA 假设。",
+    "description": "vllm-ascend 在 vLLM 的硬件抽象框架内实现了一层完整的 Ascend 适配：vLLM 定义了 Platform、WorkerBase、AttentionBackend、Sampler、DeviceCommunicatorBase 等平台无关抽象接口，vllm-ascend 通过继承和注册机制提供 NPU 实现。还额外构建了 Ascend 特有的抽象层（AscendConfig、ACLGraphWrapper、compilation passes），这些在 CUDA 后端中没有直接对应。",
     "platform_independent": [
-      "vLLM Platform 抽象基类（vllm.platforms.Platform）",
-      "vLLM WorkerBase 接口（vllm.v1.worker.worker_base.WorkerBase）",
-      "vLLM AttentionBackend 接口（vllm.v1.attention.backend.AttentionBackend）",
-      "vLLM AttentionImpl 接口（vllm.v1.attention.backend.AttentionImpl）",
-      "vLLM Sampler 接口（vllm.v1.sample.sampler.Sampler）",
-      "vLLM AttentionLayer 接口（vllm.v1.attention.backend.AttentionLayer）",
-      "vLLM ModelRegistry（vllm.model_registry）",
-      "vLLM KVCacheSpec/KVCacheConfig（vllm.v1.kv_cache_interface）",
-      "vLLM VllmConfig 配置体系（vllm.config.VllmConfig）",
-      "vLLM AttentionBackendEnum（vllm.v1.attention.backends.registry）",
-      "vLLM CUDAGraphOptions/CompilationMode（vllm.compilation.*）",
-      "PyTorch 标准接口（torch.nn.Module, torch.Tensor 等）"
+      "vllm.platforms.Platform — NPUPlatform 实现",
+      "vllm.v1.worker.worker_base.WorkerBase — NPUWorker 实现",
+      "vllm.v1.worker.gpu_model_runner.GPUModelRunner — NPUModelRunner 实现",
+      "vllm.v1.attention.backend.AttentionBackend — AscendAttentionBackend 实现",
+      "vllm.v1.sample.sampler.Sampler — AscendSampler 实现",
+      "vllm.distributed.device_communicators.base_device_communicator.DeviceCommunicatorBase — NPUCommunicator 实现",
+      "vllm.platforms — compilation 后端和 pass manager 注册接口"
     ],
     "platform_specific": [
-      "NPUPlatform - Ascend NPU 平台注册和全局管理",
-      "AscendAttentionBackend - Ascend NPU 注意力后端实现",
-      "AscendMLABackend - MLA（Multi-head Latent Attention）注意力",
-      "AscendSFABackend/AscendDSABackend - 稀疏注意力后端",
-      "ACLGraphWrapper - Ascend ACL Graph 图捕获/回放（对标 CUDA Graph）",
-      "NPUCommunicator - 基于 HCCL/PyHCCL 的设备通信器",
-      "CaMemAllocator - NPU 统一内存池分配器",
-      "NPUWorker - Ascend NPU 工作器实现",
-      "NPUModelRunner - Ascend NPU 模型执行器",
-      "CANN 自定义算子 - ops/ 目录下的所有自定义算子",
-      "Triton-Ascend 内核 - ops/triton/ 目录下的 Triton 内核",
-      "GraphFusionPassManager + 图融合 Pass 集合",
-      "Quantization Methods - NPU 定制的量化方法和内核",
-      "KVCache Offload - NPU 特有的 KV Cache 卸载实现",
-      "EPLB - Expert Parallel 负载均衡的 NPU 实现",
-      "AscendConfig - NPU 专属配置体系（VLLM_ASCEND_* 环境变量）",
-      "AscendMultiConnector - 跨节点 KV Transfer 的 Ascend 连接器",
-      "_310p/* - 310P 芯片专用实现（不含图编译能力）",
-      "xlite/* - openEuler Xlite 集成"
+      "ACLGraphWrapper — Ascend NPUGraph 捕获/回放（类比 CUDA Graph，但使用 torch.npu.NPUGraph）",
+      "AscendCompiler — 自定义 torch.compile 后端，调用 CANN 特定的编译和 fusion pass",
+      "GraphFusionPassManager — 管理 Ascend 特定的算子融合 pass（allreduce+rmsnorm、qknorm+rope 等）",
+      "AscendConfig — 管理 Ascend 特有的配置项（NZ 格式、flashcomm、多流重叠、profiling chunk 等）",
+      "NPUCommunicator — 基于 HCCL/PyHCCL 的集合通信（替代 NCCL）",
+      "device_allocator/camem.py CaMemAllocator — Ascend 自定义内存分配器",
+      "utils.py 中的 NZ 格式转换（nd_to_nz_2d/maybe_trans_nz）— Ascend 特有的 FRACTAL_NZ 数据格式",
+      "ops/triton/ — 基于 Triton-Ascend 的 kernel（替代 CUDA Triton）",
+      "ops/fused_moe/ — Ascend 上 MoE 算子的完整流水线",
+      "_cann_ops_custom/ — CANN 自定义算子（Attention 各种变体）",
+      "attention/dsa_v1.py、sfa_v1.py、mla_v1.py、fa3_v1.py — Ascend 特有的 attention 实现",
+      "quantization/ — Ascend 特有的量化方法和 MXFP4 格式支持",
+      "_310p/ — 310P 芯片专用子模块（包括分离的 attention/quantization/ops）",
+      "patch/ — 针对 Ascend 运行时的 vLLM 猴子补丁"
     ]
   },
   "test_structure": {
     "path": "tests/",
-    "description": "测试目录分为 ut（单元测试）和 e2e（端到端测试）两大类别。ut/ 包含按模块组织的单元测试（attention、ops、compilation、distributed、quantization 等），以及全局功能的测试文件。e2e/ 按测试频率和规模组织：pull_request/（PR 门禁，分 1/2/4 卡测试）、nightly/（每日测试，包含 310p 和单/多节点）、weekly/（每周测试）。e2e 测试覆盖模型精度验证（tests/e2e/models/）、ACL Graph 一致性、vLLM 接口适配等。测试工具函数集中在 conftest.py、utils.py、model_utils.py 中。"
+    "description": "测试分为两类：tests/ut/ 单元测试（按模块组织，与源码目录对应：attention/compilation/core/device/device_allocator/distributed/eplb/kv_offload/lora/model_loader/ops/patch/profiler/quantization/sample/spec_decode/worker/xlite/ 等，外加顶层测试文件如 test_ascend_config.py、test_platform.py、test_batch_invariant.py、test_envs.py、test_utils.py 等）；tests/e2e/ 端到端测试（按场景组织：models/ 模型级测试、nightly/weekly/pull_request 按运行频率分类、vllm_interface/ 接口测试、doctests/ 文档测试，附带 coverage.md 覆盖报告生成工具和 model_utils.py 模型工具函数）。"
   }
 }

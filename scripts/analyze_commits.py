@@ -2,6 +2,7 @@
 import argparse
 import json
 import os
+import re
 import sys
 import subprocess
 import tempfile
@@ -222,7 +223,117 @@ def build_context_section(context):
     return "\n".join(parts)
 
 
-def build_prompt(repo, date, commits_data, data_dir, local_repo=None):
+# ── Path-based triage for ascend impact ──────────────────────────────
+# If ALL changed files in a commit match these patterns, it can be
+# auto-determined as ascend_affected=false, skipping the LLM call.
+
+AUTO_FALSE_DIRS = (
+    "tests/",
+    "docs/",
+    ".github/",
+    "benchmarks/",
+    "csrc/",
+    ".buildkite/",
+    ".buildifier/",
+)
+
+AUTO_FALSE_EXTS = (".md", ".rst", ".txt", ".cfg", ".ini")
+
+AUTO_FALSE_FILES = {
+    "format.sh", "Dockerfile", "Makefile", "CMakeLists.txt",
+    "pyproject.toml", "setup.py", "setup.cfg",
+    "Cargo.toml", "Cargo.lock",
+    "mkdocs.yaml", "mkdocs.yml",
+    "README.md", "CONTRIBUTING.md", "CODE_OF_CONDUCT.md", "LICENSE",
+    ".gitignore", ".gitattributes",
+    ".pre-commit-config.yaml", ".codespellrc", ".flake8",
+}
+
+_RE_PLATFORM_SPEC = re.compile(
+    r"vllm/platforms/(cuda|rocm|xpu|cpu|tpu|unspecified)\.py$"
+)
+_RE_WORKER_SPEC = re.compile(
+    r"vllm/v1/worker/(gpu_worker|cpu_worker|xpu_worker)\.py$"
+)
+_RE_ATTN_BACKEND_SPEC = re.compile(
+    r"vllm/v1/attention/backends/"
+    r"(flash_attn|flashinfer|rocm_attn|cpu_attn|triton_attn|"
+    r"rocm_aiter|flex_attention|turboquant_attn)\.py$"
+)
+
+
+def _is_auto_false_path(filename):
+    """Check if a single file path is definitely NOT ascend-relevant."""
+    if filename.startswith(AUTO_FALSE_DIRS):
+        return True
+    if filename.endswith(AUTO_FALSE_EXTS):
+        return True
+    if filename in AUTO_FALSE_FILES:
+        return True
+    if filename.startswith("rust/") or filename.endswith(".rs"):
+        return True
+    if _RE_PLATFORM_SPEC.search(filename):
+        return True
+    if _RE_WORKER_SPEC.search(filename):
+        return True
+    if _RE_ATTN_BACKEND_SPEC.search(filename):
+        return True
+    return False
+
+
+def triage_ascend(commit):
+    """Check if a commit definitely does NOT affect vllm-ascend.
+
+    Returns True if every changed file is in a non-ascend-relevant path,
+    meaning the commit can be auto-marked as ascend_affected=false.
+    Returns False if any file needs LLM judgment.
+    """
+    files = commit.get("files", [])
+    if not files:
+        return False
+    return all(_is_auto_false_path(f.get("filename", "")) for f in files)
+
+
+def auto_analyze_commit(commit, repo):
+    """Generate a minimal analysis for a triaged no-ascend-impact commit."""
+    title = commit.get("message", "").split("\n")[0].lower()
+    if any(w in title for w in ["fix", "bug", "hotfix"]):
+        tags = ["bugfix", "low-risk"]
+    elif any(w in title for w in ["feat", "add", "support", "implement"]):
+        tags = ["feature", "low-risk"]
+    elif any(w in title for w in ["refactor", "cleanup", "rename", "restruct"]):
+        tags = ["refactor", "low-risk"]
+    elif any(w in title for w in ["perf", "optimize", "speed"]):
+        tags = ["performance", "low-risk"]
+    elif any(w in title for w in ["test", "ci", "chore", "bump", "upgrade"]):
+        tags = ["chore"]
+    else:
+        tags = ["chore"]
+
+    is_vllm = "vllm-ascend" not in repo
+    result = {
+        "sha": commit["sha"],
+        "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+        "tags": tags,
+    }
+    if is_vllm:
+        result["ascend_impact"] = {
+            "ascend_affected": False,
+            "functionality": "无影响",
+            "testing": "无影响",
+            "needs_test_update": False,
+            "suggested_test_areas": [],
+        }
+    else:
+        result["test_impact"] = {
+            "needs_test_update": False,
+            "reason": "（自动判定）该 commit 不涉及 vllm-ascend 核心逻辑变更。",
+            "suggested_test_areas": [],
+        }
+    return result
+
+
+def build_prompt(repo, date, commits_data, data_dir, local_repo=None, commit_subset=None):
     is_vllm = "vllm-ascend" not in repo
 
     if is_vllm:
@@ -247,6 +358,14 @@ def build_prompt(repo, date, commits_data, data_dir, local_repo=None):
     context = load_context(data_dir, repo)
     context_section = build_context_section(context)
 
+    # When analyzing vllm commits, also load vllm-ascend architecture
+    # as a reference so the AI can make precise ascend impact judgments.
+    if is_vllm:
+        ascend_context = load_context(data_dir, "vllm-project/vllm-ascend")
+        if ascend_context:
+            ascend_section = build_context_section(ascend_context)
+            context_section += "\n\n## vllm-ascend 架构参考（用于评估 ascend_impact）\n" + ascend_section
+
     if local_repo:
         source_section = (
             f"该项目的源码位于本地路径：{local_repo}\n"
@@ -256,8 +375,14 @@ def build_prompt(repo, date, commits_data, data_dir, local_repo=None):
     else:
         source_section = "（本地源码不可用，如对变更不确定请标注\"不确定\"）"
 
+    commits_src = commits_data.get("commits", [])
+    if commit_subset is not None:
+        commits_src = [c for c in commits_src if c["sha"] in commit_subset]
+        if not commits_src:
+            return ""
+
     commits_for_prompt = []
-    for c in commits_data.get("commits", []):
+    for c in commits_src:
         commit_info = {
             "sha": c["sha"],
             "message": c["message"],
@@ -443,7 +568,8 @@ def analyze_commits(repo, date, data_dir, confirm, force, local_repo=None, model
     if commits_data is None:
         return False
 
-    num_commits = len(commits_data.get("commits", []))
+    all_commits = commits_data.get("commits", [])
+    num_commits = len(all_commits)
     if num_commits == 0:
         print(f"No commits found for {repo} on {date}")
         return False
@@ -467,36 +593,95 @@ def analyze_commits(repo, date, data_dir, confirm, force, local_repo=None, model
 
     print(f"Analyzing {num_commits} commits for {repo} on {date}...")
 
-    prompt = build_prompt(repo, date, commits_data, data_dir, local_repo=local_repo)
+    # Phase 1: triage — path-based pre-filter
+    is_vllm = "vllm-ascend" not in repo
+    llm_shas = []
+    auto_analysis = []
+    for c in all_commits:
+        if is_vllm and triage_ascend(c):
+            auto_analysis.append(auto_analyze_commit(c, repo))
+        else:
+            llm_shas.append(c["sha"])
 
-    print("Calling Reasonix...")
-    output = call_reasonix(prompt, model=model)
-    if output is None:
-        print("Failed to get response from Reasonix")
-        return False
+    if auto_analysis:
+        print(f"  ├ {len(auto_analysis)} commits auto-determined (no ascend impact)")
+    if llm_shas:
+        print(f"  └ {len(llm_shas)} commits sent to Reasonix for analysis")
 
-    analysis = extract_json_from_output(output)
-    if analysis is None:
-        print("Failed to parse JSON from Reasonix output")
-        print(f"Raw output (first 500 chars): {output[:500]}")
-        return False
-
-    errors = validate_analysis(analysis, commits_data, repo)
-    if errors:
-        print(f"Validation errors:")
-        for e in errors:
-            print(f"  - {e}")
-        if not confirm and not force:
-            print("Analysis result invalid, not writing to file")
+    # Phase 2: call LLM only for non-triaged commits
+    if llm_shas:
+        llm_set = set(llm_shas)
+        prompt = build_prompt(repo, date, commits_data, data_dir, local_repo=local_repo, commit_subset=llm_set)
+        if not prompt:
+            print("ERROR: empty prompt after subset filter")
             return False
-        if confirm:
-            answer = input("Write anyway? [y/N] ").strip().lower()
-            if answer != "y":
-                print("Skipped.")
-                return False
 
-    analysis["date"] = date
-    analysis["repo"] = repo
+        print("Calling Reasonix...")
+        output = call_reasonix(prompt, model=model)
+        if output is None:
+            print("Failed to get response from Reasonix")
+            return False
+
+        analysis = extract_json_from_output(output)
+        if analysis is None:
+            print("Failed to parse JSON from Reasonix output")
+            print(f"Raw output (first 500 chars): {output[:500]}")
+            return False
+
+        errors = validate_analysis(analysis, commits_data, repo)
+        if errors:
+            print(f"Validation errors:")
+            for e in errors:
+                print(f"  - {e}")
+            if not confirm and not force:
+                print("Analysis result invalid, not writing to file")
+                return False
+            if confirm:
+                answer = input("Write anyway? [y/N] ").strip().lower()
+                if answer != "y":
+                    print("Skipped.")
+                    return False
+    else:
+        # All commits were triaged — no LLM call needed
+        analysis = None
+
+    # ── Phase 3: merge auto + LLM results ─────────────────────────
+    merged_shas = {}
+    for ac in auto_analysis:
+        merged_shas[ac["sha"]] = ac
+    if analysis and "commits" in analysis:
+        for ac in analysis["commits"]:
+            merged_shas[ac["sha"]] = ac
+
+    merged_commits = []
+    for c in all_commits:
+        ac = merged_shas.get(c["sha"])
+        if ac:
+            merged_commits.append(ac)
+        else:
+            # Should not happen, but fallback
+            merged_commits.append({
+                "sha": c["sha"],
+                "comment": "（分析缺失）",
+                "tags": ["chore"],
+            })
+
+    # Build the final analysis object
+    is_vllm = "vllm-ascend" not in repo
+    if analysis is None:
+        # All auto — build a minimal analysis structure
+        analysis = {
+            "date": date,
+            "repo": repo,
+            "daily_summary": f"当日 {len(auto_analysis)} 条 commit 均不涉及 vllm-ascend。",
+        }
+        if is_vllm:
+            analysis["ascend_impact_summary"] = "当日所有变更均为 tests / docs / CI / 平台特化代码，对 vllm-ascend 无影响。"
+    else:
+        analysis["date"] = date
+        analysis["repo"] = repo
+
+    analysis["commits"] = merged_commits
     analysis["generated_at"] = datetime.now(TZ_CN).isoformat()
 
     if confirm:

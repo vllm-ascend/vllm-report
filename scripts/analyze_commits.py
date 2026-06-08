@@ -70,11 +70,12 @@ ASCEND_IMPACT_VLLM = "（仅 vllm 仓库需要填写）：评估对 vllm-ascend 
 ASCEND_IMPACT_ASCEND = "（vllm-ascend 仓库无需填写，填写 null 即可）"
 
 VLLM_ASCEND_REQUIREMENT = """**ascend_impact**（仅 vllm 仓库需要填写）：评估对 vllm-ascend 项目的影响
+   - ascend_affected：该 commit 是否影响 vllm-ascend（布尔值，影响则 true，不影响则 false）
    - functionality：功能层面的影响（参考架构上下文中的硬件适配层信息判断）
    - testing：测试层面的影响
    - needs_test_update：vllm-ascend 是否因此变更需要新增、删除或更新测试用例（布尔值）
    - suggested_test_areas：如果 needs_test_update 为 true，建议变更的文件或模块（列表）
-   - 如果该 commit 不影响 vllm-ascend，则 functionality 和 testing 填写"无影响"，needs_test_update 填 false"""
+   - 如果该 commit 不影响 vllm-ascend，则 ascend_affected 填 false，functionality 和 testing 填写"无影响"，needs_test_update 填 false"""
 ASCEND_ASCEND_REQUIREMENT = ""
 
 VLLM_TEST_REQUIREMENT = ""
@@ -107,6 +108,7 @@ ASCEND_ASCEND_SUMMARY_FIELD = ""
 
 VLLM_ASCEND_COMMIT_FIELD = ''',
       "ascend_impact": {
+        "ascend_affected": true,
         "functionality": "<功能影响>",
         "testing": "<测试影响>",
         "needs_test_update": true,
@@ -293,31 +295,10 @@ def build_prompt(repo, date, commits_data, data_dir, local_repo=None):
     return prompt
 
 
-def extract_text_from_json_events(output):
-    if not output:
-        return None
-    texts = []
-    for line in output.strip().splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            event = json.loads(line)
-            if event.get("type") == "text":
-                text = event.get("part", {}).get("text", "")
-                if text:
-                    texts.append(text)
-        except json.JSONDecodeError:
-            continue
-    return "".join(texts) if texts else output
-
-
-def call_opencode(prompt, workdir=None, model="deepseek/deepseek-v4-flash"):
+def call_reasonix(prompt, model="deepseek-v4-flash"):
+    """Call Reasonix CLI to analyze commits."""
     try:
-        cmd = ["opencode", "run", "--format", "json", "--model", model]
-        if workdir:
-            cmd += ["--dir", workdir]
-        cmd.append(prompt)
+        cmd = ["reasonix", "run", "--model", model, prompt]
         result = subprocess.run(
             cmd,
             capture_output=True,
@@ -325,15 +306,15 @@ def call_opencode(prompt, workdir=None, model="deepseek/deepseek-v4-flash"):
             timeout=600,
         )
         if result.returncode != 0:
-            print(f"opencode returned non-zero exit code: {result.returncode}")
+            print(f"reasonix returned non-zero exit code: {result.returncode}")
             if result.stderr:
                 print(f"stderr: {result.stderr[:500]}")
-        return extract_text_from_json_events(result.stdout)
+        return result.stdout
     except subprocess.TimeoutExpired:
-        print("opencode call timed out (120s)")
+        print("reasonix call timed out (600s)")
         return None
     except FileNotFoundError:
-        print("opencode CLI not found. Please install it first.")
+        print("reasonix CLI not found. Please install it first.")
         return None
 
 
@@ -349,6 +330,12 @@ def extract_json_from_output(output):
             text = text[start:].strip()
         if text.endswith("```"):
             text = text[:-3].strip()
+
+    # Strip Reasonix trailing stats line (from the last "\n— " onwards)
+    stats_marker = "\n— "
+    stats_idx = text.rfind(stats_marker)
+    if stats_idx != -1:
+        text = text[:stats_idx].strip()
 
     # Try to find the outermost JSON object, handling trailing content
     json_start = text.find("{")
@@ -451,7 +438,7 @@ def display_analysis(analysis):
     print("=" * 60 + "\n")
 
 
-def analyze_commits(repo, date, data_dir, confirm, force, local_repo=None, model="deepseek/deepseek-v4-flash"):
+def analyze_commits(repo, date, data_dir, confirm, force, local_repo=None, model="deepseek-v4-flash"):
     commits_data = load_commits_data(data_dir, repo, date)
     if commits_data is None:
         return False
@@ -482,15 +469,15 @@ def analyze_commits(repo, date, data_dir, confirm, force, local_repo=None, model
 
     prompt = build_prompt(repo, date, commits_data, data_dir, local_repo=local_repo)
 
-    print("Calling opencode CLI...")
-    output = call_opencode(prompt, workdir=local_repo, model=model)
+    print("Calling Reasonix...")
+    output = call_reasonix(prompt, model=model)
     if output is None:
-        print("Failed to get response from opencode")
+        print("Failed to get response from Reasonix")
         return False
 
     analysis = extract_json_from_output(output)
     if analysis is None:
-        print("Failed to parse JSON from opencode output")
+        print("Failed to parse JSON from Reasonix output")
         print(f"Raw output (first 500 chars): {output[:500]}")
         return False
 
@@ -563,7 +550,7 @@ def main():
     parser.add_argument("--force", action="store_true", help="Force overwrite existing analysis")
     parser.add_argument("--data-dir", default="data", help="Data directory")
     parser.add_argument("--local-repo", default=None, help="Path to local repo source code (auto-detected if not specified)")
-    parser.add_argument("--model", default="deepseek/deepseek-v4-flash", help="opencode model to use (default: deepseek/deepseek-v4-flash)")
+    parser.add_argument("--model", default="deepseek-v4-flash", help="Reasonix model to use (default: deepseek-v4-flash)")
     args = parser.parse_args()
 
     if not args.date and not args.latest and not args.catch_up:

@@ -130,6 +130,145 @@
     render();
   }
 
+  async function loadCommitsForRange(startStr, endStr) {
+    const datesInRange = [];
+    const d = new Date(startStr + 'T00:00:00+08:00');
+    const end = new Date(endStr + 'T00:00:00+08:00');
+    while (d <= end) {
+      const ds = cnDateStr(d);
+      if (availableDates.includes(ds)) {
+        datesInRange.push(ds);
+      }
+      d.setDate(d.getDate() + 1);
+    }
+
+    const [commitResults, analysisResults] = await Promise.all([
+      Promise.all(datesInRange.map(function (date) {
+        return fetchJSON(dataUrl(currentRepo, 'commits', date));
+      })),
+      Promise.all(datesInRange.map(function (date) {
+        return fetchJSON(dataUrl(currentRepo, 'analysis', date));
+      })),
+    ]);
+
+    var allCommits = [];
+    var allAnalysis = {};
+
+    for (var i = 0; i < commitResults.length; i++) {
+      if (commitResults[i] && commitResults[i].commits) {
+        commitResults[i].commits.forEach(function (c) {
+          c._exportDate = datesInRange[i];
+          allCommits.push(c);
+        });
+      }
+    }
+
+    for (var j = 0; j < analysisResults.length; j++) {
+      if (analysisResults[j] && analysisResults[j].commits) {
+        analysisResults[j].commits.forEach(function (a) {
+          allAnalysis[a.sha] = a;
+        });
+      }
+    }
+
+    return { commits: allCommits, analysis: allAnalysis };
+  }
+
+  async function exportToExcel() {
+    var startDate = $('#rangeStart').value;
+    var endDate = $('#rangeEnd').value;
+
+    if (!startDate || !endDate) {
+      alert('Please select both start and end dates');
+      return;
+    }
+
+    if (startDate > endDate) {
+      alert('Start date must be before end date');
+      return;
+    }
+
+    var btn = $('#exportBtn');
+    var originalText = btn.textContent;
+    btn.textContent = 'Exporting...';
+    btn.disabled = true;
+
+    try {
+      var result = await loadCommitsForRange(startDate, endDate);
+
+      if (result.commits.length === 0) {
+        alert('No commits found in the selected date range');
+        btn.textContent = originalText;
+        btn.disabled = false;
+        return;
+      }
+
+      var headers = ['SHA', 'Date', 'Author', 'Title', 'Tags', 'Ascend Affected', 'Needs Test Update', 'AI Analysis', 'Additions', 'Deletions', 'Files Changed'];
+      var rows = [headers];
+
+      result.commits.forEach(function (commit) {
+        var a = result.analysis[commit.sha] || null;
+        var tags = a && a.tags ? a.tags.join(', ') : '';
+        var ascendAffected = a && a.ascend_impact && a.ascend_impact.ascend_affected ? 'Yes' : '';
+        var needsTest = a && (
+          (a.test_impact && a.test_impact.needs_test_update) ||
+          (a.ascend_impact && a.ascend_impact.needs_test_update)
+        ) ? 'Yes' : '';
+        var comment = a && a.comment ? a.comment : '';
+        var title = commit.message.split('\n')[0];
+        var additions = commit.stats ? commit.stats.total_additions : 0;
+        var deletions = commit.stats ? commit.stats.total_deletions : 0;
+        var files = commit.stats ? commit.stats.files_changed : 0;
+        var author = (commit.author && commit.author.name) || 'unknown';
+
+        rows.push([
+          commit.sha,
+          commit._exportDate,
+          author,
+          title,
+          tags,
+          ascendAffected,
+          needsTest,
+          comment,
+          additions,
+          deletions,
+          files
+        ]);
+      });
+
+      var wb = XLSX.utils.book_new();
+      var ws = XLSX.utils.aoa_to_sheet(rows);
+
+      var colWidths = headers.map(function (_, i) {
+        var maxLen = headers[i].length;
+        rows.forEach(function (row) {
+          var len = String(row[i] || '').length;
+          if (len > maxLen) maxLen = len;
+        });
+        return { wch: Math.min(maxLen + 3, 80) };
+      });
+      ws['!cols'] = colWidths;
+
+      XLSX.utils.book_append_sheet(wb, ws, 'Commits');
+
+      var wbout = XLSX.write(wb, { bookType: 'xlsx', type: 'array' });
+      var blob = new Blob([wbout], { type: 'application/octet-stream' });
+      var link = document.createElement('a');
+      var prefix = repoDir(currentRepo);
+      link.href = URL.createObjectURL(blob);
+      link.download = prefix + '-commits-' + startDate + '-' + endDate + '.xlsx';
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(link.href);
+    } catch (err) {
+      alert('Export failed: ' + (err.message || 'unknown error'));
+    } finally {
+      btn.textContent = originalText;
+      btn.disabled = false;
+    }
+  }
+
   function showLoading(show) {
     $('#loading').style.display = show ? 'flex' : 'none';
     if (show) {
@@ -165,7 +304,7 @@
         case 'needs-test':
           return (a.test_impact && a.test_impact.needs_test_update) || (a.ascend_impact && a.ascend_impact.needs_test_update);
         case 'affects-ascend':
-          return a.ascend_impact && a.ascend_impact.functionality && a.ascend_impact.functionality !== '无影响';
+          return a.ascend_impact && a.ascend_impact.ascend_affected === true;
         case 'high-risk':
           return a.tags && a.tags.some((t) => t === 'high-risk');
         default:
@@ -442,6 +581,15 @@
         content.classList.toggle('open');
       }
     });
+
+    $('#exportBtn').addEventListener('click', exportToExcel);
+
+    // Set default date range to last 7 days
+    var today = cnDateStr(new Date());
+    var weekAgo = new Date(today + 'T00:00:00+08:00');
+    weekAgo.setDate(weekAgo.getDate() - 6);
+    $('#rangeStart').value = cnDateStr(weekAgo);
+    $('#rangeEnd').value = today;
 
     $$('.filter-chip')[0].classList.add('active');
     detectDataBase().then(() => {

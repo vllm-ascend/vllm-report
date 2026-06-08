@@ -1,0 +1,635 @@
+{
+  "date": "2026-06-05",
+  "repo": "vllm-project/vllm",
+  "generated_at": "2026-06-08T15:46:21.561643+08:00",
+  "daily_summary": "当日共38个 commit，主要集中在三大方向：(1) Deepseek V4 注意力层大规模重构（#44569/#44561），消除 DeepseekV4MLA/DeepseekV4MLAAttention 包装类，将平台特化逻辑下沉到 ABC 子类；消除 50+ 模型文件中 KV cache scale 加载样板代码（#43167）；(2) Rust 前端持续增强——支持 `include_reasoning=false`、`--language-model-only`、批量 auto-abort；(3) ROCm/XPU 平台适配——hipBLASLt GEMM 在线调优、sparse indexer workspace manager、block_fp8_moe、Aiter unified attention 测试。另有 KV connector PP-aware handshake、分布式 split_group 新路径（opt-in）、mamba KDA conv state 统一、shutdown 日志优化、FP64 Gumbel 精度修复等。",
+  "ascend_impact_summary": "当日变更对 vllm-ascend 影响有限但有明确关注点：(1) KV cache scale 样板代码移除（#43167）是最大影响——若 vllm-ascend 有自定义模型实现的 load_weights，需同步删除相应锅炉板代码；(2) Sampler 新增 use_fp64_gumbel 参数，若 vllm-ascend 有自定义 sampler 需适配；(3) parallel_state 新增 split_group 路径的 `_platform_device_type()` 已正确处理 OOT 平台，无额外适配需求；(4) query_start_loc padding 修复、Deepseek RoPE device 修复、mamba KDA conv state 修改变更范围小，仅当 vllm-ascend 有对应自定义实现时才需关注。",
+  "commits": [
+    {
+      "sha": "91e17d43152b6209c7bf444e08df4e3a803012d9",
+      "comment": "修复 Sarvam MLA 模型在 transformers v5 上的 forward 兼容性。transformers v5 将 `validate_rope` 的 `ignore_keys` 参数移到了 `PreTrainedConfig` 类属性 `ignore_keys_at_rope_validation`。通过 `_patch_hf_transformers_validate_rope` 函数在 HFConfigParser 解析 sarvam_mla 模型配置时动态 patch，将 kwargs 中的 ignore_keys 写入类属性后转发调用，避免新旧版本签名不兼容。使用 `_PATCH_HF_VALIDATE_ROPE` 集合控制需要 patch 的模型类型，未来可扩展。实现优雅，包含防重复 patch 检测。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "tokenizer"
+      ],
+      "ascend_impact": {
+        "functionality": "无影响——变换的是 HuggingFace transformers 侧的兼容性逻辑，与硬件平台无关",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "aa6fb8a329bf092a3fd29cfb399aa22feed7f5a1",
+      "comment": "ROCm 关键 bug 修复：将 `cuda_view.cu` 和 `cuda_utils_kernels.cu` 从 stable ABI（`_C_stable_libtorch`）回退到 regular ABI（`_C`）。原因是 ROCm 仍使用 torch 2.10，不支持 torch 2.11 的 stable ABI。同时将 `TORCH_TARGET_VERSION` 从 2.11 降至 2.10 以匹配实际 pytorch 版本。新增 `csrc/cuda_view.cu`（regular ABI 版本，与之前删除的文件相同）和 `csrc/ops.h` 中对应的声明。这是对 #44334/#44648 的补充——#44334 迁移到 stable ABI 时未考虑 ROCm 兼容性。",
+      "tags": [
+        "bugfix",
+        "critical",
+        "medium-risk",
+        "rocm"
+      ],
+      "ascend_impact": {
+        "functionality": "无影响——ROCm 专属的 CUDA/HIP 内核 ABI 修复",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "6a894574bf7b78fe639cb0c5ddf3eed911ea9011",
+      "comment": "为 multi-tier KV cache offloading 系统新增对象存储（S3 兼容）二级 tier。新增 `vllm/v1/kv_offload/tiering/obj/` 模块，包含 `ObjectStoreSecondaryTierManager` 实现，通过 NIXL 库的 OBJ 后端实现 CPU DRAM <-> S3 的异步传输。通过 `SecondaryTierFactory.register_tier('obj', ...)` 注册到工厂。包含完整的 mock 基础单元测试（365 行），使用 MockNixlAgent 模拟 NIXL 后端避免依赖真实 S3。修复 spec.py 中的错误日志格式（将 tier_config 对象改为 index）。实现完整，包含启动探测（`_probe_connectivity`）、存在性查询、失败处理和优雅关闭。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "kv-offload"
+      ],
+      "ascend_impact": {
+        "functionality": "无影响——新增的 S3 后端不影响现有 tier，通过工厂注册与平台无关",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "7f003a1285af4bca511606b8731171347300f893",
+      "comment": "重构 MiniCPMV processor 支持批处理输入（batched preprocessing）。主要改动：(1) `_convert_images_texts_to_inputs` 从单样本处理改为循环处理多个文本，对每个样本独立生成 input_ids 和 image_bounds；(2) 新增维度为 1 的分支进行 left-padding 和对齐 image_bounds；(3) `pad()` 方法从处理 `orig_items[key]` 形式的字典列表改为直接处理 tensor 列表，返回 (padded_tensor, padding_lengths) 二元组。注意 pad() 方法将之前的 dim=1/dim=2 分支映射改为 dim=0/dim=1，且 `input_ids.unsqueeze(0)` 被移除——这意味着调用者不再假定 batch 维度。潜在风险：返回的 `attention_mask` 使用 `padded_input_ids.ne(0)`，`image_bounds` 从单个 tensor 变为列表。",
+      "tags": [
+        "refactor",
+        "medium-risk",
+        "multimodal",
+        "tokenizer"
+      ],
+      "ascend_impact": {
+        "functionality": "无影响——MiniCPMV processor 是纯 Python transformer 处理逻辑，与硬件平台无关",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "ef0df7dbd68fcd47391e3b45b94378c2a21b59c2",
+      "comment": "升级 mypy 从 1.19.1 到 1.20.2 并简化 CI/本地配置。将之前的 mypy-local（非 CI）和 mypy-3.10（CI）两个 hook 合并为单一的 mypy-3.10 hook，不再区分 `ci` 参数。mypy.py 脚本简化，移除了 `ci` 参数（之前是 sys.argv[1]）。同步修复了新 mypy 版本发现的 4 个 type 问题（COLBERT_MODELS 类型注解、trtllm_mxint4_moe 缺失参数、tensorizer 的 dict 解包保护、test_graph_partition 的 assert）。更新 AGENTS.md 中 mypy 运行命令从 3.10 改为 3.12。从 Mergify 配置中移除 mypy 运行提示。",
+      "tags": [
+        "chore",
+        "ci",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "functionality": "无影响——CI/tooling 变更",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "a80af243560e25f915010011db76ae97c0cef5b5",
+      "comment": "加速文档构建。主要变更：(1) mkdocs.yaml 中配置优化——启用 api-autonav 的 `docstring_section_style: list` 和 `parameter_headings: true` 加速 mkdocstrings 处理，添加 `summary: true` 替代 `summary.modules: true`，增加排除项忽略 transformers_utils/configs 和 transformers_utils/processors；(2) 批量将 32 个文件中的 reStructuredText `:param: / :return:` 风格 docstring 迁移为 Google-style `Args:/Returns:` 风格，这是 mkdocstrings 效率更高的格式。同步更新 AGENTS.md 明确要求 Google-style docstring。修复一个 docs markdown 中的相对路径。",
+      "tags": [
+        "refactor",
+        "docs",
+        "low-risk",
+        "ci"
+      ],
+      "ascend_impact": {
+        "functionality": "无影响——纯文档/docstring 格式变更",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "c66b19800bb3d9ff958d5db82463aa19d2bbc255",
+      "comment": "升级 mistral-common 依赖从 1.11.2 到 1.11.3。涉及 requirements 目录下 7 个文件，全部为版本号变更。",
+      "tags": [
+        "chore",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "functionality": "无影响——依赖版本升级",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "6a11d72df7f15b39d76570dba5f415ff2b0292b3",
+      "comment": "为 Cohere2MoeForCausalLM（Command A+）添加结构化输出的 JSON tag 支持。一行变更，在 MODEL_TO_TAG_STYLE 的 Cohere2MoeForCausalLM 条目中增加 `COMMAND_A_PLUS_JSON_TAG`，使得 reasoning parser 同时支持 Command A 和 Command A+ 两种 tag 风格。",
+      "tags": [
+        "feature",
+        "low-risk",
+        "reasoning"
+      ],
+      "ascend_impact": {
+        "functionality": "无影响——Cohere reasoning parser 特定变更",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "02d2da0748a11de735df0a65f8e7dae5bb99ec96",
+      "comment": "DSV4 性能优化：将 metadata-independent 的部分（attn_gemm_parallel_execute 的输出处理 + fused_q_kv_rmsnorm）从 `@eager_break_during_capture` 标注的 attention_impl 方法中移出到外层 forward 方法中，使这些操作可以在 CUDA Graph 捕获的图段中执行而非 eager 断点内运行。修改 `attention_impl` 签名，新增 qr/kv/kv_score/indexer_kv_score/indexer_weights 参数（由外层计算后传入）。被 `eager_break_during_capture` 包裹的部分缩小到 wq_b + kv_insert + compressor/indexer 等 metadata-dependent 操作。",
+      "tags": [
+        "performance",
+        "medium-risk",
+        "attention",
+        "deepseek-v4"
+      ],
+      "ascend_impact": {
+        "functionality": "无影响——Deepseek V4 专属注意力层优化",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "bbb6c274c80b58551ca3cabee674ddd66e1cfbab",
+      "comment": "修复 Gemma4 模型在 CPU 平台上的崩溃——GPUModelRunner 调用 `torch.cuda.mem_get_info()` 时 CPU 平台没有该方法。在 CpuPlatform 上新增 `mem_get_info()` 类方法实现，使用 `get_memory_node_info()` 返回可用/总内存。这是 `Platform` 抽象基类接口的标准实现，其他平台已存在该方法。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "platform",
+        "cpu"
+      ],
+      "ascend_impact": {
+        "functionality": "无影响——CPU 平台专属的 mem_get_info 实现。如果 vllm-ascend 的 AscendPlatform 也需要 mem_get_info，建议自行检查是否已有实现",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "62215e72c6ff4979009c27aa95f7449213007f8f",
+      "comment": "大规模重构：从 50+ 模型实现中消除 KV cache scale 加载锅炉板代码。核心设计：(1) `QuantizationConfig` 新增 `get_cache_scale_mapper()` 方法（替代之前的 `get_cache_scale(name)`），返回一个 `WeightsMapper` 实例；(2) 新增 `KVCacheScaleParameter` 类封装标量 scale 参数的创建和 weight_loader；(3) `AutoWeightsLoader.load_weights()` 自动从 model/children 的 quant_config 获取 mapper 并应用到权重流；(4) `BaseKVCacheMethod` 使用 `KVCacheScaleParameter()` 替代手动 `nn.Parameter(torch.tensor(-1.0))`；(5) Fp8Config 和 QuarkConfig 实现 `get_cache_scale_mapper()` 替换旧的 `get_cache_scale()`。`maybe_remap_kv_scale_name` 新增早期返回——如果名字已在 params_dict 中则跳过正则 remap（避免 mapper 与正则重复处理）。`WeightsMapper.__or__` 新增 `orig_to_new_regex` 合并。单个模型实现（glm_ocr_mtp.py, hy_v3_mtp.py）在加载前手动应用 mapper。删除 56 个文件中的锅炉板代码和 1 个测试文件中的相关测试。潜在影响：任何实现自定义 `load_weights` 的模型若自己处理 kv cache scale 加载，需迁移到使用 `AutoWeightsLoader` 的自动机制。",
+      "tags": [
+        "refactor",
+        "high-risk",
+        "quantization",
+        "model-loader"
+      ],
+      "ascend_impact": {
+        "functionality": "高风险。若 vllm-ascend 有自定义模型实现（如 AscendModel）且其 load_weights 中包含 get_cache_scale 锅炉板代码，则需要：删除这些代码（~12 行/文件），并确保自定义模型使用 AutoWeightsLoader 或手动调用 quant_config.get_cache_scale_mapper()。若 vllm-ascend 完全复用 vLLM 的模型实现则无影响。如果继承 BaseKVCacheMethod，现在自动获得 KVCacheScaleParameter 行为",
+        "testing": "建议检查 vllm-ascend 是否运行了 kv cache scale 相关测试。新引入的 KVCacheScaleParameter 的 shape 校验（numel != 1）可能暴露 vllm-ascend 侧潜在的 scale tensor shape 问题",
+        "needs_test_update": true,
+        "suggested_test_areas": [
+          "自定义模型 load_weights 检查",
+          "kv_cache_scale 加载测试"
+        ]
+      }
+    },
+    {
+      "sha": "7fe7800fa4ce9709e9e3361f6b44b1ccf28c775f",
+      "comment": "修复 FP32 exponential 采样在 CUDA 上的尾部分布截断问题。CUDA 的 FP32 uniform 只有 24 位精度，导致极小值的 exponential 采样值不可能出现，进而影响 Gumbel-max exponential race 采样在长尾场景的统计正确性。实现方案：在 Sampler/TopKTopPSampler/RejectionSampler/SpecDecodeBaseProposer 中增加 `use_fp64_gumbel` 参数（来自 `ModelConfig.use_fp64_gumbel`），当开启时所有 exponential 噪声张量创建为 FP64（而非 FP32）。新增工具函数 `empty_exponential_noise_like()` 和 `sample_with_exponential_noise()` 统一处理混合精度场景（FP64 q + FP32 probs 时使用 `q.reciprocal_().mul_(probs)` 避免直接除法）。Triton kernel also supports USE_FP64_GUMBEL. 新增统计验证脚本 tools/gumbel_precision/prove_exponential_race_precision.py。新增 4 个测试文件/函数验证 fp64 路径的正确性。默认 behavior 不变（use_fp64_gumbel=False）。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "sampling",
+        "speculative-decoding"
+      ],
+      "ascend_impact": {
+        "functionality": "中等影响。若 vllm-ascend 有自定义 sampler 实现（如替换 TopKTopPSampler/RejectionSampler/Sampler），需要：在对应类中添加 use_fp64_gumbel 参数传递，并确保 exponential 采样路径支持 FP64。若完全继承 vLLM 的 sampler 类则无影响（参数默认 False 保持向后兼容）。GPUModelRunner 的 sampler 创建新增 use_fp64_gumbel 参数",
+        "testing": "建议在 vllm-ascend 上运行 test_topk_topp_sampler.py 和 test_rejection_sampler.py 中与 fp64 相关的测试",
+        "needs_test_update": true,
+        "suggested_test_areas": [
+          "自定义 sampler 的 use_fp64_gumbel 参数适配",
+          "exponential 采样精度测试"
+        ]
+      }
+    },
+    {
+      "sha": "8a83e6f2d752660dfe598395fb13809bb55fb53f",
+      "comment": "Rust 前端优化：批量处理 auto-abort 请求。之前每个请求的 auto-abort 单独发送一个 Abort 消息到 engine，在高并发场景下（大量客户端同时断开）会触发大量 engine 往返。改为使用 `recv_many` 批量接收 abort 请求（最多 1024 个），按 engine_id 分组后每个 engine 发送一条批量 Abort 消息。新增 `dropping_multiple_live_streams_aborts_all_in_a_burst` 测试验证批量行为。",
+      "tags": [
+        "performance",
+        "low-risk",
+        "rust",
+        "frontend"
+      ],
+      "ascend_impact": {
+        "functionality": "无影响——Rust 前端专属变更",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "efc347f1b2e635753ae8a594e9714109c200fcd3",
+      "comment": "文档修复：将 'Modes that don't use' 修正为 'Models that don't use'。上下文是描述了不支持 fastokens 的模型类型（mistral, grok2, kimi_audio）。",
+      "tags": [
+        "docs",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "functionality": "无影响——文档 typo 修复",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "d98b8f371c503d4b86039d43e486116043b706b3",
+      "comment": "启动 NixlConnector 的 `kv_role='kv_both'` 废弃周期。主要变更：(1) NixlConnector 构造函数中对 `kv_role='kv_both'` 发出 `warning_once` 废弃警告，建议使用 `kv_producer`（prefill 实例）或 `kv_consumer`（decode 实例）；(2) 更新所有文档（docs/design/nixl_kv_cache_lease.md, docs/features/nixl_connector_usage.md）将 kv_both 替换为 kv_producer/kv_consumer；(3) 更新集成测试脚本和单元测试中的角色配置；(4) 在 nixl_connector.py 中新增 `test_kv_both_deprecation_warning` 和 `test_explicit_kv_role_no_deprecation_warning` 测试。",
+      "tags": [
+        "refactor",
+        "medium-risk",
+        "kv-connector"
+      ],
+      "ascend_impact": {
+        "functionality": "无影响——NixlConnector 专属的废弃周期，vllm-ascend 不使用 NixlConnector",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "e64237ae82c9fa8abf9fabf96c2c4a9dcbfcd040",
+      "comment": "Rust 前端支持 `include_reasoning=false` 请求参数。非流式响应：在最终消息中过滤 reasoning 内容；当 reasoning 被隐藏时，同时隐藏对应的 logprobs 和 token_ids 输出（避免通过 per-token metadata 泄露被隐藏的推理 token）。流式响应：借助 `inside_hidden_reasoning` 和 `suppress_current_update_metadata` 状态变量跟踪当前是否在处理被隐藏的 reasoning block，在 BlockDelta/LogprobsDelta/BlockStart/BlockEnd 事件处理中根据 include_reasoning 标志过滤。validate.rs 移除了之前对 `include_reasoning=false` 的拒绝。新增 4 个测试用例验证非流式和流式场景。convert.rs 新增 `include_reasoning` 字段传递。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "rust",
+        "frontend",
+        "reasoning"
+      ],
+      "ascend_impact": {
+        "functionality": "无影响——Rust 前端专属变更，不涉及 Python 推理路径",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "d61d8566ec30691645d91727ca7daced073e8f14",
+      "comment": "更新 mistral tokenizer 测试期待值以反映 `continue_final_message` 修复。两个变更：(1) token_ids 期待值移除末尾的 `2`（即 `</s>` token）；(2) 对应 decoded 文本也移除 `</s>` 后缀。这是对 mistral_common 库行为变化的跟进。",
+      "tags": [
+        "test",
+        "low-risk",
+        "tokenizer"
+      ],
+      "ascend_impact": {
+        "functionality": "无影响——测试数据更新",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "d2f70da116257d02f34d12bf478c974ea9179dac",
+      "comment": "修复 GPUModelRunner dummy_run 中 query_start_loc 的 padding 问题。当 num_reqs 小于 num_reqs_padded（CUDA Graph 对齐）时，`self.query_start_loc.np[num_reqs + 1 : num_reqs_padded + 1]` 之前的填充值是未定义垃圾数据。修复：将这些位置填充为 `cum_num_tokens[-1]`（即最后一个有效请求的累积 token 数），确保注意力元数据在这些 padding 位置上使用正确的 token 计数。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "model-runner",
+        "cudagraph"
+      ],
+      "ascend_impact": {
+        "functionality": "中等影响。若 vllm-ascend 继承 GPUModelRunner 并使用 CUDA Graph 捕获路径的 dummy_run，则通过继承链自动获得该修复。若 vllm-ascend 有独立实现的 model runner 且执行类似 dummy run 操作，需检查是否有对应的 query_start_loc padding 逻辑",
+        "testing": "建议在 vllm-ascend 上验证 CUDA Graph 路径下 dummy run 是否正确",
+        "needs_test_update": true,
+        "suggested_test_areas": [
+          "model runner dummy run 的 query_start_loc 填充检查"
+        ]
+      }
+    },
+    {
+      "sha": "6542d48964be70dad281ce5e2675e287d394938f",
+      "comment": "修复 `test_invocations` 在新 openai SDK 版本中的不稳定失败问题。新版本 openai SDK 可能在 `chat.completions.create()` 返回值中注入额外字段（如 `moderation`），导致 `/invocations` 端点和 `/v1/chat/completions` 端点的输出 keys 不一致。修复方法：两个端点都使用 raw `requests.post` 获取 JSON 响应并直接比较字典，避免 SDK 的字段注入。",
+      "tags": [
+        "bugfix",
+        "test",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "functionality": "无影响——测试修复",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "ca73293fa6f59cf58eda61ebd3f7117f097b4c7f",
+      "comment": "修复 Rust incremental detokenizer 的 UTF-8 字符边界 panic。`next_chunk` 方法中的 cutoff 计算（`cumulative_output.len().saturating_sub(min_bytes_to_buffer)`）可能落在多字节 UTF-8 字符的中间，导致后续 slice 操作 panic。修复：在计算 cutoff 后调用 `floor_char_boundary()` 确保分割点在字符边界上。新增回归测试用例使用中文字符串 \"你好A\"。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "rust",
+        "tokenizer"
+      ],
+      "ascend_impact": {
+        "functionality": "无影响——Rust detokenizer 专属修复",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "ef3af56a974aa3bce145068d480c4b864375cbc9",
+      "comment": "修复 `LLM.wait_for_completion` 方法 docstring 中 output_type 参数描述的歧义，明确说明不传参时同时接受 RequestOutput 和 PoolingRequestOutput。",
+      "tags": [
+        "docs",
+        "bugfix",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "functionality": "无影响——docstring 修复",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "b4a6f26c904c4dc1653c1bb623c4cb8186347175",
+      "comment": "ROCm 性能优化：在稀疏注意力 indexer 中使用 workspace manager 管理中间张量分配（k_fp8, k_scale, logits 等）。主要变更：(1) prefill 路径中的 `torch.empty()` 分配替换为 `workspace_manager.get_simultaneous()` 实现内存复用；(2) decode 路径的 `torch.full` 分配也改为 workspace 管理；(3) 新增 profile-time 预分配逻辑（在 dummy run 时通过非 real-impl 路径预留内存）。降低显存分配开销。",
+      "tags": [
+        "performance",
+        "medium-risk",
+        "rocm",
+        "attention"
+      ],
+      "ascend_impact": {
+        "functionality": "无影响——ROCm 专属的 workspace manager 优化",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "165b7864d0e3208e09c33ed4ce459d2bca3c99ea",
+      "comment": "ROCm 新特性：集成 Aiter hipBLASLt GEMM 在线调优（`AiterHipbMMPerTokenFp8ScaledMMLinearKernel`）。新增 FP8 scaled MM 内核，通过 `VLLM_ROCM_USE_AITER=1` + `VLLM_ROCM_USE_AITER_LINEAR=1` + `VLLM_ROCM_USE_AITER_LINEAR_HIPBMM=1` 三个环境变量控制（默认关闭）。在 ROCm FP8 kernel 优先级列表中排在首位。实现了 `is_supported`、`can_implement`、`process_weights_after_loading`（应用权重 shuffle 和 transpose）、`apply_scaled_mm`。`rocm.py` 中当三个 flag 都开启且为 MI3xx 时自动设置 `HIP_ONLINE_TUNING=1`。新增 `_ensure_hipb_mm_extension_initialized()` 确保每设备初始化。包含完整测试套件。集成后 vLLM 的 Linear 层选择路径（Fp8MoeBackend.ROCM 的 kernel 列表）将优先尝试 hipBLASLt 路径。",
+      "tags": [
+        "feature",
+        "performance",
+        "medium-risk",
+        "rocm",
+        "quantization"
+      ],
+      "ascend_impact": {
+        "functionality": "无影响——ROCm 专属的 hipBLASLt/COMGR 在线调优，不影响其他平台",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "c505cd93effcae9bce02f7a5386dfc27b82fb3cc",
+      "comment": "CI 调整：注释掉 CPU-Compatibility Tests 步骤。原因是 SDE（Software Development Emulator）无法从 CI host 下载（AWS WAF 限制）。这只是临时禁用，不删除代码。",
+      "tags": [
+        "ci",
+        "low-risk",
+        "cpu"
+      ],
+      "ascend_impact": {
+        "functionality": "无影响——CI 配置变更",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "96229fa99e9942be9d6d808c9e07b81d2c256f74",
+      "comment": "KV connector handshake 支持 PP-aware 聚合。核心变更：(1) `KVConnectorBase_V1` 新增 `set_xfer_handshake_metadata_pp_aware()` 默认方法，keyed by `(pp_rank, tp_rank)`，默认为 legacy 兼容：若任何 `pp_rank > 0` 则报错（因为 legacy connector 不支持 PP-disaggregated），否则 unwrap 到 `{tp_rank: metadata}` 调用旧的 set_xfer_handshake_metadata()。(2) `EngineCore.__init__` 现在构建 `dict[tuple[int,int], Any]` 而非 `dict[int, Any]`，调用 `set_xfer_handshake_metadata_pp_aware()`。(3) Worker 的 `get_kv_connector_handshake_metadata()` 返回 `{(pp_rank, tp_rank): metadata}` 结构。(4) TransferTopology 的 `_engines` 从 `dict[EngineId, info]` 改为 `dict[tuple[EngineId, int], info]`（key 增加 pp_rank 维度），所有查询方法增加 `remote_pp_rank` 参数。EngineTransferInfo 新增 `remote_pp_rank`/`start_layer`/`end_layer` 字段（默认值为 0，向后兼容）。(5) MultiConnector 转发 `set_xfer_handshake_metadata_pp_aware` 到子 connector。新增 3 个测试文件覆盖 legacy/PP-aware/contract 场景。改动影响：所有使用了 set_xfer_handshake_metadata 接口的 connector 子类需要关注——虽然默认实现保证了向后兼容，但建议 PP-aware connector 重写该方法。",
+      "tags": [
+        "feature",
+        "refactor",
+        "high-risk",
+        "kv-connector",
+        "distributed"
+      ],
+      "ascend_impact": {
+        "functionality": "中等影响。若 vllm-ascend 实现了自定义 KVConnector 子类，需要：检查该类是否使用了 `set_xfer_handshake_metadata()`。默认的 `set_xfer_handshake_metadata_pp_aware()` 实现保持了向后兼容（unwrap to legacy），但若 vllm-ascend 未来需要在 PP 场景下使用 KV connector，则应重写该方法。若 vllm-ascend 不使用 KV connector 则无影响",
+        "testing": "建议检查 vllm-ascend 的 KV connector 测试是否覆盖 handshake 场景",
+        "needs_test_update": true,
+        "suggested_test_areas": [
+          "自定义 KVConnector 的 handshake 接口检查",
+          "multi-connector 测试"
+        ]
+      }
+    },
+    {
+      "sha": "da1daf40bf18e5eaae04f26a80a537c8168a8bc2",
+      "comment": "修复 Gemma4 Unified 模型中 vision embedder 被错误量化的问题。在 `Gemma4UnifiedVisionEmbedder` 初始化时传入 `prefix` 参数，并在 `patch_dense` ReplicatedLinear 中设置 `prefix=f\"{prefix}.patch_dense\"`。这样一来，QuantizationConfig 的 `ignore` 列表（通常包含 \"vision_embedder\"）可以通过前缀匹配正确跳过该层。之前在 `Gemma4UnifiedForConditionalGeneration` 中创建 vision embedder 时未传 prefix。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "multimodal",
+        "quantization"
+      ],
+      "ascend_impact": {
+        "functionality": "无影响——Gemma4 专属的多模态量化修复",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "4efd6ffde09477800294a8ed9cc752017812c3b1",
+      "comment": "Deepseek V4 Attention 层大规模重构。核心变更：(1) 消除 `DeepseekV4MLA` 和 `DeepseekV4MLAAttention` 两层包装类，将功能合并到 `DeepseekV4Attention`（抽象基类，ABC）；(2) 所有线性层（fused_wqa_wkv, wq_b, wo_a, wo_b 等）和初始化逻辑从 `nvidia/model.py` / `amd/model.py` 中的 `DeepseekV4Attention` 子类移到 `attention.py:DeepseekV4Attention` 基类；(3) 平台特化逻辑通过三个抽象方法实现：`forward_mqa()`、`_o_proj()`、`get_padded_num_q_heads()`，由子类 `DeepseekV4FlashMLAAttention`（CUDA FlashMLA）、`DeepseekV4FlashInferMLAAttention`（CUDA FlashInfer）、`DeepseekV4ROCMAiterMLAAttention`（ROCm）提供实现；(4) `_o_proj()` 取代了之前 `DeepseekV4MLA.forward()` 中的 `if current_platform.is_rocm()` 条件分支——CUDA 路径 (`deep_gemm_fp8_o_proj`) 和 ROCm 路径 (`rocm_inv_rope_einsum`) 分别位于各自的子类中；(5) nvidia/ops/o_proj.py 新增共享的 `compute_fp8_einsum_recipe()` 和 `deep_gemm_fp8_o_proj()` 函数；(6) `_select_v4_sparse_impl()` 改为 `_select_dsv4_attn_cls()` 返回注意力类而非 impl；(7) `WeightsMapper` 中原用 `.attn.mla_attn.compressor.` 的 substr remapping 不再需要（因为类结构扁平化）；(8) `flashmla.py` 中删除了抽象父类 `DeepseekV4SparseMLAAttentionImpl`（之前继承自 `SparseMLAAttentionImpl`），所有方法从 classmethod 改为 instance method。潜在风险：重构幅度大（8 文件，+521/-918），注意力层初始化顺序和参数绑定可能有变动，需要验证模型加载和 forward 正确性。",
+      "tags": [
+        "refactor",
+        "high-risk",
+        "attention",
+        "deepseek-v4"
+      ],
+      "ascend_impact": {
+        "functionality": "无影响——Deepseek V4 专属注意力层重构，不涉及 vllm-ascend 可能使用的通用注意力后端",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "56aff0dd15c0d01abc3f1de2b773aff2ed61d7a0",
+      "comment": "将 `cuda_view` 和 `silu_and_mul_per_block_quant` 内核从 regular ABI（不稳定 PyTorch ABI）迁移到 stable ABI（libtorch_stable）。同时移动 `cuda_utils_kernels.cu` 和 `cutlass_extensions/common.cpp` 到 libtorch_stable/ 目录并更新引用路径。`cuda_view.cu` 从 `torch::Tensor` ABI 重写为 `torch::stable::Tensor` ABI（新增 `csrc/libtorch_stable/cuda_view.cu`，删除旧文件）。`fused_silu_mul_block_quant.cu` 迁移并重写为 stable ABI 宏（STD_TORCH_CHECK, VLLM_STABLE_DISPATCH_FLOATING_TYPES 等）。TORCH_TARGET_VERSION 恢复为 2.11（#44648 曾为 ROCm 降为 2.10，此 commit 只影响 CUDA 且恢复 2.11）。25 个文件变更。这是 CUDA 内核迁移到 stable ABI 系列的第 10 个 PR。",
+      "tags": [
+        "refactor",
+        "medium-risk",
+        "cuda",
+        "kernel"
+      ],
+      "ascend_impact": {
+        "functionality": "无影响——CUDA 专属的 stable ABI 迁移，不影响 Ascend NPU 平台",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "063ce98fb7104dba93f72d56c094fb8b708bd793",
+      "comment": "XPU 平台支持 block FP8 MoE。新增 `XPUExpertsBlockFp8` 类（继承 `XPUExperts`），支持 `(kFp8Static128BlockSym, kFp8Dynamic128Sym)` 量化方案。在 `Fp8MoeBackend.XPU` 的 kernel 列表末尾添加 `XPUExpertsBlockFp8`。同步更新 Intel CI 测试脚本增加一个 block FP8 MoE 测试用例。",
+      "tags": [
+        "feature",
+        "low-risk",
+        "xpu",
+        "moe",
+        "quantization"
+      ],
+      "ascend_impact": {
+        "functionality": "无影响——XPU 专属的 MoE 量化支持",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "62d6f06e3db276030ae46b2e0b3915674515ca74",
+      "comment": "Rust 前端新增 `--language-model-only` 参数，加载模型时跳过 multimodal processor。`HfChatBackend.from_resolved_model_files()` 在 `options.language_model_only` 为 true 时跳过 `MultimodalModelInfo::from_paths()` 调用，避免因缺失 preprocessor_config.json 等文件而失败。选项从 CLI 传递到 ManagedEngine（转为 `--language-model-only` Python flag）。新增测试验证该标志确实跳过 processor 加载并允许无效的 preprocessor_config。",
+      "tags": [
+        "feature",
+        "low-risk",
+        "rust",
+        "frontend",
+        "multimodal"
+      ],
+      "ascend_impact": {
+        "functionality": "无影响——Rust 前端专属变更",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "b7c5baf63d5f95d18493a7fae3c75fc4853732a7",
+      "comment": "修复 DeepSeek V4 RoPE cache 构建时设备不匹配的问题。之前的代码使用 `current_platform.device_type` 创建 t 张量，但 `inv_freq` 可能在不同设备上（如 Meta device）。改为使用 `inv_freq.device` 确保 t 与 inv_freq 在同一设备上。修复了当模型权重在 meta device 上初始化时可能引发的设备不匹配错误。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "rotary-embedding",
+        "deepseek-v4"
+      ],
+      "ascend_impact": {
+        "functionality": "低影响。若 vllm-ascend 使用 DeepseekV4ScalingRotaryEmbedding 且有自定义 device 管理，这个修复有益但不会破坏现有代码。`inv_freq.device` 比 `current_platform.device_type` 更鲁棒",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "a55fccfc7cefc2d085d3557bace0e345cef67961",
+      "comment": "Mamba KDA（Key-Value-Query Delta Attention）conv state 缓存统一。之前的实现将 conv_state_q、conv_state_k、conv_state_v 分为三个独立缓存，分别跟踪。优化后合并为一个统一的 conv_state 缓存（维度为 `proj_size + 2*proj_k_size`），在 forward 时使用 `chunk(3, dim=-2)` 拆分。对应地，`MambaStateShapeCalculator.kda_state_shape()` 从返回 (conv_q_shape, conv_k_shape, conv_k_shape, recurrent_shape) 改为 (conv_shape, recurrent_shape)；`MambaStateDtypeCalculator.kda_state_dtype()` 从返回 (d,d,d,fp32) 改为 (d, fp32)；`MambaStateCopyFuncCalculator.kda_state_copy_func()` 简化。三个文件变更。好处是减少了参数数量和缓存管理复杂性。潜在风险：conv state 的合并改变了 cached state 结构，依赖旧形态的外部代码需同步更新。",
+      "tags": [
+        "refactor",
+        "medium-risk",
+        "mamba",
+        "attention"
+      ],
+      "ascend_impact": {
+        "functionality": "中等影响。若 vllm-ascend 有自定义 mamba KDA 实现或自定义缓存管理依赖 `get_mamba_state_shape_from_config()` / `get_mamba_state_dtype_from_config()` 等方法，则需要：更新对应的方法返回值类型（从 4-tuple 变为 2-tuple），并修改 conv state 的处理逻辑（从独立缓存改为合并缓存后 chunk）。若 vllm-ascend 完全复用 vLLM 的 mamba 实现（如 KimiLinearForCausalLM）则无影响",
+        "testing": "建议检查 vllm-ascend 的 mamba 相关测试是否覆盖 conv state 操作",
+        "needs_test_update": true,
+        "suggested_test_areas": [
+          "mamba conv state 形状检查",
+          "KDA 状态初始化测试"
+        ]
+      }
+    },
+    {
+      "sha": "41a4829f2202f726711349994526afd4b24be868",
+      "comment": "全面优化 shutdown 日志，使关闭流程更清晰可追踪。为 shutdown 路径中所有关键组件（API server、EngineCore、MPClient、Executor、Scheduler、WorkerProc、分布式环境、进程管理器）添加结构化的 `[shutdown] component: message` 日志格式。关键变更：(1) 每个组件使用 `logger.info_once` / `logger.debug_once` 标识阶段开始和完成；(2) shutdown timeout 为 0 时标记为 'abort' 模式，非零时为 'drain' 模式；(3) 进程清理时记录剩余进程数和各阶段耗时。7 个文件。",
+      "tags": [
+        "refactor",
+        "low-risk",
+        "observability"
+      ],
+      "ascend_impact": {
+        "functionality": "无影响——日志优化，不改变行为逻辑",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "38fd2405f35e9a38347f34deec1ad6d1bce0c2fb",
+      "comment": "新增可选的 `split_group` 分布式进程组创建路径（通过 `VLLM_DISTRIBUTED_USE_SPLIT_GROUP=1` 启用）。主要变更：(1) `GroupCoordinator.__init__` 增加 `split_group` 路径——使用 `torch.distributed.split_group()` 一次性创建所有 subgroup，而非为每个 rank 列表循环调用 `new_group()`；(2) `init_distributed_environment()` 中当 split_group 启用时使用混合 backend `cpu:gloo,cuda:nccl` 和 eager `device_id` 绑定初始化默认 PG——这种初始化方式是 `split_group` 的前置条件；(3) 新增 `_platform_device_type()` 函数处理 OOT 平台（`current_platform.device_name`）；(4) 新增 `_validate_default_pg_for_split_group()` 检查默认 PG 的 `bound_device_id` 和 CPU backend 存在性；(5) 新增环境变量 `VLLM_DISTRIBUTED_USE_SPLIT_GROUP`（默认 0，opt-in）；(6) 新增 `test_split_group.py` 测试文件（233 行，4 个测试覆盖 basic/multi-subgroup/contract）。同步修改多个分布式测试以支持新的初始化方式。默认行为不变（legacy new_group 路径）。",
+      "tags": [
+        "feature",
+        "high-risk",
+        "distributed",
+        "parallel-state"
+      ],
+      "ascend_impact": {
+        "functionality": "中等影响。新增的 `_platform_device_type()` 已正确处理 OOT 平台（`return current_platform.device_name`），vllm-ascend 无需额外修改。但若 vllm-ascend 自定义了 `init_distributed_environment()` 或 `GroupCoordinator` 子类，则需要注意 `split_group` opt-in 路径的存在。默认（VLLM_DISTRIBUTED_USE_SPLIT_GROUP=0）行为不变，不影响 vllm-ascend",
+        "testing": "建议在 vllm-ascend 上运行 test_split_group.py 验证 OOT 平台兼容性（skip if not set flag）",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "a947f7a420de439a1f403c3f11c0cfdba03715df",
+      "comment": "扩展 lightning_attn 和 awq_triton kernel 测试以支持 XPU 平台。主要变更：(1) 测试中使用 `current_platform.device_type` 替代硬编码 `\\\"cuda\\\"`；(2) 新增 `pytest.mark.skipif` 条件——`is_cuda_alike() or is_xpu()`；(3) lightning_attn.py 中 CUDA compute capability 检查只在 `is_cuda()` 为 true 时执行。3 个文件。",
+      "tags": [
+        "test",
+        "low-risk",
+        "xpu"
+      ],
+      "ascend_impact": {
+        "functionality": "无影响——XPU 测试扩展",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "439203d32c642db4e7db04847a0e231b728628e0",
+      "comment": "修复 `test_cutlass_moe.py`。主要修复：(1) `make_dummy_moe_config` 新增 `max_num_tokens`、`num_local_experts` 参数，不再假设 `num_local_experts=num_experts`；(2) `make_dummy_moe_config` 中当 `num_local_experts` 有值时正确传递；(3) CUTLASS MoE 的 `fused_moe` 调用现在传入 `expert_map` 而非 `None`（修复了 `CutlassExpertsFp8Base` 中的一个 bug——之前硬编码 `expert_map=None` 导致 sparsed MoE chunks 无法正确选择专家）；(4) test_run_cutlass_moe_fp8 传入 `expert_map=None` 参数。",
+      "tags": [
+        "bugfix",
+        "test",
+        "low-risk",
+        "moe"
+      ],
+      "ascend_impact": {
+        "functionality": "无影响——CUTLASS MoE 测试修复",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "8d9536a775a87eae5e0a1904603aa4725562765e",
+      "comment": "新增 Pooler Head 类（EmbeddingPoolerHead、ClassifierPoolerHead、TokenEmbeddingPoolerHead、TokenClassifierPoolerHead）的单元测试（481 行）。覆盖 passthrough、head_dtype、projector/classifier、matryoshka dimensions、activation (PoolerNormalize)、Platt scaling、mixed batch、chunked prefill、empty batch 等场景。",
+      "tags": [
+        "test",
+        "low-risk",
+        "pooling"
+      ],
+      "ascend_impact": {
+        "functionality": "无影响——新增测试文件",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "3da29aa4a5509b068d378bd8aedbe4837cecf6a6",
+      "comment": "文档重构：重组 quantization 文档目录结构，增加 INT8 W4A8 文档并标注 Arm CPU 支持。主要变更：(1) 将 `fp8.md` / `int4.md` / `int8.md` 移动到 `llm_compressor/` 子目录并重命名；(2) 新增 `llm_compressor/int8_w4a8.md` 描述 INT4 权重 + INT8 激活的 W4A8 量化方案，包含 groupwise 和 channelwise 两个 recipe；(3) 更新 `README.md` 中的硬件支持矩阵新增 Arm CPU 列；(4) 文档改进：代码块从 collapsible `??? code` 改为直接展示，添加 separate environment 提示，添加 mkdocs redirect 映射避免断链。",
+      "tags": [
+        "docs",
+        "low-risk",
+        "quantization"
+      ],
+      "ascend_impact": {
+        "functionality": "无影响——文档重构和新增",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "06f94633e786f8e871c927bef3d93aced8e26be4",
+      "comment": "ROCm 新增 Aiter unified attention kernel 的正确性测试（339 行）。比较 `aiter.ops.triton.unified_attention` 与 `ref_paged_attn` 参考实现，覆盖 decode / prefill / mixed batch 场景以及 FP8 variants（fp8_kv / fp8_query / fp8_query_kv）。仅在 ROCm MI300/MI350 上运行。",
+      "tags": [
+        "test",
+        "low-risk",
+        "rocm",
+        "attention"
+      ],
+      "ascend_impact": {
+        "functionality": "无影响——ROCm 测试新增",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    }
+  ]
+}

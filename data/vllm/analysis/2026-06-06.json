@@ -1,0 +1,282 @@
+{
+  "date": "2026-06-06",
+  "repo": "vllm-project/vllm",
+  "generated_at": "2026-06-08T15:47:56.287659+08:00",
+  "daily_summary": "当日变更主要集中在五个方向：(1) Qwen3.5 GDN 注意力性能优化，通过将混合 prefill+decode 批次中 decode 部分剥离到循环 kernel 来加速；(2) 多个 bugfix，涵盖 FP8 RMSNorm 融合、ROCm rotary embedding grid 越界、MoE max_capture_size 配置快照、sequence_parallel_chunk 自定义 op 输入别名、Cohere routing type、mHC kernel miscompile、GPT-OSS Harmony 指令渲染等；(3) Phi-4 mini JSON 工具解析器 Rust 前端；(4) ROCm 平台 RoPE + static Q FP8 量化融合；(5) 分布式 DP Ray placement group 节点白名单。另有文档更新、TPU 依赖升级、Mergify 配置优化和池化层 assert 转异常等维护性变更。",
+  "ascend_impact_summary": "当日所有变更为平台特定实现（ROCm/CUDA/TPU）、Rust 前端、文档、CI 或核心逻辑内部重构，未修改 Platform 基类、WorkerBase、AttentionBackend 等硬件适配层抽象接口。对 vllm-ascend 无影响。",
+  "commits": [
+    {
+      "sha": "fa27d4e9cf3c8d8a5a143f38c346b27c02b2c2e3",
+      "comment": "Qwen3.5 GDN 线性注意力性能优化。当非 spec decode batch 中混合 prefill 和 1-token decode 时，将 decode 部分剥离出来通过 fused_sigmoid_gating_delta_rule_update（循环 kernel）处理，prefill 部分继续走 chunk_gated_delta_rule。对应的 GDNAttentionMetadataBuilder 在构建 chunk_indices/chunk_offsets 时会对剥离后的 prefill-only 部分做 rebase。实现上在 GDNAttentionMetadata 中新增了 prefill_query_start_loc/prefill_state_indices/prefill_has_initial_state 三个字段用于 chunk kernel 的独立入参。风险在于 split 逻辑的条件判断（spec_sequence_masks is None && num_prefills > 0 && num_decodes > 0）与 metadata builder 中的对齐必须严格一致，否则会导致下标越界或状态更新错误。",
+      "tags": [
+        "performance",
+        "high-risk",
+        "attention",
+        "mamba",
+        "gdn"
+      ],
+      "ascend_impact": {
+        "functionality": "无影响。变更仅在 GDN attention backend（Qwen3.5 特有）内，不影响平台抽象层。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "67d3792d99f345015a8bd01a3703be1469b60d7d",
+      "comment": "修复 Qwen3.5-FP8 nightly 测试失败。RMSNorm + quant 融合 pass 中的 _rms_input_weight_dtype_match 守卫函数之前只处理了 rms_norm 操作，忽略了 fused_add_rms_norm 操作。当模型使用 fused_add_rms_norm 时该守卫直接 return True 跳过 dtype 检查，导致 input/weight dtype 不匹配的 fusion 被错误允许。修复方式是将 fused_add_rms_norm 也纳入该守卫的检查范围。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "compilation"
+      ],
+      "ascend_impact": {
+        "functionality": "无影响。变更在 compilation/passes/fusion 编译融合 pass 中，不会影响 vllm-ascend 的平台适配。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "00d1fb77475567aef7d019881612e7ad564bb132",
+      "comment": "ROCm 平台修复。flash_attn 的 Triton rotary kernel 使用 grid = (cdiv(nheads, BLOCK_H), cdiv(seq_len, BLOCK_M), batch)，当视觉 encoder 将大量图像 patch 打包到一个 batch 时 gridY 会超过 HIP 的 per-dim 限制 65535，导致 hipModuleLaunchKernel 返回 invalid argument。修复方式是在 forward_hip 中预计算 grid_y 和 batch，超出限制时 fallback 到 native PyTorch 实现。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "roc",
+        "rotary-embedding"
+      ],
+      "ascend_impact": {
+        "functionality": "无影响。ROCm 平台特定修复。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "c9b4b184b408ca1ad779828cd1394c6c5217ded2",
+      "comment": "为 MistralCommonFeatureExtractor 添加 fetch_audio 方法以兼容 transformers>=5.10。transformers 5.10 在 ProcessorMixin 中新增了 prepare_inputs_layout 方法，该方法会无条件调用 self.feature_extractor.fetch_audio()。MistralCommonFeatureExtractor 是 duck-typed 的特征提取器，之前未实现该接口，导致加载 Voxtral 模型时抛出 AttributeError。实现遵循 SequenceFeatureExtractor.fetch_audio 的契约，支持 numpy/Tensor/list/str 等多种输入类型。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "tokenizer",
+        "transformers-utils"
+      ],
+      "ascend_impact": {
+        "functionality": "无影响。变更在 transformers_utils/processors 中，不影响硬件适配层。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "f87df1df9e93042fcfbd939d5fab0b7b0f47abc8",
+      "comment": "将 max_cudagraph_capture_size 快照到 FusedMoEConfig 中而非在 MoE expert 运行时通过 get_current_vllm_config() 读取。三个消费方（FlashInferExperts、TrtLlmMxfp4Experts、Mxfp4MoEMethod）各自独立调用全局 config 获取同一值，存在重复代码且难以测试。通过 FusedMoEConfig 新增 max_capture_size 字段，在 FusedMoE 创建时从 compilation_config 快照传入，各 expert 直接从 config 读取。这是纯重构，无行为变更。",
+      "tags": [
+        "refactor",
+        "low-risk",
+        "moe",
+        "model-executor"
+      ],
+      "ascend_impact": {
+        "functionality": "无影响。MoE 内部重构，不影响平台抽象层。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "eafbb06331caf580023b8da6871063499a37b403",
+      "comment": "将 pooler 模块中的 assert 语句替换为适当的 ValueError/RuntimeError 异常。涉及 seqwise/tokwise 的 heads、methods、poolers 及 config/pooler 共 7 个文件的 assert 替换。assert 在 Python 优化模式（-O）下会被跳过，使用异常可确保校验逻辑始终生效，同时提供更清晰的错误信息。",
+      "tags": [
+        "refactor",
+        "low-risk",
+        "pooler",
+        "model-executor"
+      ],
+      "ascend_impact": {
+        "functionality": "无影响。pooler 层内部错误处理改进，不影响平台接口。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "ec0a31d4aa019567395d9e7cce67d1e6ac56974a",
+      "comment": "修复 mHC fused-RMSNorm big-fuse kernel 在 hidden_size != 4096 时的编译错误。T.Pipelined 的 num_stages 参数从 3 改为 2，避免当 hidden_size/hidden_block 的比值不等于 4096/128 时 tilelang 编译错误。这是一个一行修复，风险极低。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "kernel",
+        "mhc"
+      ],
+      "ascend_impact": {
+        "functionality": "无影响。TileLang kernel fix，针对 CUDA/ROCm，不影响平台抽象接口。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "c8beda4cc38b1b34c172dc149b31b4e39dc2b569",
+      "comment": "为 Phi-4 mini 模型新增 JSON tool parser。Phi-4 mini 的 tool call 格式为 functools[{\"name\": ..., \"arguments\": ...}]，通过已有 JsonToolCallParser 框架实现。注册在 phi4_mini_json 名称下（通过名称而非模型名模式匹配）。新增完整单元测试覆盖 streaming、parallel calls、嵌套参数等场景。",
+      "tags": [
+        "feature",
+        "low-risk",
+        "rust",
+        "tool-parser",
+        "frontend"
+      ],
+      "ascend_impact": {
+        "functionality": "无影响。Rust 前端变更，不涉及 Python 后端或硬件适配。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "2f27c9a1500accc4faf7217f2af254a981df084e",
+      "comment": "修复 UnsafeCloneEliminationPass 错误移除了改变 tensor 内存布局的 clone。新增 clone_preserves_layout 守卫函数，在 clone 的 stride 或 storage_offset 与输入不一致时保留 clone。例如 x[:, :3].contiguous() 的 clone 会创建 compact (3, 1) stride 的新 tensor，移除它会导致后续操作拿到错误 layout 的 view。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "compilation",
+        "ir"
+      ],
+      "ascend_impact": {
+        "functionality": "无影响。compilation passes/IR 层修复，不影响平台抽象接口。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "4765f0f189fd0cd032a79da37ba427c3ba60ec33",
+      "comment": "修复 sequence_parallel_chunk_impl 自定义操作输入别名问题。当无需 padding 时 y is x，torch.narrow 返回的视图与输入共享同一存储，违反了 functional custom op 的约定（输出不能是输入的 view）。修复方式是在无 pad 情况下对 narrow 结果做 clone()，有 pad 时 y 是新 tensor 不存在别名问题。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "model-executor",
+        "sequence-parallel"
+      ],
+      "ascend_impact": {
+        "functionality": "无影响。model_executor/models/utils.py 中的序列并行工具函数修复。vllm-ascend 若不使用 CUDA Graph 编译则不受影响。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "a50e675b0d864660b10bfdc40f3b0224695d0a92",
+      "comment": "修复 Cohere MoE 的 RoutingMethodType。之前的代码对所有使用 token_choice_with_bias 的 Cohere MoE 返回 SigmoidRenorm，但实际上按是否开启 renormalize 应区分 Sigmoid 和 SigmoidRenorm 两种类型。同时将新类型注册到 TrtLlmBf16Experts 和 TrtLlmNvFp4Experts 的支持列表中。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "moe",
+        "cohere",
+        "model-executor"
+      ],
+      "ascend_impact": {
+        "functionality": "无影响。Cohere 模型特定的 MoE router 修复。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "f6a708ab2bfd1278d4ca54ed150295efb3f16ed5",
+      "comment": "更新 batch_invariance 文档。将硬件要求从 SM90+ 放宽到 SM80+（即 A100 及以上），新增 Llama-3.2-3B-Instruct 到已验证模型列表。",
+      "tags": [
+        "docs",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "functionality": "无影响。纯文档变更。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "4200f621472925f8039191b9ff3b72951134cdf5",
+      "comment": "ROCm GPT-OSS 平台 Fuse RoPE + static Q FP8 quantization 到 fused_rope_and_unified_kv_cache_update 自定义 op 中。新增 RopeStaticQQuantKVCachePattern 编译融合模式，匹配 rope -> static_scaled_fp8_quant -> kv_cache_update 的图模式，将其替换为 fused op + 后置 quant。新增完整测试验证融合的数值正确性和 negative control（关闭融合功能时 fusion 不应生效）。",
+      "tags": [
+        "feature",
+        "performance",
+        "medium-risk",
+        "rock",
+        "compilation",
+        "fusion"
+      ],
+      "ascend_impact": {
+        "functionality": "无影响。ROCm 平台特定融合 pass，使用 torch.ops._C.static_scaled_fp8_quant（仅 ROCm AITER 可用）。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "c73b0d0db97b90e32b7c8dc2a92756eaf0ec237c",
+      "comment": "新增 VLLM_RAY_DP_PLACEMENT_NODE_IPS 环境变量，允许将 Ray DP placement group 限定到指定的节点 IP 列表。这在多引擎场景下隔离不同引擎的 DP 节点分配非常有用。提取了 _node_ip_from_resources 工具函数复用原有逻辑。当白名单不包含 master IP 时自动添加并 warning。如果白名单节点 GPU 资源不足以放置所有 DP rank 则抛出 ValueError。",
+      "tags": [
+        "feature",
+        "low-risk",
+        "distributed",
+        "engine",
+        "ray"
+      ],
+      "ascend_impact": {
+        "functionality": "无直接影响。该特性在 engine/utils 中，通过环境变量控制，仅在 data_parallel_backend=ray 时生效。vllm-ascend 若不使用 Ray DP 则无影响。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "e28e369f78c3453c031ad89dd089f966a63e9f2b",
+      "comment": "Mergify 配置优化：只有当 PR 标记了 ready 或 verified 标签时才自动评论合并提示，减少无意义的 bot 评论。",
+      "tags": [
+        "ci",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "functionality": "无影响。CI 配置变更。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "703fb17b132f784c397493bfe69bce58ec58a0a7",
+      "comment": "GPT-OSS Harmony 指令渲染的全面修复。核心变更： (1) system 消息现在被转换为 developer 消息（使用 DeveloperContent/# Instructions 前缀），而非之前的 system 角色保留；(2) 新增 extract_instructions_from_messages 工具函数从 messages 列表中剥离首条 system/developer 指令；(3) 新增 build_harmony_preamble 统一构建 Harmony 前缀消息（system + developer 消息）减少 serving 层的重复代码；(4) Responses API serving 中修复了之前忽略 system 消息的问题，通过 extract_instructions_from_messages 提取指令；(5) 将 flatten_chat_text_content 重构为通用的 flatten_input_text_content。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "entrypoints",
+        "openai-api",
+        "harmony"
+      ],
+      "ascend_impact": {
+        "functionality": "无影响。HTTP entrypoints 层的渲染逻辑变更，不涉及平台抽象。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "b593396c7a70ddf31ddbbfaac2007e6c5f4650bd",
+      "comment": "TPU 依赖 tpu-inference 从 0.20.0 升级到 0.21.0。常规依赖升级。",
+      "tags": [
+        "chore",
+        "low-risk",
+        "tpu"
+      ],
+      "ascend_impact": {
+        "functionality": "无影响。TPU 平台依赖升级。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    }
+  ]
+}

@@ -4,7 +4,7 @@ Send daily analysis report via email as styled HTML.
 
 Environment variables:
   SMTP_HOST       SMTP server (default: smtp.qq.com)
-  SMTP_PORT       SMTP port (default: 587)
+  SMTP_PORT       SMTP port (default: 465)
   SMTP_USER       SMTP username
   SMTP_PASS       SMTP password or app password
   NOTIFY_EMAIL    Recipient email address(es), comma-separated
@@ -274,8 +274,8 @@ def build_html(repos, date_str):
 
 def send_email(subject, html_body):
     host = os.environ.get("SMTP_HOST", "smtp.qq.com")
-    port_str = os.environ.get("SMTP_PORT", "587")
-    port = int(port_str) if port_str else 587
+    port_str = os.environ.get("SMTP_PORT", "465")
+    port = int(port_str) if port_str else 465
     user = os.environ.get("SMTP_USER", "")
     password = os.environ.get("SMTP_PASS", "")
     recipients = os.environ.get("NOTIFY_EMAIL", "").split(",")
@@ -291,10 +291,13 @@ def send_email(subject, html_body):
     msg["To"] = ", ".join(recipients)
 
     try:
-        with smtplib.SMTP(host, port) as server:
-            server.starttls()
-            server.login(user, password)
-            server.sendmail(from_addr, recipients, msg.as_string())
+        server = smtplib.SMTP(host, port, timeout=30)
+        server.ehlo()
+        server.starttls()
+        server.ehlo()
+        server.login(user, password)
+        server.sendmail(from_addr, recipients, msg.as_string())
+        server.quit()
         print(f"Email sent to {', '.join(recipients)}")
     except Exception as e:
         print(f"Failed to send email: {e}")

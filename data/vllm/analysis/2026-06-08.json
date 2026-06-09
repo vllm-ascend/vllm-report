@@ -1,0 +1,355 @@
+{
+  "date": "2026-06-08",
+  "repo": "vllm-project/vllm",
+  "generated_at": "2026-06-09T10:02:54.074626+08:00",
+  "daily_summary": "当日主旋律是**MoE 层大规模重构**（FusedMoE → MoERunner + RoutedExperts 拆分），涉及 47 个文件、~2700 行变更，彻底改变了 MoE 层的参数所有权和模块层次结构。此外，新增了 FP8 per-channel 在线量化方法、移除了废弃的 P2pNcclConnector（含示例、文档和基准测试脚本）、为 XPU 补充了 DeepSeek V4 完整 decode 通路（~2759 行新增），并修复了 MambaManager 在动态 draft token 下的断言崩溃、Gemma4 音频塔错误消息和 FunASR 初始化等多个 bug。CI/构建方面：ROCm Stage C 测试镜像化、CPU Docker 构建缓存锁修复。",
+  "ascend_impact_summary": "当日变更对 vllm-ascend 影响最大的提交是 **MoE 重构**（dc68bd8c）：FusedMoE 从类变为工厂函数，权重参数和量化方法属性迁移到 `routed_experts` 子模块，所有 `layer.quant_method` → `layer._quant_method`，这些是破坏性 API 变更，会直接影响 vllm-ascend 的 patch 层、fused_moe 算子层和 model_runner。其次是 **P2pNcclConnector 移除**（5add018）：vllm-ascend 若引用了该连接器需要清理。**DeepSeek V4 XPU 解码通路**（eebce65）修改了 `__init__.py` 中 DeepSeek V4 模型的分发逻辑，vllm-ascend 需验证自身的 DeepSeek V4 模型加载路径是否仍正确。其他 CI/XPU/benchmark/池化层变更基本无影响。",
+  "commits": [
+    {
+      "sha": "ba94a3b9989666f950e1f784d18f2033c63c6cad",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "chore"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "dc68bd8c4199b00631fe71eb37313f406cc66ac1",
+      "comment": "**MoE 层重大重构**：将原来的 `FusedMoE` 类拆分为三个职责明确的部分——(1) `FusedMoE` 现在是工厂函数，返回 `MoERunner` 实例；(2) `RoutedExperts` 新类拥有所有权重参数（w13_weight、w2_weight 及各尺度张量），继承 `PluggableLayer` 并注册为 `routed_experts` 插件；(3) `MoERunner` 作为编排器持有 `RoutedExperts` 和 `Router`，负责前向调度。所有对外 API 发生迁移：`layer.quant_method` → `layer._quant_method`，`layer.w13_weight` → `layer.routed_experts.w13_weight`，`process_weights_after_loading(layer)` → `process_weights_after_loading(layer.routed_experts)`。Router 构造函数简化，移除 `indices_type_getter` 回调参数，改为 `select_experts()` 直接接受 `topk_indices_dtype`。`is_act_and_mul` 参数从 FusedMoE 构造函数移除，改为 `FusedMoEConfig` 的属性，由 `MoEActivation.is_gated` 计算。`SharedExperts` 继承 `nn.Module` 并改 `apply()` 为 `forward()`。`FusedMoEConfig` 新增 `intermediate_size_per_partition` 的 `__post_init__` 自动计算。EPLB 状态从 FusedMoE 移到 router。新增向后兼容的 `maybe_remap_moe_expert_param_name()` 处理新旧权重名之间的映射。风险：这是破坏性重构，所有引用 `FusedMoE` 类及其实例属性的外部代码（含量化方法、LoRA 层、模型定义、vllm-ascend 等 OOT 项目）均需适配。",
+      "tags": [
+        "refactor",
+        "high-risk",
+        "fused_moe",
+        "model-runner"
+      ],
+      "ascend_impact": {
+        "ascend_affected": true,
+        "functionality": "**破坏性变更**。vllm-ascend 的以下模块直接引用 `FusedMoE` 或其内部属性：(1) `vllm_ascend/ops/fused_moe/` — 须确认是否直接访问 `layer.w13_weight`、`layer.w2_weight` 等（现移到 `layer.routed_experts.*`）；(2) `vllm_ascend/patch/` — 猴子补丁层可能用到 `isinstance(..., FusedMoE)` 或 `layer.quant_method`（改为 `layer._quant_method`）；(3) 所有 `process_weights_after_loading(layer)` 调用需改为 `process_weights_after_loading(layer.routed_experts)`；(4) 若使用了 `is_act_and_mul` 参数构造 FusedMoE，该参数已移除（由 activation 类型自动推断）；(5) `fused_moe_make_expert_params_mapping()` 新增 `routed_experts_prefix` 参数；(6) `FusedMoE` 不再是类，`isinstance` 检查会失败，应改为 `isinstance(module, MoERunner)`。",
+        "testing": "vllm-ascend 的 fused_moe 算子测试需验证在新 API 下是否能正确加载权重和运行前向。vllm-ascend 的 E2E MoE 模型测试可能因 API 变更而失败。",
+        "needs_test_update": true,
+        "suggested_test_areas": [
+          "tests/ut/ops/fused_moe/",
+          "tests/e2e/models/ (含 MoE 的模型端到端测试)",
+          "vllm_ascend/ops/fused_moe/ 相关测试"
+        ]
+      }
+    },
+    {
+      "sha": "753e9d55e6a37f7eaa698d11bcb15990845d4f08",
+      "comment": "新增 `fp8_per_channel` 在线量化方法：per-output-channel 权重量化 + per-token 动态激活量化。添加了 `Fp8PtpcOnlineLinearMethod`（线性层）和 `Fp8PtpcOnlineMoEMethod`（MoE 层），并注册到 `_ONLINE_SHORTHANDS`（CLI 快捷名 `fp8_per_channel`）和 `QUANT_KEY_NAMES`。MoE 方法排除不支持 per-channel 权重的后端（MARLIN/CPU/FLASHINFER 类）。新增 E2E 测试（含 OLMoE-1B MoE 模型和 Qwen3-0.6B 密集模型）和单元测试。风险：低，新方法完全可选，不影响现有量化路径。",
+      "tags": [
+        "feature",
+        "low-risk",
+        "quantization"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "ac3409d162a92c4f57ccfd6ed37b7304b1e5747f",
+      "comment": "为 benchmark 脚本 `vllm/benchmarks/serve.py` 新增 `_align_prompts_to_server_tokenizer()` 函数。当使用 `random` 或 `prefix_repetition` 数据集时，自动检测客户端 tokenizer 与服务器的 tokenizer 是否一致（通过调用 `/tokenize` API），若不匹配则截断/重编码 prompt 以对齐。修复了因 tokenizer 差异导致 prompt_len 预期不匹配的问题。风险：低，仅影响 benchmark 脚本。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "benchmarks"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "93ee4cd47f97f547cc4d2ecd23408dfe37db57ae",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "chore"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "980796cd075cb8e2591352a725e8adb668152aab",
+      "comment": "修复两个 CPU 相关问题：(1) `Dockerfile.cpu` 中 Rust 构建缓存卷添加 `sharing=locked` 防止并行 CI 构建竞争导致镜像构建失败；(2) `vllm/_custom_ops.py` 的 `DnnlMatmulHandler` 将 `torch.ops._C.release_dnnl_matmul_handler` 引用缓存到 `self.dtor` 避免在 `__del__` 中因模块已销毁而找不到函数，修复 Python 退出时的警告。风险：低。",
+      "tags": [
+        "bugfix",
+        "ci",
+        "low-risk",
+        "cpu"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "5add018bebbd54471af32094923205fe4c9b7740",
+      "comment": "移除 `P2pNcclConnector` 及其所有相关文件，包括：(1) `benchmarks/disagg_benchmarks/` 下 4 个 benchmark 脚本（disagg_overhead/disagg_performance/proxy/visualize）；(2) `docs/design/p2p_nccl_connector.md` 设计文档；(3) `examples/disaggregated/` 下的 Python 和 shell 示例；(4) 核心实现 `vllm/distributed/kv_transfer/kv_connector/v1/p2p/` 目录（含 connector、engine、tensor_memory_pool）；(5) factory 中的注册和 `docs/features/disagg_prefill.md` 的引用；(6) `KVTransferConfig.kv_parallel_size` 的 P2pNcclConnector 说明移除。移除了共 ~3069 行代码。这是废弃组件的清理，不影响现有可用连接器（MooncakeConnector、NixlConnector、MoRIIOConnector 等）。风险：中低，但若其他项目引用了 `P2pNcclConnector` 类名会导入失败。",
+      "tags": [
+        "refactor",
+        "chore",
+        "medium-risk",
+        "distributed",
+        "kv_transfer"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。vllm-ascend 有自己的 KV 传输连接器（MooncakeConnector、UCMConnector 等）且不使用 P2pNcclConnector。但需确认 vllm-ascend 是否有任何 import 或引用 vllm 的 P2pNcclConnector（如 factory 注册路径 `\"vllm.distributed.kv_transfer.kv_connector.v1.p2p.p2p_nccl_connector\"`），若有则需移除对应引用。",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "d5fe994e79104a6d38b71b73a55a66476a5e0908",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "chore"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "fa662b1a8b497e10eb7d6e2a458048c1c9508b72",
+      "comment": "XPU 专用修复：将 `topk_topp_triton.py` 中 XPU 设备上的 `block_size` 从 8192 下压到 4096、`block_size_trunc` 从 4096 下压到 2048。大 BLOCK_SIZE 在 XPU 上单次扫描的 pivot 逼近（用于 top-p 采样）精度不够，导致 top-p mask 差异测试失败。同时启用 XPU CI 中的 `test_topk_topp_sampler.py` 测试。风险：低，仅影响 XPU 设备。",
+      "tags": [
+        "bugfix",
+        "performance",
+        "low-risk",
+        "xpu",
+        "sampler"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "3c0b4432be91d4a5fda590f3fb3236cd087882c5",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "feature",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "469f3dcf1d70349d0776ef82bdc5c4aff20a93f2",
+      "comment": "修复 Gemma4 音频塔缺失时的错误消息，使用 `get_served_model_name()` 获取完整的模型标识串（含 served model name），替换直接引用 `model_config.model` 显示的原始模型 ID。风险：低。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "model",
+        "multimodal"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "94fcdd007fe5cfa2a2f97cf062424cad543404df",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "feature",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "d9ff7e4e9a397c5c3ac6337116cc71969c966a23",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "chore"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "967c5c3bc38891f4465d3f4e99917ed837bb3833",
+      "comment": "ROCm CI 大规模增强：将多个测试区域（Attention、Engine、Entrypoints、Kernels、LM Eval、Models、Spec Decode 等）添加 ROCm 镜像，支持 AMD MI300/MI325 硬件。在 Docker 运行中添加了容器缓存目录管理（TORCHINDUCTOR_CACHE_DIR、TRITON_CACHE_DIR 等）和连接预检脚本（`CONTAINER_PREFLIGHT`）。默认 HuggingFace 下载超时从 60s 提高到 300s（`HF_HUB_DOWNLOAD_TIMEOUT`）。删除了 `test-amd.yaml` 中 mi250 的 Engine 测试项并新增 Speculators Correctness 和 Extract Hidden States Integration 测试。将多个测试标记为 `optional: true`。风险：低，纯 CI 配置变更。",
+      "tags": [
+        "ci",
+        "low-risk",
+        "rocm",
+        "test"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "54c660c3a6c30c79e6457a162a19f4ed68042743",
+      "comment": "XPU MoE 内核类命名规范化和导出列表补充：(1) `XPUExpertsMXFp4` → `XPUExpertsMxFp4`（统一大小写风格）；(2) `XPUExpertsMxfp8` → `XPUExpertsMxFp8`；(3) 在 `__init__.py` 的导出列表中添加 `XPUExpertsBlockFp8`、`XPUExpertsMxFp8`、`XPUExpertsMxFp4`（之前缺失）。Oracle 文件和 compressed_tensors 量化方法的引用也随之更新。风险：低，纯重命名，不影响功能。",
+      "tags": [
+        "refactor",
+        "low-risk",
+        "xpu",
+        "fused_moe"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "8fb0274415062912ec56c6629a04cbac60121fe3",
+      "comment": "简化 ViT CUDA Graph 接口：(1) 移除 `step3_vl.py` 中 `DeepseekVL3Model` 的 `get_input_modality()` 重写（它只返回 `\"image\"`）；(2) 在 `interfaces.py` 的 `EncoderCUDAGraphInterface` 基类中添加默认实现 `get_input_modality()` 返回 `\"image\"`。这样子类不重写也能获得默认值。风险：低，纯简化。",
+      "tags": [
+        "refactor",
+        "low-risk",
+        "multimodal",
+        "cuda_graph"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "eebce65756f0beb08547439728da98b5e1a7119c",
+      "comment": "为 XPU 添加完整的 DeepSeek V4 模型支持（~2759 行新增），包括：(1) `vllm/models/deepseek_v4/xpu/model.py` — XPU 专用 DeepSeek V4 模型，含 MegaMoE 的 XPU 路径（基于 deep_gemm）、`DeepseekV4MoE`（支持 fused_moe 和 mega_moe 两种模式）、HC（HyperCompressed）操作支持；(2) `xpumtp.py` — MTP 投机解码层；(3) `xpu_sparse.py` — XPU 稀疏注意力实现，prefill 用 BF16 稀疏 MLA（`triton_bf16_mla_sparse_interface`），decode 用 `xpu_sparse_decode_fp8`；(4) `xpu_sparse_decode_fp8.py` — 对 FP8 UE8M0 KV cache 实时去量化到 BF16 后调用 BF16 稀疏注意力；(5) `xpu_qnorm_rope_kv_fp8_insert.py` — Triton 内核实现 Q 的 per-head RMSNorm + GPT-J RoPE 和 KV 的 RoPE + UE8M0 FP8 量化插入；(6) 在 `mhc.py` 中为 `MHCPreOp`、`MHCPostOp`、`HCHeadOp` 添加 `forward_xpu()` 方法（委派给 `forward_native` 或 Triton）；(7) 在 `scaled_mm/xpu.py` 中添加 UE8M0 scale 格式转换（`float8_e8m0fnu` → `float32`）以避免 oneDNN 内核走错路径；(8) `__init__.py` 修改模型分发逻辑：ROCm → amd, XPU → xpu, 其他 → nvidia。风险：中等，主要影响 DeepSeek V4 的 `__init__.py` 分发优先级和 mhc.py 中新增的 forward_xpu 方法（不会影响其他平台，但 vllm-ascend 需确认分发逻辑）。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "xpu",
+        "model",
+        "deepseek_v4",
+        "attention"
+      ],
+      "ascend_impact": {
+        "ascend_affected": true,
+        "functionality": "**DeepSeek V4 模型分发逻辑变更**：`vllm/models/deepseek_v4/__init__.py` 的导入优先级变为 `is_rocm() → amd`, `is_xpu() → xpu`, 否则 `→ nvidia`。Ascend NPU 既不是 ROCm 也不是 XPU，所以会走 nvidia 分支。这本身不是问题（nvidia 模型使用标准 CUDA 算子），但 vllm-ascend 若希望使用 Ascend 专用的 DeepSeek V4 模型（`vllm_ascend/models/`），需要通过 `vllm.model_executor.custom_op` 的 OOT mechanism 或 model registry 替换来实现，`__init__.py` 的变更不应破坏此机制。此外 `mhc.py` 新增的 `forward_xpu()` 方法不影响其他平台，但 vllm-ascend 若有 MHC 相关的 monkey patch 需确保兼容。`scaled_mm/xpu.py` 中 FP8 e8m0→float32 的转换逻辑不会影响 Ascend（这是 XPU 专用文件）。",
+        "testing": "需验证 vllm-ascend 在 DeepSeek V4 模型上的 E2E 推理是否正常，确认 `__init__.py` 的新分发逻辑不会干扰 OOT 模型加载。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "303916e93d66da301231c9aee80489951a5cd8f6",
+      "comment": "修复 `MambaManager.allocate_slots()` 中因后缀解码（suffix decoding）动态变化 draft token 数量导致的断言失败。原代码 `assert num_required_blocks == len(req_blocks)` 过于严格——当上一轮多分配了 block 时，本轮需要的 block 数可能小于已分配数。改为 `num_required_blocks <= len(req_blocks)` 并在不足时按需分配，否则直接返回空。新增回归测试模拟动态 draft token 场景。风险：低，修复了明确报告的 bug（#39271）。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "scheduler",
+        "kv_cache",
+        "spec_decode"
+      ],
+      "ascend_impact": {
+        "ascend_affected": true,
+        "functionality": "**修复了 MambaManager 断言**。vllm-ascend 使用 vLLM 的 `MambaManager`（位于 `vllm/v1/core/single_type_kv_cache_manager.py`），该修复使断言更宽松（`<=` 替代 `==`），vllm-ascend 无需改动即可受益。但需确认 vllm-ascend 是否有自己的 MambaManager 覆盖或 monkey patch（查看 `vllm_ascend/patch/`），若有则需同步该修复。",
+        "testing": "无影响。断言放宽不会破坏现有测试。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "5633405964b1b34fb4b227c65745839f42c711cb",
+      "comment": "为所有 pooler 类（SequencePooler、TokenPooler、各类 PoolerHead、PoolerActivation、BOSEOSFilter）添加 `extra_repr()` 方法以改进 `print(model)` 的可调试性。纯新增代码，无行为变更。风险：低。",
+      "tags": [
+        "feature",
+        "low-risk",
+        "model",
+        "pooling"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "6124a98a9bb9cccf0f3a808568f4ab662c0fad08",
+      "comment": "修复 FunASR-Nano 模型初始化时崩溃的问题。为 `FunASRForConditionalGeneration` 添加 `get_language_model()` 方法返回 `self.model.decoder`，以满足 `SupportsMultiModal` 接口契约。风险：低。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "model",
+        "multimodal",
+        "audio"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "2ed0a9627b50d9d1d26eddb84abb7e7afc2984c1",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "chore"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    }
+  ]
+}

@@ -251,22 +251,18 @@ def write_daily_commits(data_dir, repo, day, commits, branch="main", overwrite=F
     update_dates_index(data_dir, repo)
 
 
-def update_meta(data_dir, repo, latest_sha, total_new, branch="main"):
+def update_meta(data_dir, repo, latest_sha, branch="main"):
     repo_dir = os.path.join(data_dir, repo_dir_name(repo))
     meta_path = os.path.join(repo_dir, "meta.json")
-
-    existing = load_json(meta_path) or {}
-    prev_total = existing.get("total_commits_fetched", 0)
 
     meta = {
         "repo": repo,
         "branch": branch,
         "last_commit_sha": latest_sha,
         "last_fetch_time": datetime.now(TZ_CN).isoformat(),
-        "total_commits_fetched": prev_total + total_new,
     }
     save_json_atomic(meta_path, meta)
-    print(f"Updated meta: latest_sha={latest_sha[:8]}, total={meta['total_commits_fetched']}")
+    print(f"Updated meta: latest_sha={latest_sha[:8]}")
 
 
 def get_current_sha_local(local_repo):
@@ -535,7 +531,6 @@ def fetch_commits(repo, branch, data_dir, token, local_repo=None):
                     "branch": branch,
                     "last_commit_sha": "",
                     "last_fetch_time": datetime.now(TZ_CN).isoformat(),
-                    "total_commits_fetched": 0,
                 })
                 print("No commits found in local repo, initialized empty meta.json")
                 return
@@ -544,7 +539,6 @@ def fetch_commits(repo, branch, data_dir, token, local_repo=None):
                 "branch": branch,
                 "last_commit_sha": current_sha,
                 "last_fetch_time": datetime.now(TZ_CN).isoformat(),
-                "total_commits_fetched": 0,
             })
             print(f"Initialized meta.json with anchor: {current_sha[:8]} (no history fetched)")
             return
@@ -557,7 +551,6 @@ def fetch_commits(repo, branch, data_dir, token, local_repo=None):
                     "branch": branch,
                     "last_commit_sha": "",
                     "last_fetch_time": datetime.now(TZ_CN).isoformat(),
-                    "total_commits_fetched": 0,
                 })
                 print("No commits found, initialized empty meta.json")
                 return
@@ -568,7 +561,6 @@ def fetch_commits(repo, branch, data_dir, token, local_repo=None):
                 "branch": branch,
                 "last_commit_sha": latest_sha,
                 "last_fetch_time": datetime.now(TZ_CN).isoformat(),
-                "total_commits_fetched": 0,
             })
             print(f"Initialized meta.json with anchor: {latest_sha[:8]} (no history fetched)")
             return
@@ -612,7 +604,7 @@ def fetch_commits(repo, branch, data_dir, token, local_repo=None):
 
     if commits_detail:
         latest_sha = commits_detail[0]["sha"]
-        update_meta(data_dir, repo, latest_sha, total_new, branch=branch)
+        update_meta(data_dir, repo, latest_sha, branch=branch)
 
     print(f"Done: fetched {total_new} new commits across {len(groups)} days")
 

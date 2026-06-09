@@ -291,10 +291,7 @@ def send_email(subject, html_body):
     msg["To"] = ", ".join(recipients)
 
     try:
-        server = smtplib.SMTP(host, port, timeout=30)
-        server.ehlo()
-        server.starttls()
-        server.ehlo()
+        server = smtplib.SMTP_SSL(host, port, timeout=30)
         server.login(user, password)
         server.sendmail(from_addr, recipients, msg.as_string())
         server.quit()

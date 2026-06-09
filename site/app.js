@@ -24,6 +24,8 @@
   let analysisData = null;
   let activeFilter = 'all';
   let searchQuery = '';
+  let dateOffset = 0;
+  let analysisDates = [];
 
   const $ = (sel) => document.querySelector(sel);
   const $$ = (sel) => document.querySelectorAll(sel);
@@ -82,6 +84,15 @@
 
     if (availableDates.length === 0) {
       availableDates.push(cnDateStr(new Date()));
+    }
+  }
+
+  async function loadAnalysisDates() {
+    var data = await fetchJSON(DATA_BASE + '/' + repoDir(currentRepo) + '/analysis-dates.json');
+    if (data && data.dates) {
+      analysisDates = data.dates;
+    } else {
+      analysisDates = [];
     }
   }
 
@@ -203,7 +214,7 @@
         return;
       }
 
-      var headers = ['SHA', 'Date', 'Author', 'Title', 'Tags', 'Ascend Affected', 'Needs Test Update', 'AI Analysis', 'Additions', 'Deletions', 'Files Changed'];
+      var headers = ['SHA', 'Date', 'Author', 'Title', 'Tags', 'Ascend Affected', 'Needs Test Update', 'AI Analysis', 'Test Impact Reason', 'Changed Files', 'Additions', 'Deletions', 'Files Changed'];
       var rows = [headers];
 
       result.commits.forEach(function (commit) {
@@ -215,6 +226,13 @@
           (a.ascend_impact && a.ascend_impact.needs_test_update)
         ) ? 'Yes' : '';
         var comment = a && a.comment ? a.comment : '';
+        var testReason = '';
+        if (a && a.test_impact && a.test_impact.reason) {
+          testReason = a.test_impact.reason;
+        } else if (a && a.ascend_impact && a.ascend_impact.needs_test_update) {
+          testReason = a.ascend_impact.testing || '';
+        }
+        var fileList = (commit.files || []).map(function (f) { return f.filename; }).join('; ');
         var title = commit.message.split('\n')[0];
         var additions = commit.stats ? commit.stats.total_additions : 0;
         var deletions = commit.stats ? commit.stats.total_deletions : 0;
@@ -230,6 +248,8 @@
           ascendAffected,
           needsTest,
           comment,
+          testReason,
+          fileList,
           additions,
           deletions,
           files
@@ -328,6 +348,23 @@
     $('#statFiles').textContent = totalFiles;
   }
 
+  function updateFilterChips(allCommits) {
+    var filters = ['all', 'needs-test', 'affects-ascend', 'high-risk', 'feature', 'bugfix', 'refactor', 'performance'];
+    var saved = activeFilter;
+    var counts = {};
+    for (var i = 0; i < filters.length; i++) {
+      activeFilter = filters[i];
+      counts[filters[i]] = filterCommits(allCommits).length;
+    }
+    activeFilter = saved;
+    $$('.filter-chip').forEach(function (chip) {
+      var f = chip.dataset.filter;
+      var count = counts[f] || 0;
+      var label = chip.textContent.replace(/\s*\(\d+\)$/, '');
+      chip.textContent = label + ' (' + count + ')';
+    });
+  }
+
   function renderSummary() {
     const el = $('#dailySummary');
     if (analysisData && analysisData.daily_summary) {
@@ -363,6 +400,14 @@
 
   function escapeHtml(str) {
     return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
+
+  function highlightText(text, query) {
+    if (!query) return escapeHtml(text);
+    var escaped = escapeHtml(text);
+    var q = escapeHtml(query).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    var re = new RegExp('(' + q + ')', 'gi');
+    return escaped.replace(re, '<mark>$1</mark>');
   }
 
   function renderMarkdown(str) {
@@ -430,7 +475,7 @@
     html += `<span class="expand-arrow">\u25B6</span>`;
     html += `<a class="commit-sha" href="https://github.com/${currentRepo}/commit/${commit.sha}" target="_blank">${shaShort}</a>`;
     html += `<div class="commit-message">`;
-    html += `<div class="commit-title">${escapeHtml(title)}</div>`;
+    html += `<div class="commit-title">${highlightText(title, searchQuery)}</div>`;
     if (body) html += `<div class="commit-body">${escapeHtml(body)}</div>`;
     html += `</div>`;
 
@@ -510,34 +555,122 @@
   }
 
   function renderDateBar() {
-    const today = cnDateStr(new Date());
-    const days = 14;
-    const dates = [];
-    const d = new Date(today + 'T00:00:00+08:00');
-    const weekdayNames = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
-    for (let i = 0; i < days; i++) {
-      const ds = cnDateStr(d);
-      const wd = weekdayNames[d.getDay()];
-      dates.push({ date: ds, weekday: wd });
-      d.setDate(d.getDate() - 1);
-    }
-    dates.reverse();
+    var days = 14;
+    var today = new Date(cnDateStr(new Date()) + 'T00:00:00+08:00');
+    today.setDate(today.getDate() - dateOffset);
+    var start = new Date(today);
+    start.setDate(start.getDate() - days + 1);
 
-    const currentDate = availableDates[currentDateIndex];
-    let html = '';
-    for (const { date, weekday } of dates) {
-      const hasData = availableDates.includes(date);
-      const isActive = date === currentDate;
-      let cls = 'date-chip';
+    var weekdayNames = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+    var currentDate = availableDates[currentDateIndex];
+    var html = '';
+
+    // Prev button
+    var prevDisabled = dateOffset >= 90;
+    html += '<button class="date-nav" id="datePrev"' + (prevDisabled ? ' disabled' : '') + '>◀</button>';
+
+    var d = new Date(start);
+    for (var i = 0; i < days; i++) {
+      var ds = cnDateStr(d);
+      var wd = weekdayNames[d.getDay()];
+      var hasData = availableDates.indexOf(ds) !== -1;
+      var hasAnalysis = analysisDates.indexOf(ds) !== -1;
+      var isActive = ds === currentDate;
+      var cls = 'date-chip';
       if (hasData) cls += ' has-data';
+      if (hasAnalysis && hasData) cls += ' has-analysis';
       if (isActive) cls += ' active';
-      html += `<div class="${cls}" data-date="${date}"><span class="chip-weekday">${weekday}</span><span class="chip-date">${date.slice(5)}</span></div>`;
+      html += '<div class="' + cls + '" data-date="' + ds + '"><span class="chip-weekday">' + wd + '</span><span class="chip-date">' + ds.slice(5) + '</span></div>';
+      d.setDate(d.getDate() + 1);
     }
+
+    html += '<button class="date-nav" id="dateNext"' + (dateOffset === 0 ? ' disabled' : '') + '>▶</button>';
+
     $('#dateBar').innerHTML = html;
 
-    // Scroll active chip into view
-    const active = $('#dateBar .active');
+    var active = $('#dateBar .active');
     if (active) active.scrollIntoView({ behavior: 'smooth', inline: 'center', block: 'nearest' });
+  }
+
+  function restoreExpanded() {
+    var saved = sessionStorage.getItem('vllmExpanded');
+    if (!saved) return;
+    var shas = JSON.parse(saved);
+    if (!Array.isArray(shas)) return;
+    shas.forEach(function (sha) {
+      var card = document.querySelector('.commit-card[data-sha="' + sha + '"]');
+      if (card) card.classList.add('expanded');
+    });
+  }
+
+  function renderCoverageBar() {
+    var el = $('#coverageBar');
+    if (!availableDates.length || !analysisDates.length) {
+      el.style.display = 'none';
+      return;
+    }
+    var total = availableDates.length;
+    var analyzed = 0;
+    for (var i = 0; i < availableDates.length; i++) {
+      if (analysisDates.indexOf(availableDates[i]) !== -1) {
+        analyzed++;
+      }
+    }
+    var pct = Math.round(analyzed / total * 100);
+    var missing = total - analyzed;
+    var color = missing === 0 ? 'var(--accent)' : (missing < 5 ? 'var(--accent-orange)' : 'var(--accent-red)');
+    el.style.display = 'flex';
+    el.innerHTML = '<span class="coverage-label">Analysis Coverage</span>' +
+      '<div class="coverage-track"><div class="coverage-fill" style="width:' + pct + '%;background:' + color + '"></div></div>' +
+      '<span class="coverage-text">' + analyzed + '/' + total + ' days</span>';
+  }
+
+  function computeModuleHeatmap(commits) {
+    if (!commits || !commits.length) return [];
+    var counts = {};
+    commits.forEach(function (c) {
+      if (!c.files) return;
+      var seen = {};
+      c.files.forEach(function (f) {
+        var parts = f.filename.split('/');
+        var key;
+        if (parts.length >= 3) {
+          key = parts[0] + '/' + parts[1] + '/' + parts[2] + '/';
+        } else if (parts.length >= 2) {
+          key = parts[0] + '/' + parts[1] + '/';
+        } else {
+          key = parts[0];
+        }
+        if (!seen[key]) {
+          seen[key] = true;
+          counts[key] = (counts[key] || 0) + 1;
+        }
+      });
+    });
+    var sorted = Object.keys(counts).map(function (k) { return { path: k, count: counts[k] }; });
+    sorted.sort(function (a, b) { return b.count - a.count; });
+    return sorted.slice(0, 10);
+  }
+
+  function renderHeatmap(commits) {
+    var el = $('#heatmapSection');
+    var bar = $('#heatmapBar');
+    var modules = computeModuleHeatmap(commits);
+    if (!modules.length) {
+      el.style.display = 'none';
+      return;
+    }
+    el.style.display = 'block';
+    var maxCount = modules[0].count;
+    var html = '';
+    for (var i = 0; i < modules.length; i++) {
+      var m = modules[i];
+      var w = Math.round(m.count / maxCount * 100);
+      html += '<div class="heatmap-row"><span class="heatmap-path">' + escapeHtml(m.path) + '</span>' +
+        '<div class="heatmap-track"><div class="heatmap-fill" style="width:' + w + '%"></div></div>' +
+        '<span class="heatmap-count">' + m.count + '</span></div>';
+    }
+    bar.innerHTML = html;
   }
 
   function render() {
@@ -554,7 +687,10 @@
     renderSummary();
     renderStats(commitsData.commits);
     renderDateBar();
+    renderCoverageBar();
+    renderHeatmap(commitsData.commits);
 
+    updateFilterChips(commitsData.commits);
     const filtered = filterCommits(commitsData.commits);
     if (filtered.length === 0) {
       $('#commitList').innerHTML = `<div class="empty-state"><div class="title">No matching commits</div><div class="subtitle">Try adjusting your filter or search</div></div>`;
@@ -563,6 +699,7 @@
 
     const html = filtered.map(renderCommitCard).join('');
     $('#commitList').innerHTML = html;
+    restoreExpanded();
   }
 
   function init() {
@@ -586,12 +723,26 @@
 
     $('#dateBar').addEventListener('click', (e) => {
       const chip = e.target.closest('.date-chip');
-      if (!chip) return;
-      const date = chip.dataset.date;
-      const idx = availableDates.indexOf(date);
-      if (idx !== -1) {
-        currentDateIndex = idx;
-        loadDate(date);
+      if (chip) {
+        const date = chip.dataset.date;
+        const idx = availableDates.indexOf(date);
+        if (idx !== -1) {
+          currentDateIndex = idx;
+          loadDate(date);
+        }
+        return;
+      }
+      const prev = e.target.closest('#datePrev');
+      if (prev && !prev.disabled) {
+        dateOffset += 14;
+        renderDateBar();
+        return;
+      }
+      const next = e.target.closest('#dateNext');
+      if (next && !next.disabled) {
+        dateOffset = Math.max(0, dateOffset - 14);
+        renderDateBar();
+        return;
       }
     });
 
@@ -614,6 +765,12 @@
       if (header) {
         const card = header.closest('.commit-card');
         card.classList.toggle('expanded');
+        // Save expanded state to sessionStorage
+        var expanded = [];
+        document.querySelectorAll('.commit-card.expanded').forEach(function (c) {
+          expanded.push(c.dataset.sha);
+        });
+        sessionStorage.setItem('vllmExpanded', JSON.stringify(expanded));
         return;
       }
 
@@ -638,13 +795,15 @@
     $$('.filter-chip')[0].classList.add('active');
     detectDataBase().then(() => {
       loadAvailableDates().then(() => {
-        currentDateIndex = 0;
-        if (availableDates.length > 0) {
-          loadDate(availableDates[0]);
-        } else {
-          showLoading(false);
-          $('#emptyState').style.display = 'block';
-        }
+        loadAnalysisDates().then(function () {
+          currentDateIndex = 0;
+          if (availableDates.length > 0) {
+            loadDate(availableDates[0]);
+          } else {
+            showLoading(false);
+            $('#emptyState').style.display = 'block';
+          }
+        });
       });
     });
   }

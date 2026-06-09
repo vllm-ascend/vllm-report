@@ -86,13 +86,13 @@ def get_commits_list(repo, branch, token, since_sha=None):
             all_commits.append(commit)
 
         if since_sha and len(commits) < PER_PAGE:
-            print(f"Reached end of history without finding anchor, collecting all")
-            return all_commits
+            print(f"Warning: anchor commit not found within {MAX_PAGES} pages, resetting anchor")
+            return []
 
         page += 1
 
-    return all_commits
-
+    print("Warning: anchor not found, resetting")
+    return []
 
 def get_commit_detail(repo, sha, token):
     return github_request(f"{GITHUB_API}/repos/{repo}/commits/{sha}", token)

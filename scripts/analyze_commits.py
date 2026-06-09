@@ -566,13 +566,14 @@ def display_analysis(analysis):
 def analyze_commits(repo, date, data_dir, confirm, force, local_repo=None, model="deepseek-v4-flash"):
     commits_data = load_commits_data(data_dir, repo, date)
     if commits_data is None:
-        return False
+        print(f"No commit data for {repo} on {date}, skipping")
+        return True
 
     all_commits = commits_data.get("commits", [])
     num_commits = len(all_commits)
     if num_commits == 0:
-        print(f"No commits found for {repo} on {date}")
-        return False
+        print(f"No commits found for {repo} on {date}, skipping")
+        return True
 
     repo_dir = get_repo_dir(data_dir, repo)
     analysis_path = os.path.join(repo_dir, "analysis", f"{date}.json")

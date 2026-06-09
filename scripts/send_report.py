@@ -290,14 +290,23 @@ def send_email(subject, html_body):
     msg["From"] = from_addr
     msg["To"] = ", ".join(recipients)
 
-    try:
-        with smtplib.SMTP(host, port, timeout=30) as server:
-            server.starttls()
+    last_err = None
+    for try_port in (465, 587):
+        try:
+            if try_port == 465:
+                server = smtplib.SMTP_SSL(host, 465, timeout=30)
+            else:
+                server = smtplib.SMTP(host, 587, timeout=30)
+                server.starttls()
             server.login(user, password)
             server.sendmail(from_addr, recipients, msg.as_string())
-        print(f"Email sent to {', '.join(recipients)}")
-    except Exception as e:
-        print(f"Failed to send email: {e}")
+            server.quit()
+            print(f"Email sent via port {try_port}")
+            return
+        except Exception as e:
+            last_err = e
+            continue
+    print(f"Failed to send email: {last_err}")
 
 
 def main():

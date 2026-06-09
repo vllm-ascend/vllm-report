@@ -332,7 +332,7 @@
     const el = $('#dailySummary');
     if (analysisData && analysisData.daily_summary) {
       el.style.display = 'block';
-      $('#summaryText').textContent = analysisData.daily_summary;
+      $('#summaryText').innerHTML = renderMarkdown(analysisData.daily_summary);
     } else {
       el.style.display = 'none';
     }
@@ -363,6 +363,50 @@
 
   function escapeHtml(str) {
     return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
+
+  function renderMarkdown(str) {
+    if (!str) return '';
+    // First escape HTML to prevent XSS
+    var s = escapeHtml(str);
+    // Code blocks (```...```) - must be done before inline code
+    s = s.replace(/```(\w*)\n([\s\S]*?)```/g, function (_, lang, code) {
+      return '<pre><code>' + code.trim() + '</code></pre>';
+    });
+    // Inline code `...`
+    s = s.replace(/`([^`]+)`/g, '<code>$1</code>');
+    // Bold **text** or __text__
+    s = s.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+    s = s.replace(/__(.+?)__/g, '<strong>$1</strong>');
+    // Italic *text* or _text_ (single, but not inside words)
+    s = s.replace(/\*([^*\n]+)\*/g, '<em>$1</em>');
+    s = s.replace(/(?<![:\w])_([^_\n]+)_(?![:\w])/g, '<em>$1</em>');
+    // Links [text](url)
+    s = s.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank">$1</a>');
+    // ### headings
+    s = s.replace(/^### (.+)$/gm, '<h4>$1</h4>');
+    s = s.replace(/^## (.+)$/gm, '<h3>$1</h3>');
+    s = s.replace(/^# (.+)$/gm, '<h2>$1</h2>');
+    // Unordered list items - wrap consecutive - items in <ul>
+    s = s.replace(/^- (.+)$/gm, '<li>$1</li>');
+    s = s.replace(/(<li>.*<\/li>\n?)+/g, '<ul>$&</ul>');
+    // Ordered list items
+    s = s.replace(/^\d+\. (.+)$/gm, '<li>$1</li>');
+    s = s.replace(/(?:<li>.*<\/li>\n?)+/g, function (match) {
+      if (match.indexOf('<ul>') === -1) {
+        return '<ol>' + match + '</ol>';
+      }
+      return match;
+    });
+    // Double line breaks = new paragraph
+    s = s.replace(/\n\n/g, '</p><p>');
+    // Single line break
+    s = s.replace(/\n/g, '<br>');
+    // Wrap in paragraph if not already wrapped
+    if (!s.startsWith('<')) {
+      s = '<p>' + s + '</p>';
+    }
+    return s;
   }
 
   function renderCommitCard(commit) {
@@ -410,12 +454,12 @@
     if (hasAnalysis) {
       html += `<div class="analysis-section">`;
       if (a.comment) {
-        html += `<div class="ai-comment"><div class="ai-label">AI Analysis</div>${escapeHtml(a.comment)}</div>`;
+        html += `<div class="ai-comment"><div class="ai-label">AI Analysis</div>${renderMarkdown(a.comment)}</div>`;
       }
       if (a.test_impact) {
         html += `<div class="impact-card test-impact">`;
         html += `<div class="impact-label${a.test_impact.needs_test_update ? ' needs-test' : ''}">${a.test_impact.needs_test_update ? '\u26A0 Test Update Needed' : 'Test Impact'}</div>`;
-        html += `<div class="impact-text"><strong>Reason:</strong> ${escapeHtml(a.test_impact.reason || '')}</div>`;
+        html += `<div class="impact-text"><strong>Reason:</strong> ${renderMarkdown(a.test_impact.reason || '')}</div>`;
         if (a.test_impact.suggested_test_areas && a.test_impact.suggested_test_areas.length > 0) {
           html += `<div class="impact-text" style="margin-top:4px"><strong>Areas:</strong> ${a.test_impact.suggested_test_areas.map(escapeHtml).join(', ')}</div>`;
         }
@@ -428,10 +472,10 @@
           html += `<div class="impact-card ascend-impact">`;
           html += `<div class="impact-label ascend">Ascend Impact</div>`;
           if (funcImp && funcImp !== '无影响') {
-            html += `<div class="impact-text"><strong>Functionality:</strong> ${escapeHtml(funcImp)}</div>`;
+            html += `<div class="impact-text"><strong>Functionality:</strong> ${renderMarkdown(funcImp)}</div>`;
           }
           if (testImp && testImp !== '无影响') {
-            html += `<div class="impact-text" style="margin-top:4px"><strong>Testing:</strong> ${escapeHtml(testImp)}</div>`;
+            html += `<div class="impact-text" style="margin-top:4px"><strong>Testing:</strong> ${renderMarkdown(testImp)}</div>`;
           }
           if (a.ascend_impact.needs_test_update) {
             html += `<div class="impact-text" style="margin-top:4px"><span class="stat-badge additions" style="font-size:0.75rem">\u26A0 Test Update Needed</span></div>`;

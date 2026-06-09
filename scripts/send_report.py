@@ -274,7 +274,8 @@ def build_html(repos, date_str):
 
 def send_email(subject, html_body):
     host = os.environ.get("SMTP_HOST", "smtp.qq.com")
-    port = int(os.environ.get("SMTP_PORT", 587))
+    port_str = os.environ.get("SMTP_PORT", "587")
+    port = int(port_str) if port_str else 587
     user = os.environ.get("SMTP_USER", "")
     password = os.environ.get("SMTP_PASS", "")
     recipients = os.environ.get("NOTIFY_EMAIL", "").split(",")

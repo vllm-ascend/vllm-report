@@ -273,8 +273,8 @@ def build_html(repos, date_str):
 
 
 def send_email(subject, html_body):
-    host = os.environ.get("SMTP_HOST", "smtp.qq.com")
-    port_str = os.environ.get("SMTP_PORT", "465")
+    host = os.environ.get("SMTP_HOST") or "smtp.qq.com"
+    port_str = os.environ.get("SMTP_PORT") or "465"
     port = int(port_str) if port_str else 465
     user = os.environ.get("SMTP_USER", "")
     password = os.environ.get("SMTP_PASS", "")

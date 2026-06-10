@@ -1,0 +1,281 @@
+{
+  "date": "2026-06-10",
+  "repo": "vllm-project/vllm",
+  "generated_at": "2026-06-10T09:33:51.479889+08:00",
+  "daily_summary": "当日变更集中在三个方向：(1) Gemma4 模型的 attention 后端统一——引入 FA4 的 mm_prefix 双向注意力支持（PrefixLM 视觉 token），将 Gemma4 从强制 Triton 回退改为优先 FA4、Triton 降级，并在 CommonAttentionMetadata 层标准化了 mm_prefix_range 的计算流程；(2) Mistral 推理/工具调用流重构——创建独立 MistralParser 将混合推理+工具调用的流式逻辑从 tool_parser 和 serving 层解耦，大幅简化 serving.py；(3) 安全修复——修复图像 EXIF 方向未归一化（JPEG 旋转）、PNG tRNS 透明通道未处理、音频解压炸弹（新增 VLLM_MAX_AUDIO_DECODE_DURATION_S 限制）。此外还包括 DeepSeek V4 OOM 修复（RoutedExperts 量化路径遗漏）、Qwen3.5 EP 权重加载修复、ROCm AITER fused-MoE 的 sqrtsoftplus 融合优化、Mooncake 多 NIC 的 RNIC 选择重构等。",
+  "ascend_impact_summary": "当日变更对 vllm-ascend 有中等影响。核心 attention 接口变更（use_mm_prefix 参数加入 supports_combination）不破坏向后兼容，但 AscendAttentionBackend 默认 supports_mm_prefix() 返回 False，Gemma4 在 Ascend 上无法使用 FA4 mm_prefix；split_decodes_prefills_and_extends() 的断言修复提升稳定性；Mooncake RDMA 工具函数删除需确认 Ascend 无直接依赖；fused_topk_bias_router 中 sqrtsoftplus 新增 fused CUDA 分支对 Ascend 存在潜在 kernel 缺失风险；图像/音频安全修复直接影响共享的多模态加载链。",
+  "commits": [
+    {
+      "sha": "6deb05e0e4f6c298a60975f188cd044773ae6dec",
+      "comment": "Gemma4 模型 heterogeneous head dimensions（head_dim vs global_head_dim）的自适应 attention 后端选择。核心变更：(1) 将 Gemma4Config 从无条件强制 Triton 改为优先检测 FA4 可用性——FA4 可用且 max_head_dim ≤ 512 时自动启用 FA4 并设置 flash_attn_version=4，否则回退到 Triton；(2) 向 AttentionBackend 接口增加 use_mm_prefix 维度（supports_combination 参数、validate_configuration 检查、supports_mm_prefix() 方法），支持 PrefixLM 模型中视觉 token 的双向注意力范围；(3) 在 flash_attn.py 中实现 FA4 mask_mod（CuTE-DSL）实现 causal OR mm_prefix 的注意力掩码；(4) 将 mm_prefix_range_tensor 计算从 TritonAttentionMetadata 提取到共享 utils.py 的 compute_mm_prefix_range_tensor()，各 backend builder 统一使用；(5) CommonAttentionMetadata 增加 mm_req_doc_ranges 字典字段在元数据构建前计算；(6) GPUModelRunner 中 mm_prefix 计算从原有的 _set_mm_prefix_range_for_metadata 后处理改为 build() 前的 CommonAttentionMetadata 注入；(7) dFlash 的 draft model 清除 is_mm_prefix_lm 避免 FA4 因 mm_prefix 需求被拒绝。潜在风险：CuTE-DSL mask_mod 仅 NVIDIA CUDA 可用；FA4 的 mm_prefix 需求在 slide_window 超限过滤上依赖滑动窗口逻辑；新接口参数需要所有 AttentionBackend 子类至少兼容默认实现。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "attention",
+        "model-runner",
+        "gpu-model-runner"
+      ],
+      "ascend_impact": {
+        "ascend_affected": true,
+        "functionality": "AttentionBackend 接口新增 use_mm_prefix 参数——AscendAttentionBackend 继承默认 supports_combination() 实现，无编译错误。但 supports_mm_prefix() 默认返回 False，validate_configuration 会拒绝 mm_prefix=true 的请求。Gemma4 在 Ascend 上如果 FA4 不可用仍会走 Triton 回退路径（需 Ascend 侧确认 TritonAttentionBackend 支持）。mm_req_doc_ranges 在 CommonAttentionMetadata 中为 None 默认值，不影响现有 Ascend 推理。",
+        "testing": "Ascend 无 Gemma4 mm_prefix 相关测试；compute_mm_prefix_range_tensor 迁移到 utils.py 后 Ascend 各 backend 通过继承共享此函数。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "d82ac0092392f84b1c0f65d2f8846d320cf0fd23",
+      "comment": "Mistral 推理和工具调用解析逻辑的架构重构。将原本分散在 MistralToolParser（extract_maybe_reasoning_and_tool_streaming、build_non_streaming_tool_calls）和 serving.py（~160 行 Mistral 专用分支）的混合推理+工具调用流式逻辑提取到新的 vllm/parser/mistral.py MistralParser。MistralParser 继承 DelegatingParser，通过 _maybe_force_auto_tool_parsing() 在 grammar_from_tool_parser 时禁用 named/required tool_choice 解析（Mistral v11+ 格式不兼容），并在 parse() 中为缺失 ID 的 FunctionCall 回填 MistralToolCall ID。serving.py 大幅简化——移除 is_mistral_grammar_path 分支、is_mistral_tokenizer 判断和 MistralToolCall 特殊处理，统一使用标准 ToolCall。MistralReasoningParser 新增 is_reasoning_end_streaming() 方法。ParserManager 中注册 MistralParser 为 Mistral tool_parser 的专用 parser。删除 385 行测试（被移入 MistralParser 对应的测试）。低风险重构，不改变行为。",
+      "tags": [
+        "refactor",
+        "low-risk",
+        "serving",
+        "tool-parser",
+        "reasoning"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "dac9e9a6401103384aaef307970bcfb7ceec50b4",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "chore"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "d7607ad2730ff26b5cb8730354179a4d42dc45d1",
+      "comment": "修复 DeepSeek V4 在使用 FP8 量化时的 OOM 问题。DeepseekV4FP8Config.get_quant_method() 和 is_mxfp4_quant() 中原本只检查 isinstance(layer, MoERunner)，但 fused_moe 模块新增了 RoutedExperts 类（包装每个 expert 的权重矩阵）。当 use_presharded_weights=True 时，MoE 层结构可能使用 RoutedExperts 而非 MoERunner，导致 isinstance 检查失败，回退到父类 Fp8Config.get_quant_method() 返回未量化的 UnquantizedFusedMoEMethod，分配了全精度权重引发 OOM。修复将 isinstance 检查扩展为 (MoERunner, RoutedExperts)。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "quantization",
+        "fused-moe",
+        "deepseek-v4"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "此修复作用于 vllm/models/deepseek_v4/quant_config.py 中的 DeepseekV4FP8Config，是 NVIDIA DeepSeek V4 路径的量化配置。Ascend 使用自己的 DeepSeek V4 模型定义（vllm_ascend/models/deepseek_v4.py）和量化层（vllm_ascend/quantization/），不直接使用此共享配置。",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "d955745d58c2b8e8973ff96284d475f0a9f4cc6b",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "bugfix",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "e1ed89dbee7190f356c6f19da02e60bd457a365e",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "performance",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "1c2ffc6f8891809fa819d71ba360d08129d476ac",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "feature",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "ca4cfd873163cc1911f98385e776fba6e7300f9f",
+      "comment": "修复 Qwen3.5 在 Expert Parallelism (EP) 下的权重加载问题。原来使用硬编码的 fused_expert_params_mapping（假设固定的 base_layer.w13_weight/w2_weight 结构），在 EP 模式下权重分片方式不同导致映射错误。改用 fused_moe_make_expert_params_mapping() 动态生成映射，根据实际模型结构和 TP 配置正确解析 gate_up_proj 和 down_proj 的 shard_id。同时在 Qwen3.5 MTP 模块中做相同修复。测试配置增加 --no-enable-flashinfer-autotune 避免 FP8 测试的 autotune 冲突。低风险。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "model",
+        "fused-moe",
+        "weight-loading"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "c9c1540e61b229def0d16395a3489c68a1581f0f",
+      "comment": "修复 ROCm AITER FA + EAGLE 投机解码场景下 Llama 模型的断言失败。split_decodes_prefills_and_extends() 中原本在检查 max_query_len ≤ decode_threshold 的早期返回之前就断言了 seq_lens_cpu_upper_bound is not None。当使用 EAGLE 且所有请求都是 decode（max_query_len ≤ 1）时，seq_lens_cpu_upper_bound 可能为 None（因为 CommonAttentionMetadata 中该字段默认为 None），导致断言失败。修复将早期返回移到断言之前。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "attention",
+        "spec-decode",
+        "rocm"
+      ],
+      "ascend_impact": {
+        "ascend_affected": true,
+        "functionality": "split_decodes_prefills_and_extends() 是 vllm/v1/attention/backends/utils.py 中的共享工具函数，被所有 attention 后端（包括 Ascend）在 metadata 构建中使用。此修复将早期返回移到 seq_lens_cpu_upper_bound 断言之前，当所有 query 都是 decode 时避免断言崩溃。Ascend 的 attention metadata builder 从中直接受益。",
+        "testing": "不需要新增测试，已有路径覆盖。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "c1d754d681108096d8a125054f01a51afd60c618",
+      "comment": "Mooncake KV transfer 的 RDMA 网卡选择逻辑重构。删除 Python 侧的 RNIC 选择函数（get_configured_worker_rnic、get_current_physical_gpu_index、_get_explicit_worker_rnic），将设备选择委托给 Mooncake C++ 层处理。原 Python 实现根据物理 GPU 索引从 CSV 设备列表中索引 RNIC，在多 NIC 主机上无法利用所有 HCA。C++ 侧支持 auto-selection 可充分利用所有可用网卡。同时将 MooncakeStoreConfig.load_from_env() 重命名为 load_from_config() 以反映实际语义。删除 88 行相关测试和 69 行 rdma_utils.py 代码。潜在风险：原有 Python 侧 CSV 校验（设备数量不足的错误提示）不再存在。",
+      "tags": [
+        "refactor",
+        "medium-risk",
+        "distributed",
+        "kv-transfer",
+        "mooncake"
+      ],
+      "ascend_impact": {
+        "ascend_affected": true,
+        "functionality": "删除的 rdma_utils.py 函数（get_configured_worker_rnic、get_current_physical_gpu_index、_get_explicit_worker_rnic）是共享 Mooncake 连接器代码。如果 Ascend 的 KV transfer 模块（vllm_ascend/distributed/）中的 Mooncake 集成直接 import 了这些函数，引用会中断。MooncakeStoreConfig.load_from_env() 重命名为 load_from_config() 也需同步。需确认 Ascend 的 Mooncake worker 是否直接使用了这些共享函数或有自己的封装。",
+        "testing": "删除的测试（test_get_configured_worker_rnic_*）在 shared 路径下，vllm-ascend 如果也有类似的 RNIC 选择测试需要检查。",
+        "needs_test_update": true,
+        "suggested_test_areas": [
+          "vllm_ascend/distributed/ 中的 Mooncake 集成代码"
+        ]
+      }
+    },
+    {
+      "sha": "01d8cd92dd963140bddc1e82df7df55d0efa920c",
+      "comment": "ROCm AITER fused-MoE 下 sqrtsoftplus 评分函数的性能优化。将原本的 PyTorch 计算路径（F.softplus(gating_output).sqrt() → torch.topk）替换为 fused CUDA kernel（vllm_topk_softplus_sqrt），该 kernel 在 single pass 中完成 softplus → sqrt → topk 和 bias 修正，减少内存带宽消耗。在新的 fused_topk_bias() 中，sqrtsoftplus 分支在 ROCm AITER 和非 AITER 路径中都以早期返回方式处理（不经过通用的 softmax/sigmoid 分值计算），保持了与原有逻辑的等效性。XPU 平台使用纯 PyTorch 回退（_topk_softplus_sqrt_torch）。其他平台（非 CUDA/ROCm/XPU）调用 ops.topk_hash_softplus_sqrt 自定义 op。",
+      "tags": [
+        "performance",
+        "low-risk",
+        "fused-moe",
+        "rocm",
+        "router"
+      ],
+      "ascend_impact": {
+        "ascend_affected": true,
+        "functionality": "fused_topk_bias_router.py 是共享的 MoE router 代码。当 scoring_func=\"sqrtsoftplus\" 时，新代码路由到 vllm_topk_softplus_sqrt()。该函数对非 CUDA、非 ROCm、非 XPU 平台（包括 Ascend）会调用 ops.topk_hash_softplus_sqrt——这是一个 vLLM 自定义 CUDA op，在 Ascend 上不可用。如果 Ascend 使用共享的 FusedTopKBiasRouter 且遇到 sqrtsoftplus 评分函数，会因缺少此 kernel 而崩溃。但 DeepSeek V4 默认使用 sigmoid 评分函数，触发概率较低。Ascend 有自己的 MoE ops 目录（vllm_ascend/ops/fused_moe/），可能不使用 shared router。",
+        "testing": "需确认 Ascend 的 MoE router 路径是否会经过 shared vllm_topk_softplus_sqrt。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "a4b14b98c6f6a10bee1f48154baf4098b7e117ca",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "performance",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "cf1c90672404548aa3bc51f92c4745576a65ee26",
+      "comment": "安全修复：图像 EXIF 方向元数据和 PNG tRNS 透明通道处理。两个漏洞：(1) EXIF orientation——JPEG 等格式的旋转/翻转元数据（orientation tag）未被归一化，像素数据与视觉显示方向不一致，可能导致下游处理（如 OCR）行为异常。修复在 ImageMediaIO.load_bytes() 中新增 normalize_image() 调用，使用 PIL.ImageOps.exif_transpose() 自动旋转像素数据。(2) PNG tRNS 透明通道——调色板（P 模式）、灰度（L 模式）和 RGB 模式 PNG 文件可通过 tRNS chunk 定义透明色（非 RGBA 通道方式），原有的 convert_image_mode() 只处理了 RGBA 模式，对 P/L/RGB 模式的 tRNS 透明色会直接 convert 到 RGB，透明区域变黑而非背景色。修复通过 _has_transparency() 检测所有透明度类型（含 info['transparency']），对含透明度的非 RGBA 图像先转为 RGBA 再调用 rgba_to_rgb()。",
+      "tags": [
+        "bugfix",
+        "security",
+        "low-risk",
+        "multimodal",
+        "image-processing"
+      ],
+      "ascend_impact": {
+        "ascend_affected": true,
+        "functionality": "vllm/multimodal/image.py 和 vllm/multimodal/media/image.py 是共享的多模态图像处理链。Ascend 的多模态模型也经过这条路径进行图像解码和预处理。EXIF 方向归一化和 tRNS 透明通道修复对 Ascend 上的多模态推理同样生效，提升了图像输入的准确性和安全性。",
+        "testing": "新增的测试（test_exif_transpose_normalizes_orientation、test_palette_with_trns_to_rgb 等）在 vllm 共享测试中覆盖。Ascend 无需额外测试。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "766ce2bb6bb614075fa7b0998c06d257f9c49f22",
+      "comment": "修复 MiDashengLM 语音编码器 attention 在 TP>1 下的崩溃。原代码使用 C // self.num_heads（从 QKV 投影的总维度 C 除以 num_heads 计算 head_dim），但在 tensor parallelism 下 QKV 线性层被分片（shard），C 是分片后的维度而非完整维度，导致计算出的 head_dim 错误。修复使用 self.head_dim（已在初始化时正确设置为 head_size / tp_size）代替。同时修复输出 reshape 使用 self.q_size（通过 TP 分片的 query 维度）而非 C。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "model",
+        "tensor-parallelism",
+        "audio-encoder"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "3d119f78f77cd460c39a1c8ba8303724ad1f88bc",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "feature",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "1b1359c33269446f13c05da9a90c25174cbea590",
+      "comment": "安全修复：音频解压炸弹（decompression bomb）DoS 防御。新增环境变量 VLLM_MAX_AUDIO_DECODE_DURATION_S（默认 600 秒），限制解码后的音频最大时长。在 load_audio_soundfile() 和 load_audio_pyav() 两个路径中均实现：(1) 基于文件元数据的早期拒绝——读取容器/stream 的 duration 元数据，若已超过限制则立即拒绝解码，避免计算浪费；(2) 解码过程中的累积样本计数——实时检查解码后的累计采样数是否超过 max_duration_s * sr，一旦超出立即抛出异常。load_audio() 函数新增 max_duration_s 参数并在 serving 层传入。PyAV 路径额外处理了 metadata_duration_s 的两种获取方式（stream.duration * time_base 和 container.duration）。soundfile 路径使用 f.frames / native_sr 计算时长。",
+      "tags": [
+        "bugfix",
+        "security",
+        "low-risk",
+        "multimodal",
+        "audio",
+        "env-vars"
+      ],
+      "ascend_impact": {
+        "ascend_affected": true,
+        "functionality": "vllm/multimodal/media/audio.py 中的 load_audio、load_audio_pyav、load_audio_soundfile 是共享的音频加载函数，新增了 max_duration_s 参数。新环境变量 VLLM_MAX_AUDIO_DECODE_DURATION_S 也在共享的 vllm/envs.py 中注册。Ascend 的 speech-to-text 服务和音频多模态模型使用同一套共享加载链，可以自动获得解压炸弹防护。",
+        "testing": "共享测试已覆盖（test_load_audio_max_duration_respected、test_load_audio_max_duration_rejected），Ascend 侧无需额外测试。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    }
+  ]
+}

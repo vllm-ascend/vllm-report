@@ -381,20 +381,25 @@ def build_prompt(repo, date, commits_data, data_dir, local_repo=None, commit_sub
         if not commits_src:
             return ""
 
+    # Truncate context section if needed (~52KB combined) to leave budget
+    # for patches under Linux MAX_ARG_STRLEN (128KB per single argument).
+    MAX_CONTEXT_BYTES = 20000
+    if len(context_section) > MAX_CONTEXT_BYTES:
+        context_section = context_section[:MAX_CONTEXT_BYTES] + "\n# ... (context truncated, full context available in local repo)"
+
     # Build commits JSON and measure actual prompt size. If the prompt
-    # exceeds the safe limit (~800KB leaving room for argv + minimal env
-    # under 1MB ARG_MAX), retry with increasingly aggressive truncation.
+    # exceeds Linux MAX_ARG_STRLEN (128KB per argument), retry with
+    # increasingly aggressive truncation.
     commits_for_prompt = []
+    SAFETY_LIMIT = 115000
     truncation_rounds = [
         # (max_lines, head_tail) — try in order until prompt fits
         (0, False),       # round 0: no truncation
-        (200, False),     # round 1: head 200 lines
-        (100, True),      # round 2: head+tail 50+50
-        (40, True),       # round 3: head+tail 20+20
+        (100, False),     # round 1: head 100 lines
+        (50, False),      # round 2: head 50 lines
+        (20, True),       # round 3: head+tail 10+10
+        (10, True),       # round 4: head+tail 5+5
     ]
-    # SAFETY_LIMIT: max prompt bytes leaving ~200KB headroom under 1MB ARG_MAX
-    # for argv (~50B) + minimal env (~5KB) + kernel overhead.
-    SAFETY_LIMIT = 800000
     prompt = None
     for round_idx, (max_lines, head_tail) in enumerate(truncation_rounds):
         commits_for_prompt.clear()
@@ -477,6 +482,8 @@ def _minimal_env():
 
 def call_reasonix(prompt, model="deepseek-v4-flash"):
     """Call Reasonix CLI to analyze commits."""
+    prompt_bytes = len(prompt.encode("utf-8"))
+    print(f"  [call] prompt size: {prompt_bytes:,} bytes, argv overhead: ~50 bytes")
     try:
         cmd = ["reasonix", "run", "--model", model, prompt]
         result = subprocess.run(

@@ -421,11 +421,16 @@ def build_prompt(repo, date, commits_data, data_dir, local_repo=None, commit_sub
 
 
 def call_reasonix(prompt, model="deepseek-v4-flash"):
-    """Call Reasonix CLI to analyze commits."""
+    """Call Reasonix CLI to analyze commits.
+
+    The prompt is passed via stdin (`-` arg) to avoid ARG_MAX overflow
+    when the commit diffs are large.
+    """
     try:
-        cmd = ["reasonix", "run", "--model", model, prompt]
+        cmd = ["reasonix", "run", "--model", model, "-"]
         result = subprocess.run(
             cmd,
+            input=prompt,
             capture_output=True,
             text=True,
             timeout=600,

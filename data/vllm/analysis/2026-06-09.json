@@ -1,10 +1,464 @@
 {
   "date": "2026-06-09",
   "repo": "vllm-project/vllm",
-  "generated_at": "2026-06-10T09:26:10.005324+08:00",
-  "daily_summary": "当日仅有一个低风险的 bugfix commit，修复 Qwen3-Omni 多模态模型在 VIT attention 前向过程中 `cu_seqlens` 张量可能留在 CPU 上导致设备不匹配的问题。变更集中在模型注册表中的 Qwen3-Omni-MoE thinker 模型实现，通过添加一行 `cu_seqlens.to(device)` 确保在 profile_run（预热阶段）等场景下张量正确位于计算设备上。该修复对 Ascend NPU 平台无负面影响。",
-  "ascend_impact_summary": "当日变更对 vllm-ascend 无实质影响。修复在共享模型代码中，与平台无关——`.to(self.device)` 在 Ascend 上会正确移至 NPU 设备，是一种无害的通用健壮性改进。vllm-ascend 无需更新测试用例。",
+  "generated_at": "2026-06-10T09:47:54.677122+08:00",
+  "daily_summary": "当天变更以 bugfix 和性能优化为主，涵盖面广。核心亮点包括：(1) Qwen3.5 的 QK-RMSNorm+RoPE+gate 三合一 Triton kernel 融合，降低显存读写延迟；(2) ROCm 平台上 AllReduce+RMSNorm+per-group FP8 quant 三合一 AITER kernel 融合，针对 DeepSeek V3.2 的解码性能优化；(3) GLM-4.1V 编码器全 CUDA Graph 支持，覆盖图像和视频场景；(4) Cohere2 MoE 权重加载对 Transformers ≥5.10 的兼容性修复；(5) ModernBERT 的 token-classification 精度对齐 HF baseline。此外还有多个小范围 bugfix：MiniCPM-o 设备不匹配、MM cache 悬挂、KV events 编码格式切换、Qwen3-Omni cu_seqlens 设备放置、音频 ImportError 传播等。平台侧 Intel XPU 升级 torch-xpu 到 2.12 并优化 CI Docker 构建；ROCm 端修复 Kimi-K2.5 的 FP8 prefill workspace 预留时机问题。总体来说当天变更比较分散但都是针对性修复和增量优化，无重大架构重构。",
+  "ascend_impact_summary": "当日变更对 vllm-ascend 影响较小。可能产生间接影响的有：(1) Transformers multimodal 后端的多模态编码器性能分析逻辑变更（Gemma3 encoder profiling 和 raw_inputs 移除），该后端是 Ascend 多模态推理的公共基础；(2) KV events 编码格式从 array 切换为 map，Ascend 如有订阅该事件流需检查反序列化兼容性；(3) LRUCache.touch() 修复和音频 ImportError 传播是通用工具层修改，推荐同步更新。其余变更（XPU 特定、ROCm 特定、NVIDIA 特定 kernel config、CUDA Graph 相关）对 Ascend 无直接影响。",
   "commits": [
+    {
+      "sha": "cad4ca12b89523793b009129d954492fdcaf1026",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "bugfix",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "b6971198008e37637b80b0cdc183bf4bad11376e",
+      "comment": "修复 ModernBERT token-classification 任务的精度对齐问题。(1) 在 ModernBertAttention.__init__ 中添加 dtype 参数并传递至 RoPE embedding，之前硬编码为 torch.float16 与 Config 中配置的 dtype 可能不一致导致精度偏差；(2) MLP 中激活函数从硬编码 nn.GELU() 改为使用 config.hidden_activation 动态获取，以匹配 HuggingFace 不同 checkpoint 可能使用不同激活函数的场景；(3) sliding_window 计算在 Transformers v5 路径下改为 config.sliding_window + 1（inclusive 边界）。风险较低，均为配置驱动的修复。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "model-runner"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。ModernBERT 模型非 Ascend 生态主推模型，且变更仅涉及模型实现内部细节。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "b4c6dc64548c46be62abcf5b0bafa7d6ec1a8ae6",
+      "comment": "Intel XPU 后端工具链升级：torch-xpu 从 2.11.0 升级到 2.12.0，配套 triton-xpu 从 3.7.0 升级到 3.7.1，vllm_xpu_kernels 从 0.1.9 升级到 0.1.9.1。同时修正文档中关于 torch 版本对应关系的描述。mteb 测试依赖添加版本约束。纯平台特定变更，对其他平台无影响。",
+      "tags": [
+        "chore",
+        "low-risk",
+        "xpu"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。XPU 平台特有升级。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "2ee51063722c9e6d28f71340966942394f330c0e",
+      "comment": "清理 Transformers modeling backend 中已废弃的 raw_inputs 支持路径。(1) MultiModalMixin.forward() 中移除 kwargs 中只保留 token_type_ids 的过滤逻辑，改为直接不传递 kwargs 给 super().forward()，因为 Gemma3/PaliGemma 已不再依赖此路径；(2) 移除 supports_multimodal_raw_input_only 类属性，该标志已不再使用；(3) mm_token_type_ids 查找方式改为使用 dict.get + pop 一步完成。这些废弃代码来自 Gemma3 早期版本的多模态处理路径，现已由更完善的 MultiModalProcessor.apply() 替代。",
+      "tags": [
+        "refactor",
+        "low-risk",
+        "multimodal"
+      ],
+      "ascend_impact": {
+        "ascend_affected": true,
+        "functionality": "Transformers multimodal backend 是 Ascend 多模态推理的基础抽象。本次移除了 MultiModalMixin 中 kwargs 过滤逻辑和 supports_multimodal_raw_input_only 属性，如果 vllm-ascend 有自定义多模态 mixin 类依赖这些属性，需要检查兼容性。",
+        "testing": "建议检查 vllm-ascend 中 Transformers 后端多模态模型是否正确处理了 forward() 的 kwargs 传递。",
+        "needs_test_update": false,
+        "suggested_test_areas": [
+          "vllm-ascend 多模态模型前向传播兼容性"
+        ]
+      }
+    },
+    {
+      "sha": "7a89b72564a2c39d170b9478e947382216710ee2",
+      "comment": "新增 fused_qk_rmsnorm_rope_gate Triton kernel，将 Qwen3.5 注意力路径中原本分离的 split + QK-RMSNorm + partial NeoX RoPE + gate copy 四个步骤合并为单次 Triton launch。新文件 vllm/model_executor/layers/fused_qk_norm_rope.py 包含 Triton kernel 实现和 Python 入口函数，通过 current_platform.is_cuda() 控制启用，仅在 CUDA 平台生效（fallback 到 eager 路径）。Qwen3NextAttention 中新增 use_fused_qk_norm_rope_gate 标志决策逻辑（检查 attn_output_gate、is_neox_style、CUDA 平台、纯文本推理）。性能收益显著（减少 kernel launch 开销和显存中间读写）。新增测试文件 tests/kernels/test_fused_qk_norm_rope_gate.py，与 reference 实现（纯 PyTorch 分步路径）对比精度。",
+      "tags": [
+        "performance",
+        "medium-risk",
+        "attention",
+        "triton"
+      ],
+      "ascend_impact": {
+        "ascend_affected": true,
+        "functionality": "该 fused kernel 仅在 current_platform.is_cuda() 时启用，Ascend NPU 上自动走 eager fallback。但 Qwen3NextAttention 的决策逻辑修改会影响到所有平台（q_norm/k_norm 初始化、project_qkv_gate 方法重构），Ascend 上的 Qwen3.5 模型推理不受影响（走 eager 路径），但需验证 eager 路径正确性。",
+        "testing": "如果 vllm-ascend 支持 Qwen3.5 模型，建议验证 attention 输出精度。",
+        "needs_test_update": true,
+        "suggested_test_areas": [
+          "vllm/models/deepseek_v4/ 等非 Qwen3.5 之外的注意力测试",
+          "vllm-ascend 上 Qwen3.5 模型推理回归测试"
+        ]
+      }
+    },
+    {
+      "sha": "dc10e467a9859f220ba9d36c31c50fb22bc38373",
+      "comment": "修复 MiniMax 的 fused allreduce+RMSNorm kernel 中的 fp32 variance all-reduce 问题。核心修复：新增 _all_reduce_variance() 辅助函数，将 variance 张量展开为 1D 后再做 all_reduce，避免 FlashInfer 的 fused all-reduce（只缓存了 16-bit workspace）错误处理 fp32 张量导致结果损坏。同时为 workspace 分配添加 try/except 异常处理，防止无 P2P 支持的拓扑（如消费级 PCIe 卡）上模型加载失败，降级到 eager 路径。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "attention"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。MiniMax 的 fused allreduce+RMSNorm 使用了 CUDA custom op (minimax_allreduce_rms_qk) 和 FlashInfer 特定逻辑，Ascend 不涉及。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "ee4d7df2b5211448a4f9bb34e807c1dc1a360de1",
+      "comment": "修复 Cohere 模型流式 tool call 输出中 tool_call_id 可能在 function name 之前到达的问题。(1) 新增 _pending_streaming_tool_call_ids 字典缓存每个 index 的 tool_call_id，等到真正的 name delta 到达时再合并发送；(2) 过滤掉 Melody parser 输出的空字符串占位符（name=None 且 arguments=None 时跳过），避免发送无效的 OpenAI 兼容 delta。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "tool-parser"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。纯 tool parser 逻辑变更，不涉及硬件适配层。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "3e8afdf78598afc8be999a6a049be3a5fe182e48",
+      "comment": "修复 Cohere2 MoE 模型与 Transformers ≥5.10 的权重加载兼容性。Transformers 5.10+ 新增 mlp_layer_types 字段（每层的 dense/sparse 标注），而旧版本仅暴露 first_k_dense_replace。变更引入 is_prefix_dense_layer() 辅助函数，使用 config.mlp_layer_types 而非 first_k_dense_replace 判断层类型。在 Cohere2MoeModel.__init__ 中增加 mlp_layer_types 规范化逻辑：如果未设置，从 first_k_dense_replace 推导并回填。避免权重加载时层类型判断错误导致的参数不匹配。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "model-runner"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。Cohere2 MoE 模型权重加载逻辑变更，不涉及硬件适配层。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "6690a0c4de37ac965475a6ea90ad4271de77a767",
+      "comment": "修复 HMA (Heterogeneous Memory Access) 场景下 KV cache 共享层的处理。在 NixlConnectorWorker 的 layer 映射中，对于共享 KV cache 的层（如 Gemma4 的 cross-layer KV sharing），self._layer_specs 中不存在对应 layer_name。之前会 KeyError 崩溃，现在使用 .get() 加 continue 跳过。同时新增 Gemma4 的端到端精度测试配置，使用 chat completions API（Gemma4 对 chat template 敏感），更新 lm_eval 评估参数。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "distributed"
+      ],
+      "ascend_impact": {
+        "ascend_affected": true,
+        "functionality": "NixlConnectorWorker 的 KV transfer 逻辑是通用基础设施。如果 vllm-ascend 使用了 Nixl KV transfer connector 或有自己的 KV 传输层实现，建议检查类似问题。同时 Gemma4 的测试配置更新不影响 Ascend 功能。",
+        "testing": "无直接影响。vllm-ascend 如有 KV transfer 功能可参考此修复。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "1c23c4203007d16d96b1f07847f5bf1b663ad0d7",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "feature",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "b12e42d13277a691226e0f6654ad04f790acadd6",
+      "comment": "优化 Intel XPU CI 的 Docker 镜像构建流程。(1) 简化 docker pull 锁机制：移除早期的双重检查逻辑，改为在 create container 前的锁内统一执行 pull-exists-pull 三选一；(2) Dockerfile 优化：合并 RUN 指令减少层数，将 build 阶段和依赖安装合并，减少镜像层数量和构建时间。纯 CI/DevOps 变更。",
+      "tags": [
+        "ci",
+        "low-risk",
+        "xpu"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。XPU 平台 CI 脚本和 Dockerfile 变更。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "69fdaffbcd8cb406a9750685370a831fe8978a0a",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "feature",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "80e2c4462dd9a94252b4b0061d00ed66908131c1",
+      "comment": "ROCm 平台重大性能优化：将 AllReduce + RMSNorm + per-group FP8 quantization 融合为单个 AITER custom op。新增三个编译融合 pattern：(1) AiterAllreduceFusedRMSNormGroupQuantFP8Pattern（all_reduce -> rms_norm -> group_fp8_quant，无 residual）；(2) AiterAllreduceFusedAddRMSNormGroupQuantFP8Pattern（all_reduce -> fused_add_rms_norm -> group_fp8_quant，单个 consumer）；(3) AiterAllreduceFusedAddRMSNormGroupQuantWithIndexerPattern（两个 consumer，模拟 DSv3.2 indexer fan-out）。在 ROCm MI355X TP4 上，独立 group_fp8_quant 约 535μs/decode step，此 fusion 可完全消除该开销。新增 vllm/_aiter_ops.py 中 fused_ar_rms_per_group_quant 的 protocol 定义和实现，新增 comprehensive test 覆盖四种场景。",
+      "tags": [
+        "performance",
+        "medium-risk",
+        "compilation",
+        "rocm"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。ROCm 平台 AITER 特定优化，使用了 ROCm 私有的 custom op 接口。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "5b3807e862fe70f51139ac518a5dd361e57de2e5",
+      "comment": "KV cache 事件结构体从 array_like 编码切换为 map 编码。移除 msgspec.Struct 中的 array_like=True 参数，使得 KVCacheEvent 序列化时使用字段名作为 key（map 格式）而非按位置索引（array 格式）。这样提高了可读性和向后兼容性（添加新字段不会破坏旧格式）。同时更新了示例订阅者代码。",
+      "tags": [
+        "refactor",
+        "low-risk",
+        "distributed"
+      ],
+      "ascend_impact": {
+        "ascend_affected": true,
+        "functionality": "KV events 序列化格式变更。如果 vllm-ascend 有订阅 KV cache 事件流的逻辑（如自定义事件订阅器），需要确保反序列化兼容新的 map 编码格式。",
+        "testing": "建议检查 vllm-ascend 中是否有 KV 事件的消费者，确认其 msgspec 解码器配置兼容 map 格式。",
+        "needs_test_update": true,
+        "suggested_test_areas": [
+          "vllm-ascend KV events 订阅/反序列化兼容性测试"
+        ]
+      }
+    },
+    {
+      "sha": "59401ac9f18c246dceffce28bc878881179405e4",
+      "comment": "为 Qwen3-Next-80B 模型在 H100 GPU 上 TP=4 场景新增 fused_moe FP8 的 Triton heuristic 配置文件。配置覆盖 batch size 96-1024，在 batch 96-512 范围有约 25% 性能提升。配置参数包括 BLOCK_SIZE_M/N/K、GROUP_SIZE_M、num_warps、num_stages，通过 Triton 的 autotuning 流程选择最佳组合。纯 NVIDIA 平台优化。",
+      "tags": [
+        "performance",
+        "low-risk",
+        "fused-moe"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。NVIDIA H100 特定 MoE kernel 配置。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "d841386d272200dd381a5791833771db9a47adf7",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "feature",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "fff9210b2a5f0acbfbd6e972c985e81f04ae17c8",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "chore"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "70db1488c5d5f428b23b86223ec6bd4ec89b210f",
+      "comment": "为 DeepSeek V4 XPU 平台添加 MHC fused_post_pre 支持。(1) 在 vllm/model_executor/layers/mhc.py 的 MHCFusedPostPreOp 中新增 forward_native（拆分为 mhc_post_torch + mhc_pre_torch）和 forward_xpu（复用 forward_native）实现，之前仅有 CUDA (tilelang) 和 ROCm (tilelang) 实现；(2) 在 DeepSeekV4 XPU 的 DecoderLayer 中将之前分离的 hc_pre + attn + hc_post 流水线重构为 fused_post_pre 模式（fused post-pre 在 attention 和 FFN 之间传递 residual/post_mix/res_mix 状态），减少 kernel launch 次数。这是 XPU 平台 DeepSeek V4 推理的关键性能优化。",
+      "tags": [
+        "feature",
+        "low-risk",
+        "deepseek-v4",
+        "xpu"
+      ],
+      "ascend_impact": {
+        "ascend_affected": true,
+        "functionality": "DeepSeek V4 的 MHC (Hybrid Channel) 模块在 CUDA 上已有 tilelang fused kernel，ROCm 上也已适配。此次 XPU 添加的是 forward_native 分解实现。如果 vllm-ascend 需要支持 DeepSeek V4 的 MHC，可以参考此提交添加 forward_npu 实现或直接复用 forward_native。同时注意 DecoderLayer 中 attn 和 FFN 之间的 fused_post_pre 流水线重构——如果 Ascend 也实现 MHC 模块，建议采用相同的 fused 接口以减少 kernel launch。",
+        "testing": "建议 vllm-ascend 如需支持 DeepSeek V4，需要实现 MHC fused_post_pre 的 forward_npu 路径。",
+        "needs_test_update": true,
+        "suggested_test_areas": [
+          "vllm/model_executor/layers/mhc.py MHCFusedPostPreOp.forward_npu",
+          "vllm/models/deepseek_v4/ (如需支持 Ascend NPU 的 decoder layer 适配)"
+        ]
+      }
+    },
+    {
+      "sha": "2385e140d6965c279b48f9c50f51e2fddfcf66bd",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "chore"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "dab60fc65894e7dadcc9a126f68b138af839d500",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "bugfix",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "996222f4bffc7b0c1e50bb18b42e9f0f09867d7b",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "chore"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "e6fc848d4ff2d00759516b0c7a47ba640d44e4b2",
+      "comment": "修复 MiniCPM-o 模型中 Resampler2_5 的 pos_embed 设备不匹配问题。之前 .to(dtype=dtype) 未指定 device，在 profile_run 场景下 pos_embed 可能位于 CPU 而后续操作在 GPU，导致 cuda/cpu device mismatch 错误。添加 device=device 参数确保张量始终在同一设备上。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "multimodal"
+      ],
+      "ascend_impact": {
+        "ascend_affected": true,
+        "functionality": "设备不匹配修复对 Ascend 同样有益。MiniCPM-o 模型如果需要在 Ascend 上运行，此修复确保了 pos_embed 到正确设备的复制。",
+        "testing": "无直接影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "f843ac1a1c4f0d69a19a086c65603db75edebac7",
+      "comment": "修复 Gemma3 使用 Transformers modeling backend 时的多模态编码器 profiling 问题。新增 _get_max_encoder_tokens() 方法，专门针对 Gemma3 处理器计算编码器最大 token 数：Gemma3 的 SigLIP 编码器将每个 64x64 patch grid pooling 到 256 个 image token，而 HF processor 返回的 num_image_tokens 是 pooling 后的值，需要根据 image_size/patch_size 反算出 pre-pooling 的 patch token 数作为 profile 上限，以避免编码器 CUDA memory 不足。同时修复 ROCm 上 test fixture 在 server 启动前预加载 HF embeddings 到 CPU 以避免 VRAM 竞争。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "multimodal"
+      ],
+      "ascend_impact": {
+        "ascend_affected": true,
+        "functionality": "Transformers MultimodalProcessingInfo.get_max_image_tokens() 行为变更：对 Gemma3 现在返回 pre-pooling 的最大编码器 token 数而非 HF processor 的 pooling 后值。如果 vllm-ascend 使用 Transformers modeling backend 运行 Gemma3，此变更会改变 KV cache allocation 和 memory budget 计算，需要验证 Ascend NPU 上的内存规划是否适配。",
+        "testing": "建议在 vllm-ascend 上使用 Gemma3 Transformers 后端验证多模态推理的正确性和内存使用。",
+        "needs_test_update": true,
+        "suggested_test_areas": [
+          "vllm-ascend 上 Gemma3 Transformers 多模态推理回归测试",
+          "vllm-ascend memory budget / KV cache allocation 验证"
+        ]
+      }
+    },
+    {
+      "sha": "7c2aa3108ab405d98101b931fc6a0298f98365cc",
+      "comment": "修复 LRUCache.touch() 方法中因 stale LRU order key 导致的 multithread hang。之前的 try/except KeyError 分支在 cache miss 时会重新插入 key（self._LRUCache__order[key] = None），这在多线程环境下可能导致对已删除 key 的插入，进而破坏 order dict 的链表结构造成死循环 hang。修复为仅在 key in self（即 key 同时存在于 cache 和 order dict 中）时 move_to_end。这是性能关键路径的 bugfix，影响 multimodal cache 等使用 LRU 策略的模块。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "cache"
+      ],
+      "ascend_impact": {
+        "ascend_affected": true,
+        "functionality": "LRUCache.touch() 是通用工具类方法，修复了多线程安全相关的 hang 问题。如果 vllm-ascend 使用了 vLLM 的 LRUCache（如 multimodal cache、KV cache 等），此修复自动受益。",
+        "testing": "无需额外测试。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "ebf53ba373bf296d6c0fb8e88c02011397636ef0",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "bugfix",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "baacbfcebf5eb9e04f66baf8efb72e3d24b9ef26",
+      "comment": "修复 ROCm 上 Kimi-K2.5 模型的 FP8 prefill workspace 预留时机问题。(1) 在 AiterMLAMetadataBuilder 初始化时，除了 max_num_reqs 和 max_prefill_qlen 之外，还需要传入 max_num_batched_tokens 参数来预留 final_lse scratch 的最大空间——因为 final_lse 大小取决于 total_q（batch 内所有 prefill request 的 Q-length 之和），而多 request 并发时 total_q 可能超过单一 request 的 max_prefill_qlen。预留必须在 workspace manager lock 之前完成（warmup 后 lock），否则 warmup 后 workspace 不足会崩溃。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "attention",
+        "rocm"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。ROCm 平台 AITER MLA attention 后端特定修复，使用 aiter get_ps_metadata_info_v1 等 ROCm 私有接口。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "d8218b1ee7db3e7582e0151e942d17963a1e3e13",
+      "comment": "修复 load_audio_pyav 中 ImportError 未被正确传播的问题。当 pyav 模块缺失时，最内层会触发 ImportError，但之前的 ValueError except 块无法捕获它，导致异常被外层通用 Exception 块错误地包装为 ValueError（\"Failed to load audio\"）丢失原始错误信息。添加 ImportError 到捕获列表，使其正确传播。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "multimodal"
+      ],
+      "ascend_impact": {
+        "ascend_affected": true,
+        "functionality": "音频加载工具函数 load_audio_pyav 是通用模块。ImportError 传播修复使缺失依赖时的错误信息更准确，对 Ascend 无功能影响。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "9f153aa781f07d74b8574b57eab71551374c9498",
+      "comment": "为 GLM-4.1V 模型添加完整的多模态编码器 CUDA Graph 支持。主要变更：(1) Glm4vForConditionalGeneration 继承 SupportsEncoderCudaGraph 接口并实现相关方法；(2) Glm4vVisionTransformer 重构：rot_pos_emb 参数从 torch.Tensor 改为 list[list[int]] 以支持 CUDA Graph 的静态输入形状，新增 pre-computed position embedding 路径（pos_embeds_interpolate），支持数据并行 (DP) 下的 TP size 管理；(3) 调整 attention mask 和 causal mask 计算以适应 CUDA Graph 的静态 shape；(4) 更新文档和测试配置。覆盖图像和视频两种输入模式。这是 GLM-4.1V 多模态推理性能的关键优化（减少编码器 kernel launch 开销）。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "multimodal",
+        "cuda-graph"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无直接影响。CUDA Graph 是 NVIDIA 平台特有的优化（CUDAGraph capture/replay），不适用于 Ascend NPU。但 GLM-4.1V 模型实现的 RMSNorm 和 attention 层重构可能影响 Ascend 上同等模型的推理逻辑（走 eager 路径即可）。",
+        "testing": "如果 vllm-ascend 支持 GLM-4.1V 多模态推理，建议验证模型 forward 路径的正确性（走非 CUDA Graph 路径）。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
     {
       "sha": "d3de61502fa685ab03368f8b431a5b8cdf843982",
       "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
@@ -22,18 +476,16 @@
     },
     {
       "sha": "540aaf21406bad1eb0f3d5ddc5e835e45ea01e43",
-      "comment": "**变更意图**：修复 Qwen3-Omni-MoE thinker 模型在 VIT（视觉 transformer）attention 前向时 `cu_seqlens` 张量设备不匹配的 bug。具体场景是：在 `profile_run`（模型预热阶段）`grid_thw`（grid temporal-height-width 张量）可能在 CPU 上，经过 `F.pad(cu_seqlens, ...)` 后 `cu_seqlens` 仍留在 CPU 上，而 FlashAttention 3 (FA3) VIT attention 后端要求 `cu_seqlens` 在 CUDA 设备上，导致运行时错误。\n\n**实现方式**：在第 994 行新增 `cu_seqlens = cu_seqlens.to(self.device, non_blocking=True)`，在 VIT attention 接收 `cu_seqlens` 之前将其显式移动到模型所在的计算设备。使用了 `non_blocking=True` 以允许设备间传输与后续计算异步重叠，不引入额外同步开销。该修复位于 `Qwen3OmniMoeThinker` 类的 `forward()` 方法中，紧跟在 `cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)` 之后。\n\n**潜在风险**：极低。3 行纯新增代码，无删除或修改。`.to(device, non_blocking=True)` 是标准 PyTorch 操作——当张量已在目标设备时是空操作；当不在时异步复制。对 `profile_run` 路径和正常推理路径均安全。不会引入回归问题。",
+      "comment": "修复 Qwen3-Omni VIT attention 中 cu_seqlens 设备不匹配问题。在 profile_run 时 grid_thw 可能在 CPU 上，导致计算出的 cu_seqlens 也在 CPU 上，而 FA3 (FlashAttention v3) 的 VIT attention 要求 cu_seqlens 在 GPU 上。添加 .to(self.device, non_blocking=True) 确保其正确放置。",
       "tags": [
         "bugfix",
         "low-risk",
-        "model-registry",
-        "multimodal",
-        "attention"
+        "multimodal"
       ],
       "ascend_impact": {
-        "ascend_affected": false,
-        "functionality": "无影响。变更位于共享模型代码（`vllm/model_executor/models/qwen3_omni_moe_thinker.py`），vllm-ascend 直接使用上游模型定义（其在 `vllm_ascend/models/` 中仅有 DeepSeek V4 系列的自定义实现）。`.to(self.device)` 调用是平台无关的——在 Ascend NPU 上会正确将张量移至 NPU 设备，无副作用。该修复对 Ascend 也是健壮性改进。",
-        "testing": "无影响。变更不改变任何行为逻辑或接口签名，仅增加设备兼容性保障。",
+        "ascend_affected": true,
+        "functionality": "设备不匹配修复是通用问题。如果 vllm-ascend 运行 Qwen3-Omni 模型，此修复可避免 profile_run 场景下的设备错误。但注意 Ascend NPU 上使用的 attention 后端可能不同（如 DSA/SFA），设备放置逻辑可能需要相应适配。",
+        "testing": "无直接影响。",
         "needs_test_update": false,
         "suggested_test_areas": []
       }

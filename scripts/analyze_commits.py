@@ -381,6 +381,26 @@ def build_prompt(repo, date, commits_data, data_dir, local_repo=None, commit_sub
         if not commits_src:
             return ""
 
+    # Estimate raw patch size to decide if truncation is needed.
+    # After env stripping, ~1MB of ARG_MAX is available for the prompt.
+    # JSON + template overhead roughly doubles the raw patch bytes in the prompt.
+    total_patch_bytes = sum(
+        len(f.get("patch", ""))
+        for c in commits_src
+        for f in c.get("files", [])
+    )
+    if total_patch_bytes > 600000:
+        # Keep head + tail (half each) so AI sees both the entry point
+        # and the closing context of each changed function.
+        max_patch_lines = 100
+        trunc_head_tail = True
+    elif total_patch_bytes > 350000:
+        max_patch_lines = 150
+        trunc_head_tail = False
+    else:
+        max_patch_lines = 0  # no truncation
+        trunc_head_tail = False
+
     commits_for_prompt = []
     for c in commits_src:
         commit_info = {
@@ -391,12 +411,24 @@ def build_prompt(repo, date, commits_data, data_dir, local_repo=None, commit_sub
             "files": [],
         }
         for f in c.get("files", []):
+            patch = f.get("patch", "")
+            if max_patch_lines and patch:
+                patch_lines = patch.splitlines()
+                if len(patch_lines) > max_patch_lines:
+                    if trunc_head_tail:
+                        half = max_patch_lines // 2
+                        head = "\n".join(patch_lines[:half])
+                        tail = "\n".join(patch_lines[-half:])
+                        patch = f"{head}\n# ... ({len(patch_lines) - max_patch_lines} lines truncated in head+tail) ...\n{tail}"
+                    else:
+                        patch = "\n".join(patch_lines[:max_patch_lines])
+                        patch += f"\n# ... ({len(patch_lines) - max_patch_lines} more lines truncated)"
             commit_info["files"].append({
                 "filename": f["filename"],
                 "status": f["status"],
                 "additions": f["additions"],
                 "deletions": f["deletions"],
-                "patch": f.get("patch", ""),
+                "patch": patch,
             })
         commits_for_prompt.append(commit_info)
 
@@ -420,20 +452,38 @@ def build_prompt(repo, date, commits_data, data_dir, local_repo=None, commit_sub
     return prompt
 
 
-def call_reasonix(prompt, model="deepseek-v4-flash"):
-    """Call Reasonix CLI to analyze commits.
+def _minimal_env():
+    """Return a minimal env to free ARG_MAX space for the prompt.
 
-    The prompt is passed via stdin (`-` arg) to avoid ARG_MAX overflow
-    when the commit diffs are large.
+    GitHub Actions injects many large env vars (GITHUB_TOKEN, ACTIONS_*,
+    RUNNER_*) that consume significant ARG_MAX budget. We strip all but
+    the essentials reasonix actually needs.
     """
+    keep = {"PATH", "HOME", "USER", "DEEPSEEK_API_KEY", "GITHUB_TOKEN"}
+    stripped_count = 0
+    stripped_bytes = 0
+    result = {}
+    for k, v in os.environ.items():
+        if k in keep:
+            result[k] = v
+        else:
+            stripped_count += 1
+            stripped_bytes += len(k) + len(v)
+    if stripped_count > 0:
+        print(f"  [env] stripped {stripped_count} vars (~{stripped_bytes:,} bytes) to save ARG_MAX space")
+    return result
+
+
+def call_reasonix(prompt, model="deepseek-v4-flash"):
+    """Call Reasonix CLI to analyze commits."""
     try:
-        cmd = ["reasonix", "run", "--model", model, "-"]
+        cmd = ["reasonix", "run", "--model", model, prompt]
         result = subprocess.run(
             cmd,
-            input=prompt,
             capture_output=True,
             text=True,
             timeout=600,
+            env=_minimal_env(),
         )
         if result.returncode != 0:
             print(f"reasonix returned non-zero exit code: {result.returncode}")

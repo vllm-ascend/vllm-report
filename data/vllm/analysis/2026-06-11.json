@@ -1,0 +1,211 @@
+{
+  "date": "2026-06-11",
+  "repo": "vllm-project/vllm",
+  "generated_at": "2026-06-11T04:28:39.083319+08:00",
+  "daily_summary": "当日变更以 bugfix 和功能增强为主，涵盖了 MoE 权重加载的 TP 感知对齐、Qwen3-ASR 转录 prompt 支持、EPLB 异步模式与 NCCL 通信器的兼容性拒绝、K8s 部署文档从 Ray 切换为默认 MP 模式、CohereASR 模型 V2 runner 修复、Llama4/LFM2-MoE/mllama4 的权重加载修复、非 function tool 类型（WebSearchTool）的 tool parsing 崩溃修复、Nemotron MoE 精度回退修复，以及 hybrid cache 的 Marconi 式准入策略新特性。整体质量修复为主，涉及分布式通信、模型加载、MoE、ASR 等多个子系统。",
+  "ascend_impact_summary": "当日变更中，ROCm 专用 MoE 补丁（#44679）和 K8s 文档变更（#39400）对 Ascend 无影响；tool parsing 崩溃修复（#45147）属于 API 层不依赖硬件。其余 6 个 commit 对 Ascend 均有不同程度影响：EPLB 配置校验（#44978）修改了 create_eplb_communicator 签名（str|None → str），Ascend 调用该函数需要确保 communicator 非 None；Qwen3-ASR（#35415）、CohereASR V2 runner（#44568）、Llama4 权重加载（#45047）、Nemotron MoE（#45037）以及 hybrid cache Marconi 准入（#37898）均为 vLLM 核心层的变更，Ascend 无需修改即可继承，但建议在对应场景下进行回归验证。",
+  "commits": [
+    {
+      "sha": "16282a9c4ee754bedd67f72b01ac76ae8568dbdd",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "chore"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "5b6b536fdc41b0f56bbf7cbb19c00eb544d6b16e",
+      "comment": "ROCm AITER fused MoE 的 padding 计算 TP-aware 修复。原代码在计算 hidden_pad 和 intermediate_pad 时，硬编码了 alignment（hidden_pad // 128 * 128, intermediate_pad // 64 * 64 * 2），其中 intermediate_pad 的 `* 2` 是基于始终单卡 TP 的假设。当 TP>1 时，intermediate_size_per_partition 已经是按 TP 分割后的尺寸，再乘以 2 会导致 padding 错误。本次修复将 alignment 逻辑提前，对 intermediate_pad 乘以 2 的条件改为 `(2 if moe_config.tp_size == 1 else 1)`，即仅在单卡 TP 时放大 padding。同时将之前 inline 在 fused_moe() 调用参数中的对齐计算提取为独立的赋值语句，逻辑更清晰。这是一个低风险的精确 bugfix，不影响非 ROCm 平台。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "layer/moe"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "12f3f19c1959174c81735b4d7dbfac7182a5e3c7",
+      "comment": "为 Qwen3-ASR 模型添加 OpenAI 转录 API 的 `prompt` 参数支持。核心变更包括：(1) 新增 `_sanitize_transcription_user_text()` 函数，采用 fixpoint 循环双重过滤（正则 + 字符串替换），防御性地剥离用户输入中的 ChatML 控制 token（如 `<|im_end|>`）和 `<asr_text>` 分隔符，防止 prompt 注入攻击；(2) 修改 `get_generation_prompt()` 方法，当 `request_prompt` 非空时在 user turn 前插入 `system` turn，匹配官方 Qwen3-ASR SDK 行为；(3) 修正语言标识逻辑——translate 任务使用 `to_language`，transcribe 任务使用 `language`。测试新增了 64 行覆盖 sanitizer 的各种攻击路径（嵌套重建、idempotency 等）。该变更安全性设计良好，采用 fixpoint 确保单次过滤无法绕过。",
+      "tags": [
+        "feature",
+        "low-risk",
+        "model/multimodal",
+        "security"
+      ],
+      "ascend_impact": {
+        "ascend_affected": true,
+        "functionality": "Qwen3-ASR 模型新增了 prompt 参数支持和安全 sanitizer，这些是 vLLM 核心模型代码的变更，如果 vllm-ascend 支持在 Ascend NPU 上运行 Qwen3-ASR 模型，将自动继承此功能。无需 Ascend 侧额外适配。",
+        "testing": "vllm-ascend 如果在 Ascend NPU 上测试 Qwen3-ASR 转录流程，建议验证带 prompt 参数的转录请求能正确生成 system turn 提示词。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "6471ec75bdcbe54200d4a35d1ca284b1baac6336",
+      "comment": "重构 EPLB 通信器选择逻辑，拒绝 NCCL 类通信器与 async EPLB 的组合。具体变更：(1) EPLBConfig 验证新增：`use_async + (torch_nccl/pynccl)` 直接抛 ValueError，原因是 NCCL 多流冲突会导致死锁；(2) ParallelConfig 验证新增：`enable_elastic_ep + use_async` 也直接被拒绝，因为 Elastic EP 强制使用 pynccl；(3) `create_eplb_communicator()` 的 `backend` 参数类型从 `str | None` 改为 `str`，删除了 None→torch_nccl 的 fallback 逻辑，并在所有调用点前插入 assert 检查非 None；(4) `override_envs_for_eplb()` 精简了 NCCL_MAX_CTAS 的覆盖条件，移除了 DeepEP low-latency 的判定逻辑，只保留 DeepGEMM Mega MoE 的情况。该变更提升了系统健壮性，将隐式 fallback 和运行时死锁提前为启动时验证错误。潜在风险：`backend` 参数类型收紧可能导致 vllm-ascend 等下游调用 `create_eplb_communicator(None)` 的代码立即崩溃。",
+      "tags": [
+        "bugfix",
+        "refactor",
+        "medium-risk",
+        "distributed/eplb",
+        "config"
+      ],
+      "ascend_impact": {
+        "ascend_affected": true,
+        "functionality": "关键变更：(1) `create_eplb_communicator()` 的 `backend` 参数从 `str|None` 变为 `str`，删除了 None→torch_nccl 的 fallback——如果 vllm-ascend 的 EPLB 相关代码调用此函数时传递 None，将直接引发 TypeError；调用点新增的 assert 也要求 communicator 必须非 None。(2) `override_envs_for_eplb()` 移除了 DeepEP low-latency 的 NCCL_MAX_CTAS 覆盖逻辑。如果 Ascend 平台使用了 NCCL 类通信器（如 pynccl）+ async EPLB 的组合，配置验证会直接拒绝启动。建议检查 Ascend EPLB 配置中 communicator 的设置。",
+        "testing": "建议验证 Ascend 平台上 EPLB 的配置路径：确保 communicator 已正确设置且非 None；验证 Elastic EP + async EPLB 的拒绝逻辑在 Ascend 上行为正确。",
+        "needs_test_update": true,
+        "suggested_test_areas": [
+          "vllm_ascend/tests/test_eplb_config.py（如有）",
+          "检查 Ascend EPLB 通信器初始化代码中 create_eplb_communicator 的调用方式"
+        ]
+      }
+    },
+    {
+      "sha": "3d300aecb1e6639872b698bd74ed38fb81d9603e",
+      "comment": "K8s 部署文档（LWS 和 Kthena）从默认 Ray 模式切换为默认 Multi-Processing (MP) 模式。主要变更：LWS 的 YAML 示例同时提供 `Multiprocessing (default)` 和 `Ray` 两个 tab，其中 MP 模式不再需要 `multi-node-serving.sh` 脚本和 Ray 集群启动，直接通过 `vllm serve` 的 `--nnodes/--node-rank/--master-addr/--headless` 参数实现多节点推理；Kthena 文档同样更新为 MP 和 Ray 两个选项；`multi-node-serving.sh` 注释示例新增 `--distributed-executor-backend ray` 显式指定。这是一个纯文档变更，没有代码逻辑改动。",
+      "tags": [
+        "docs",
+        "low-risk",
+        "deployment/k8s"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "ffce72c0415701eb10af86668cf504a5eeba2a72",
+      "comment": "修复 V2 Model Runner 中 CohereASR 模型缺少 embed_input_ids 属性的 AttributeError。`init_model_state()` 函数在创建 model state 时，原先只检查 `WhisperForConditionalGeneration` 架构以选择 WhisperModelState，但 CohereASR（`CohereAsrForConditionalGeneration`）也使用相同的 encoder-decoder 架构，因此也需要使用相同的 WhisperModelState。本次变更将条件从单架构检查改为多架构 or 检查。这是一个微小的、低风险的 bugfix，防止 V2 runner 使用错误的 model state 初始化路径。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "model-runner",
+        "multimodal"
+      ],
+      "ascend_impact": {
+        "ascend_affected": true,
+        "functionality": "CohereASR 模型在 V2 model runner 中现在也被识别为 encoder-decoder 架构，使用 WhisperModelState。vllm-ascend 如果在 Ascend NPU 上运行 CohereASR 模型并使用 V2 runner，将自动受益于此修复，无需额外适配。",
+        "testing": "如果 Ascend 支持 CohereASR 模型，建议在 V2 runner 下验证模型状态初始化的正确性。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "bfe1001ab6d59d7da1f70a3bc107cebaff91f925",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "bugfix",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "fa8c868a3c64994ac0f8b7a0e0bc6d575e378567",
+      "comment": "修复 Llama4 系列模型的 MoE 权重加载。核心问题是 `maybe_remap_moe_expert_param_name()` 函数硬编码了 `mlp.experts.` 路径前缀，但 Llama4 的 MoE 子模块名称为 `feed_forward.experts.`（而非 `mlp.experts.`），导致权重映射失败。修复将匹配路径从 `\".mlp.experts.\"` 泛化为 `\".experts.\"`，并在插入 `routed_experts.` 时使用带 count 参数的 `.replace()` 避免意外替换。同时在 `llama4.py`、`mllama4.py`、`lfm2_moe.py` 三个模型的 `load_weights()` 方法中添加了对该函数的调用。该修复影响 Llama4（文本）、Mllama4（多模态）、LFM2-MoE 三个模型，确保了新的 MoERunner→RoutedExperts 层次结构能正确加载旧格式的 checkpoint。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "model-loading",
+        "layer/moe"
+      ],
+      "ascend_impact": {
+        "ascend_affected": true,
+        "functionality": "Llama4/mllama4/LFM2-MoE 的权重加载修复在 vLLM 核心的 weight_utils.py 和模型实现中。如果 vllm-ascend 在 Ascend NPU 上支持 Llama4 或 mllama4 模型，此修复将自动生效。权重映射函数 `maybe_remap_moe_expert_param_name` 为通用函数，不影响平台特定代码。",
+        "testing": "如果 Ascend 支持 Llama4/mllama4/LFM2-MoE，建议在对应模型上做权重加载的回归测试。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "d1bcb4b44cc3d7bc625d9a3b490c7766f79f400f",
+      "comment": "修复当 tools 列表中包含非 function 类型 tool（如 `WebSearchTool`）时 tool parsing 崩溃的问题。原代码在 `_extract_tool_info()` 中对非 FunctionTool/ChatCompletionToolsParam 类型的 tool 抛出 TypeError，而 `get_json_schema_from_tools()` 和 `find_tool_properties()` 在遍历 tools 时没有跳过非 function tool。修复方案：新增 `_is_function_tool()` 辅助函数，在 `find_tool_properties()` 中跳过非 function tool，在 `_get_json_schema_from_tools()` 中仅用 function tool 构造 JSON schema。新增测试覆盖混合 tool 列表的场景和仅含非 function tool 的场景。这是一个低风险的 API 层修复，不影响推理核心逻辑。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "entrypoints/tool-parser"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "29026682cb29335dcea15d82c14ee18fff40f71d",
+      "comment": "修复由 #41184 引入的 Nemotron 模型精度下降问题。#41184 新增了 `apply_routed_scale_to_output` 参数，当此参数为 True 时，`routed_scaling_factor` 应在 MoE 正向传播的后期阶段（输出时）应用，而不是在前期（gate/router 打分时）就已经缩放。但 `FusedMoE()` 函数将 `routed_scaling_factor` 直接传递给 `MOERunner`，导致双重缩放。本次修复在传递 `routed_scaling_factor` 给 MOERunner 之前，检查 `apply_routed_scale_to_output`：如果为 True，则将 `routed_scaling_factor` 设置为 1.0（即不在 MoERunner 内缩放），让缩放逻辑在输出阶段单独处理。这是一个精确的精度修复，仅影响 `apply_routed_scale_to_output=True` 的模型（如 Nemotron），对其他模型无影响。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "layer/moe",
+        "model/nemotron"
+      ],
+      "ascend_impact": {
+        "ascend_affected": true,
+        "functionality": "FusedMoE 层的 `routed_scaling_factor` 传递逻辑变更——当 `apply_routed_scale_to_output=True` 时，`routed_scaling_factor` 被设为 1.0 而非原值。如果 vllm-ascend 在 Ascend NPU 上支持 Nemotron 或任何使用 `apply_routed_scale_to_output=True` 的 MoE 模型，此修复会修正其精度。修复位于 vLLM 核心的 fused_moe/layer.py 中，所有平台共享此层实现，Ascend 无需额外适配。",
+        "testing": "如果 Ascend 支持 Nemotron 模型，建议在 Ascend NPU 上进行精度（perplexity/logprob）回归验证。",
+        "needs_test_update": false,
+        "suggested_test_areas": [
+          "vllm_ascend/tests/test_nemotron_accuracy.py（如有）"
+        ]
+      }
+    },
+    {
+      "sha": "dc66e01a7040fdfa8287fbfbbf73f9ac46a1b679",
+      "comment": "新增 Marconi-style 混合缓存准入策略（Admission Policy for Hybrid Cache），优化 mamba_align 缓存模式下共享前缀检测。核心变更：(1) `KV Cache Coordinator` 新增 `num_uncached_common_prefix_tokens` 属性，计算逻辑为 `longest_hit_length - hit_length`——即在多注意力组（full attention + mamba_align）的循环迭代中，记录所有组中最长的缓存命中长度与最终命中长度之差，差值即为未缓存的共享前缀长度；(2) `Scheduler._mamba_block_aligned_split()` 新增 `num_uncached_common_prefix_tokens` 参数，当检测到未缓存的共享前缀 >= block_size 且当前调度 token 数大于此前缀时，将 `num_new_tokens` 截断到共享前缀长度（对齐到 block_size 边界），从而优先让共享前缀被缓存，提高后续请求的 cache hit 率；(3) Scheduler.schedule() 中在 `has_mamba_layers` 条件下读取 coordinator 的 `num_uncached_common_prefix_tokens` 并传递给 split 函数；(4) 新增单元测试 `test_hybrid_cache_mamba_align_shared_prefix_detection` 验证前缀检测和调度调整逻辑。该优化在混合模型中通过有意让请求共享前缀先被 cache，可显著提高缓存效率。",
+      "tags": [
+        "feature",
+        "performance",
+        "low-risk",
+        "scheduler",
+        "kv-cache",
+        "hybrid-model"
+      ],
+      "ascend_impact": {
+        "ascend_affected": true,
+        "functionality": "hybrid cache 的 Marconi 准入策略是 vLLM 核心调度器和 KV cache coordinator 的变更。vllm-ascend 如果使用 vLLM 的标准 Scheduler 和 KVCacheCoordinator（即未重写这些组件），将自动受益于此优化。key 变更点为：`KVCacheCoordinator` 新增 `num_uncached_common_prefix_tokens` 属性，`Scheduler._mamba_block_aligned_split()` 新增参数——均为向后兼容的添加，不影响现有代码路径。",
+        "testing": "建议在 Ascend NPU 上运行 hybrid 模型（如带 mamba_align 缓存的模型）时，验证共享前缀检测逻辑在 sched 调度中的行为是否正确，以及 cache hit 率是否有预期提升。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "2ba68d9bf704434c8eb9364fefc4459819347077",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "bugfix",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    }
+  ]
+}

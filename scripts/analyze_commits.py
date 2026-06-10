@@ -381,128 +381,95 @@ def build_prompt(repo, date, commits_data, data_dir, local_repo=None, commit_sub
         if not commits_src:
             return ""
 
-    # Truncate context section if needed (~52KB combined) to leave budget
-    # for patches under Linux MAX_ARG_STRLEN (128KB per single argument).
-    MAX_CONTEXT_BYTES = 20000
-    if len(context_section) > MAX_CONTEXT_BYTES:
-        context_section = context_section[:MAX_CONTEXT_BYTES] + "\n# ... (context truncated, full context available in local repo)"
-
-    # Build commits JSON and measure actual prompt size. If the prompt
-    # exceeds Linux MAX_ARG_STRLEN (128KB per argument), retry with
-    # increasingly aggressive truncation.
+    # Build full commits JSON with complete patches (no truncation needed
+    # since opencode run --file avoids ARG_MAX limitations).
     commits_for_prompt = []
-    SAFETY_LIMIT = 115000
-    truncation_rounds = [
-        # (max_lines, head_tail) — try in order until prompt fits
-        (0, False),       # round 0: no truncation
-        (100, False),     # round 1: head 100 lines
-        (50, False),      # round 2: head 50 lines
-        (20, True),       # round 3: head+tail 10+10
-        (10, True),       # round 4: head+tail 5+5
-    ]
-    prompt = None
-    for round_idx, (max_lines, head_tail) in enumerate(truncation_rounds):
-        commits_for_prompt.clear()
-        for c in commits_src:
-            commit_info = {
-                "sha": c["sha"],
-                "message": c["message"],
-                "author": c.get("author", {}),
-                "stats": c.get("stats", {}),
-                "files": [],
-            }
-            for f in c.get("files", []):
-                patch = f.get("patch", "")
-                if max_lines and patch:
-                    patch_lines = patch.splitlines()
-                    if len(patch_lines) > max_lines:
-                        if head_tail:
-                            half = max_lines // 2
-                            head = "\n".join(patch_lines[:half])
-                            tail = "\n".join(patch_lines[-half:])
-                            patch = f"{head}\n# ... ({len(patch_lines) - max_lines} lines truncated in head+tail) ...\n{tail}"
-                        else:
-                            patch = "\n".join(patch_lines[:max_lines])
-                            patch += f"\n# ... ({len(patch_lines) - max_lines} more lines truncated)"
-                commit_info["files"].append({
-                    "filename": f["filename"],
-                    "status": f["status"],
-                    "additions": f["additions"],
-                    "deletions": f["deletions"],
-                    "patch": patch,
-                })
-            commits_for_prompt.append(commit_info)
+    for c in commits_src:
+        commit_info = {
+            "sha": c["sha"],
+            "message": c["message"],
+            "author": c.get("author", {}),
+            "stats": c.get("stats", {}),
+            "files": [],
+        }
+        for f in c.get("files", []):
+            commit_info["files"].append({
+                "filename": f["filename"],
+                "status": f["status"],
+                "additions": f["additions"],
+                "deletions": f["deletions"],
+                "patch": f.get("patch", ""),
+            })
+        commits_for_prompt.append(commit_info)
 
-        commits_json = json.dumps(commits_for_prompt, ensure_ascii=False, indent=2)
-        prompt = PROMPT_TEMPLATE.format(
-            repo=repo,
-            date=date,
-            commits_json=commits_json,
-            context_section=context_section,
-            source_section=source_section,
-            test_requirement=test_requirement,
-            test_summary_desc=test_summary_desc,
-            test_summary_field=test_summary_field,
-            test_commit_field=test_commit_field,
-            ascend_requirement=ascend_requirement,
-            ascend_summary_desc=ascend_summary_desc,
-            ascend_summary_field=ascend_summary_field,
-            ascend_commit_field=ascend_commit_field,
-        )
-        if round_idx > 0:
-            print(f"  [truncate] round {round_idx}: max_lines={max_lines}, head_tail={head_tail}, prompt_size={len(prompt):,} bytes")
-        if len(prompt) < SAFETY_LIMIT:
-            break
-    else:
-        print(f"  [truncate] WARNING: final round still at {len(prompt):,} bytes, may hit ARG_MAX")
+    commits_json = json.dumps(commits_for_prompt, ensure_ascii=False, indent=2)
+    prompt = PROMPT_TEMPLATE.format(
+        repo=repo,
+        date=date,
+        commits_json=commits_json,
+        context_section=context_section,
+        source_section=source_section,
+        test_requirement=test_requirement,
+        test_summary_desc=test_summary_desc,
+        test_summary_field=test_summary_field,
+        test_commit_field=test_commit_field,
+        ascend_requirement=ascend_requirement,
+        ascend_summary_desc=ascend_summary_desc,
+        ascend_summary_field=ascend_summary_field,
+        ascend_commit_field=ascend_commit_field,
+    )
     return prompt
 
 
 def _minimal_env():
-    """Return a minimal env to free ARG_MAX space for the prompt.
+    """Return a minimal env for the subprocess.
 
     GitHub Actions injects many large env vars (GITHUB_TOKEN, ACTIONS_*,
-    RUNNER_*) that consume significant ARG_MAX budget. We strip all but
-    the essentials reasonix actually needs.
+    RUNNER_*). We keep only the essentials opencode actually needs.
     """
-    keep = {"PATH", "HOME", "USER", "DEEPSEEK_API_KEY", "GITHUB_TOKEN"}
-    stripped_count = 0
-    stripped_bytes = 0
+    keep = {"PATH", "HOME", "USER", "GITHUB_TOKEN"}
     result = {}
     for k, v in os.environ.items():
         if k in keep:
             result[k] = v
-        else:
-            stripped_count += 1
-            stripped_bytes += len(k) + len(v)
-    if stripped_count > 0:
-        print(f"  [env] stripped {stripped_count} vars (~{stripped_bytes:,} bytes) to save ARG_MAX space")
     return result
 
 
-def call_reasonix(prompt, model="deepseek-v4-flash"):
-    """Call Reasonix CLI to analyze commits."""
+def call_opencode(prompt, model="deepseek/deepseek-v4-flash"):
+    """Call opencode CLI to analyze commits.
+
+    Uses opencode run --file to pass the prompt via a file instead of
+    a command-line argument, avoiding ARG_MAX (argument list too long) errors.
+    """
     prompt_bytes = len(prompt.encode("utf-8"))
-    print(f"  [call] prompt size: {prompt_bytes:,} bytes, argv overhead: ~50 bytes")
+    print(f"  [call] prompt size: {prompt_bytes:,} bytes")
     try:
-        cmd = ["reasonix", "run", "--model", model, prompt]
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=600,
-            env=_minimal_env(),
-        )
-        if result.returncode != 0:
-            print(f"reasonix returned non-zero exit code: {result.returncode}")
-            if result.stderr:
-                print(f"stderr: {result.stderr[:500]}")
-        return result.stdout
+        fd, prompt_path = tempfile.mkstemp(suffix=".txt", prefix="opencode_prompt_")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(prompt)
+
+            cmd = ["opencode", "run", "--file", prompt_path, "--model", model]
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=600,
+                env=_minimal_env(),
+            )
+            if result.returncode != 0:
+                print(f"opencode returned non-zero exit code: {result.returncode}")
+                if result.stderr:
+                    print(f"stderr: {result.stderr[:500]}")
+                return None
+            return result.stdout
+        finally:
+            os.unlink(prompt_path)
     except subprocess.TimeoutExpired:
-        print("reasonix call timed out (600s)")
+        print("opencode call timed out (600s)")
         return None
     except FileNotFoundError:
-        print("reasonix CLI not found. Please install it first.")
+        print("opencode CLI not found. Please install it first.")
         return None
 
 
@@ -519,7 +486,7 @@ def extract_json_from_output(output):
         if text.endswith("```"):
             text = text[:-3].strip()
 
-    # Strip Reasonix trailing stats line (from the last "\n— " onwards)
+    # Strip opencode trailing stats line (from the last "\n— " onwards)
     stats_marker = "\n— "
     stats_idx = text.rfind(stats_marker)
     if stats_idx != -1:
@@ -613,7 +580,7 @@ def display_analysis(analysis):
         print(f"  {comment[:200]}{'...' if len(comment) > 200 else ''}")
         ti = ac.get("test_impact")
         if ti:
-            if ti.get("needs_new_test"):
+            if ti.get("needs_test_update"):
                 print(f"  ⚠ 需新增测试: {ti.get('reason', '')[:120]}")
                 print(f"     建议范围: {', '.join(ti.get('suggested_test_areas', []))}")
         ai = ac.get("ascend_impact")
@@ -626,7 +593,7 @@ def display_analysis(analysis):
     print("=" * 60 + "\n")
 
 
-def analyze_commits(repo, date, data_dir, confirm, force, local_repo=None, model="deepseek-v4-flash"):
+def analyze_commits(repo, date, data_dir, confirm, force, local_repo=None, model="deepseek/deepseek-v4-flash"):
     commits_data = load_commits_data(data_dir, repo, date)
     if commits_data is None:
         print(f"No commit data for {repo} on {date}, skipping")
@@ -670,7 +637,7 @@ def analyze_commits(repo, date, data_dir, confirm, force, local_repo=None, model
     if auto_analysis:
         print(f"  ├ {len(auto_analysis)} commits auto-determined (no ascend impact)")
     if llm_shas:
-        print(f"  └ {len(llm_shas)} commits sent to Reasonix for analysis")
+        print(f"  └ {len(llm_shas)} commits sent to opencode for analysis")
 
     # Phase 2: call LLM only for non-triaged commits
     if llm_shas:
@@ -680,15 +647,15 @@ def analyze_commits(repo, date, data_dir, confirm, force, local_repo=None, model
             print("ERROR: empty prompt after subset filter")
             return False
 
-        print("Calling Reasonix...")
-        output = call_reasonix(prompt, model=model)
+        print("Calling opencode...")
+        output = call_opencode(prompt, model=model)
         if output is None:
-            print("Failed to get response from Reasonix")
+            print("Failed to get response from opencode")
             return False
 
         analysis = extract_json_from_output(output)
         if analysis is None:
-            print("Failed to parse JSON from Reasonix output")
+            print("Failed to parse JSON from opencode output")
             print(f"Raw output (first 500 chars): {output[:500]}")
             return False
 
@@ -799,7 +766,7 @@ def main():
     parser.add_argument("--force", action="store_true", help="Force overwrite existing analysis")
     parser.add_argument("--data-dir", default="data", help="Data directory")
     parser.add_argument("--local-repo", default=None, help="Path to local repo source code (auto-detected if not specified)")
-    parser.add_argument("--model", default="deepseek-v4-flash", help="Reasonix model to use (default: deepseek-v4-flash)")
+    parser.add_argument("--model", default="deepseek/deepseek-v4-flash", help="opencode model to use (default: deepseek/deepseek-v4-flash)")
     args = parser.parse_args()
 
     if not args.date and not args.latest and not args.catch_up:

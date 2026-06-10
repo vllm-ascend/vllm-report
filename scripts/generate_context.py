@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Generate architecture context for a vLLM project by walking the local source
-tree and reading key interface files, then asking Reasonix to synthesize
+tree and reading key interface files, then asking opencode to synthesize
 a structured JSON summary.
 
 Execution frequency: weekly is recommended (architecture doesn't change
@@ -226,7 +226,7 @@ def extract_json_from_output(output):
         if text.endswith("```"):
             text = text[:-3].strip()
 
-    # Strip Reasonix trailing stats line
+    # Strip opencode trailing stats line
     stats_marker = "\n— "
     stats_idx = text.rfind(stats_marker)
     if stats_idx != -1:
@@ -250,30 +250,43 @@ def extract_json_from_output(output):
     return None
 
 
-def call_reasonix(prompt, model="deepseek-v4-flash"):
-    """Call Reasonix CLI to analyze architecture."""
+def call_opencode(prompt, model="deepseek/deepseek-v4-flash"):
+    """Call opencode CLI to analyze architecture.
+
+    Uses opencode run --file to pass the prompt via a file instead of
+    a command-line argument, avoiding ARG_MAX errors.
+    """
+    import tempfile
     try:
-        cmd = ["reasonix", "run", "--model", model, prompt]
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=600,
-        )
-        if result.returncode != 0:
-            print(f"reasonix returned non-zero exit code: {result.returncode}")
-            if result.stderr:
-                print(f"stderr: {result.stderr[:500]}")
-        return result.stdout
+        fd, prompt_path = tempfile.mkstemp(suffix=".txt", prefix="opencode_prompt_")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(prompt)
+
+            cmd = ["opencode", "run", "--file", prompt_path, "--model", model]
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=600,
+            )
+            if result.returncode != 0:
+                print(f"opencode returned non-zero exit code: {result.returncode}")
+                if result.stderr:
+                    print(f"stderr: {result.stderr[:500]}")
+                return None
+            return result.stdout
+        finally:
+            os.unlink(prompt_path)
     except subprocess.TimeoutExpired:
-        print("reasonix call timed out (600s)")
+        print("opencode call timed out (600s)")
         return None
     except FileNotFoundError:
-        print("reasonix CLI not found. Please install it first.")
+        print("opencode CLI not found. Please install it first.")
         return None
 
 
-def generate_context(repo, data_dir, force, local_repo=None, model="deepseek-v4-flash"):
+def generate_context(repo, data_dir, force, local_repo=None, model="deepseek/deepseek-v4-flash"):
     repo_dir = os.path.join(data_dir, repo_dir_name(repo))
     context_path = os.path.join(repo_dir, "context", "architecture.json")
 
@@ -311,15 +324,15 @@ def generate_context(repo, data_dir, force, local_repo=None, model="deepseek-v4-
         extra_context=extra,
     )
 
-    print("Calling Reasonix to synthesize architecture summary...")
-    output = call_reasonix(prompt, model=model)
+    print("Calling opencode to synthesize architecture summary...")
+    output = call_opencode(prompt, model=model)
     if output is None:
-        print("Failed to get response from Reasonix")
+        print("Failed to get response from opencode")
         return False
 
     context = extract_json_from_output(output)
     if context is None:
-        print("Failed to parse JSON from Reasonix output")
+        print("Failed to parse JSON from opencode output")
         print(f"Raw output (first 500 chars): {output[:500]}")
         return False
 
@@ -352,8 +365,8 @@ def main():
         help="Path to local repo source code (auto-detected)"
     )
     parser.add_argument(
-        "--model", default="deepseek-v4-flash",
-        help="Reasonix model to use (default: deepseek-v4-flash)"
+        "--model", default="deepseek/deepseek-v4-flash",
+        help="opencode model to use (default: deepseek/deepseek-v4-flash)"
     )
     args = parser.parse_args()
 

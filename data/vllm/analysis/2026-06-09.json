@@ -1,9 +1,9 @@
 {
   "date": "2026-06-09",
   "repo": "vllm-project/vllm",
-  "generated_at": "2026-06-10T09:21:33.578961+08:00",
-  "daily_summary": "当日仅包含一个微小的 Qwen3-Omni 模型 bugfix commit：修复 VIT（视觉 Transformer）编码器中 `cu_seqlens` 张量在 `profile_run` 阶段可能残留在 CPU 上、导致 FlashAttention 3 attention 计算时 device 不匹配而崩溃的问题。",
-  "ascend_impact_summary": "本次变更对 vllm-ascend 无直接影响。变更针对 Qwen3-Omni 模型特有的 VIT encoder 路径，vllm-ascend 目前未适配该模型。修复使用的 `.to(self.device)` 是设备无关 API，理论上也适用于 NPU 场景，但当前无需任何动作。",
+  "generated_at": "2026-06-10T09:26:10.005324+08:00",
+  "daily_summary": "当日仅有一个低风险的 bugfix commit，修复 Qwen3-Omni 多模态模型在 VIT attention 前向过程中 `cu_seqlens` 张量可能留在 CPU 上导致设备不匹配的问题。变更集中在模型注册表中的 Qwen3-Omni-MoE thinker 模型实现，通过添加一行 `cu_seqlens.to(device)` 确保在 profile_run（预热阶段）等场景下张量正确位于计算设备上。该修复对 Ascend NPU 平台无负面影响。",
+  "ascend_impact_summary": "当日变更对 vllm-ascend 无实质影响。修复在共享模型代码中，与平台无关——`.to(self.device)` 在 Ascend 上会正确移至 NPU 设备，是一种无害的通用健壮性改进。vllm-ascend 无需更新测试用例。",
   "commits": [
     {
       "sha": "d3de61502fa685ab03368f8b431a5b8cdf843982",
@@ -22,17 +22,18 @@
     },
     {
       "sha": "540aaf21406bad1eb0f3d5ddc5e835e45ea01e43",
-      "comment": "**变更意图**：修复 Qwen3-Omni 模型 VIT（视觉 Transformer）编码器 forward 过程中的 device 不匹配 bug。在 `profile_run`（模型预热 / profile 阶段）时，`grid_thw`（grid 维度张量）可能位于 CPU 上，导致由其派生出的 `cu_seqlens` 也位于 CPU。但 FlashAttention 3（FA3）的 VIT attention 实现要求 `cu_seqlens` 必须在 CUDA 设备上，从而引发崩溃。\n\n**实现方式**：在将 `cu_seqlens` 传入 attention 层之前，添加一行 `cu_seqlens = cu_seqlens.to(self.device, non_blocking=True)`，显式将其搬运到模型所在设备。使用 `non_blocking=True` 以允许异步传输，避免阻塞计算流。\n\n**潜在风险/评价**：\n- **低风险**：变更极小（3 行新增），逻辑清晰。`.to(device, non_blocking=True)` 是 PyTorch 中标准的张量设备搬运写法，不会对已有正确路径产生影响（若已在正确设备上则近乎零开销）。\n- 该问题在 CUDA Graph capture 或 profile run 等预热阶段尤为常见，因为此阶段的输入可能来自 CPU 端构造的 dummy 数据。\n- 一个更彻底的方案可能是确保 `grid_thw` 在源头就位于正确设备，但当前 fix 作为防御性编程同样合理且更易维护。",
+      "comment": "**变更意图**：修复 Qwen3-Omni-MoE thinker 模型在 VIT（视觉 transformer）attention 前向时 `cu_seqlens` 张量设备不匹配的 bug。具体场景是：在 `profile_run`（模型预热阶段）`grid_thw`（grid temporal-height-width 张量）可能在 CPU 上，经过 `F.pad(cu_seqlens, ...)` 后 `cu_seqlens` 仍留在 CPU 上，而 FlashAttention 3 (FA3) VIT attention 后端要求 `cu_seqlens` 在 CUDA 设备上，导致运行时错误。\n\n**实现方式**：在第 994 行新增 `cu_seqlens = cu_seqlens.to(self.device, non_blocking=True)`，在 VIT attention 接收 `cu_seqlens` 之前将其显式移动到模型所在的计算设备。使用了 `non_blocking=True` 以允许设备间传输与后续计算异步重叠，不引入额外同步开销。该修复位于 `Qwen3OmniMoeThinker` 类的 `forward()` 方法中，紧跟在 `cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)` 之后。\n\n**潜在风险**：极低。3 行纯新增代码，无删除或修改。`.to(device, non_blocking=True)` 是标准 PyTorch 操作——当张量已在目标设备时是空操作；当不在时异步复制。对 `profile_run` 路径和正常推理路径均安全。不会引入回归问题。",
       "tags": [
         "bugfix",
         "low-risk",
-        "model-runner",
-        "multimodal"
+        "model-registry",
+        "multimodal",
+        "attention"
       ],
       "ascend_impact": {
         "ascend_affected": false,
-        "functionality": "无影响。该变更仅涉及 Qwen3-Omni 模型的 VIT encoder 路径（`vllm/model_executor/models/qwen3_omni_moe_thinker.py`）。vllm-ascend 目前没有适配 Qwen3-Omni 模型（其模型定义目录 `vllm_ascend/models/` 仅包含 DeepSeek V4 系列）。修复中使用的 `.to(self.device)` 本身是设备无关 API，若未来 vllm-ascend 支持 Qwen3-Omni，该行代码在 NPU 上也能正确工作（将张量搬运至 NPU 设备）。",
-        "testing": "无影响。没有新增或修改测试用例。",
+        "functionality": "无影响。变更位于共享模型代码（`vllm/model_executor/models/qwen3_omni_moe_thinker.py`），vllm-ascend 直接使用上游模型定义（其在 `vllm_ascend/models/` 中仅有 DeepSeek V4 系列的自定义实现）。`.to(self.device)` 调用是平台无关的——在 Ascend NPU 上会正确将张量移至 NPU 设备，无副作用。该修复对 Ascend 也是健壮性改进。",
+        "testing": "无影响。变更不改变任何行为逻辑或接口签名，仅增加设备兼容性保障。",
         "needs_test_update": false,
         "suggested_test_areas": []
       }

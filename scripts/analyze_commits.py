@@ -381,74 +381,75 @@ def build_prompt(repo, date, commits_data, data_dir, local_repo=None, commit_sub
         if not commits_src:
             return ""
 
-    # Estimate raw patch size to decide if truncation is needed.
-    # After env stripping, ~1MB of ARG_MAX is available for the prompt.
-    # JSON + template overhead roughly doubles the raw patch bytes in the prompt.
-    total_patch_bytes = sum(
-        len(f.get("patch", ""))
-        for c in commits_src
-        for f in c.get("files", [])
-    )
-    if total_patch_bytes > 600000:
-        # Keep head + tail (half each) so AI sees both the entry point
-        # and the closing context of each changed function.
-        max_patch_lines = 100
-        trunc_head_tail = True
-    elif total_patch_bytes > 350000:
-        max_patch_lines = 150
-        trunc_head_tail = False
-    else:
-        max_patch_lines = 0  # no truncation
-        trunc_head_tail = False
-
+    # Build commits JSON and measure actual prompt size. If the prompt
+    # exceeds the safe limit (~800KB leaving room for argv + minimal env
+    # under 1MB ARG_MAX), retry with increasingly aggressive truncation.
     commits_for_prompt = []
-    for c in commits_src:
-        commit_info = {
-            "sha": c["sha"],
-            "message": c["message"],
-            "author": c.get("author", {}),
-            "stats": c.get("stats", {}),
-            "files": [],
-        }
-        for f in c.get("files", []):
-            patch = f.get("patch", "")
-            if max_patch_lines and patch:
-                patch_lines = patch.splitlines()
-                if len(patch_lines) > max_patch_lines:
-                    if trunc_head_tail:
-                        half = max_patch_lines // 2
-                        head = "\n".join(patch_lines[:half])
-                        tail = "\n".join(patch_lines[-half:])
-                        patch = f"{head}\n# ... ({len(patch_lines) - max_patch_lines} lines truncated in head+tail) ...\n{tail}"
-                    else:
-                        patch = "\n".join(patch_lines[:max_patch_lines])
-                        patch += f"\n# ... ({len(patch_lines) - max_patch_lines} more lines truncated)"
-            commit_info["files"].append({
-                "filename": f["filename"],
-                "status": f["status"],
-                "additions": f["additions"],
-                "deletions": f["deletions"],
-                "patch": patch,
-            })
-        commits_for_prompt.append(commit_info)
+    truncation_rounds = [
+        # (max_lines, head_tail) — try in order until prompt fits
+        (0, False),       # round 0: no truncation
+        (200, False),     # round 1: head 200 lines
+        (100, True),      # round 2: head+tail 50+50
+        (40, True),       # round 3: head+tail 20+20
+    ]
+    # SAFETY_LIMIT: max prompt bytes leaving ~200KB headroom under 1MB ARG_MAX
+    # for argv (~50B) + minimal env (~5KB) + kernel overhead.
+    SAFETY_LIMIT = 800000
+    prompt = None
+    for round_idx, (max_lines, head_tail) in enumerate(truncation_rounds):
+        commits_for_prompt.clear()
+        for c in commits_src:
+            commit_info = {
+                "sha": c["sha"],
+                "message": c["message"],
+                "author": c.get("author", {}),
+                "stats": c.get("stats", {}),
+                "files": [],
+            }
+            for f in c.get("files", []):
+                patch = f.get("patch", "")
+                if max_lines and patch:
+                    patch_lines = patch.splitlines()
+                    if len(patch_lines) > max_lines:
+                        if head_tail:
+                            half = max_lines // 2
+                            head = "\n".join(patch_lines[:half])
+                            tail = "\n".join(patch_lines[-half:])
+                            patch = f"{head}\n# ... ({len(patch_lines) - max_lines} lines truncated in head+tail) ...\n{tail}"
+                        else:
+                            patch = "\n".join(patch_lines[:max_lines])
+                            patch += f"\n# ... ({len(patch_lines) - max_lines} more lines truncated)"
+                commit_info["files"].append({
+                    "filename": f["filename"],
+                    "status": f["status"],
+                    "additions": f["additions"],
+                    "deletions": f["deletions"],
+                    "patch": patch,
+                })
+            commits_for_prompt.append(commit_info)
 
-    commits_json = json.dumps(commits_for_prompt, ensure_ascii=False, indent=2)
-
-    prompt = PROMPT_TEMPLATE.format(
-        repo=repo,
-        date=date,
-        commits_json=commits_json,
-        context_section=context_section,
-        source_section=source_section,
-        test_requirement=test_requirement,
-        test_summary_desc=test_summary_desc,
-        test_summary_field=test_summary_field,
-        test_commit_field=test_commit_field,
-        ascend_requirement=ascend_requirement,
-        ascend_summary_desc=ascend_summary_desc,
-        ascend_summary_field=ascend_summary_field,
-        ascend_commit_field=ascend_commit_field,
-    )
+        commits_json = json.dumps(commits_for_prompt, ensure_ascii=False, indent=2)
+        prompt = PROMPT_TEMPLATE.format(
+            repo=repo,
+            date=date,
+            commits_json=commits_json,
+            context_section=context_section,
+            source_section=source_section,
+            test_requirement=test_requirement,
+            test_summary_desc=test_summary_desc,
+            test_summary_field=test_summary_field,
+            test_commit_field=test_commit_field,
+            ascend_requirement=ascend_requirement,
+            ascend_summary_desc=ascend_summary_desc,
+            ascend_summary_field=ascend_summary_field,
+            ascend_commit_field=ascend_commit_field,
+        )
+        if round_idx > 0:
+            print(f"  [truncate] round {round_idx}: max_lines={max_lines}, head_tail={head_tail}, prompt_size={len(prompt):,} bytes")
+        if len(prompt) < SAFETY_LIMIT:
+            break
+    else:
+        print(f"  [truncate] WARNING: final round still at {len(prompt):,} bytes, may hit ARG_MAX")
     return prompt
 
 

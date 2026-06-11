@@ -34,12 +34,12 @@ def repo_dir_name(repo):
     return repo.split("/")[-1]
 
 
-def ensure_repo(repo, local_path=None, project_dir=None):
+def ensure_repo(repo, local_path=None, project_dir=None, branch="main"):
     local = resolve_local_repo(repo, local_path, project_dir)
     if local is None:
         return None
 
-    pull_repo(local, repo)
+    pull_repo(local, repo, branch)
     return local
 
 
@@ -86,14 +86,14 @@ def resolve_local_repo(repo, local_path=None, project_dir=None):
     return None
 
 
-def pull_repo(local_path, repo):
+def pull_repo(local_path, repo, branch="main"):
     print(f"Pulling latest changes for {repo} at {local_path}...")
 
     upstream = _find_upstream_remote(local_path, repo)
 
     try:
         result = subprocess.run(
-            ["git", "pull", "--ff-only", upstream, "main"],
+            ["git", "pull", "--ff-only", upstream, branch],
             cwd=local_path,
             capture_output=True,
             text=True,

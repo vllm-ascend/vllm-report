@@ -106,7 +106,7 @@ def tag_html(tags):
 def load_commit_files(repo, date_str):
     """Load full commit data with file lists for a date."""
     repo_dir = repo_dir_name(repo)
-    data = load_json(f"{DATA_DIR}/{repo_dir}/commits/{date_str}.json")
+    data = load_json(f"{data_dir}/{repo_dir}/commits/{date_str}.json")
     if not data:
         return {}
     files_by_sha = {}
@@ -115,7 +115,7 @@ def load_commit_files(repo, date_str):
     return files_by_sha
 
 
-def build_html(repos, date_str):
+def build_html(repos, date_str, data_dir="data"):
     ps = []
     ps.append(f"""<!DOCTYPE html><html><head><meta charset="utf-8"><style>{CSS}</style></head><body>
 <div class="container">
@@ -124,7 +124,7 @@ def build_html(repos, date_str):
     any_data = False
     for repo in repos:
         repo_dir = repo_dir_name(repo)
-        analysis = load_json(f"{DATA_DIR}/{repo_dir}/analysis/{date_str}.json")
+        analysis = load_json(f"{data_dir}/{repo_dir}/analysis/{date_str}.json")
         files_map = load_commit_files(repo, date_str)
         short = repo.split("/")[-1]
         is_vllm = "ascend" not in repo
@@ -165,8 +165,8 @@ def build_html(repos, date_str):
         for i, c in enumerate(commits):
             tags = c.get("tags", [])
             comment = c.get("comment", "")
-            sha = c["sha"][:12]
-            sha_full = c["sha"]
+            sha = c.get("sha", "")[:12]
+            sha_full = c.get("sha", "")
             is_high_risk = "high-risk" in tags
             is_ascend = c.get("ascend_impact",{}).get("ascend_affected") is True
             is_auto = "自动判定" in comment
@@ -249,9 +249,9 @@ def build_html(repos, date_str):
             ps.append(f"""<div style="margin-top:12px;padding-top:12px;border-top:1px solid #e2e8f0;"><div style="font-size:11px;color:#718096;margin-bottom:6px;">Hot modules</div>{"".join(rows)}</div>""")
 
         # ── Coverage ──
-        commits_idx = load_json(f"{DATA_DIR}/{repo_dir}/dates.json")
-        analysis_idx = load_json(f"{DATA_DIR}/{repo_dir}/analysis-dates.json")
-        if commits_idx and analysis_idx:
+        commits_idx = load_json(f"{data_dir}/{repo_dir}/dates.json") or {}
+        analysis_idx = load_json(f"{data_dir}/{repo_dir}/analysis-dates.json") or {}
+        if commits_idx.get("dates") and analysis_idx.get("dates"):
             all_d = set(commits_idx.get("dates", []))
             done_d = set(analysis_idx.get("dates", []))
             analyzed = len(all_d & done_d)
@@ -317,12 +317,16 @@ def send_email(subject, html_body):
 
 
 def main():
-    repos = ["vllm-project/vllm", "vllm-project/vllm-ascend"]
-    date_str = datetime.now(TZ_CN).strftime("%Y-%m-%d")
-    if len(sys.argv) > 1:
-        date_str = sys.argv[1]
+    import argparse
+    parser = argparse.ArgumentParser(description="Send daily analysis report via email")
+    parser.add_argument("date", nargs="?", default=None, help="Date (YYYY-MM-DD), defaults to today")
+    parser.add_argument("--data-dir", default="data", help="Data directory")
+    args = parser.parse_args()
 
-    html = build_html(repos, date_str)
+    repos = ["vllm-project/vllm", "vllm-project/vllm-ascend"]
+    date_str = args.date or datetime.now(TZ_CN).strftime("%Y-%m-%d")
+
+    html = build_html(repos, date_str, data_dir=args.data_dir)
     print(html[:500] + "...")
     subject = f"vLLM Report — {date_str}"
     send_email(subject, html)

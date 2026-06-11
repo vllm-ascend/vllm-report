@@ -6,6 +6,7 @@ Run this after fixing the fetch_commits bug to clean up stale data.
 import json
 import os
 import sys
+import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from source_repo import repo_dir_name
@@ -57,9 +58,15 @@ def clean_stale_data(data_dir, repo):
 
     dates_path = os.path.join(repo_dir, "dates.json")
     kept = sorted(kept_dates)
-    with open(dates_path, "w") as fh:
-        json.dump({"dates": kept}, fh, indent=2)
-    print(f"Cleaned {removed} stale files for {repo}, {len(kept)} dates kept")
+    fd, tmp_path = tempfile.mkstemp(dir=repo_dir, suffix=".json")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump({"dates": kept}, fh, indent=2)
+        os.replace(tmp_path, dates_path)
+    except Exception:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        raise
     return removed
 
 

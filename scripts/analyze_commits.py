@@ -549,7 +549,7 @@ def validate_analysis(analysis, commits_data, repo):
             errors.append(f"Commit {ac['sha'][:8]} missing field: tags")
 
         ti = ac.get("test_impact")
-        if ti:
+        if ti is not None and not is_vllm:
             if "needs_test_update" not in ti:
                 errors.append(f"Commit {ac['sha'][:8]} test_impact missing 'needs_test_update'")
             if "reason" not in ti:

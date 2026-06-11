@@ -7,6 +7,7 @@ Call after analysis completes.
 import json
 import os
 import sys
+import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from source_repo import repo_dir_name
@@ -26,8 +27,15 @@ def update_analysis_index(data_dir, repo):
     )
 
     idx_path = os.path.join(repo_dir, "analysis-dates.json")
-    with open(idx_path, "w") as fh:
-        json.dump({"dates": dates}, fh, indent=2)
+    fd, tmp_path = tempfile.mkstemp(dir=repo_dir, suffix=".json")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump({"dates": dates}, fh, indent=2)
+        os.replace(tmp_path, idx_path)
+    except Exception:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        raise
 
 
 def main():

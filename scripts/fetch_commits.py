@@ -35,16 +35,25 @@ def github_request(url, token, params=None):
                 url, headers=headers, params=params, timeout=REQUEST_TIMEOUT
             )
 
-            remaining = int(resp.headers.get("X-RateLimit-Remaining", 5000))
-            if remaining < 100:
-                reset_time = int(resp.headers.get("X-RateLimit-Reset", 0))
-                wait_seconds = max(reset_time - int(time.time()), 0) + 5
-                print(f"Rate limit low ({remaining} remaining), waiting {wait_seconds}s")
-                time.sleep(wait_seconds)
-                continue
+            remaining_str = resp.headers.get("X-RateLimit-Remaining")
+            if remaining_str:
+                remaining = int(remaining_str)
+                if remaining < 100:
+                    reset_str = resp.headers.get("X-RateLimit-Reset", "0")
+                    reset_time = int(reset_str) if reset_str else 0
+                    wait_seconds = max(reset_time - int(time.time()), 0) + 5
+                    print(f"Rate limit low ({remaining} remaining), waiting {wait_seconds}s")
+                    time.sleep(wait_seconds)
+                    continue
 
             if resp.status_code == 200:
                 return resp.json()
+            elif resp.status_code in (403, 429):
+                retry_after_str = resp.headers.get("Retry-After")
+                retry_after = int(retry_after_str) if retry_after_str else RETRY_DELAYS[attempt]
+                print(f"Rate limited (HTTP {resp.status_code}), retrying after {retry_after}s")
+                time.sleep(retry_after)
+                continue
             elif resp.status_code == 404:
                 print(f"Resource not found: {url}")
                 return None
@@ -87,12 +96,12 @@ def get_commits_list(repo, branch, token, since_sha=None):
 
         if since_sha and len(commits) < PER_PAGE:
             print(f"Warning: anchor commit not found within {MAX_PAGES} pages, resetting anchor")
-            return []
+            return None
 
         page += 1
 
     print("Warning: anchor not found, resetting")
-    return []
+    return None
 
 def get_commit_detail(repo, sha, token):
     return github_request(f"{GITHUB_API}/repos/{repo}/commits/{sha}", token)
@@ -111,6 +120,8 @@ def parse_commit_brief(commit_item):
         "date": commit_author.get("date", ""),
         "message": commit_data.get("message", ""),
         "parents": [p["sha"] for p in commit_item.get("parents", [])],
+        "stats": {},
+        "files": [],
     }
 
 
@@ -206,7 +217,7 @@ def merge_commits(existing_commits, new_commits):
         if c["sha"] not in existing_shas:
             merged.append(c)
             existing_shas.add(c["sha"])
-    merged.sort(key=lambda x: x["date"], reverse=True)
+    merged.sort(key=lambda x: x.get("date", ""), reverse=True)
     return merged
 
 
@@ -413,7 +424,7 @@ def fetch_commits_from_local(local_repo, branch, data_dir, repo, since_sha=None)
     if since_sha:
         range_spec = f"{since_sha}..HEAD"
     else:
-        range_spec = f"HEAD"
+        range_spec = "--root"
 
     try:
         result = subprocess.run(
@@ -461,7 +472,7 @@ def refresh_date_commits(local_repo, repo, date, data_dir, branch, token):
             after = f"{date}T00:00:00+08:00"
             before = f"{date}T23:59:59+08:00"
             result = subprocess.run(
-                ["git", "log", "--format=%H", "--after", after, "--before", before, "main"],
+                ["git", "log", "--format=%H", "--after", after, "--before", before, branch],
                 cwd=local_repo,
                 capture_output=True,
                 text=True,
@@ -520,6 +531,9 @@ def fetch_commits(repo, branch, data_dir, token, local_repo=None):
     meta = load_json(meta_path)
 
     since_sha = meta.get("last_commit_sha") if meta else None
+    # Empty string anchor is equivalent to no anchor
+    if since_sha == "":
+        since_sha = None
 
     if not since_sha:
         os.makedirs(repo_dir, exist_ok=True)
@@ -573,6 +587,17 @@ def fetch_commits(repo, branch, data_dir, token, local_repo=None):
 
     if commits_detail is None:
         commits_list = get_commits_list(repo, branch, token, since_sha=since_sha)
+        if commits_list is None:
+            # Anchor not found — reset and start fresh
+            print("Anchor commit not found in history, resetting meta.json anchor")
+            since_sha = None
+            save_json_atomic(meta_path, {
+                "repo": repo,
+                "branch": branch,
+                "last_commit_sha": "",
+                "last_fetch_time": datetime.now(TZ_CN).isoformat(),
+            })
+            return
         if not commits_list:
             print("No new commits found")
             return
@@ -628,7 +653,7 @@ def main():
     if args.api_only:
         local_repo = None
     else:
-        local_repo = ensure_repo(args.repo, args.local_repo, project_dir)
+        local_repo = ensure_repo(args.repo, args.local_repo, project_dir, branch=args.branch)
 
     if args.refresh_date:
         refresh_date_commits(local_repo, args.repo, args.refresh_date, args.data_dir, args.branch, token)

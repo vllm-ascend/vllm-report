@@ -426,8 +426,12 @@
     // Italic *text* or _text_ (single, but not inside words)
     s = s.replace(/\*([^*\n]+)\*/g, '<em>$1</em>');
     s = s.replace(/(?<![:\w])_([^_\n]+)_(?![:\w])/g, '<em>$1</em>');
-    // Links [text](url)
-    s = s.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank">$1</a>');
+    // Links [text](url) — sanitize to http/https only
+    s = s.replace(/\[([^\]]+)\]\(([^)]+)\)/g, function (_, text, url) {
+      url = url.trim();
+      if (!url.startsWith('http://') && !url.startsWith('https://')) return text;
+      return '<a href="' + escapeHtml(url) + '" target="_blank">' + text + '</a>';
+    });
     // ### headings
     s = s.replace(/^### (.+)$/gm, '<h4>$1</h4>');
     s = s.replace(/^## (.+)$/gm, '<h3>$1</h3>');
@@ -728,6 +732,7 @@
         const idx = availableDates.indexOf(date);
         if (idx !== -1) {
           currentDateIndex = idx;
+          dateOffset = 0;
           loadDate(date);
         }
         return;

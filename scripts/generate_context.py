@@ -269,6 +269,7 @@ def call_opencode(prompt, model="deepseek/deepseek-v4-flash"):
                 capture_output=True,
                 text=True,
                 timeout=600,
+                env=_minimal_env(),
             )
             if result.returncode != 0:
                 print(f"opencode returned non-zero exit code: {result.returncode}")

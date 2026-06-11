@@ -4,8 +4,9 @@ import json
 import os
 import re
 import sys
-import subprocess
 import tempfile
+import urllib.request
+import urllib.error
 from datetime import datetime, timezone, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -48,7 +49,7 @@ PROMPT_TEMPLATE = """你是一个代码变更分析专家。请对以下 commit 
 7. {ascend_summary_desc}
 
 ## 输出格式
-严格输出以下 JSON 格式，不要输出任何其他内容：
+严格输出以下 JSON 格式，不要输出任何其他内容，不要使用文件写入工具，直接在回复中输出 JSON：
 ```json
 {{
   "date": "{date}",
@@ -369,8 +370,7 @@ def build_prompt(repo, date, commits_data, data_dir, local_repo=None, commit_sub
     if local_repo:
         source_section = (
             f"该项目的源码位于本地路径：{local_repo}\n"
-            f"如果你对某个 commit 的变更不确定，请走读该路径下的源码来理解上下文，不要硬猜。\n"
-            f"可以使用文件读取工具查看 {local_repo} 下的任何文件。"
+            f"如果你对某个 commit 的变更不确定，请参考上述 patch 内容进行分析，不要硬猜。"
         )
     else:
         source_section = "（本地源码不可用，如对变更不确定请标注\"不确定\"）"
@@ -381,8 +381,7 @@ def build_prompt(repo, date, commits_data, data_dir, local_repo=None, commit_sub
         if not commits_src:
             return ""
 
-    # Build full commits JSON with complete patches (no truncation needed
-    # since opencode run --file avoids ARG_MAX limitations).
+    # Build full commits JSON with complete patches.
     commits_for_prompt = []
     for c in commits_src:
         commit_info = {
@@ -421,55 +420,71 @@ def build_prompt(repo, date, commits_data, data_dir, local_repo=None, commit_sub
     return prompt
 
 
-def _minimal_env():
-    """Return a minimal env for the subprocess.
-
-    GitHub Actions injects many large env vars (GITHUB_TOKEN, ACTIONS_*,
-    RUNNER_*). We keep only the essentials opencode actually needs.
-    """
-    keep = {"PATH", "HOME", "USER", "GITHUB_TOKEN"}
-    result = {}
-    for k, v in os.environ.items():
-        if k in keep:
-            result[k] = v
-    return result
+DEFAULT_API_BASE = "https://api.deepseek.com/v1"
 
 
-def call_opencode(prompt, model="deepseek/deepseek-v4-flash"):
-    """Call opencode CLI to analyze commits.
+def call_llm(prompt):
+    """Call the LLM API directly via environment variables.
 
-    Uses opencode run --file to pass the prompt via a file instead of
-    a command-line argument, avoiding ARG_MAX (argument list too long) errors.
+    Required env var:
+      LLM_API_KEY  — API key (e.g. DeepSeek sk-xxx)
+
+    Optional env vars:
+      LLM_API_BASE  — API base URL (default: {DEFAULT_API_BASE})
+      LLM_MODEL     — model name sent to API (default: "deepseek-chat")
     """
     prompt_bytes = len(prompt.encode("utf-8"))
     print(f"  [call] prompt size: {prompt_bytes:,} bytes")
-    try:
-        fd, prompt_path = tempfile.mkstemp(suffix=".txt", prefix="opencode_prompt_")
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write(prompt)
 
-            cmd = ["opencode", "run", "--file", prompt_path, "--model", model]
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=600,
-                env=_minimal_env(),
-            )
-            if result.returncode != 0:
-                print(f"opencode returned non-zero exit code: {result.returncode}")
-                if result.stderr:
-                    print(f"stderr: {result.stderr[:500]}")
-                return None
-            return result.stdout
-        finally:
-            os.unlink(prompt_path)
-    except subprocess.TimeoutExpired:
-        print("opencode call timed out (600s)")
+    api_key = os.environ.get("LLM_API_KEY")
+    if not api_key:
+        print("Error: LLM_API_KEY environment variable not set")
         return None
-    except FileNotFoundError:
-        print("opencode CLI not found. Please install it first.")
+
+    api_base = os.environ.get("LLM_API_BASE", DEFAULT_API_BASE).rstrip("/")
+    api_model = os.environ.get("LLM_MODEL", "deepseek-chat")
+
+    endpoint = f"{api_base}/chat/completions"
+    body = json.dumps({
+        "model": api_model,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.1,
+        "max_tokens": 16384,
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        endpoint,
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=600) as resp:
+            result = json.loads(resp.read())
+        content = result["choices"][0]["message"]["content"]
+        if not content or not content.strip():
+            print("LLM returned empty response")
+            return None
+        return content
+    except urllib.error.HTTPError as e:
+        print(f"API HTTP error: {e.code} {e.reason}")
+        try:
+            detail = e.read().decode("utf-8")
+            print(f"  Response: {detail[:300]}")
+        except Exception:
+            pass
+        return None
+    except urllib.error.URLError as e:
+        print(f"API connection error: {e.reason}")
+        return None
+    except json.JSONDecodeError as e:
+        print(f"API returned invalid JSON: {e}")
+        return None
+    except KeyError as e:
+        print(f"Unexpected API response format (missing {e})")
         return None
 
 
@@ -486,7 +501,7 @@ def extract_json_from_output(output):
         if text.endswith("```"):
             text = text[:-3].strip()
 
-    # Strip opencode trailing stats line (from the last "\n— " onwards)
+    # Strip trailing stats line (from the last "\n- " onwards)
     stats_marker = "\n— "
     stats_idx = text.rfind(stats_marker)
     if stats_idx != -1:
@@ -593,7 +608,7 @@ def display_analysis(analysis):
     print("=" * 60 + "\n")
 
 
-def analyze_commits(repo, date, data_dir, confirm, force, local_repo=None, model="deepseek/deepseek-v4-flash"):
+def analyze_commits(repo, date, data_dir, confirm, force, local_repo=None):
     commits_data = load_commits_data(data_dir, repo, date)
     if commits_data is None:
         print(f"No commit data for {repo} on {date}, skipping")
@@ -637,7 +652,7 @@ def analyze_commits(repo, date, data_dir, confirm, force, local_repo=None, model
     if auto_analysis:
         print(f"  ├ {len(auto_analysis)} commits auto-determined (no ascend impact)")
     if llm_shas:
-        print(f"  └ {len(llm_shas)} commits sent to opencode for analysis")
+        print(f"  └ {len(llm_shas)} commits sent to LLM for analysis")
 
     # Phase 2: call LLM only for non-triaged commits
     if llm_shas:
@@ -647,16 +662,43 @@ def analyze_commits(repo, date, data_dir, confirm, force, local_repo=None, model
             print("ERROR: empty prompt after subset filter")
             return False
 
-        print("Calling opencode...")
-        output = call_opencode(prompt, model=model)
+        print("Calling LLM...")
+        output = call_llm(prompt)
         if output is None:
-            print("Failed to get response from opencode")
+            print("Failed to get response from LLM")
             return False
 
         analysis = extract_json_from_output(output)
         if analysis is None:
-            print("Failed to parse JSON from opencode output")
-            print(f"Raw output (first 500 chars): {output[:500]}")
+            print("Failed to parse JSON from LLM output")
+            # Show diagnostic info about the output
+            print(f"Output length: {len(output)} chars")
+            print(f"First 100 chars: {output[:100]!r}")
+            print(f"Last 100 chars: {output[-100:]!r}")
+            # Save full output to a file for inspection
+            dump_path = os.path.join(data_dir, "llm_raw_output.txt")
+            try:
+                with open(dump_path, "w", encoding="utf-8") as f:
+                    f.write(output)
+                print(f"Full raw output saved to: {dump_path}")
+            except OSError:
+                print("(could not save raw output to file)")
+
+            # Fallback: LLM agent may have written the JSON to a file
+            # instead of outputting it to stdout. Check for it.
+            fallback_path = os.path.join(data_dir, "_llm_result.json")
+            if os.path.exists(fallback_path):
+                print(f"Trying fallback: reading {fallback_path}...")
+                try:
+                    with open(fallback_path, "r", encoding="utf-8") as f:
+                        analysis = json.load(f)
+                    # Remove the fallback file so it doesn't accumulate
+                    os.unlink(fallback_path)
+                except (json.JSONDecodeError, OSError) as e:
+                    print(f"Fallback also failed: {e}")
+                    analysis = None
+
+        if analysis is None:
             return False
 
         errors = validate_analysis(analysis, commits_data, repo)
@@ -754,7 +796,7 @@ def get_unanalyzed_dates(data_dir, repo):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Analyze commits using opencode CLI")
+    parser = argparse.ArgumentParser(description="Analyze commits using LLM")
     parser.add_argument(
         "--repo", action="append", required=True,
         help="GitHub repo (owner/repo), can specify multiple times"
@@ -766,7 +808,6 @@ def main():
     parser.add_argument("--force", action="store_true", help="Force overwrite existing analysis")
     parser.add_argument("--data-dir", default="data", help="Data directory")
     parser.add_argument("--local-repo", default=None, help="Path to local repo source code (auto-detected if not specified)")
-    parser.add_argument("--model", default="deepseek/deepseek-v4-flash", help="opencode model to use (default: deepseek/deepseek-v4-flash)")
     args = parser.parse_args()
 
     if not args.date and not args.latest and not args.catch_up:
@@ -802,7 +843,7 @@ def main():
 
         for date in dates_to_analyze:
             print(f"\n--- Analyzing {repo} / {date} ---")
-            result = analyze_commits(repo, date, args.data_dir, args.confirm, args.force, local_repo=local_repo, model=args.model)
+            result = analyze_commits(repo, date, args.data_dir, args.confirm, args.force, local_repo=local_repo)
             if not result:
                 success = False
 

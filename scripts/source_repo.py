@@ -196,3 +196,5 @@ def get_current_sha(local_path):
     except Exception:
         pass
     return None
+
+

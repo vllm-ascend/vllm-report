@@ -5,8 +5,8 @@ Daily commit monitor and AI analysis for [vllm](https://github.com/vllm-project/
 ## Features
 
 - **Daily Commit Fetching** — Automatically fetches new commits (with full diff) via GitHub Actions at 08:00 CST every day
-- **AI Analysis** — Analyzes each commit for intent, risk, test impact, and cross-project (vllm → vllm-ascend) impact via opencode CLI
-- **Architecture Context Cache** — Weekly auto-generated project architecture summaries injected into AI analysis prompts, reducing token waste
+- **AI Analysis** — Analyzes each commit for intent, risk, test impact, and cross-project (vllm → vllm-ascend) impact via LLM API (DeepSeek)
+- **Architecture Context Cache** — Weekly auto-generated project architecture summaries injected into AI analysis prompts, improving accuracy and reducing token waste
 - **Static Web Dashboard** — Dark-themed monitor page with commit list, diff viewer, AI analysis overlay, and tag-based filtering
 - **Local Source Code Support** — Can read local vllm/vllm-ascend repos to fetch commits via `git log` instead of GitHub API
 
@@ -15,7 +15,7 @@ Daily commit monitor and AI analysis for [vllm](https://github.com/vllm-project/
 ```
 vllm-report/
 ├── .github/workflows/
-│   ├── daily-commit.yml       # Daily fetch + optional AI analysis
+│   ├── daily-commit.yml       # Daily fetch + AI analysis
 │   └── pages.yml              # GitHub Pages deployment
 ├── data/
 │   ├── vllm/
@@ -28,8 +28,8 @@ vllm-report/
 ├── scripts/
 │   ├── source_repo.py         # Local repo discovery/pull/clone
 │   ├── fetch_commits.py       # Fetch commit data
-│   ├── analyze_commits.py     # AI analysis via opencode
-│   └── generate_context.py    # Generate architecture context
+│   ├── analyze_commits.py     # AI analysis via LLM API
+│   └── generate_context.py    # Generate architecture context via LLM API
 ├── site/
 │   ├── index.html
 │   ├── style.css
@@ -60,7 +60,16 @@ Local repo discovery order:
 2. Common paths: `~/code/vllm`, `~/projects/vllm`, etc.
 3. Auto-clone to `repos/` directory
 
-### 2. Generate Architecture Context
+### 2. Set Up LLM API Key
+
+```bash
+export LLM_API_KEY="sk-你的DeepSeekAPIKey"
+# Optional overrides:
+# export LLM_API_BASE="https://api.deepseek.com/v1"
+# export LLM_MODEL="deepseek-chat"
+```
+
+### 3. Generate Architecture Context
 
 ```bash
 # Generate for the first time
@@ -73,9 +82,9 @@ python scripts/generate_context.py --repo vllm-project/vllm --force
 python scripts/generate_context.py --repo vllm-project/vllm --repo vllm-project/vllm-ascend --force
 ```
 
-This calls opencode to read the project source code and produces `data/{repo}/context/architecture.json`, which is used by the analysis script to avoid blind guessing.
+This reads the project source code and produces `data/{repo}/context/architecture.json`, which is used by the analysis script to avoid blind guessing.
 
-### 3. Run AI Analysis
+### 4. Run AI Analysis
 
 ```bash
 # Analyze all unanalyzed dates (default)
@@ -91,7 +100,7 @@ python scripts/analyze_commits.py --repo vllm-project/vllm --confirm
 python scripts/analyze_commits.py --repo vllm-project/vllm --force
 ```
 
-### 4. View Dashboard
+### 5. View Dashboard
 
 Open `site/index.html` locally, or deploy via GitHub Pages (auto-deployed when `site/` or `data/` changes).
 
@@ -101,14 +110,10 @@ Open `site/index.html` locally, or deploy via GitHub Pages (auto-deployed when `
 
 | Secret | Description |
 |--------|-------------|
+| `DEEPSEEK_API_KEY` | API key for DeepSeek (or your LLM provider) |
 | `GITHUB_TOKEN` | Default token (auto-provided) |
-| `OPENCODE_API_KEY` | Required only if `ENABLE_AI_ANALYSIS` is enabled |
 
-### Required Variables
-
-| Variable | Description |
-|----------|-------------|
-| `ENABLE_AI_ANALYSIS` | Set to `true` to enable the AI analysis steps |
+Analysis runs unconditionally when commits exist — no feature flag needed.
 
 ### GitHub Pages
 

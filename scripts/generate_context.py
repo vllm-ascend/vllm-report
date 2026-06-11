@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Generate architecture context for a vLLM project by walking the local source
-tree and reading key interface files, then asking opencode to synthesize
+tree and reading key interface files, then using an LLM to synthesize
 a structured JSON summary.
 
 Execution frequency: weekly is recommended (architecture doesn't change
@@ -10,8 +10,9 @@ daily, but vLLM evolves fast enough that monthly would miss things).
 import argparse
 import json
 import os
-import subprocess
 import sys
+import urllib.request
+import urllib.error
 from datetime import datetime, timezone, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -88,7 +89,7 @@ CONTEXT_PROMPT_TEMPLATE = """你是一个资深代码架构分析师。请根据
 {extra_context}
 
 ## 输出格式
-输出 JSON 格式，不要输出其他内容：
+输出 JSON 格式，不要输出其他内容，不要使用文件写入工具，直接在回复中输出 JSON：
 ```json
 {{
   "repo": "{repo}",
@@ -226,7 +227,7 @@ def extract_json_from_output(output):
         if text.endswith("```"):
             text = text[:-3].strip()
 
-    # Strip opencode trailing stats line
+    # Strip trailing stats line
     stats_marker = "\n— "
     stats_idx = text.rfind(stats_marker)
     if stats_idx != -1:
@@ -250,44 +251,75 @@ def extract_json_from_output(output):
     return None
 
 
-def call_opencode(prompt, model="deepseek/deepseek-v4-flash"):
-    """Call opencode CLI to analyze architecture.
+DEFAULT_API_BASE = "https://api.deepseek.com/v1"
 
-    Uses opencode run --file to pass the prompt via a file instead of
-    a command-line argument, avoiding ARG_MAX errors.
+
+def call_llm(prompt):
+    """Call the LLM API directly via environment variables.
+
+    Required env var:
+      LLM_API_KEY  — API key (e.g. DeepSeek sk-xxx)
+
+    Optional env vars:
+      LLM_API_BASE  — API base URL (default: {DEFAULT_API_BASE})
+      LLM_MODEL     — model name sent to API (default: "deepseek-chat")
     """
-    import tempfile
+    prompt_bytes = len(prompt.encode("utf-8"))
+    print(f"  [call] prompt size: {prompt_bytes:,} bytes")
+
+    api_key = os.environ.get("LLM_API_KEY")
+    if not api_key:
+        print("Error: LLM_API_KEY environment variable not set")
+        return None
+
+    api_base = os.environ.get("LLM_API_BASE", DEFAULT_API_BASE).rstrip("/")
+    api_model = os.environ.get("LLM_MODEL", "deepseek-chat")
+
+    endpoint = f"{api_base}/chat/completions"
+    body = json.dumps({
+        "model": api_model,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.1,
+        "max_tokens": 16384,
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        endpoint,
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        },
+    )
+
     try:
-        fd, prompt_path = tempfile.mkstemp(suffix=".txt", prefix="opencode_prompt_")
+        with urllib.request.urlopen(req, timeout=600) as resp:
+            result = json.loads(resp.read())
+        content = result["choices"][0]["message"]["content"]
+        if not content or not content.strip():
+            print("LLM returned empty response")
+            return None
+        return content
+    except urllib.error.HTTPError as e:
+        print(f"API HTTP error: {e.code} {e.reason}")
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write(prompt)
-
-            cmd = ["opencode", "run", "--file", prompt_path, "--model", model]
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=600,
-                env=_minimal_env(),
-            )
-            if result.returncode != 0:
-                print(f"opencode returned non-zero exit code: {result.returncode}")
-                if result.stderr:
-                    print(f"stderr: {result.stderr[:500]}")
-                return None
-            return result.stdout
-        finally:
-            os.unlink(prompt_path)
-    except subprocess.TimeoutExpired:
-        print("opencode call timed out (600s)")
+            detail = e.read().decode("utf-8")
+            print(f"  Response: {detail[:300]}")
+        except Exception:
+            pass
         return None
-    except FileNotFoundError:
-        print("opencode CLI not found. Please install it first.")
+    except urllib.error.URLError as e:
+        print(f"API connection error: {e.reason}")
+        return None
+    except json.JSONDecodeError as e:
+        print(f"API returned invalid JSON: {e}")
+        return None
+    except KeyError as e:
+        print(f"Unexpected API response format (missing {e})")
         return None
 
 
-def generate_context(repo, data_dir, force, local_repo=None, model="deepseek/deepseek-v4-flash"):
+def generate_context(repo, data_dir, force, local_repo=None):
     repo_dir = os.path.join(data_dir, repo_dir_name(repo))
     context_path = os.path.join(repo_dir, "context", "architecture.json")
 
@@ -325,16 +357,32 @@ def generate_context(repo, data_dir, force, local_repo=None, model="deepseek/dee
         extra_context=extra,
     )
 
-    print("Calling opencode to synthesize architecture summary...")
-    output = call_opencode(prompt, model=model)
+    print("Calling LLM to synthesize architecture summary...")
+    output = call_llm(prompt)
     if output is None:
-        print("Failed to get response from opencode")
+        print("Failed to get response from LLM")
         return False
 
     context = extract_json_from_output(output)
     if context is None:
-        print("Failed to parse JSON from opencode output")
-        print(f"Raw output (first 500 chars): {output[:500]}")
+        print("Failed to parse JSON from LLM output")
+        print(f"Output length: {len(output)} chars")
+        print(f"First 100 chars: {output[:100]!r}")
+        print(f"Last 100 chars: {output[-100:]!r}")
+
+        # Fallback: LLM agent may have written the JSON to a file
+        fallback_path = os.path.join(repo_dir, "_llm_result.json")
+        if os.path.exists(fallback_path):
+            print(f"Trying fallback: reading {fallback_path}...")
+            try:
+                with open(fallback_path, "r", encoding="utf-8") as f:
+                    context = json.load(f)
+                os.unlink(fallback_path)
+            except (json.JSONDecodeError, OSError) as e:
+                print(f"Fallback also failed: {e}")
+                context = None
+
+    if context is None:
         return False
 
     context["repo"] = repo
@@ -365,10 +413,6 @@ def main():
         "--local-repo", default=None,
         help="Path to local repo source code (auto-detected)"
     )
-    parser.add_argument(
-        "--model", default="deepseek/deepseek-v4-flash",
-        help="opencode model to use (default: deepseek/deepseek-v4-flash)"
-    )
     args = parser.parse_args()
 
     project_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -381,7 +425,7 @@ def main():
             success = False
             continue
         result = generate_context(repo, args.data_dir, args.force,
-                                  local_repo=local, model=args.model)
+                                  local_repo=local)
         if not result:
             success = False
 

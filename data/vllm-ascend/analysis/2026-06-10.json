@@ -1,0 +1,435 @@
+{
+  "date": "2026-06-10",
+  "repo": "vllm-project/vllm-ascend",
+  "generated_at": "2026-06-11T10:54:08.845488+08:00",
+  "daily_summary": "当日变更主要集中在Bug修复、性能优化和CI基础设施改进。Bug修复方面，修复了FP32多模态编码器attention回归、PD分离场景下SWA KV传输块裁剪、MTP占位符draft token拒绝采样崩溃、DeepSeek-V4-Pro精度问题、netloader加载draft模型时的deepcopy崩溃、以及A3 DSV4精度问题。性能优化方面，实现了DSA CP中通过CPU重计算local_seq_lens消除D2H同步、修复了MTP copy_valid_sampled_token_count的dtype不匹配导致的阻塞同步。CI方面，引入了ninja增量构建缓存加速csrc编译、添加了vLLM verified ref锚点文件、移除了lint Dockerfile中的硬编码commit。此外，还新增了weight offload到Ascend NPU的支持、store_kv_block自定义算子、轻量级logger扩展、以及负载均衡代理示例的多worker支持。",
+  "test_impact_summary": "当日变更对测试看护有显著影响。多个Bug修复引入了新的单元测试（如test_device_op.py、test_mooncake_hybrid_connector.py、test_recompute_scheduler.py、test_rejection_sampler.py），覆盖了FP32 attention fallback、SWA块裁剪、占位符token拒绝采样等关键路径。新增的weight offload功能引入了端到端测试（test_cpu_weight_offload.py），需要定期运行。store_kv_block算子新增了nightly测试。CI基础设施的改进（ninja缓存、vLLM ref锚点）本身不引入新测试，但会影响测试执行效率和版本对齐。整体来看，测试覆盖得到了加强，但需要关注新增的e2e测试在CI中的稳定性和执行时间。",
+  "commits": [
+    {
+      "sha": "0b5223c5cb08aa6b4f2a1ec4a12568ac9ff6bb3e",
+      "comment": "修复了PR #8671引入的FP32多模态编码器attention回归。PR #8671将A2/A3多模态编码器attention从`npu_fusion_attention`切换到`_npu_flash_attention_unpad`以提升性能，但后者不支持FP32输入，导致SigLIP等FP32视觉编码器退化。此PR在`BaseDeviceAdaptor.npu_flash_attention`中恢复了dtype感知的算子选择：FP32时使用`npu_fusion_attention`，FP16/BF16时使用`_npu_flash_attention_unpad`。同时修复了A5DeviceAdaptor中`seq_lens_cpu`的Python列表转换。新增了CPU单元测试覆盖FP32 fallback和低精度快速路径。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "attention",
+        "device"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "新增了CPU单元测试覆盖FP32 fallback和低精度快速路径，现有测试已足够覆盖变更。",
+        "suggested_test_areas": [
+          "tests/ut/device/test_device_op.py"
+        ]
+      }
+    },
+    {
+      "sha": "bb4851ccbb1bef04c47b3c68e83e41ba5f8aeb0d",
+      "comment": "修复了vLLM上游单元测试因Ascend特定状态或行为泄漏到通用、非NPU和仅配置流程中而失败的问题。主要修改包括：1) `platform.py`中增加早期返回逻辑，当device_type不是npu或model_config为空时跳过Ascend特定配置更新；2) `ascend_config.py`中增加model_config的空安全守卫，并优化全局AscendConfig单例复用规则，仅对相同的VllmConfig实例复用；3) `punica_npu.py`中LoRA索引处理与GPU/XPU上游实现对齐，根据实际活跃token数量截断LoRA索引。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "platform",
+        "lora",
+        "config"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "新增了AscendConfig实例隔离和npu-smi优先内存查询的单元测试，现有测试已覆盖主要变更。",
+        "suggested_test_areas": [
+          "tests/ut/test_ascend_config.py",
+          "tests/ut/test_platform.py"
+        ]
+      }
+    },
+    {
+      "sha": "bbdad2ba34046aa0591020464d20c3b16ce113f3",
+      "comment": "更新了PD分离负载均衡代理示例，支持多worker场景。当使用`uvicorn --workers > 1`时，每个worker进程拥有独立内存空间，导致调度状态不一致。此PR引入了共享调度架构：一个中心化的`SharedProxyScheduler`拥有全局可变状态，每个uvicorn worker维护本地HTTP客户端池，通过`BaseManager`进行多进程协调。使用惰性删除堆模式高效处理后端压力变化。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "distributed",
+        "example"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "这是一个示例文件更新，不涉及核心库代码变更，现有测试无需修改。",
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "a3b10cb6f02a54edde9a28c6da7bd02169cd3b39",
+      "comment": "修复了PD kv-consumer MTP占位符draft token在Ascend拒绝采样器中的处理。在D节点的第一个decode步骤中，PD kv-consumer MTP必须在`spec_token_ids`中保留`PLACEHOLDER_TOKEN_ID`（-1）以保持所需的完整图decode形状。该值是调度占位符，不是真实的词汇token。采样器不能将其用作目标或draft概率表的索引。修复方法：在Triton内核和PyTorch回退路径中，直接拒绝占位符draft token并使用recovered token路径；避免使用token id -1读取概率表；避免Python回退负索引。新增了回归测试覆盖PD消费者占位符调度契约和占位符安全的随机拒绝采样。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "spec_decode",
+        "sampler"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "新增了PD消费者占位符调度契约和占位符安全的随机拒绝采样测试，现有测试已覆盖主要变更。",
+        "suggested_test_areas": [
+          "tests/ut/core/test_recompute_scheduler.py",
+          "tests/ut/sample/test_rejection_sampler.py"
+        ]
+      }
+    },
+    {
+      "sha": "941ba056b9383dedcd11796ac6a77b1b5912d258",
+      "comment": "将vLLM上游的`PrefetchOffloader`（CPU权重卸载与异步H2D预取）移植到Ascend NPU，并修复了ACL图捕获因未加入copy stream而崩溃的问题。主要变更：1) 新增`NPUPrefetchOffloader`，替换所有`torch.cuda.*`为`torch.npu.*`等效API；2) 在`model_runner_v1.py`中，当`offload_backend=prefetch`时替换父类设置的CUDA offloader；3) 在`acl_graph.py`中，在ACL图捕获前调用`sync_prev_onload()`，在`torch.npu.graph`上下文中调用`join_after_forward()`。新增了端到端测试覆盖prefetch后端（eager/ACL graph/selective params）和UVA后端。",
+      "tags": [
+        "feature",
+        "high-risk",
+        "compilation",
+        "model-runner",
+        "offload"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "新增了端到端测试覆盖prefetch后端和UVA后端，需要在CI中配置运行。",
+        "suggested_test_areas": [
+          "tests/e2e/pull_request/one_card/test_cpu_weight_offload.py"
+        ]
+      }
+    },
+    {
+      "sha": "a53f8a023016219a3d5246a881d74d4d8d892f0c",
+      "comment": "新增了`store_kv_block` AscendC自定义算子，用于在C8稀疏化场景下加速KV缓存存储。通过`additional-config`中的`c8_enable_reshape_optim`控制是否使用该算子，仅在P节点上使用。算子将连续的slot映射分组，批量执行数据拷贝，减少kernel启动开销。涉及csrc/目录下的算子实现、tiling、infershape、torch绑定，以及SFA attention中的调用集成。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "ops",
+        "attention",
+        "kv_cache"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "新增了nightly测试覆盖store_kv_block算子的正确性和性能，需要在CI中配置运行。",
+        "suggested_test_areas": [
+          "tests/e2e/nightly/single_node/ops/singlecard_ops/test_store_kv_block.py"
+        ]
+      }
+    },
+    {
+      "sha": "5f76de9682bdab9292a48d4f51793f6d40883456",
+      "comment": "修复了`fused_sigmoid_gating_delta_rule_update_kernel` Triton内核的编译失败问题。该问题在Qwen3.5的某些解码场景下可触发。原实现通过将无效的`h0_indices`映射到0、加载值、然后使用`tl.where`丢弃无效值，导致更复杂的IR模式，在Ascend Triton上可能触发MLIR lowering失败。修复方法是将有效性条件直接移到`tl.load`的mask参数中，避免后处理。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "ops",
+        "triton"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "这是一个Triton内核的编译修复，不改变功能逻辑，现有测试已足够覆盖。",
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "976d5766af9d04f958a5e47affd78255ee8ca585",
+      "comment": "修复了DeepSeek-V4-Pro共享expert路径的精度问题。PR #9600修复了#9589精度问题，但其wrapper侧合成的`group_index`将no-group路径变为了has-group路径。Python调用点传递`group_index=None`、`quant_mode=1`、`swiglu_mode=1`和`clamp_limit=...`，因此内核路径需要保留no-group语义并执行clamp。修复方法：移除合成的`group_index`，使arch32 int32 no-group `swiglu_mode=1`路径进入DSK tiling，并使用`groupNum_=1`进行no-group tiling检查。",
+      "tags": [
+        "bugfix",
+        "high-risk",
+        "ops",
+        "moe",
+        "quantization"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "这是一个精度修复，不改变API或配置，现有测试已足够覆盖。",
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "5d652de7a8b58e0462ce34964c5173f20fb81f8f",
+      "comment": "修复了A3 DSV4精度问题。主要变更：1) `dsa_v1.py`中slot mapping赋值改为in-place操作，并修复了A5设备上因slot_mapping形状不匹配导致的RuntimeError；2) `device_op.py`中将`triton_q_rms`导入移到顶层并添加`HAS_TRITON`守卫，无Triton时使用PyTorch原生RMS Norm实现。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "attention",
+        "device"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "这是一个精度修复，不改变API或配置，现有测试已足够覆盖。",
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "b0841c3dcc1cd6be50ff1f08164c4f74b3e6d6c0",
+      "comment": "实现了轻量级logger扩展，为vLLM-Ascend模块添加`[vllm-ascend] [module_name]`前缀，同时保持vLLM核心日志不变。通过替换vLLM handler的formatter实现，无需修改任何现有模块代码。在`vllm_ascend/__init__.py`中导入`vllm_ascend.logger`触发formatter patching。",
+      "tags": [
+        "refactor",
+        "low-risk",
+        "logging"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "新增了logger模块的单元测试，覆盖模块名推断、formatter前缀添加等场景。",
+        "suggested_test_areas": [
+          "tests/ut/test_logger.py"
+        ]
+      }
+    },
+    {
+      "sha": "1f0f111909784282b2accc5d02481b6df4ddeabd",
+      "comment": "修复了MTP `copy_valid_sampled_token_count`中的阻塞同步问题。根因是`valid_sampled_token_count_cpu`的dtype为`torch.int32`，而`valid_sampled_token_count_gpu`为`torch.int64`，导致算子生成隐式dtype转换，引起阻塞同步。修复方法：将`valid_sampled_token_count_cpu`重新初始化为`torch.int64`，并回滚PR #9656的内容。同时将`_copy_valid_sampled_token_count`的调用位置提前到`propose_draft_token_ids`中，以正确覆盖所有路径。",
+      "tags": [
+        "bugfix",
+        "performance",
+        "medium-risk",
+        "spec_decode",
+        "model-runner"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "这是一个性能修复，不改变功能逻辑，现有测试已足够覆盖。",
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "499298afbb77b4206616ae2084b5cbf8c50c7c44",
+      "comment": "更新了上游测试配置，移除3个不可用的测试用例（`test_unquantized_backend_selection.py`、`test_reload.py`、`test_reward.py`），并添加了在v0.21.0版本中通过的测试用例。",
+      "tags": [
+        "test",
+        "ci",
+        "low-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "这是CI测试配置的更新，不涉及代码变更。",
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "789fb707f564d0bf2f3f34548776268fb8c0c9e0",
+      "comment": "更新了nightly测试用例的配置参数，包括Qwen3.5-27B-w8a8-A3、Qwen3.5-397B-A17B-w8a8-mtp-A3和Deepseekv3.2-w8a8-A3的temperature、top_p、threshold等参数调整。",
+      "tags": [
+        "test",
+        "ci",
+        "low-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "这是CI测试配置的更新，不涉及代码变更。",
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "fcf5a1d549896070d9baf2e58240503a4ca24fd3",
+      "comment": "修复了Kimi-K2.6密集draft模型被错误识别为MoE模型的问题。vLLM的配置加载机制在推测解码设置期间自动将目标（主）模型的配置属性传播到draft模型。当使用Kimi-K2.6基于Eagle3的draft模型与MoE主模型配合时，配置继承错误地将主模型的MoE属性传递给draft模型，导致vLLM将密集draft模型误识别为MoE模型。在启用FlashComm1的环境下，draft模型非法进入MoE优化和通信路径，导致初始化失败。修复方法：在`is_drafter_moe_model`中增加对`Eagle3DeepseekV2ForCausalLM`架构的检查，强制返回False。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "spec_decode",
+        "distributed"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "这是一个配置修复，不改变API或配置，现有测试已足够覆盖。",
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "6058de5bcf5d8231a8faeaa42055358036e22454",
+      "comment": "将AISBench仓库链接从Gitee更新到GitHub，涉及多个文档和翻译文件。同时改进了文档格式，添加了空行，并更新了Docker pull命令以使用版本替换。",
+      "tags": [
+        "docs",
+        "low-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "这是文档更新，不涉及代码变更。",
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "1bf0e35f5b14ab1e5a970912c37a9b41dd6ecad7",
+      "comment": "（分析缺失）",
+      "tags": [
+        "chore"
+      ]
+    },
+    {
+      "sha": "09ec5292d5354277d481c04a2368b43de4e2666b",
+      "comment": "将EPLB测试配置中的mooncake端口从36000/36100改为30000/30200，以避免端口被占用的问题。同时调整了EPLB配置参数（expert_heat_collection_interval和algorithm_execution_interval）。",
+      "tags": [
+        "test",
+        "ci",
+        "low-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "这是CI测试配置的更新，不涉及代码变更。",
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "be000c0070b9a0fcdf7eef1369104d5c0211a293",
+      "comment": "修复了netloader加载draft模型时`deepcopy(vllm_config)`崩溃的问题。根因是PR d7bca903引入了`deepcopy(vllm_config)`用于在弹性加载失败时恢复原始配置，但draft模型的`VllmConfig`浅拷贝了可能已包含`BasevLLMParameter`对象的子配置，`deepcopy`遍历到这些Parameter对象时崩溃。修复方法：将`deepcopy(vllm_config)`替换为仅保存`vllm_config.quant_config`（模型加载期间唯一需要恢复的字段），并在`revert_to_default()`中先deepcopy `load_config`再修改。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "model_loader"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "单元测试已通过，现有测试已足够覆盖。",
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "39248816e371537d4feb80cb736b557bb1a13e67",
+      "comment": "移除了lint Dockerfile中硬编码的vLLM commit，改为从`.github/vllm-main-verified.commit`文件读取。该文件由PR #9801引入，作为已验证的vLLM ref锚点。lint镜像构建工作流读取该文件，将其暴露为`main_commit`步骤输出，并作为`VLLM_COMMIT`构建参数传递给`Dockerfile.lint`。",
+      "tags": [
+        "ci",
+        "low-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "这是CI基础设施的改进，不涉及代码变更。",
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "bef69f9f4ca72093270b79d6b0e37464d87e3228",
+      "comment": "添加了两个仓库级别的已验证vLLM ref锚点文件：`.github/vllm-main-verified.commit`（已验证的上游vLLM main commit）和`.github/vllm-release-tag.commit`（匹配的vLLM release tag）。这些文件作为PR选择测试和文档元数据的共享真实来源。工作流从这些文件读取commit/tag，用于vLLM checkout和selected-test矩阵。`docs/source/conf.py`也直接读取这些锚点文件用于`main_vllm_commit`和`main_vllm_tag`。",
+      "tags": [
+        "ci",
+        "docs",
+        "low-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "这是CI和文档基础设施的改进，不涉及代码变更。",
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "871759a2319f4c55e40880f6657ba5fd38866f58",
+      "comment": "优化了DSA CP中的性能，通过CPU重计算`local_query_start_loc`和`local_seq_lens`来消除D2H同步。原实现使用`.item()`从GPU张量获取标量值，导致D2H同步。修复方法：在CPU上使用`query_start_loc_cpu`和`seq_lens_cpu`重计算这些值，避免GPU到CPU的数据传输。同时重构了`_build_local_token_metadata`方法，支持可选的`local_query_start_loc`和`local_seq_lens`参数，当为None时创建新的张量。",
+      "tags": [
+        "performance",
+        "medium-risk",
+        "attention",
+        "context_parallel"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "这是一个性能优化，不改变功能逻辑，现有测试已足够覆盖。",
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "97c7f0dadf595bb766236a447735a2448dd40874",
+      "comment": "标准化了Triton算子的日志记录，添加`[TritonOps]`日志标签，并在多个Triton算子中打印输入形状信息，以方便调试和问题诊断。涉及的文件包括activation、bincount、fla、fused_gdn_gating、layernorm_gated、linearnorm、mamba、mul_add、penalty、rms_norm、rope、triton_utils等。",
+      "tags": [
+        "refactor",
+        "low-risk",
+        "ops",
+        "triton",
+        "logging"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "这是日志改进，不改变功能逻辑，现有测试已足够覆盖。",
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "55d5bd15974e98a7f813bf3e2a480039461f721b",
+      "comment": "引入了ninja增量构建缓存，加速csrc编译。将CI中的csrc编译从哈希精确匹配缓存（几乎零命中率）替换为ninja中间构建缓存。Ninja的依赖跟踪检测到更改的文件，仅重新编译差异部分。新增了`schedule_cache_csrc_build.yaml`（每日定时构建缓存），修改了`_selected_tests.yaml`和`_optional_smart_e2e.yaml`以恢复缓存。统一了缓存键格式。",
+      "tags": [
+        "ci",
+        "performance",
+        "low-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "这是CI基础设施的改进，不涉及代码变更。",
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "9914ffa27058165634dd9f46d37dc75debe8ce10",
+      "comment": "统一并改进了vllm-ascend多个模块（eplb、fused_moe、context_parallel、spec_decode、sample）的日志质量。添加了一致的模块前缀标签（如`[eplb/worker]`、`[fused_moe/layer]`），优化了日志级别，在关键决策点添加了缺失的诊断日志，并增强了错误消息的可操作性。",
+      "tags": [
+        "refactor",
+        "low-risk",
+        "logging",
+        "eplb",
+        "moe",
+        "spec_decode",
+        "sampler"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "这是日志改进，不改变功能逻辑，现有测试已足够覆盖。",
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "15bfdc7415241ef2bed72bc9ac1df9b711c0ee67",
+      "comment": "自动翻译了7个文档文件，包括ACL_Graph设计文档、FAQ、MiniMax-M2.5教程、additional_config、batch_invariance、graph_mode和speculative_decoding特性指南。",
+      "tags": [
+        "docs",
+        "low-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "这是文档翻译更新，不涉及代码变更。",
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "7cb4cd119c7772b0286feffa6de41527f4c864c5",
+      "comment": "修复了PD分离场景下SWA KV传输块裁剪顺序问题。在PD分离服务中，P端SWA KV传输可能保留为原始prompt长度分配的block ID。之前的顺序是先裁剪SWA块，然后才修剪传输块。由于`_compute_transfer_block_ids()`没有修剪SWA组，陈旧的或未写入的SWA尾部块可能作为`remote_block_ids`发送。当D端在`npu_sparse_attn_sharedkv`中消费这些陈旧的SWA块时，layer-0 attention可能产生全NaN隐藏状态，导致请求卡住。修复方法：先按实际P端prompt长度修剪所有KV缓存组的传输block ID，然后应用SWA窗口裁剪。",
+      "tags": [
+        "bugfix",
+        "high-risk",
+        "distributed",
+        "kv_transfer",
+        "attention"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "新增了单元测试覆盖SWA块裁剪和prompt长度修剪场景。",
+        "suggested_test_areas": [
+          "tests/ut/kv_offload/test_mooncake_hybrid_connector.py"
+        ]
+      }
+    },
+    {
+      "sha": "7d28ab4e955136a1d7e46a0bede88ada7edbb7d0",
+      "comment": "修复了AscendStore分组哈希查找编码不一致问题。调度器查找RPC将block hashes序列化为十六进制字符串，而worker存储路径重新哈希原始`BlockHash`字节。引入分组重新哈希后，哈希十六进制字符串字节和原始字节产生不同的分组摘要，导致查找和存储键可能不一致。修复方法：在`_block_hash_to_bytes()`中，对于64字符的十六进制字符串，先解码为原始字节再重新哈希，保留非十六进制字符串的UTF-8回退。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "distributed",
+        "kv_transfer"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "这是一个内部键生成一致性修复，不改变API或配置，现有测试已足够覆盖。",
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "ee88e356a0703e74cd6499b470f740b319d7dcb5",
+      "comment": "修复了异步推测解码后CP相关decode状态可能基于乐观的CPU端长度构建的问题。异步推测解码可能在Eagle验证后修正`num_computed_tokens`，而CP相关decode状态仍可能基于旧的CPU端长度构建。修复方法：在异步推测token修正后，将修正后的seq_lens同步回CPU镜像；使用修正后的decode序列长度构建CP元数据；从修正后的`num_computed_tokens`重建target input ids和positions；重建target pre-PCP slot mapping；使用预计算位置重用`generate_pcp_mtp_input`刷新Eagle/MTP全布局输入和draft slot mappings。",
+      "tags": [
+        "bugfix",
+        "high-risk",
+        "spec_decode",
+        "context_parallel",
+        "model-runner"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "这是一个内部状态一致性修复，不改变API或配置，现有测试已足够覆盖。",
+        "suggested_test_areas": []
+      }
+    }
+  ]
+}

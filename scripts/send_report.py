@@ -192,7 +192,7 @@ def build_html(repos, date_str, data_dir="data"):
                 func = ai.get("functionality", "")
                 test_imp = ai.get("testing", "")
                 if func:
-                    lines.append(f"""<div class="item-comment" style="color:#3182ce;"><strong>vllm-ascend影响分析:</strong> {func[:200]}</div>""")
+                    lines.append(f"""<div class="item-comment" style="color:#3182ce;margin-top:6px;"><strong>vllm-ascend影响分析:</strong> {func[:200]}</div>""")
                 if test_imp:
                     lines.append(f"""<div class="item-comment" style="color:#3182ce;"><strong>  Testing:</strong> {test_imp[:200]}</div>""")
             ti = c.get("test_impact")
@@ -200,7 +200,7 @@ def build_html(repos, date_str, data_dir="data"):
                 reason = ti.get("reason", "")
                 areas = ti.get("suggested_test_areas", [])
                 if reason:
-                    lines.append(f"""<div class="item-comment" style="color:#dd6b20;"><strong>🧪 Test:</strong> {reason[:200]}</div>""")
+                    lines.append(f"""<div class="item-comment" style="color:#dd6b20;margin-top:6px;"><strong>🧪 Test:</strong> {reason[:200]}</div>""")
                 if areas:
                     lines.append(f"""<div class="item-comment" style="color:#dd6b20;"><strong>  Areas:</strong> {', '.join(areas[:5])}</div>""")
             lines.append("</div>")

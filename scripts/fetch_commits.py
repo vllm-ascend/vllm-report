@@ -525,7 +525,7 @@ def refresh_date_commits(local_repo, repo, date, data_dir, branch, token):
     return True
 
 
-def fetch_commits(repo, branch, data_dir, token, local_repo=None):
+def fetch_commits(repo, branch, data_dir, token, local_repo=None, date=None):
     repo_dir = os.path.join(data_dir, repo_dir_name(repo))
     meta_path = os.path.join(repo_dir, "meta.json")
     meta = load_json(meta_path)
@@ -622,6 +622,12 @@ def fetch_commits(repo, branch, data_dir, token, local_repo=None):
 
     groups = group_commits_by_date(commits_detail)
 
+    if date:
+        groups = {day: commits for day, commits in groups.items() if day == date}
+        if not groups:
+            print(f"No commits found for date {date}, skipping")
+            return
+
     total_new = 0
     for day, day_commits in sorted(groups.items()):
         write_daily_commits(data_dir, repo, day, day_commits, branch=branch)
@@ -643,6 +649,7 @@ def main():
     parser.add_argument("--local-repo", default=None, help="Path to local repo source code (auto-detected if not specified)")
     parser.add_argument("--refresh-date", default=None, help="Force re-fetch all commits on a specific date (YYYY-MM-DD) and overwrite existing data")
     parser.add_argument("--api-only", action="store_true", help="Skip local repo discovery, use GitHub API only")
+    parser.add_argument("--date", default=None, help="Only keep commits on this date (YYYY-MM-DD, UTC+8)")
     args = parser.parse_args()
 
     token = args.token or os.environ.get("GITHUB_TOKEN")
@@ -658,7 +665,7 @@ def main():
     if args.refresh_date:
         refresh_date_commits(local_repo, args.repo, args.refresh_date, args.data_dir, args.branch, token)
     else:
-        fetch_commits(args.repo, args.branch, args.data_dir, token, local_repo=local_repo)
+        fetch_commits(args.repo, args.branch, args.data_dir, token, local_repo=local_repo, date=args.date)
 
 
 if __name__ == "__main__":

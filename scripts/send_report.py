@@ -208,9 +208,9 @@ def build_html(repos, date_str, data_dir="data"):
                 func = ai.get("functionality", "")
                 test_imp = ai.get("testing", "")
                 if func:
-                    lines.append(f"""<div class="section-header">⬆ vllm-ascend 影响</div><div class="section-body">{func[:200]}</div>""")
+                    lines.append(f"""<div class="section-header">⬆ vllm-ascend 影响分析</div><div class="section-body">{func[:200]}</div>""")
                 if test_imp:
-                    lines.append(f"""<div class="item-comment" style="color:#6366f1;"><strong>Testing:</strong> {test_imp[:200]}</div>""")
+                    lines.append(f"""<div class="section-header">🧪 测试影响分析</div><div class="section-body">{test_imp[:200]}</div>""")
             ti = c.get("test_impact")
             if ti and ti.get("needs_test_update"):
                 reason = ti.get("reason", "")

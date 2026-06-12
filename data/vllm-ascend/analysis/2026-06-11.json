@@ -1,0 +1,303 @@
+{
+  "date": "2026-06-11",
+  "repo": "vllm-project/vllm-ascend",
+  "generated_at": "2026-06-12T14:27:03.708124+08:00",
+  "daily_summary": "当日变更主要集中在 DeepSeek V4 模型的适配优化和 310P 芯片的功能增强上。核心工作包括：修复 DSA Attention 中 W8A8 动态量化的冲突问题，通过共享量化结果减少重复计算；修复压缩前缀缓存的查找路径，使其在 DeepSeek V4 压缩 KV 场景下使用正确的逻辑块大小；将 DeepSeek V4 的缓存钩子从 worker patch 迁移到模型定义中，并移除旧的 patch 文件和环境变量开关，实现自动启用；为 310P 芯片增加了 MTP 投机解码和图模式支持，包括新的 KV 块清零器、注意力后端状态扩展、模型运行器适配和采样器 CPU RNG 支持。此外，还修复了 MTP 权重加载中的参数匹配 bug、RecomputeScheduler 的 AttributeError、CI 中的超时和构建缓存问题，并升级了 Mooncake 版本和 CI 镜像。",
+  "test_impact_summary": "当日变更对测试看护有显著影响。DeepSeek V4 相关重构（移除 patch 和环境变量）需要确保现有 e2e 测试仍能正确运行，新增的压缩前缀缓存单元测试（test_compressed_prefix_cache.py）覆盖了关键逻辑边界。310P MTP 功能新增了 e2e 测试和单元测试，但部分测试因本地环境依赖无法运行，需在 CI 中验证。DSA W8A8 修复和 MTP 权重加载 bug 修复需要回归相关量化测试和 MTP 测试。CI 构建缓存回退和超时修复直接影响测试稳定性。整体来看，测试覆盖范围有所扩大，但部分新功能（如 310P MTP 图模式）的测试仍需在真实硬件上验证。",
+  "commits": [
+    {
+      "sha": "971d50b3f982fd2ba7d9ffdee35e985fc54cd808",
+      "comment": "修复 DSA v1 Attention 中 W8A8 动态量化与 DeepSeek V4 模型前向传播的冲突问题。核心改进包括：1) 提取 `_is_w8a8_dynamic()` 辅助函数，集中化 W8A8 动态量化检测逻辑，替换多处重复的量化方法检查；2) 在 prefill 和 decode 阶段，当 `wq_a` 和 `wkv` 都使用 W8A8 动态量化时，共享 `hidden_states` 的一次动态量化结果（`hs_int8, hs_pertoken_scale`），避免重复计算；3) 调整 decode 阶段的计算顺序，将 `wq_a(hidden_states)` 提前到 `wq_b` 分支之前，并传递 `qr_pertoken_scale` 给 indexer 路径以复用已量化的 `qr`。这些优化减少了量化计算开销，并修复了 W8A8 动态量化与 DSA 注意力机制协同工作时的潜在错误。",
+      "tags": [
+        "bugfix",
+        "performance",
+        "attention",
+        "quantization",
+        "medium-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "变更修改了 DSA Attention 的前向传播逻辑，特别是 W8A8 动态量化路径。需要确保现有的 DeepSeek V4 量化测试（如 W8A8 动态量化）能够覆盖新的共享量化路径，并验证 prefill 和 decode 阶段的正确性。",
+        "suggested_test_areas": [
+          "tests/e2e/pull_request/four_card/test_deepseek_v4.py",
+          "tests/ut/attention/"
+        ]
+      }
+    },
+    {
+      "sha": "eef0b36b3cac8f6ae5a23ac56036ec678ad6ed79",
+      "comment": "修复 DeepSeek V4 压缩前缀缓存的查找路径问题。在 `CompressAttentionManager.find_longest_cache_hit()` 中，当处理压缩 KV 组时，一个物理 KV 块覆盖 `block_size * compress_ratio` 个原始 token，但查找路径直接迭代了传入的物理粒度 `block_hashes`。修复方法是在查找前使用 `BlockHashListWithBlockSize` 将传入的物理 hash 列表转换为正确的逻辑块大小，确保缓存命中检查使用正确的块粒度。同时修复了 `AscendHybridKVCacheCoordinator._get_effective_block_size()` 和 `_get_block_hashes()` 中的逻辑，使其在混合注意力场景下正确处理压缩组的块大小。新增了三个 CPU 单元测试覆盖：拒绝部分压缩逻辑块命中、保持相同逻辑块可命中、防止全注意力部分命中隐藏压缩组未命中。",
+      "tags": [
+        "bugfix",
+        "refactor",
+        "kv-cache",
+        "prefix-cache",
+        "low-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "新增了专门的单元测试文件 `tests/ut/test_compressed_prefix_cache.py`，覆盖了压缩前缀缓存的关键边界场景。这些测试是 CPU 可运行的，对验证修复的正确性至关重要。",
+        "suggested_test_areas": [
+          "tests/ut/test_compressed_prefix_cache.py"
+        ]
+      }
+    },
+    {
+      "sha": "cebff41ef28ecf08a0ae9ad7542b717c370edd79",
+      "comment": "将 DeepSeek V4 的 Ascend 特定缓存覆盖从 worker patch 迁移到模型定义中。具体操作：1) 在 `vllm_ascend/models/deepseek_v4.py` 中新增 `AscendCompressorStateCache`、`AscendDeepseekV4IndexerCache` 和 `AscendDeepseekV4SWACache` 三个类，它们继承自 vLLM 上游的对应缓存类并覆写 `get_kv_cache_spec()` 和 `get_attn_backend()` 方法；2) 在 `DeepseekV4Attention` 中直接创建 `AscendDeepseekV4SWACache` 实例并通过 `DSAModules` 传递给 `AscendDeepseekSparseAttention`；3) 删除 `vllm_ascend/patch/worker/patch_deepseek_compressor.py` 及其在 `__init__.py` 中的注册。这是一个纯内部重构，不改变行为，但使代码结构更清晰，将 Ascend 特定逻辑集中在模型定义模块中。",
+      "tags": [
+        "refactor",
+        "model",
+        "patch",
+        "low-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "这是一个纯重构，不改变外部行为。现有的 DeepSeek V4 相关 e2e 测试应能继续通过，无需新增测试。但需要确保重构后所有引用路径正确。",
+        "suggested_test_areas": [
+          "tests/e2e/pull_request/four_card/test_deepseek_v4.py"
+        ]
+      }
+    },
+    {
+      "sha": "3dff82b574771711f27aa9a37418beadccf8aa0c",
+      "comment": "移除过时的 `VLLM_ASCEND_APPLY_DSV4_PATCH` 环境变量。DeepSeek V4 现在通过 KV cache spec 中的 `model_version=\"deepseek_v4\"` 自动检测并启用 Ascend 混合 KV cache coordinator，不再需要用户手动设置环境变量。具体变更：1) 从 `envs.py` 中移除该环境变量定义；2) 从 `patch/platform/__init__.py` 中移除条件导入，使 `patch_speculative_config` 无条件导入；3) 在 `patch_kv_cache_coordinator.py` 中新增 `_is_deepseek_v4_kv_cache_spec()` 和 `_is_deepseek_v4_kv_cache_config()` 检测函数，替代环境变量检查；4) 更新所有文档和测试配置，移除该环境变量的设置。这是一个用户可见的改进，简化了 DeepSeek V4 的使用流程。",
+      "tags": [
+        "refactor",
+        "ci",
+        "docs",
+        "low-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "移除了环境变量，需要更新所有依赖该环境变量的测试配置和文档。新增的 `_is_deepseek_v4_kv_cache_spec()` 检测逻辑需要单元测试覆盖，已在 `test_prefix_cache_cp_patches.py` 中新增。",
+        "suggested_test_areas": [
+          "tests/ut/patch/platform/test_prefix_cache_cp_patches.py",
+          "tests/e2e/pull_request/four_card/test_deepseek_v4.py"
+        ]
+      }
+    },
+    {
+      "sha": "7ea0447f6bb90f998847805cbe6307ad2e3498e8",
+      "comment": "修复 PCP（Pipeline Context Parallelism）与 MTP（Multi-Token Prediction）结合时的 shape 错误问题。在 DeepSeek R1 W8A8 长序列测试配置中，添加 `--additional-config '{\"recompute_scheduler_enable\":true}'` 参数，启用重计算调度器来解决 PCP+MTP 组合下的 shape 不匹配问题。这是一个 CI 配置修复，不涉及代码逻辑变更。",
+      "tags": [
+        "bugfix",
+        "ci",
+        "scheduler",
+        "low-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "仅修改了 CI 测试配置文件，添加了新的配置参数。不需要新增测试，但需要确保该配置在 CI 中正确生效。",
+        "suggested_test_areas": [
+          "tests/e2e/nightly/multi_node/internal_dp/config/DeepSeek-R1-W8A8-longseq.yaml"
+        ]
+      }
+    },
+    {
+      "sha": "9536e40f0ba821d2aad6bf8d0d8b09ed64915bbd",
+      "comment": "升级 Mooncake 传输引擎版本从 0.3.8.post1 到 0.3.9，并更新多个 Dockerfile 中的基础镜像。主要变更：1) 所有 Dockerfile 中的 `MOONCAKE_TAG` 更新为 `v0.3.9`；2) CI 工作流中的 Mooncake wheel 文件名更新；3) `Dockerfile.lint` 的基础镜像从 Python 3.11 升级到 3.12；4) `Dockerfile.buildwheel.310p` 的基础镜像从 `manylinux_2_28` 升级到 `manylinux_2_34`，以解决新版 CANN 对 C++ 符号 `_ZSt28__throw_bad_array_new_lengthv@@GLIBCXX_3.4.29` 的依赖。这是一个基础设施升级，不涉及功能逻辑变更。",
+      "tags": [
+        "chore",
+        "ci",
+        "infrastructure",
+        "low-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "仅升级了依赖版本和基础镜像，不改变任何功能逻辑。现有测试应能继续通过，无需新增测试。",
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "c68b1b572da9b0ec7a29d57bfd28a74f70aa743f",
+      "comment": "修复和补充 batch_invariance 功能的文档说明。主要更新：1) `installation.md`：更新了关于 `VLLM_BATCH_INVARIANT=1` 环境变量的说明，强调必须在构建 vllm-ascend 之前设置，并添加了指向 batch invariance 功能指南的链接；2) `batch_invariance.md`：更新了软件需求说明，明确用户需要在构建前设置环境变量，并在顶部添加了安装说明的 note。同时更新了已验证模型列表，新增 `Qwen/Qwen3-235B-A22B`。这是一个纯文档更新。",
+      "tags": [
+        "docs",
+        "low-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "纯文档更新，不涉及代码或测试变更。",
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "63aa6eba465ff8aeaff5f1fcbd4231b656a840ec",
+      "comment": "修复 nightly CI 测试中超时问题。DeepSeek R1 模型权重较大，加载时间较长，因此将 `VLLM_ENGINE_READY_TIMEOUT_S` 环境变量设置为 7200 秒（2小时），以延长等待时间，防止因权重加载超时导致的测试失败。这是一个 CI 配置修复。",
+      "tags": [
+        "bugfix",
+        "ci",
+        "low-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "仅修改了 CI 测试配置文件中的超时设置，不涉及功能逻辑变更。",
+        "suggested_test_areas": [
+          "tests/e2e/nightly/single_node/models/configs/MTPX-DeepSeek-R1-0528-W8A8.yaml"
+        ]
+      }
+    },
+    {
+      "sha": "93cd5edb3468e65001549c513e04e3d04f622c14",
+      "comment": "将 CI 变体标签从 `a2` 重命名为 `910b`，以与 CANN 基础镜像命名规范对齐。主要变更：1) 更新 `schedule_release_code_and_wheel.yml` 中的 `make_variant.py` 调用参数；2) 更新 `config.json` 中的 `variant_label` 和 `npu_type` 属性；3) 升级 310P wheel 基础镜像到 `manylinux_2_34`；4) 更新 `installation.md` 中的安装说明，添加 uv 缓存清理提示和清华镜像源。这是一个 CI 和文档的清理工作。",
+      "tags": [
+        "ci",
+        "docs",
+        "chore",
+        "low-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "不涉及功能逻辑变更，仅更新 CI 配置和文档。",
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "22b9098719daa134b10340b0cf26fe6a4798a062",
+      "comment": "修复 GLM5.1 W8A8 MTP 模型权重加载错误。vLLM PR #41706 后，`GlmMoeDsaForCausalLM.load_weights` 使用 `AutoWeightsLoader`，该加载器不会跳过 MTP 层的 `rot.weight`，导致加载权重时出现 ValueError。修复方法：新增 `AscendGlmMoeDsaForCausalLM` 类，覆写 `load_weights` 方法，使用 `AutoWeightsLoader` 并传入 `skip_prefixes=[MTP_ROT_WEIGHT_NAME]` 参数来跳过 `rot.weight`。同时在 `patch/__init__.py` 中添加了该 patch 的说明文档。",
+      "tags": [
+        "bugfix",
+        "model",
+        "patch",
+        "medium-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "修复了 MTP 权重加载的关键 bug，需要确保 GLM5.1 MTP 模型的 e2e 测试能够正确加载权重并运行。建议在 CI 中添加或更新相关测试。",
+        "suggested_test_areas": [
+          "tests/e2e/pull_request/one_card/"
+        ]
+      }
+    },
+    {
+      "sha": "969baeda89c88666d123e1b55f99235b07051a69",
+      "comment": "为 Ascend 310P 芯片添加 MTP 投机解码和图模式支持。这是一个大型功能增强，涉及多个模块：1) 新增 `AscendKVBlockZeroer310`，通过直接 tensor 写入清零 KV 块，替代 Triton 方案（310P 不支持 Triton）；2) 扩展 310P 注意力后端 `AscendAttentionBackendImpl310`，支持 `SpecDecoding` 状态，使用 `forward_chunked_prefill_310` 处理 MTP 验证；3) 更新 `AscendAttentionMetadataBuilder310`，添加 `query_lens_cpu` 支持，用于 ATB splitfuse 的 host 端 qLensTensor；4) 更新 `NPUModelRunner310`，支持 MTP 图捕获/回放，包括 `_build_attn_state` 和 `_dummy_run` 的适配；5) 更新 310P 采样器，使用 CPU RNG 生成指数分布值；6) 新增 `AscendRejectionSampler310`，使用 PyTorch 路径进行 recovered token 采样；7) 更新 GDN 注意力层，支持图模式下的 conv1d buffer replay；8) 新增 `AscendSpecDecodeBaseProposer310`，处理空丢弃索引的情况；9) 新增 e2e 测试和单元测试。这是一个高风险变更，涉及多个核心模块的协同工作。",
+      "tags": [
+        "feature",
+        "high-risk",
+        "spec-decode",
+        "310p",
+        "attention",
+        "model-runner",
+        "sampler"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "新增了大量功能代码和测试文件。新增的 e2e 测试 `test_spec_decode_mtp_310p.py` 需要在 310P 硬件上运行验证。单元测试覆盖了 KV 块清零器、注意力后端、采样器等模块。但部分测试因本地环境依赖无法运行，需要在 CI 中验证。",
+        "suggested_test_areas": [
+          "tests/e2e/pull_request/one_card/_310p/test_spec_decode_mtp_310p.py",
+          "tests/ut/_310p/attention/test_attention_v1_310.py",
+          "tests/ut/_310p/sample/test_sampler_310.py",
+          "tests/ut/_310p/test_kv_block_zeroer_310p.py"
+        ]
+      }
+    },
+    {
+      "sha": "6ce137f8765e6b85ea59b40eb14acc8ee8fd1e17",
+      "comment": "修复 MTP 模型权重加载中的参数匹配 bug。原代码使用 `if \".scale\" in name` 进行子串匹配，条件过于宽泛，会匹配到包含 `.scale` 子串但并非以 `.scale` 结尾的参数名（如 `foo.scale_bar`），导致参数被错误地重命名为 `.weight_scale`。修复方法是将条件改为 `if name.endswith(\".scale\")`，精确匹配以 `.scale` 结尾的参数名。这是一个精确的 bug 修复，影响范围小。",
+      "tags": [
+        "bugfix",
+        "model",
+        "low-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "修复了一个精确的参数匹配 bug，现有 MTP 权重加载测试应能覆盖此场景。无需新增测试。",
+        "suggested_test_areas": [
+          "tests/ut/"
+        ]
+      }
+    },
+    {
+      "sha": "f88361de478e595791ab1576f8944895bc887612",
+      "comment": "修复 `RecomputeScheduler` / `AsyncRecomputeScheduler` 中因缺少 `_get_routed_experts()` 方法导致的 `AttributeError`。当异步调度启用且请求在当前步骤停止时，会触发此错误。修复方法：在 `update_from_output` 方法中，根据 vLLM 版本（0.21.0 或更新版本）采用不同的 routed experts 提取逻辑。对于 v0.21.0，使用 `model_runner_output.routed_experts_dict`；对于更新版本，使用 `model_runner_output.routed_experts` 和 `routed_experts_mgr`。同时添加了 `enable_return_routed_experts` 配置检查。",
+      "tags": [
+        "bugfix",
+        "scheduler",
+        "medium-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "修复了异步调度场景下的崩溃问题，需要确保相关测试覆盖了 `enable_return_routed_experts` 和异步调度组合的场景。建议在调度器相关测试中添加回归测试。",
+        "suggested_test_areas": [
+          "tests/ut/core/"
+        ]
+      }
+    },
+    {
+      "sha": "8d70168cb0ea94d6233d63e46cdabcd292f8afcc",
+      "comment": "回退构建缓存功能，以避免对其他 PR 造成进一步影响。PR #10301 的构建缓存复用功能存在跨 PR 失败问题，因此决定回退部分功能，但保留本地增量构建加速。具体回退：1) 从 `_selected_tests.yaml` 中移除 csrc 构建缓存的恢复步骤和相关环境变量；2) 从 `schedule_cache_csrc_build.yaml` 中移除 `push` 和 `schedule` 触发条件，仅保留 `workflow_dispatch` 手动触发。这是一个 CI 稳定性修复。",
+      "tags": [
+        "ci",
+        "bugfix",
+        "low-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "仅回退 CI 构建缓存功能，不涉及功能逻辑变更。",
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "0a79510a0433189d8b817a2cf07d8ac3f4316fa5",
+      "comment": "修复 comment CI 的权限检查错误。主要问题：1) 使用 `GITHUB_TOKEN` 进行权限检查时，`gh api` 返回的 `permission` 字段可能不准确，改为使用 `PAT_TOKEN` 和 `role_name` 字段；2) 修复 `/rerun` 命令的权限检查逻辑，当用户未授权时正确退出并显示错误信息；3) 移除不必要的 `if: steps.auth.outputs.authorized == 'true'` 条件，简化工作流。这是一个 CI 工作流修复。",
+      "tags": [
+        "ci",
+        "bugfix",
+        "low-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "仅修复 CI 工作流权限检查逻辑，不涉及功能代码变更。",
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "60f0238b0eec4c91fe466497ae8862daf521aecc",
+      "comment": "修复 CI 中 Ninja 增量构建的多个 bug。主要改进：1) 修复 `schedule_cache_csrc_build.yaml` 中 `pip install pyyaml` 因缺少 Python 环境而失败的问题，添加了 `setup-python` 步骤；2) 将缓存时间粒度从小时级提升到秒级，避免缓存冲突；3) 在 `_selected_tests.yaml` 中修复缓存时间变量名；4) 在 `schedule_cache_csrc_build.yaml` 中引入重试机制（最多4次），以应对 Gitcode 服务器在多请求并发时的下载失败问题，每次重试有递增的 backoff 时间。这是一个 CI 稳定性增强。",
+      "tags": [
+        "ci",
+        "bugfix",
+        "low-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "仅修复 CI 构建流程，不涉及功能逻辑变更。",
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "1f5da4edbbdbfa0b7d892424dad5454b70a4611a",
+      "commit": "修复 mypy 类型检查错误。在 `vllm_ascend/worker/model_runner_v1.py:1087` 行，`valid_sampled_token_count_gpu` 的类型无法确定，添加 `# type: ignore[has-type]` 注释来抑制 mypy 错误。这是一个纯类型注解修复。",
+      "tags": [
+        "bugfix",
+        "ci",
+        "low-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "仅修复类型检查错误，不涉及功能逻辑变更。",
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "be6d6bacc0155e5a61ada5e44045e80c33d78d31",
+      "comment": "为 Ascend Atlas A2 和 A3 NPU 添加 batch_invariant_ops 的安装支持。主要变更：1) 新增 `csrc/build_batch_invariant_ops.sh` 脚本，从 OBS 下载并安装 batch_invariant 的 run 包和 whl 包；2) 在 `csrc/build_aclnn.sh` 中集成该脚本，当 `VLLM_BATCH_INVARIANT=1` 时调用；3) 更新 `csrc/aclnn_torch_adapter/op_api_common.h`，增强自定义算子库的查找逻辑，支持从 `ASCEND_CUSTOM_OPP_PATH` 和 `ASCEND_OPP_PATH/vendors/config.ini` 中查找 `libcust_opapi.so`；4) 更新多个 Dockerfile，设置 `VLLM_BATCH_INVARIANT=1` 环境变量；5) 更新文档，说明 batch invariance 功能扩展到 A2 和 A3 NPU。这是一个功能增强，使 batch invariance 功能在 A2 和 A3 上可用。",
+      "tags": [
+        "feature",
+        "ops",
+        "infrastructure",
+        "medium-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "新增了 batch_invariant_ops 的安装流程，需要确保在 A2 和 A3 硬件上的安装和功能测试。建议在 CI 中添加 batch invariance 相关的功能测试。",
+        "suggested_test_areas": [
+          "tests/e2e/",
+          "tests/ut/ops/"
+        ]
+      }
+    }
+  ]
+}

@@ -184,7 +184,7 @@ def build_html(repos, date_str, data_dir="data"):
 
         def render_commit(c):
             tags = c.get("tags", [])
-            comment = c.get("comment", "")
+            comment = c.get("comment", "") or c.get("content", "")
             sha = c.get("sha", "")[:12]
             sha_full = c.get("sha", "")
             is_high_risk = "high-risk" in tags

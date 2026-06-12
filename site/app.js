@@ -502,8 +502,8 @@
 
     if (hasAnalysis) {
       html += `<div class="analysis-section">`;
-      if (a.comment) {
-        html += `<div class="ai-comment"><div class="ai-label">AI Analysis</div>${renderMarkdown(a.comment)}</div>`;
+      if (a.comment || a.content) {
+        html += `<div class="ai-comment"><div class="ai-label">AI Analysis</div>${renderMarkdown(a.comment || a.content)}</div>`;
       }
       if (a.test_impact) {
         html += `<div class="impact-card test-impact">`;
@@ -517,23 +517,21 @@
       if (a.ascend_impact) {
         const funcImp = a.ascend_impact.functionality || '';
         const testImp = a.ascend_impact.testing || '';
-        if (funcImp !== '无影响' || testImp !== '无影响') {
-          html += `<div class="impact-card ascend-impact">`;
-          html += `<div class="impact-label ascend">Ascend Impact</div>`;
-          if (funcImp && funcImp !== '无影响') {
-            html += `<div class="impact-text"><strong>Functionality:</strong> ${renderMarkdown(funcImp)}</div>`;
-          }
-          if (testImp && testImp !== '无影响') {
-            html += `<div class="impact-text" style="margin-top:4px"><strong>Testing:</strong> ${renderMarkdown(testImp)}</div>`;
-          }
-          if (a.ascend_impact.needs_test_update) {
-            html += `<div class="impact-text" style="margin-top:4px"><span class="stat-badge additions" style="font-size:0.75rem">\u26A0 Test Update Needed</span></div>`;
-            if (a.ascend_impact.suggested_test_areas && a.ascend_impact.suggested_test_areas.length > 0) {
-              html += `<div class="impact-text" style="margin-top:4px"><strong>Areas:</strong> ${a.ascend_impact.suggested_test_areas.map(escapeHtml).join(', ')}</div>`;
-            }
-          }
-          html += `</div>`;
+        html += `<div class="impact-card ascend-impact">`;
+        html += `<div class="impact-label ascend">Ascend Impact</div>`;
+        if (funcImp) {
+          html += `<div class="impact-text"><strong>Functionality:</strong> ${renderMarkdown(funcImp)}</div>`;
         }
+        if (testImp) {
+          html += `<div class="impact-text" style="margin-top:4px"><strong>Testing:</strong> ${renderMarkdown(testImp)}</div>`;
+        }
+        if (a.ascend_impact.needs_test_update) {
+          html += `<div class="impact-text" style="margin-top:4px"><span class="stat-badge additions" style="font-size:0.75rem">\u26A0 Test Update Needed</span></div>`;
+          if (a.ascend_impact.suggested_test_areas && a.ascend_impact.suggested_test_areas.length > 0) {
+            html += `<div class="impact-text" style="margin-top:4px"><strong>Areas:</strong> ${a.ascend_impact.suggested_test_areas.map(escapeHtml).join(', ')}</div>`;
+          }
+        }
+        html += `</div>`;
       }
       html += `</div>`;
     }

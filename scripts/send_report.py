@@ -71,6 +71,9 @@ body { margin:0;padding:0;background:#f4f5f7;font-family:-apple-system,BlinkMacS
 .empty { color:#a0aec0;font-size:13px;text-align:center;padding:20px; }
 .detail-divider { border:none;border-top:1px solid #e2e8f0;margin:16px 0; }
 .repo-link { color:#8b949e;font-size:12px; }
+.commit-message { background:#f0f5ff;border-radius:4px;padding:6px 10px;margin:4px 0 8px 0;font-size:13px;font-weight:600;color:#1a1a2e;font-family:'SF Mono',Consolas,monospace; }
+.section-header { font-size:11px;font-weight:700;color:#5a6370;text-transform:uppercase;letter-spacing:0.04em;padding:4px 0 2px 0;margin-top:8px;border-bottom:1px solid #e2e8f0; }
+.section-body { padding:2px 0 4px 0; }
 """
 
 
@@ -122,6 +125,12 @@ def build_html(repos, date_str, data_dir="data"):
 
         any_data = True
         commits = analysis.get("commits", [])
+
+        commits_data = load_json(f"{data_dir}/{repo_dir}/commits/{date_str}.json") or {}
+        message_map = {}
+        for c in commits_data.get("commits", []):
+            msg = c.get("message", "") or ""
+            message_map[c["sha"]] = msg.split("\n")[0]
         daily_summary = analysis.get("daily_summary", "")
 
         # ── Stats ──
@@ -134,21 +143,21 @@ def build_html(repos, date_str, data_dir="data"):
 <div class="card-title">{icon('vllm') if is_vllm else icon('ascend')} {short} &middot; {len(commits)} commits</div>""")
 
         if daily_summary:
-            ps.append(f"""<div class="summary-box"><div class="label">Daily Summary</div><div class="text">{daily_summary}</div></div>""")
+            ps.append(f"""<div class="summary-box"><div class="label">每日总结</div><div class="text">{daily_summary}</div></div>""")
 
         if is_vllm:
             ps.append(f"""<div class="stats">
-<div class="stat"><div class="stat-value">{len(commits)}</div><div class="stat-label">Total</div></div>
-<div class="stat"><div class="stat-value">{auto_count}</div><div class="stat-label">Auto-skip</div></div>
-<div class="stat ascend"><div class="stat-value">{ascend_count}</div><div class="stat-label">{icon('ascend')} Ascend</div></div>
-<div class="stat high-risk"><div class="stat-value">{high_risk_count}</div><div class="stat-label">{icon('high_risk')} High Risk</div></div>
-<div class="stat test"><div class="stat-value">{needs_test_count}</div><div class="stat-label">{icon('test')} Needs Test</div></div>
+<div class="stat"><div class="stat-value">{len(commits)}</div><div class="stat-label">总计</div></div>
+<div class="stat"><div class="stat-value">{auto_count}</div><div class="stat-label">自动跳过</div></div>
+<div class="stat ascend"><div class="stat-value">{ascend_count}</div><div class="stat-label">{icon('ascend')} 昇腾影响</div></div>
+<div class="stat high-risk"><div class="stat-value">{high_risk_count}</div><div class="stat-label">{icon('high_risk')} 高风险</div></div>
+<div class="stat test"><div class="stat-value">{needs_test_count}</div><div class="stat-label">{icon('test')} 需测试</div></div>
 </div>""")
         else:
             ps.append(f"""<div class="stats">
-<div class="stat"><div class="stat-value">{len(commits)}</div><div class="stat-label">Total</div></div>
-<div class="stat"><div class="stat-value">{auto_count}</div><div class="stat-label">Auto-skip</div></div>
-<div class="stat high-risk"><div class="stat-value">{high_risk_count}</div><div class="stat-label">{icon('high_risk')} High Risk</div></div>
+<div class="stat"><div class="stat-value">{len(commits)}</div><div class="stat-label">总计</div></div>
+<div class="stat"><div class="stat-value">{auto_count}</div><div class="stat-label">自动跳过</div></div>
+<div class="stat high-risk"><div class="stat-value">{high_risk_count}</div><div class="stat-label">{icon('high_risk')} 高风险</div></div>
 </div>""")
 
         # ── Daily Summary ──
@@ -158,6 +167,7 @@ def build_html(repos, date_str, data_dir="data"):
         # ── Classify commits ──
         high_risk = []
         ascend_affected = []
+        test_impact = []
         others = []
         for c in commits:
             if "自动判定" in c.get("comment", ""):
@@ -167,6 +177,8 @@ def build_html(repos, date_str, data_dir="data"):
                 high_risk.append(c)
             elif is_vllm and c.get("ascend_impact", {}).get("ascend_affected"):
                 ascend_affected.append(c)
+            elif c.get("test_impact", {}).get("needs_test_update") or c.get("ascend_impact", {}).get("needs_test_update"):
+                test_impact.append(c)
             else:
                 others.append(c)
 
@@ -181,46 +193,56 @@ def build_html(repos, date_str, data_dir="data"):
             body = "\n".join(comment.split("\n")[1:]).strip() if comment else ""
             item_cls = "item-danger" if is_high_risk else ("item-ascend" if is_ascend else "item-normal")
             gh_url = f"https://github.com/{repo}/commit/{sha_full}"
+            commit_msg = message_map.get(sha_full, "")
             lines = [f"""<div class="item {item_cls}">
-<a class="item-sha" href="{gh_url}" target="_blank">{sha}</a> {tag_html(tags)}
-<div class="item-title">{title}</div>"""]
-            if body:
-                short_body = body[:300] + ("…" if len(body) > 300 else "")
-                lines.append(f"""<div class="item-comment">{short_body}</div>""")
+<a class="item-sha" href="{gh_url}" target="_blank">{sha}</a> {tag_html(tags)}"""]
+            if commit_msg:
+                lines.append(f"""<div class="commit-message">{commit_msg[:200]}</div>""")
+            if title:
+                lines.append(f"""<div class="section-header">🤖 AI 分析结果</div><div class="section-body">{title}</div>""")
+                if body:
+                    short_body = body[:300] + ("…" if len(body) > 300 else "")
+                    lines.append(f"""<div class="item-comment">{short_body}</div>""")
             ai = c.get("ascend_impact")
             if is_vllm and ai and ai.get("ascend_affected") is True:
                 func = ai.get("functionality", "")
                 test_imp = ai.get("testing", "")
                 if func:
-                    lines.append(f"""<div class="item-comment" style="color:#3182ce;margin-top:6px;"><strong>vllm-ascend影响分析:</strong> {func[:200]}</div>""")
+                    lines.append(f"""<div class="section-header">⬆ vllm-ascend 影响</div><div class="section-body">{func[:200]}</div>""")
                 if test_imp:
-                    lines.append(f"""<div class="item-comment" style="color:#3182ce;"><strong>  Testing:</strong> {test_imp[:200]}</div>""")
+                    lines.append(f"""<div class="item-comment" style="color:#3182ce;margin-left:4px;"><strong>Testing:</strong> {test_imp[:200]}</div>""")
             ti = c.get("test_impact")
             if ti and ti.get("needs_test_update"):
                 reason = ti.get("reason", "")
                 areas = ti.get("suggested_test_areas", [])
                 if reason:
-                    lines.append(f"""<div class="item-comment" style="color:#dd6b20;margin-top:6px;"><strong>🧪 Test:</strong> {reason[:200]}</div>""")
+                    lines.append(f"""<div class="section-header">🧪 测试影响</div><div class="section-body">{reason[:200]}</div>""")
                 if areas:
-                    lines.append(f"""<div class="item-comment" style="color:#dd6b20;"><strong>  Areas:</strong> {', '.join(areas[:5])}</div>""")
+                    lines.append(f"""<div class="item-comment" style="color:#dd6b20;margin-left:4px;"><strong>Areas:</strong> {', '.join(areas[:5])}</div>""")
             lines.append("</div>")
             return "\n".join(lines)
 
-        # ── ⚠️ High Risk Commits ──
+        # ── ⚠️ 高风险 ──
         if high_risk:
-            ps.append(f"""<div class="card-title" style="margin-top:14px;">⚠️ High Risk Commits</div>""")
+            ps.append(f"""<div class="card-title" style="margin-top:14px;">⚠️ 高风险</div>""")
             for c in high_risk:
                 ps.append(render_commit(c))
 
-        # ── ⬆ vllm-ascend 影响分析 ──
+        # ── ⬆ vllm-ascend 影响（仅vllm主库） ──
         if is_vllm and ascend_affected:
-            ps.append(f"""<div class="card-title" style="margin-top:14px;">⬆ vllm-ascend 影响分析</div>""")
+            ps.append(f"""<div class="card-title" style="margin-top:14px;">⬆ vllm-ascend 影响</div>""")
             for c in ascend_affected:
                 ps.append(render_commit(c))
 
-        # ── 📋 Other Commits ──
+        # ── 🧪 测试影响（仅vllm-ascend） ──
+        if not is_vllm and test_impact:
+            ps.append(f"""<div class="card-title" style="margin-top:14px;">🧪 测试影响</div>""")
+            for c in test_impact:
+                ps.append(render_commit(c))
+
+        # ── 📋 其他 ──
         if others:
-            ps.append(f"""<div class="card-title" style="margin-top:14px;">📋 Other Commits</div>""")
+            ps.append(f"""<div class="card-title" style="margin-top:14px;">📋 其他</div>""")
             for c in others:
                 ps.append(render_commit(c))
 

@@ -103,18 +103,6 @@ def tag_html(tags):
     return " ".join(parts)
 
 
-def load_commit_files(repo, date_str):
-    """Load full commit data with file lists for a date."""
-    repo_dir = repo_dir_name(repo)
-    data = load_json(f"{data_dir}/{repo_dir}/commits/{date_str}.json")
-    if not data:
-        return {}
-    files_by_sha = {}
-    for c in data.get("commits", []):
-        files_by_sha[c["sha"]] = c.get("files", [])
-    return files_by_sha
-
-
 def build_html(repos, date_str, data_dir="data"):
     ps = []
     ps.append(f"""<!DOCTYPE html><html><head><meta charset="utf-8"><style>{CSS}</style></head><body>
@@ -125,7 +113,6 @@ def build_html(repos, date_str, data_dir="data"):
     for repo in repos:
         repo_dir = repo_dir_name(repo)
         analysis = load_json(f"{data_dir}/{repo_dir}/analysis/{date_str}.json")
-        files_map = load_commit_files(repo, date_str)
         short = repo.split("/")[-1]
         is_vllm = "ascend" not in repo
 
@@ -149,116 +136,93 @@ def build_html(repos, date_str, data_dir="data"):
         if daily_summary:
             ps.append(f"""<div class="summary-box"><div class="label">Daily Summary</div><div class="text">{daily_summary}</div></div>""")
 
-        ps.append(f"""<div class="stats">
+        if is_vllm:
+            ps.append(f"""<div class="stats">
 <div class="stat"><div class="stat-value">{len(commits)}</div><div class="stat-label">Total</div></div>
 <div class="stat"><div class="stat-value">{auto_count}</div><div class="stat-label">Auto-skip</div></div>
 <div class="stat ascend"><div class="stat-value">{ascend_count}</div><div class="stat-label">{icon('ascend')} Ascend</div></div>
 <div class="stat high-risk"><div class="stat-value">{high_risk_count}</div><div class="stat-label">{icon('high_risk')} High Risk</div></div>
 <div class="stat test"><div class="stat-value">{needs_test_count}</div><div class="stat-label">{icon('test')} Needs Test</div></div>
 </div>""")
+        else:
+            ps.append(f"""<div class="stats">
+<div class="stat"><div class="stat-value">{len(commits)}</div><div class="stat-label">Total</div></div>
+<div class="stat"><div class="stat-value">{auto_count}</div><div class="stat-label">Auto-skip</div></div>
+<div class="stat high-risk"><div class="stat-value">{high_risk_count}</div><div class="stat-label">{icon('high_risk')} High Risk</div></div>
+</div>""")
 
         # ── Daily Summary ──
         if daily_summary:
-            pass  # already shown above
+            pass
 
-        # ── Per-commit detail list ──
-        for i, c in enumerate(commits):
+        # ── Classify commits ──
+        high_risk = []
+        ascend_affected = []
+        others = []
+        for c in commits:
+            if "自动判定" in c.get("comment", ""):
+                continue
+            tags = c.get("tags", [])
+            if "high-risk" in tags:
+                high_risk.append(c)
+            elif is_vllm and c.get("ascend_impact", {}).get("ascend_affected"):
+                ascend_affected.append(c)
+            else:
+                others.append(c)
+
+        def render_commit(c):
             tags = c.get("tags", [])
             comment = c.get("comment", "")
             sha = c.get("sha", "")[:12]
             sha_full = c.get("sha", "")
             is_high_risk = "high-risk" in tags
-            is_ascend = c.get("ascend_impact",{}).get("ascend_affected") is True
-            is_auto = "自动判定" in comment
-
-            if is_auto:
-                continue  # skip auto-triaged commits in detail list
-
+            is_ascend = c.get("ascend_impact", {}).get("ascend_affected") is True
             title = comment.split("\n")[0] if comment else ""
             body = "\n".join(comment.split("\n")[1:]).strip() if comment else ""
-
             item_cls = "item-danger" if is_high_risk else ("item-ascend" if is_ascend else "item-normal")
             gh_url = f"https://github.com/{repo}/commit/{sha_full}"
-
-            ps.append(f"""<div class="item {item_cls}">
+            lines = [f"""<div class="item {item_cls}">
 <a class="item-sha" href="{gh_url}" target="_blank">{sha}</a> {tag_html(tags)}
-<div class="item-title">{title}</div>""")
-
+<div class="item-title">{title}</div>"""]
             if body:
-                # Truncate to first 300 chars for email
                 short_body = body[:300] + ("…" if len(body) > 300 else "")
-                ps.append(f"""<div class="item-comment">{short_body}</div>""")
-
-            # Ascend impact details
+                lines.append(f"""<div class="item-comment">{short_body}</div>""")
             ai = c.get("ascend_impact")
-            if ai and ai.get("ascend_affected") is True:
+            if is_vllm and ai and ai.get("ascend_affected") is True:
                 func = ai.get("functionality", "")
                 test_imp = ai.get("testing", "")
                 if func:
-                    ps.append(f"""<div class="item-comment" style="color:#3182ce;"><strong>⬆ Ascend:</strong> {func[:200]}</div>""")
+                    lines.append(f"""<div class="item-comment" style="color:#3182ce;"><strong>vllm-ascend影响分析:</strong> {func[:200]}</div>""")
                 if test_imp:
-                    ps.append(f"""<div class="item-comment" style="color:#3182ce;"><strong>  Testing:</strong> {test_imp[:200]}</div>""")
-
-            # Test impact details
+                    lines.append(f"""<div class="item-comment" style="color:#3182ce;"><strong>  Testing:</strong> {test_imp[:200]}</div>""")
             ti = c.get("test_impact")
             if ti and ti.get("needs_test_update"):
                 reason = ti.get("reason", "")
                 areas = ti.get("suggested_test_areas", [])
                 if reason:
-                    ps.append(f"""<div class="item-comment" style="color:#dd6b20;"><strong>🧪 Test:</strong> {reason[:200]}</div>""")
+                    lines.append(f"""<div class="item-comment" style="color:#dd6b20;"><strong>🧪 Test:</strong> {reason[:200]}</div>""")
                 if areas:
-                    ps.append(f"""<div class="item-comment" style="color:#dd6b20;"><strong>  Areas:</strong> {', '.join(areas[:5])}</div>""")
+                    lines.append(f"""<div class="item-comment" style="color:#dd6b20;"><strong>  Areas:</strong> {', '.join(areas[:5])}</div>""")
+            lines.append("</div>")
+            return "\n".join(lines)
 
-            # Changed files
-            files = files_map.get(sha_full, [])
-            if files:
-                file_names = [f["filename"] for f in files[:5]]
-                file_text = "; ".join(file_names)
-                if len(files) > 5:
-                    file_text += f" … +{len(files)-5} more"
-                ps.append(f"""<div class="item-comment" style="color:#8b949e;font-size:11px;"><strong>Files:</strong> {file_text}</div>""")
+        # ── ⚠️ High Risk Commits ──
+        if high_risk:
+            ps.append(f"""<div class="card-title" style="margin-top:14px;">⚠️ High Risk Commits</div>""")
+            for c in high_risk:
+                ps.append(render_commit(c))
 
-            # Module-level stats
-            mod_paths = {}
-            for f in files:
-                parts = f["filename"].split("/")
-                key = "/".join(parts[:3]) + "/" if len(parts) >= 3 else f["filename"]
-                mod_paths[key] = mod_paths.get(key, 0) + 1
-            if mod_paths:
-                mod_text = "; ".join(sorted(mod_paths.keys()))
-                ps.append(f"""<div class="item-comment" style="color:#8b949e;font-size:11px;"><strong>Modules:</strong> {mod_text}</div>""")
+        # ── ⬆ vllm-ascend 影响分析 ──
+        if is_vllm and ascend_affected:
+            ps.append(f"""<div class="card-title" style="margin-top:14px;">⬆ vllm-ascend 影响分析</div>""")
+            for c in ascend_affected:
+                ps.append(render_commit(c))
 
-            ps.append("</div>")
-
-        # ── Module heatmap ──
-        mod_counts = {}
-        for c in commits:
-            files = files_map.get(c["sha"], [])
-            for f in files:
-                parts = f["filename"].split("/")
-                key = "/".join(parts[:3]) + "/" if len(parts) >= 3 else f["filename"]
-                mod_counts[key] = mod_counts.get(key, 0) + 1
-        top_mods = sorted(mod_counts.items(), key=lambda x: -x[1])[:8]
-
-        if top_mods:
-            max_n = max(n for _, n in top_mods)
-            rows = []
-            for path, n in top_mods:
-                pct = round(n / max_n * 100)
-                rows.append(f"""<div class="hm-row"><span class="hm-path">{path}</span><div class="hm-bar"><div class="hm-fill" style="width:{pct}%"></div></div><span class="hm-count">{n}</span></div>""")
-            ps.append(f"""<div style="margin-top:12px;padding-top:12px;border-top:1px solid #e2e8f0;"><div style="font-size:11px;color:#718096;margin-bottom:6px;">Hot modules</div>{"".join(rows)}</div>""")
-
-        # ── Coverage ──
-        commits_idx = load_json(f"{data_dir}/{repo_dir}/dates.json") or {}
-        analysis_idx = load_json(f"{data_dir}/{repo_dir}/analysis-dates.json") or {}
-        if commits_idx.get("dates") and analysis_idx.get("dates"):
-            all_d = set(commits_idx.get("dates", []))
-            done_d = set(analysis_idx.get("dates", []))
-            analyzed = len(all_d & done_d)
-            total = len(all_d)
-            pct = round(analyzed / total * 100) if total else 0
-            color = "#3dd68c" if analyzed == total else ("#d29922" if total - analyzed < 5 else "#e53e3e")
-            ps.append(f"""<div class="coverage"><span>Coverage</span><div class="coverage-track"><div class="coverage-fill" style="width:{pct}%;background:{color}"></div></div><span>{analyzed}/{total}</span></div>""")
+        # ── 📋 Other Commits ──
+        if others:
+            ps.append(f"""<div class="card-title" style="margin-top:14px;">📋 Other Commits</div>""")
+            for c in others:
+                ps.append(render_commit(c))
 
         ps.append("</div>")
 

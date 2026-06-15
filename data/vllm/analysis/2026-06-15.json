@@ -1,0 +1,444 @@
+{
+  "date": "2026-06-15",
+  "repo": "vllm-project/vllm",
+  "generated_at": "2026-06-16T04:54:06.977650+08:00",
+  "daily_summary": "当日变更涉及多个方面：1) 重构了推理/工具解析器的属性，统一为 Parser 接口；2) 修复了混合模型前缀缓存中跨组 KV 缓存分配的双阶段问题；3) 增强了 Triton 注意力后端对 KV cache dtype 的架构支持检查；4) 修复了 MXFP4 MOE CUTLASS 内核中的 E8M0 缩放计算；5) 增加了音频上传大小限制的安全检查；6) 修复了 DiffusionGemma 的 max_new_tokens 配置；7) 修复了 MiMo v2.x 模型的 QKV TP 分片和 FP4 支持；8) 增加了对 SamplingParams 中 temperature 值的范围校验；9) 在 usage.prompt_tokens_details 中报告多模态 token 计数；10) 移除了 XverseForCausalLM 模型支持；11) 修复了 V1 模型运行器中注意力组的分组逻辑；12) 修复了 FastAPI >=0.137 的兼容性问题；13) 引入了流式解析器引擎和新的 Qwen3 解析器；14) 修复了 CPU 后端对 cgroup 内存限制的识别；15) 为 XPU 启用了序列并行支持；16) 优化了 Llama4 权重的流式加载；17) 增强了 runai_streamer 加载器的配置验证；18) 为 /v1/embeddings 添加了 messages 和 chat_template_kwargs 支持。",
+  "ascend_impact_summary": "当日 vllm 变更对 vllm-ascend 项目影响较小。主要影响包括：1) Triton 注意力后端的 KV cache dtype 架构检查变更（vllm/v1/attention/backends/triton_attn.py）可能影响 AscendAttentionBackend 的初始化逻辑；2) 序列并行支持扩展到 XPU 的变更（vllm/compilation/passes/fusion/sequence_parallelism.py）为昇腾 NPU 的序列并行支持提供了参考实现；3) 流式解析器引擎的引入（vllm/parser/engine/）是全新的模块，vllm-ascend 无需适配；4) 其他变更（如模型移除、配置验证、bugfix）对昇腾 NPU 无直接影响。",
+  "commits": [
+    {
+      "sha": "0d80979644e0237b6ef02ce0601dc0bd654e357b",
+      "comment": "该 commit 重构了 chat serving 中的推理解析器和工具解析器属性，将它们统一为 Parser 接口。主要变更包括：1) 在 OpenAIServingChat 中移除独立的 reasoning_parser_cls 和 tool_parser 属性，统一使用 parser_cls；2) 在 batch_serving 中将 ReasoningParser 替换为统一的 Parser；3) 在 BatchChatCompletionRequest 中添加 tool_choice 和 include_reasoning 字段；4) 调整了 parser 的创建和调用逻辑，使其通过统一的 Parser 接口处理推理和工具调用。这是一个重构性质的变更，降低了代码复杂度，但需要确保所有下游调用都正确适配新的接口。",
+      "tags": [
+        "refactor",
+        "low-risk",
+        "serving"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "588db1836245bb40589d45b3e87048a53a13cfe5",
+      "comment": "该 commit 修复了混合模型（如 SWA + Full Attention）中跨组前缀缓存命中的双阶段 KV 分配问题（issue #33775）。核心问题是：当一个请求在一个 KV 缓存组中命中本地前缀缓存，同时在另一个组中需要外部（连接器）块时，较早组的外部分配可能会驱逐较晚组的本地缓存命中块，导致同一物理块被分配两次。修复方案是将分配过程分为两个阶段：1) 先通过 add_local_computed_blocks 触摸所有组的本地缓存命中块；2) 再通过 allocate_external_computed_blocks 分配外部块。这样确保了较早组的外部分配不会驱逐较晚组的尚未触摸的缓存命中块。同时将 SingleTypeKVCacheManager 中的 allocate_new_computed_blocks 拆分为 add_local_computed_blocks 和 allocate_external_computed_blocks 两个方法。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "scheduler",
+        "kv-cache"
+      ],
+      "ascend_impact": {
+        "ascend_affected": true,
+        "functionality": "KVCacheManager 的接口发生了变化：allocate_new_computed_blocks 被拆分为 add_local_computed_blocks 和 allocate_external_computed_blocks。如果 vllm-ascend 有自定义的 KVCacheManager 实现或重写了这些方法，需要同步更新。",
+        "testing": "新增了多个测试用例验证双阶段分配的正确性，包括跨组唯一性、抢占后重新分配等场景。",
+        "needs_test_update": true,
+        "suggested_test_areas": [
+          "vllm_ascend/v1/core/kv_cache_manager.py"
+        ]
+      }
+    },
+    {
+      "sha": "fa63bb9db6f48108077fb5497081f7189092d163",
+      "comment": "该 commit 移除了 Triton KV cache 中冗余的 dtype 断言，并增加了对架构支持的强制检查。主要变更：1) 在 triton_attn.py 的 TritonAttentionBackend 初始化中增加了对 fp8（需要 SM89+）和 bfloat16（需要 SM80+）的架构检查，不满足时抛出明确的 ValueError；2) 在 triton_reshape_and_cache_flash.py 中将 _is_supported_kv_cache_dtype 函数从简单的包含检查改为包含架构能力检查，并移除了多个冗余的 assert 语句。这提高了错误信息的可读性和用户体验。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "attention",
+        "triton"
+      ],
+      "ascend_impact": {
+        "ascend_affected": true,
+        "functionality": "TritonAttentionBackend 的初始化逻辑发生了变化，增加了对 fp8 和 bfloat16 的架构能力检查。如果 vllm-ascend 的 AscendAttentionBackend 继承或使用了 TritonAttentionBackend 的初始化逻辑，需要评估是否需要在昇腾 NPU 上添加类似的检查。",
+        "testing": "无直接影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "5ed15f42b93d4ea7b40f4dfc2dd7f12a44c99d75",
+      "comment": "该 commit 修复了 MXFP4 (W4A4) MOE CUTLASS 内核中的 E8M0 缩放计算。旧的内核使用了 NVFP4 公式（floor(log2(max/6)) + 127），这不符合 OCP MX 规范。修复后的内核使用正确的 OCP MX 规范公式：scale_exp = biased_exponent(round_up(vecMax)) - 2。同时修复了缩放因子的除法方式，对于 UE8M0 路径使用精确除法（1.0 / SFValue）而非近似倒数。此外，还修复了 flashinfer.py 中 mxfp4_quantize 调用缺少 .contiguous() 的问题。新增了详细的测试用例验证 E8M0 缩放的正确性、无饱和情况以及重建误差。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "quantization",
+        "kernel"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "b997071ec493765abbed990c65843ed05e4708a8",
+      "comment": "该 commit 修复了一个安全漏洞：在音频上传完全加载到内存之前强制执行大小限制。新增了 read_upload_with_limit 函数，该函数首先检查 Content-Length 头（如果可用），然后进行分块读取，一旦累积大小超过限制就立即停止，确保超大上传永远不会完全加载到内存中。同时修改了 transcription 和 translation 的 API 路由，使用新的安全读取函数替代直接的 file.read()。新增了全面的测试用例验证各种边界情况。",
+      "tags": [
+        "bugfix",
+        "security",
+        "low-risk",
+        "serving"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "6c5872efc5fca7a53f5f3aa589e8cb7896d98618",
+      "comment": "该 commit 修复了 DiffusionGemma 模型的问题：移除了 HuggingFace 的 generation_config.json 中默认的 max_new_tokens 限制（256），使 DiffusionGemma 像其他模型一样没有服务端限制，每个请求通过 max_tokens 控制自己的输出长度。通过在 override_generation_config 中将 max_new_tokens 设置为 None，使 get_diff_sampling_param 跳过该键。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "model"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "1d88c4daddb267173f69901dfbcbb20b21046fa4",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "chore"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "25c53d129302d354272e0a433fdac129be049e72",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "feature",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "9872921c5f5e733a4f46943562c0a31c9ff69493",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "chore"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "c17e2f7c84d28dfcf5e8cfcc3c5c10bd3caad8b5",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "bugfix",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "40eac9a9d92bba51ad49ca777a5517ee212ea394",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "feature",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "b5adb027ad03c29b46181752ba3b1cb84eff1dd4",
+      "comment": "该 commit 修复了 MiMo v2.x 模型的 QKV TP 分片和 FP4 支持。主要变更：1) 新增 _shard_fp8_qkv_proj 函数，正确处理融合的 fp8 QKV 投影权重的 TP 分片。当每个 TP rank 拥有多个 KV head 时，需要反量化、重新排列行顺序（从 [Q|K|V] 交错布局变为 [Q_all|K_all|V_all] 布局），然后重新量化回 fp8。2) 在 load_weights 中新增 _try_load_fp8_qkv_proj 方法，处理 fp8 QKV 投影的权重和缩放因子的延迟加载和分片。3) 在 Fp8Config 中添加 store_dtype 参数，支持在 fp8 配置中指定存储为 mxfp4 格式。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "model",
+        "quantization"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "64833f8158236a7bddeeb89efc6a3bde5d16f468",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "feature",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "ddad5dbda20c6eee443a239790e359a22cb5d65e",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "bugfix",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "ebb0a71ad0b2e2a09ed76b14338465f6b121ebfd",
+      "comment": "该 commit 在 SamplingParams 的 _verify_args 方法中增加了对 temperature 值的范围校验，限制 temperature 必须在 [0, 2] 范围内。超出范围时抛出 VLLMValidationError。这是一个安全性的改进，防止用户传入不合理的 temperature 值导致采样行为异常。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "sampling"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "48df95c43e05347070b6a99d39c053acfdeb8900",
+      "comment": "该 commit 在 usage.prompt_tokens_details 中增加了多模态 token 计数的报告。新增了 _get_mm_token_counts 函数，从 engine_input 的 mm_placeholders 中提取每个模态的 placeholder token 数量。新增了 _make_prompt_tokens_details 函数，统一构建 PromptTokenUsageInfo，包含 cached_tokens 和 multimodal_tokens。在 PromptTokenUsageInfo 模型中新增了 multimodal_tokens 字段。修改了流式和非流式生成器，将 mm_token_counts 传递给最终的 usage 信息。",
+      "tags": [
+        "feature",
+        "low-risk",
+        "serving",
+        "multimodal"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "7df4fe1bd78517d6e0f3d73487a60cb53cdb51c7",
+      "comment": "该 commit 移除了 XverseForCausalLM 模型支持。XVERSE 模型之前通过注册表映射到 LlamaForCausalLM，但由于其 tokenizer 与 transformers v5 不兼容，且模型已不再活跃维护，因此决定移除支持。在注册表中删除了映射，在已弃用模型列表中添加了 XverseForCausalLM（标记为 0.23.0 版本弃用），并更新了文档和测试配置。",
+      "tags": [
+        "chore",
+        "low-risk",
+        "model"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "b8336c3c7c298e0878f22a7bf70f4e295b2f4e01",
+      "comment": "该 commit 修复了 V1 模型运行器中注意力组的分组逻辑。之前的分组键只包含 (attn_backend_cls, kv_cache_spec)，这会导致具有不同 Q-head 数量的层（如推测解码中的 draft head 和目标 head）被错误地分到同一组，共享同一个 metadata builder。修复方案是将 num_heads_q 也作为分组键的一部分，确保不同 Q-head 数量的层获得独立的 metadata builder。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "model-runner",
+        "attention"
+      ],
+      "ascend_impact": {
+        "ascend_affected": true,
+        "functionality": "init_attn_backend 函数中的注意力分组逻辑发生了变化，分组键增加了 num_heads_q。如果 vllm-ascend 的 GPUWorker 或模型运行器使用了此函数，需要确保兼容性。",
+        "testing": "无直接影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "e8d3e22c884e95a7499ffcf37fa932751f0780df",
+      "comment": "该 commit 修复了 FastAPI >=0.137 的兼容性问题。新版本的 FastAPI 在 app.routes 中存储了没有 .path 属性的 _IncludedRouter 对象，导致 prometheus-fastapi-instrumentator 的 _get_route_name 函数无条件读取 route.path 时抛出 AttributeError，使所有请求返回 500。修复方案是打补丁替换 _get_route_name 函数，跳过没有 .path 属性的路由。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "serving",
+        "metrics"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "c4a3f9d137099023a93fbb2299f3c52477751176",
+      "comment": "该 commit 引入了流式解析器引擎（Streaming Parser Engine）框架和新的 Qwen3 解析器。这是一个重大的架构变更，将推理和工具调用的解析逻辑从手写的解析器（如 Qwen3ReasoningParser、Qwen3CoderToolParser）迁移到基于声明式配置的引擎驱动方式。核心组件包括：1) StreamingParserEngine - 流式解析引擎，协调 TokenIDScanner、IncrementalLexer 和状态机；2) ParserEngineConfig - 声明式配置，定义终端、状态和转换；3) ParserEngine - 将引擎事件转换为 DeltaMessage 的适配层；4) 适配器（ParserEngineReasoningAdapter、ParserEngineToolAdapter）使引擎通过旧的 ReasoningParser/ToolParser 接口工作。新的 Qwen3Parser 使用引擎驱动方式处理 <think>/</think> 推理和 <tool_call> XML 工具调用。同时移除了旧的 Qwen3ReasoningParser 和 Qwen3CoderToolParser。",
+      "tags": [
+        "feature",
+        "high-risk",
+        "parser",
+        "serving"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "e3e3cd54589cee689b785aab5bda81b3e4203191",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "bugfix",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "8760f972caf57f592ae2c118cecd7f105891ba13",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "chore"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "b675cb7d0fbf52cdf768df756ab4d6a576f7f756",
+      "comment": "该 commit 修复了 CPU 后端在计算 KV cache 大小时未考虑 cgroup 内存限制的问题。新增了 get_cgroup_memory_limit 函数，支持 cgroup v2（/sys/fs/cgroup/memory.max）和 v1（/sys/fs/cgroup/memory/memory.limit_in_bytes）两种接口。在 get_memory_node_info 中，当 cgroup 限制小于 NUMA 节点总内存时，使用 cgroup 限制作为 total_memory，并相应调整 available_memory。这确保了在容器或 Kubernetes Pod 中运行时，KV cache 大小计算基于 Pod 的内存限制而非宿主机内存。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "cpu",
+        "kv-cache"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "2725c84aaed1dd27085655f224b3b3c4ff2e8f1e",
+      "comment": "该 commit 为 XPU 平台启用了序列并行（Sequence Parallelism）支持。主要变更：1) 在 get_sequence_parallelism_threshold 函数中为 XPU 添加了独立的分支，使用 XPU 特定的阈值（min_hidden_size=4096, min_per_gpu_size_mb=8.0）；2) 在 pass_manager.py 中将 SequenceParallelismPass 的导入条件从 is_cuda_alike() 扩展为 is_cuda_alike() or is_xpu()；3) 在 XPU 平台配置中移除了对序列并行编译 pass 的禁用。新增了针对 XPU 的测试用例。",
+      "tags": [
+        "feature",
+        "low-risk",
+        "xpu",
+        "compilation"
+      ],
+      "ascend_impact": {
+        "ascend_affected": true,
+        "functionality": "get_sequence_parallelism_threshold 函数增加了对 XPU 平台的支持分支。如果 vllm-ascend 未来需要支持序列并行，可以参考 XPU 的实现方式，在函数中添加对昇腾 NPU 平台的支持。",
+        "testing": "新增了针对 XPU 的序列并行阈值测试用例。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "1801fad0ba6238381430794d83d4c5540c2d73aa",
+      "comment": "该 commit 优化了 Llama4 模型的权重加载方式，避免主机内存 OOM。主要变更：1) 在 llama4.py 中将权重列表推导式改为生成器表达式，使 AutoWeightsLoader 可以惰性消费权重迭代器；2) 在 mllama4.py 中重构了权重分离逻辑，将语言模型权重通过生成器流式传递给 AutoWeightsLoader，只有较小的视觉/投影器和标量专家缩放权重被缓冲到列表中。这解决了 copy-returning 加载器（如 runai_streamer）在加载大型模型时因持有整个检查点副本而导致主机 OOM 的问题。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "model",
+        "model-loader"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "3d6ce816f02bfe7ac2d36ca4837e8e67179353d9",
+      "comment": "该 commit 增强了 runai_streamer 模型加载器的配置验证。主要变更：1) 验证 model_loader_extra_config 中的键必须是允许的集合（distributed, concurrency, memory_limit），未知键会抛出 ValueError；2) 验证 distributed 必须是布尔值；3) 验证 concurrency 和 memory_limit 必须是正整数；4) 所有验证在修改 os.environ 之前完成，确保部分验证失败不会留下部分应用的环境变量。新增了全面的测试用例。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "model-loader"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "2c764c089ae7ea2132d0c530b22a8f85fbb90af6",
+      "comment": "该 commit 为 /v1/embeddings API 添加了对 messages 和 chat_template_kwargs 的支持。主要变更：1) 新增 EmbeddingChatInputRequest 和 EmbeddingBatchChatInputRequest 类，支持在 input 字段中传递聊天消息；2) 新增 EmbeddingBatchChatRequest 类，支持在 messages 字段中传递批量聊天消息；3) 将 ChatRequestMixin 拆分为 ChatRequestOptionsMixin（包含 add_generation_prompt、chat_template_kwargs 等选项）和 ChatRequestMixin（包含 messages 字段），使批量聊天请求可以复用选项而不需要 messages 字段；4) 在 EmbedIOProcessor 中新增 _pre_process_openai_chat_online 和 _batch_render_openai_chat 方法，处理聊天格式的嵌入请求。",
+      "tags": [
+        "feature",
+        "low-risk",
+        "serving",
+        "embedding"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    }
+  ]
+}

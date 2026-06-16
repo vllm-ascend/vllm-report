@@ -2,7 +2,6 @@
 import argparse
 import json
 import os
-import re
 import sys
 import tempfile
 import urllib.request
@@ -71,9 +70,18 @@ PROMPT_TEMPLATE = """你是一个代码变更分析专家。请对以下 commit 
 ASCEND_IMPACT_VLLM = "（仅 vllm 仓库需要填写）：评估对 vllm-ascend 项目的影响"
 ASCEND_IMPACT_ASCEND = "（vllm-ascend 仓库无需填写，填写 null 即可）"
 
-VLLM_ASCEND_REQUIREMENT = """**ascend_impact**（仅 vllm 仓库需要填写）：评估对 vllm-ascend 项目的影响
+VLLM_ASCEND_REQUIREMENT = """**ascend_impact**（仅 vllm 仓库需要填写）：评估对 vllm-ascend 项目的影响。
+   请基于上面架构上下文中的"接口面"、"跨项目影响判断规则"、"实现原理"来判断，不要凭感觉猜测。
+
+   判断流程：
+   1. 先看变更文件是否命中"必然影响"路径列表 → ascend_affected = true
+   2. 再看变更文件是否命中"可能影响"路径列表 → 结合变更内容判断
+   3. 纯平台特定代码（flashinfer/cuda/rocm 等）→ ascend_affected = false
+   4. 纯 docs/tests/ci/build → ascend_affected = false
+
+   输出字段：
    - ascend_affected：该 commit 是否影响 vllm-ascend（布尔值，影响则 true，不影响则 false）
-   - functionality：功能层面的影响（参考架构上下文中的硬件适配层信息判断）
+   - functionality：功能层面的影响（具体说明影响哪个接口/类，如何影响，不要写"可能""也许"等模糊词）
    - testing：测试层面的影响
    - needs_test_update：vllm-ascend 是否因此变更需要新增、删除或更新测试用例（布尔值）
    - suggested_test_areas：如果 needs_test_update 为 true，建议变更的文件或模块（列表）
@@ -197,11 +205,33 @@ def build_context_section(context):
         parts.append(f"核心模块：\n{modules_text}")
 
     if context.get("key_abstractions"):
-        abs_text = "\n".join(
-            f"  - {a.get('name', '')} ({a.get('location', '')}): {a.get('description', '')}"
-            for a in context["key_abstractions"]
-        )
-        parts.append(f"关键抽象：\n{abs_text}")
+        abs_lines = []
+        for a in context["key_abstractions"]:
+            line = f"  - {a.get('name', '')} ({a.get('location', '')})"
+            if a.get("inherits_from"):
+                line += f" extends {a['inherits_from']}"
+            line += f": {a.get('description', '')}"
+            if a.get("key_methods"):
+                methods = "; ".join(a["key_methods"])
+                line += f"\n    关键方法: {methods}"
+            if a.get("ascend_implementations"):
+                line += f"\n    Ascend 实现: {', '.join(a['ascend_implementations'])}"
+            abs_lines.append(line)
+        parts.append(f"关键抽象：\n" + "\n".join(abs_lines))
+
+    if context.get("implementation_principles"):
+        principles_lines = []
+        for p in context["implementation_principles"]:
+            lines = [
+                f"  [{p.get('module', '')}]",
+                f"    问题: {p.get('problem', '')}",
+                f"    流程: {p.get('workflow', '')}",
+                f"    交互: {p.get('interactions', '')}",
+            ]
+            if p.get("platform_differences"):
+                lines.append(f"    平台差异: {p['platform_differences']}")
+            principles_lines.append("\n".join(lines))
+        parts.append(f"实现原理：\n" + "\n".join(principles_lines))
 
     if context.get("module_dependencies"):
         parts.append(f"模块依赖：{context['module_dependencies']}")
@@ -213,6 +243,38 @@ def build_context_section(context):
             parts.append(f"  平台无关接口：{', '.join(ha['platform_independent'])}")
         if ha.get("platform_specific"):
             parts.append(f"  平台特定实现：{', '.join(ha['platform_specific'])}")
+
+    if context.get("interface_surface"):
+        iface = context["interface_surface"]
+        if iface.get("description"):
+            parts.append(f"接口面：{iface['description']}")
+        if iface.get("inheritable_interfaces"):
+            iface_lines = []
+            for ii in iface["inheritable_interfaces"]:
+                line = f"  - {ii.get('interface', '')} → Ascend: {ii.get('ascend_impl', '')}"
+                if ii.get("impact_rule"):
+                    line += f"\n    影响规则: {ii['impact_rule']}"
+                if ii.get("key_methods"):
+                    line += f"\n    关键方法: {'; '.join(ii['key_methods'])}"
+                iface_lines.append(line)
+            parts.append(f"可继承接口：\n" + "\n".join(iface_lines))
+        if iface.get("not_used_by_ascend"):
+            parts.append(f"不被 Ascend 使用的路径：{', '.join(iface['not_used_by_ascend'])}")
+
+    if context.get("cross_project_relationship"):
+        cpr = context["cross_project_relationship"]
+        if cpr.get("impact_judgment_rules"):
+            rules = cpr["impact_judgment_rules"]
+            parts.append("跨项目影响判断规则：")
+            if rules.get("definitely_affected_paths"):
+                parts.append(f"  必然影响: {'; '.join(rules['definitely_affected_paths'])}")
+            if rules.get("potentially_affected_paths"):
+                parts.append(f"  可能影响: {'; '.join(rules['potentially_affected_paths'])}")
+            if rules.get("never_affected_paths"):
+                parts.append(f"  绝不影哬: {'; '.join(rules['never_affected_paths'])}")
+        if cpr.get("patch_impact_map"):
+            patch_lines = [f"  {k} → {v}" for k, v in cpr["patch_impact_map"].items()]
+            parts.append(f"Patch 影响映射：\n" + "\n".join(patch_lines))
 
     if context.get("test_structure"):
         ts = context["test_structure"]
@@ -227,6 +289,9 @@ def build_context_section(context):
 # ── Path-based triage for ascend impact ──────────────────────────────
 # If ALL changed files in a commit match these patterns, it can be
 # auto-determined as ascend_affected=false, skipping the LLM call.
+#
+# The base set is hardcoded. It can be extended at runtime by loading
+# the not_used_by_ascend list from architecture.json (see triage_ascend).
 
 AUTO_FALSE_DIRS = (
     "tests/",
@@ -236,9 +301,10 @@ AUTO_FALSE_DIRS = (
     "csrc/",
     ".buildkite/",
     ".buildifier/",
+    "rust/",
 )
 
-AUTO_FALSE_EXTS = (".md", ".rst", ".txt", ".cfg", ".ini")
+AUTO_FALSE_EXTS = (".md", ".rst", ".txt", ".cfg", ".ini", ".rs")
 
 AUTO_FALSE_FILES = {
     "format.sh", "Dockerfile", "Makefile", "CMakeLists.txt",
@@ -250,17 +316,60 @@ AUTO_FALSE_FILES = {
     ".pre-commit-config.yaml", ".codespellrc", ".flake8",
 }
 
-_RE_PLATFORM_SPEC = re.compile(
-    r"vllm/platforms/(cuda|rocm|xpu|cpu|tpu|unspecified)\.py$"
+# Platform-specific files that are definitely NOT used by ascend.
+# These are hardcoded as a fallback; architecture.json's not_used_by_ascend
+# takes priority when available.
+AUTO_FALSE_PLATFORM_SPECIFIC = (
+    "vllm/platforms/cuda.py",
+    "vllm/platforms/rocm.py",
+    "vllm/platforms/xpu.py",
+    "vllm/platforms/tpu.py",
+    "vllm/platforms/cpu.py",
+    "vllm/platforms/zen_cpu.py",
+    "vllm/platforms/unspecified.py",
+    "vllm/v1/worker/gpu_worker.py",
+    "vllm/v1/worker/cpu_worker.py",
+    "vllm/v1/worker/xpu_worker.py",
+    "vllm/v1/attention/backends/flash_attn.py",
+    "vllm/v1/attention/backends/flashinfer.py",
+    "vllm/v1/attention/backends/rocm_attn.py",
+    "vllm/v1/attention/backends/rocm_aiter.py",
+    "vllm/v1/attention/backends/cpu_attn.py",
+    "vllm/v1/attention/backends/triton_attn.py",
+    "vllm/v1/attention/backends/flex_attention.py",
+    "vllm/v1/attention/backends/turboquant_attn.py",
+    "vllm/kernels/aiter_ops/",
+    "vllm/kernels/vllm_c/",
+    "vllm/kernels/xpu_ops/",
+    "vllm/distributed/device_communicators/cuda_communicator.py",
+    "vllm/distributed/device_communicators/cpu_communicator.py",
+    "vllm/distributed/device_communicators/xpu_communicator.py",
+    "vllm/distributed/device_communicators/ray_communicator.py",
 )
-_RE_WORKER_SPEC = re.compile(
-    r"vllm/v1/worker/(gpu_worker|cpu_worker|xpu_worker)\.py$"
-)
-_RE_ATTN_BACKEND_SPEC = re.compile(
-    r"vllm/v1/attention/backends/"
-    r"(flash_attn|flashinfer|rocm_attn|cpu_attn|triton_attn|"
-    r"rocm_aiter|flex_attention|turboquant_attn)\.py$"
-)
+
+# ── Runtime-extensible not_used_by_ascend set ────────────────────────
+# Populated by load_not_used_by_ascend() from architecture.json.
+_not_used_by_ascend_extra = set()
+
+
+def load_not_used_by_ascend(data_dir):
+    """Load the not_used_by_ascend list from vllm architecture.json.
+
+    This extends the hardcoded AUTO_FALSE patterns with architecture-aware
+    paths that the LLM identified as definitely not used by vllm-ascend.
+    """
+    global _not_used_by_ascend_extra
+    if _not_used_by_ascend_extra:
+        return
+    vllm_dir = os.path.join(data_dir, "vllm")
+    context_path = os.path.join(vllm_dir, "context", "architecture.json")
+    context = load_json(context_path)
+    if context is None:
+        return
+    iface = context.get("interface_surface", {})
+    not_used = iface.get("not_used_by_ascend", [])
+    for path in not_used:
+        _not_used_by_ascend_extra.add(path)
 
 
 def _is_auto_false_path(filename):
@@ -271,14 +380,12 @@ def _is_auto_false_path(filename):
         return True
     if filename in AUTO_FALSE_FILES:
         return True
-    if filename.startswith("rust/") or filename.endswith(".rs"):
-        return True
-    if _RE_PLATFORM_SPEC.search(filename):
-        return True
-    if _RE_WORKER_SPEC.search(filename):
-        return True
-    if _RE_ATTN_BACKEND_SPEC.search(filename):
-        return True
+    for prefix in AUTO_FALSE_PLATFORM_SPECIFIC:
+        if filename == prefix or filename.startswith(prefix.rstrip("/") + "/"):
+            return True
+    for prefix in _not_used_by_ascend_extra:
+        if filename == prefix or filename.startswith(prefix.rstrip("/") + "/"):
+            return True
     return False
 
 
@@ -639,8 +746,12 @@ def analyze_commits(repo, date, data_dir, confirm, force, local_repo=None):
 
     print(f"Analyzing {num_commits} commits for {repo} on {date}...")
 
-    # Phase 1: triage — path-based pre-filter
+    # Load not_used_by_ascend from architecture.json for better triage
     is_vllm = "vllm-ascend" not in repo
+    if is_vllm:
+        load_not_used_by_ascend(data_dir)
+
+    # Phase 1: triage — path-based pre-filter
     llm_shas = []
     auto_analysis = []
     for c in all_commits:

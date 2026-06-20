@@ -1,0 +1,346 @@
+{
+  "date": "2026-06-20",
+  "repo": "vllm-project/vllm",
+  "branch": "main",
+  "commits": [
+    {
+      "sha": "d272418f459a82e1012b60116ac00659a7017cde",
+      "author": {
+        "name": "L丶",
+        "email": "30801931+Sirius29@users.noreply.github.com"
+      },
+      "date": "2026-06-20T22:09:18+08:00",
+      "message": "[Perf] Optimize Qwen3-VL multi-video prompt processing (#46026)\n\nSigned-off-by: Sirius29 <422058530@qq.com>\nCo-authored-by: mergify[bot] <37929162+mergify[bot]@users.noreply.github.com>",
+      "parents": [
+        "7ff7f5c8eb98354d3776f6c60c90aebc2b41c1da"
+      ],
+      "stats": {
+        "total_additions": 124,
+        "total_deletions": 26,
+        "files_changed": 150
+      },
+      "files": [
+        {
+          "filename": "tests/models/multimodal/processing/test_qwen3_vl.py",
+          "status": "modified",
+          "additions": 46,
+          "deletions": 0,
+          "patch": "@@ -92,3 +92,49 @@ def test_processor_num_frames_timestamp(\n     assert len(video_phs) == 1, (\n         f\"Expected exactly 1 video placeholder, got {len(video_phs)}\"\n     )\n+\n+\n+@pytest.mark.parametrize(\"model_id\", [MODEL_ID])\n+@pytest.mark.parametrize(\"num_videos\", [2, 4])\n+def test_processor_multi_video(\n+    model_id: str,\n+    num_videos: int,\n+) -> None:\n+    \"\"\"Verify that multi-video processing produces correct placeholders.\n+\n+    This exercises the token-level replacement path in\n+    ``_call_hf_processor`` which avoids the quadratic text-level\n+    prompt expansion.\n+    \"\"\"\n+    ctx = build_model_context(\n+        model_id,\n+        limit_mm_per_prompt={\"image\": 0, \"video\": num_videos},\n+    )\n+    processor = MULTIMODAL_REGISTRY.create_processor(ctx.model_config)\n+\n+    prompt = \"<|vision_start|><|video_pad|><|vision_end|>\" * num_videos\n+    mm_data = {\"video\": [_build_video_mm_data(num_frames=8)[\"video\"][0]] * num_videos}\n+\n+    processed = processor(\n+        prompt,\n+        mm_items=processor.info.parse_mm_data(mm_data),\n+        hf_processor_mm_kwargs={\"num_frames\": 8},\n+    )\n+\n+    token_ids = processed[\"prompt_token_ids\"]\n+    assert len(token_ids) > 0\n+\n+    video_phs = processed[\"mm_placeholders\"].get(\"video\", [])\n+    assert len(video_phs) == num_videos, (\n+        f\"Expected {num_videos} video placeholders, got {len(video_phs)}\"\n+    )\n+\n+    # All placeholders should have the same length (same video params)\n+    # and must not overlap.\n+    lengths = {ph.length for ph in video_phs}\n+    assert len(lengths) == 1, f\"Placeholder lengths differ: {lengths}\"\n+    for i in range(1, len(video_phs)):\n+        prev_end = video_phs[i - 1].offset + video_phs[i - 1].length\n+        assert video_phs[i].offset >= prev_end, (\n+            f\"Placeholder {i} overlaps with placeholder {i - 1}\"\n+        )"
+        },
+        {
+          "filename": "vllm/model_executor/models/qwen3_vl.py",
+          "status": "modified",
+          "additions": 78,
+          "deletions": 26,
+          "patch": "@@ -1202,6 +1202,49 @@ def _get_dummy_videos(\n         return video_items\n \n \n+def _replace_video_token_placeholders(\n+    prompt_ids: list[int],\n+    target: list[int],\n+    replacements: list[list[int]],\n+) -> list[int]:\n+    \"\"\"Replace each 3-token video placeholder with its expanded sequence.\n+\n+    Args:\n+        prompt_ids: Token IDs of the original (unexpanded) prompt.\n+        target: 3-element list ``[vision_start_id, video_pad_id,\n+            vision_end_id]`` to search for.\n+        replacements: Per-video expanded token sequences, in prompt order.\n+\n+    Returns:\n+        Token IDs with every placeholder triplet replaced.\n+    \"\"\"\n+    result: list[int] = []\n+    repl_idx = 0\n+    i = 0\n+    n = len(prompt_ids)\n+    t0, t1, t2 = target\n+    num_repl = len(replacements)\n+\n+    while i < n:\n+        if (\n+            i + 2 < n\n+            and prompt_ids[i] == t0\n+            and prompt_ids[i + 1] == t1\n+            and prompt_ids[i + 2] == t2\n+        ):\n+            result.extend(replacements[repl_idx])\n+            repl_idx += 1\n+            i += 3\n+        else:\n+            result.append(prompt_ids[i])\n+            i += 1\n+\n+    assert repl_idx == num_repl, (\n+        f\"Found {repl_idx} video placeholders but expected {num_repl}\"\n+    )\n+    return result\n+\n+\n class Qwen3VLMultiModalProcessor(BaseMultiModalProcessor[Qwen3VLProcessingInfo]):\n     def _call_hf_processor(\n         self,\n@@ -1211,15 +1254,23 @@ def _call_hf_processor(\n         tok_kwargs: Mapping[str, object],\n     ) -> BatchFeature:\n         mm_data = dict(mm_data)\n-        processor = self.info.get_hf_processor(**mm_kwargs)\n \n         # Separate video processing from image processing. Because the videos\n         # are processed into several image patches\n+        video_input_ids_lst: list[list[int]] = []\n         if videos := mm_data.pop(\"videos\", []):\n             video_grid_thw_lst = []\n             pixel_values_videos_lst = []\n             timestamps_per_video = []\n \n+            hf_config = self.info.get_hf_config()\n+            tokenizer = self.info.get_tokenizer()\n+            merge_size = hf_config.vision_config.spatial_merge_size\n+            video_pruning_rate = self.info.ctx.get_mm_config().video_pruning_rate\n+            vision_start_token_id = hf_config.vision_start_token_id\n+            vision_end_token_id = hf_config.vision_end_token_id\n+            video_token_id = hf_config.video_token_id\n+\n             for item in videos:\n                 video_array, metadata = item\n \n@@ -1269,55 +1320,38 @@ def _call_hf_processor(\n                     tok_kwargs=tok_kwargs,\n                 )\n \n-                merge_size = processor.video_processor.merge_size\n-                # Get video grid info for EVS calculation.\n+                # Discard HF output input_ids — we use get_video_repl below\n+                # to generate the correct (EVS-adjusted) token sequence.\n+                video_outputs.pop(\"input_ids\", None)\n+\n                 video_grid_thw = video_outputs[\"video_grid_thw\"]\n                 num_frames = int(video_grid_thw[0, 0])\n                 tokens_per_frame_base = int(video_grid_thw[0, 1:].prod()) // (\n                     merge_size**2\n                 )\n \n-                # Apply EVS if enabled.\n-                video_pruning_rate = self.info.ctx.get_mm_config().video_pruning_rate\n                 if video_pruning_rate is not None and video_pruning_rate > 0.0:\n                     num_tokens = compute_retained_tokens_count(\n                         tokens_per_frame=tokens_per_frame_base,\n                         num_frames=num_frames,\n                         q=video_pruning_rate,\n                     )\n-                    # Here we just need placeholders that won't actually be replaced -\n-                    # we just need to make sure the total number of tokens is correct\n-                    # assign all tokens to the first frame.\n                     tokens_per_frame = [num_tokens] + [0] * (num_frames - 1)\n                     select_token_id = False\n                 else:\n                     tokens_per_frame = [tokens_per_frame_base] * num_frames\n                     select_token_id = True\n \n-                # Generate the video replacement with EVS-adjusted token counts\n-                tokenizer = self.info.get_tokenizer()\n-                hf_config = self.info.get_hf_config()\n                 video_repl = Qwen3VLMultiModalProcessor.get_video_repl(\n                     tokens_per_frame=tokens_per_frame,\n                     timestamps=timestamps,\n                     tokenizer=tokenizer,\n-                    vision_start_token_id=hf_config.vision_start_token_id,\n-                    vision_end_token_id=hf_config.vision_end_token_id,\n-                    video_token_id=hf_config.video_token_id,\n+                    vision_start_token_id=vision_start_token_id,\n+                    vision_end_token_id=vision_end_token_id,\n+                    video_token_id=video_token_id,\n                     select_token_id=select_token_id,\n                 )\n-\n-                # Convert token IDs to text for the HF processor flow\n-                video_placeholder = tokenizer.decode(\n-                    video_repl.full, skip_special_tokens=False\n-                )\n-                input_ids = video_outputs.pop(\"input_ids\")\n-                video_placeholder = processor.tokenizer.batch_decode(input_ids)[0]\n-                prompt = prompt.replace(\n-                    \"<|vision_start|><|video_pad|><|vision_end|>\",\n-                    video_placeholder,\n-                    1,\n-                )\n+                video_input_ids_lst.append(list(video_repl.full))\n \n                 video_grid_thw_lst.append(video_outputs[\"video_grid_thw\"])\n                 pixel_values_videos_lst.append(video_outputs[\"pixel_values_videos\"])\n@@ -1335,6 +1369,24 @@ def _call_hf_processor(\n             mm_kwargs=mm_kwargs,\n             tok_kwargs=tok_kwargs,\n         )\n+\n+        # Replace each placeholder triplet with pre-computed video tokens.\n+        if video_input_ids_lst:\n+            hf_config = self.info.get_hf_config()\n+            video_target = [\n+                hf_config.vision_start_token_id,\n+                hf_config.video_token_id,\n+                hf_config.vision_end_token_id,\n+            ]\n+            input_ids = processed_outputs.pop(\"input_ids\")\n+            if not isinstance(input_ids, list):\n+                input_ids = input_ids.tolist()\n+            (prompt_ids,) = input_ids\n+            expanded_ids = _replace_video_token_placeholders(\n+                prompt_ids, video_target, video_input_ids_lst\n+            )\n+            processed_outputs[\"input_ids\"] = [expanded_ids]\n+\n         combined_outputs = dict(\n             processed_outputs,\n             **video_outputs,"
+        }
+      ]
+    },
+    {
+      "sha": "7ff7f5c8eb98354d3776f6c60c90aebc2b41c1da",
+      "author": {
+        "name": "Sumanth R Hegde",
+        "email": "39546518+SumanthRH@users.noreply.github.com"
+      },
+      "date": "2026-06-20T22:09:09+08:00",
+      "message": "Revert \"Fix Stale Encoder Cache After Weight Update\" (#46125)",
+      "parents": [
+        "dced2907693e3d6bf9eb7168d0a8fecf1cd22dca"
+      ],
+      "stats": {
+        "total_additions": 0,
+        "total_deletions": 12,
+        "files_changed": 12
+      },
+      "files": [
+        {
+          "filename": "vllm/entrypoints/llm.py",
+          "status": "modified",
+          "additions": 0,
+          "deletions": 6,
+          "patch": "@@ -898,12 +898,6 @@ def update_weights(self, request: WeightTransferUpdateRequest | dict) -> None:\n     def finish_weight_update(self) -> None:\n         \"\"\"Finish the current weight update.\"\"\"\n         self.llm_engine.collective_rpc(\"finish_weight_update\")\n-        # Invalidate cached state computed with the old weights so it isn't\n-        # reused for subsequent requests:\n-        # - prefix cache: KV blocks computed with the old weights\n-        # - encoder cache: multimodal embeddings keyed only by mm_hash\n-        self.llm_engine.reset_prefix_cache()\n-        self.llm_engine.reset_encoder_cache()\n \n     def __repr__(self) -> str:\n         \"\"\"Return a transformers-style hierarchical view of the model.\"\"\""
+        },
+        {
+          "filename": "vllm/v1/engine/async_llm.py",
+          "status": "modified",
+          "additions": 0,
+          "deletions": 6,
+          "patch": "@@ -1109,9 +1109,3 @@ async def update_weights(self, request: WeightTransferUpdateRequest) -> None:\n     async def finish_weight_update(self) -> None:\n         \"\"\"Finish the current weight update.\"\"\"\n         await self.collective_rpc(\"finish_weight_update\")\n-        # Invalidate cached state computed with the old weights so it isn't\n-        # reused for subsequent requests:\n-        # - prefix cache: KV blocks computed with the old weights\n-        # - encoder cache: multimodal embeddings keyed only by mm_hash\n-        await self.reset_prefix_cache()\n-        await self.reset_encoder_cache()"
+        }
+      ]
+    },
+    {
+      "sha": "dced2907693e3d6bf9eb7168d0a8fecf1cd22dca",
+      "author": {
+        "name": "Matt",
+        "email": "156021403+mawong-amd@users.noreply.github.com"
+      },
+      "date": "2026-06-20T15:04:35+08:00",
+      "message": "[Hardware][AMD][CI] Fix e2e core test group (#46024)\n\nSigned-off-by: Matthew Wong <Matthew.Wong2@amd.com>\nCo-authored-by: mergify[bot] <37929162+mergify[bot]@users.noreply.github.com>",
+      "parents": [
+        "93bad119120d0f9bff707dcbf5af5c029158b969"
+      ],
+      "stats": {
+        "total_additions": 18,
+        "total_deletions": 14,
+        "files_changed": 32
+      },
+      "files": [
+        {
+          "filename": ".buildkite/test-amd.yaml",
+          "status": "modified",
+          "additions": 1,
+          "deletions": 14,
+          "patch": "@@ -647,7 +647,7 @@ steps:\n   - pytest -v -s v1/cudagraph/test_cudagraph_mode.py\n \n - label: e2e Core (1 GPU) # TBD\n-  timeout_in_minutes: 180\n+  timeout_in_minutes: 35\n   mirror_hardwares: [amdexperimental, amdproduction, amdgfx90anightly, amdmi250]\n   agent_pool: mi250_1\n   optional: true\n@@ -2075,19 +2075,6 @@ steps:\n   - export VLLM_ALLOW_INSECURE_SERIALIZATION=1\n   - pytest -v -s v1/spec_decode/test_acceptance_length.py -m slow_test\n \n-- label: e2e Core (1 GPU) # TBD\n-  timeout_in_minutes: 180\n-  mirror_hardwares: [amdexperimental, amdproduction, amdgfx942nightly, amdmi300]\n-  agent_pool: mi300_1\n-  optional: true\n-  working_dir: \"/vllm-workspace/tests\"\n-  source_file_dependencies:\n-  - vllm/v1/\n-  - tests/v1/e2e/\n-  - vllm/platforms/rocm.py\n-  commands:\n-  - pytest -v -s v1/e2e/general --ignore v1/e2e/general/test_async_scheduling.py\n-\n - label: e2e Scheduling (1 GPU) # TBD\n   timeout_in_minutes: 180\n   mirror_hardwares: [amdexperimental, amdproduction, amdgfx942nightly, amdmi300]"
+        },
+        {
+          "filename": ".buildkite/test_areas/engine.yaml",
+          "status": "modified",
+          "additions": 10,
+          "deletions": 0,
+          "patch": "@@ -74,6 +74,16 @@ steps:\n     - tests/v1/e2e/general/\n   commands:\n     - pytest -v -s v1/e2e/general --ignore v1/e2e/general/test_async_scheduling.py\n+  mirror:\n+    amd:\n+      device: mi250_1\n+      timeout_in_minutes: 35\n+      depends_on:\n+      - image-build-amd\n+      source_file_dependencies:\n+      - vllm/v1/\n+      - tests/v1/e2e/general/\n+      - vllm/platforms/rocm.py\n \n - label: V1 e2e (2 GPUs)\n   key: v1-e2e-2-gpus"
+        },
+        {
+          "filename": "tests/v1/e2e/general/test_cascade_attention.py",
+          "status": "modified",
+          "additions": 7,
+          "deletions": 0,
+          "patch": "@@ -4,9 +4,16 @@\n import pytest\n \n from vllm import LLM, SamplingParams\n+from vllm.platforms import current_platform\n \n from ....utils import create_new_process_for_each_test\n \n+if current_platform.is_rocm():\n+    pytest.skip(\n+        \"Cascade attention backends FLASH_ATTN and FLASHINFER are notsupported on ROCm\",\n+        allow_module_level=True,\n+    )\n+\n \n @create_new_process_for_each_test()\n @pytest.mark.parametrize(\"attn_backend\", [\"FLASH_ATTN\", \"FLASHINFER\"])"
+        }
+      ]
+    },
+    {
+      "sha": "93bad119120d0f9bff707dcbf5af5c029158b969",
+      "author": {
+        "name": "JasonLi314",
+        "email": "47095666+JasonLi314@users.noreply.github.com"
+      },
+      "date": "2026-06-20T11:27:45+08:00",
+      "message": "[Bugfix] Fix gridDim.y overflow for large row counts (#45255)\n\nSigned-off-by: Jason Li <li.jason.cs@gmail.com>",
+      "parents": [
+        "0fbf42af841993ab1c189efca34de6b9799526b7"
+      ],
+      "stats": {
+        "total_additions": 71,
+        "total_deletions": 12,
+        "files_changed": 83
+      },
+      "files": [
+        {
+          "filename": "csrc/libtorch_stable/quantization/w8a8/fp8/per_token_group_quant.cu",
+          "status": "modified",
+          "additions": 14,
+          "deletions": 12,
+          "patch": "@@ -301,8 +301,9 @@ __global__ void per_token_group_quant_8bit_packed_register_kernel(\n \n   const int sf_k_local = local_group_id % kGroupsPerBlockX;\n   const int row_local = local_group_id / kGroupsPerBlockX;\n-  const int sf_k_idx = blockIdx.x * kGroupsPerBlockX + sf_k_local;\n-  const int mn_idx = blockIdx.y * kRowsPerBlock + row_local;\n+  // Rows on grid.x: mn scales with tokens and can exceed the 65535 grid.y cap.\n+  const int sf_k_idx = blockIdx.y * kGroupsPerBlockX + sf_k_local;\n+  const int mn_idx = blockIdx.x * kRowsPerBlock + row_local;\n \n #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))\n   asm volatile(\"griddepcontrol.wait;\");\n@@ -496,14 +497,15 @@ void per_token_group_quant_8bit_packed(const torch::stable::Tensor& input,\n                   \" is not a multiple of 4.\");\n   const int kx = GetGroupsPerBlockX(padded_groups_per_row);\n   const int ry = 16 / kx;\n-  const int64_t blocks_x = padded_groups_per_row / kx;\n-  const int64_t blocks_y = (tma_aligned_mn + ry - 1) / ry;\n+  const int64_t row_blocks = (tma_aligned_mn + ry - 1) / ry;\n+  const int64_t sf_k_blocks = padded_groups_per_row / kx;\n   const int num_threads = (kx * ry) * THREADS_PER_GROUP;\n-  // CUDA caps grid.x and grid.y at 2^31 - 1; guard against pathological inputs.\n-  STD_TORCH_CHECK(blocks_x <= static_cast<int64_t>(INT32_MAX) &&\n-                      blocks_y <= static_cast<int64_t>(INT32_MAX),\n+  // CUDA caps grid.x at 2^31 - 1 and grid.y at 2^16 - 1 (65535).\n+  constexpr int64_t kMaxGridDimYZ = 65535;\n+  STD_TORCH_CHECK(row_blocks <= static_cast<int64_t>(INT32_MAX) &&\n+                      sf_k_blocks <= kMaxGridDimYZ,\n                   \"per_token_group_quant_8bit_packed grid too large: (\",\n-                  blocks_x, \", \", blocks_y, \").\");\n+                  row_blocks, \", \", sf_k_blocks, \").\");\n \n   auto dst_type = output_q.scalar_type();\n \n@@ -513,8 +515,8 @@ void per_token_group_quant_8bit_packed(const torch::stable::Tensor& input,\n   #define LAUNCH_REG_KERNEL_INST(T, DST_DTYPE, KX, RY)                         \\\n     do {                                                                       \\\n       cudaLaunchConfig_t config = {};                                          \\\n-      config.gridDim = dim3(static_cast<unsigned int>(blocks_x),               \\\n-                            static_cast<unsigned int>(blocks_y));              \\\n+      config.gridDim = dim3(static_cast<unsigned int>(row_blocks),             \\\n+                            static_cast<unsigned int>(sf_k_blocks));           \\\n       config.blockDim = dim3(num_threads);                                     \\\n       config.dynamicSmemBytes = 0;                                             \\\n       config.stream = stream;                                                  \\\n@@ -539,8 +541,8 @@ void per_token_group_quant_8bit_packed(const torch::stable::Tensor& input,\n #else\n   #define LAUNCH_REG_KERNEL_INST(T, DST_DTYPE, KX, RY)                         \\\n     do {                                                                       \\\n-      dim3 grid(static_cast<unsigned int>(blocks_x),                           \\\n-                static_cast<unsigned int>(blocks_y));                          \\\n+      dim3 grid(static_cast<unsigned int>(row_blocks),                         \\\n+                static_cast<unsigned int>(sf_k_blocks));                       \\\n       dim3 block(num_threads);                                                 \\\n       per_token_group_quant_8bit_packed_register_kernel<T, DST_DTYPE, 128, KX, \\\n                                                         RY>                    \\"
+        },
+        {
+          "filename": "tests/kernels/quantization/test_per_token_group_quant.py",
+          "status": "modified",
+          "additions": 57,
+          "deletions": 0,
+          "patch": "@@ -345,6 +345,63 @@ def test_per_token_group_quant_fp8_packed_zero_fills_padded_output_q(\n         )\n \n \n+@pytest.mark.skipif(\n+    not current_platform.is_cuda_alike(),\n+    reason=\"packed FP8 per-token-group quant kernel requires a CUDA-alike GPU\",\n+)\n+def test_per_token_group_quant_fp8_packed_large_mn():\n+    \"\"\"Regression test for https://github.com/vllm-project/vllm/issues/45099.\n+\n+    Some background: gridDim.x and gridDim.y have different limits of 2^31 - 1 and\n+    2^16 - 1, respectively.\n+    Prior code introduced a bug where it incorrectly assumed grid.x and y both have\n+    2^31 - 1 limits and mixed them up, which doesn't surface until the kernel is\n+    launched with a large mn that exceeds grid.y limit (2^16 - 1).\n+\n+    This issue doesn't surface often because each forward pass only processes a\n+    bounded token batch, not the full context.\n+    Quantizing tensors with more rows than that will fail at launch with\n+    \"CUDA error: invalid argument\".\n+    This is a differential test that compares fp8 output against Triton output\n+    reference when token size sits just above the gridDim.y 2^16 - 1 limit.\n+    \"\"\"\n+\n+    device = \"cuda\"\n+    group_size = 128\n+    # hidden 2048 -> 2048/128 = 16 groups per row -> kx=16, ry=1: one grid row per mn\n+    # row, so any mn > 65535 overflowed grid.y before the fix.\n+    num_tokens, hidden_dim = 65537, 2048\n+    torch.manual_seed(42)\n+    x = torch.randn((num_tokens, hidden_dim), device=device, dtype=torch.bfloat16) * 8\n+\n+    out_q, out_s_packed = fp8_utils.per_token_group_quant_fp8_packed_for_deepgemm(\n+        x,\n+        group_size=group_size,\n+        use_ue8m0=True,\n+    )\n+\n+    with patch(\"vllm.platforms.current_platform.is_cuda_alike\", return_value=False):\n+        ref_q, ref_s = fp8_utils.per_token_group_quant_fp8(\n+            x, group_size, use_ue8m0=True\n+        )\n+\n+    assert torch.equal(out_q, ref_q), \"Quantized output mismatch\"\n+\n+    # Vectorized packed-scale check; the per-element loop used by the smaller\n+    # tests is too slow at this size. groups_per_row is a multiple of 4 here,\n+    # so there is no K padding and the packed view lines up.\n+    mn = num_tokens\n+    groups_per_row = hidden_dim // group_size\n+    k_num_packed = (groups_per_row + 3) // 4\n+    assert groups_per_row % 4 == 0\n+    ref_exponents = (ref_s.reshape(mn, groups_per_row).view(torch.int32) >> 23) & 0xFF\n+    exp = ref_exponents.view(mn, k_num_packed, 4)\n+    expected = (\n+        exp[..., 0] | (exp[..., 1] << 8) | (exp[..., 2] << 16) | (exp[..., 3] << 24)\n+    )\n+    assert torch.equal(out_s_packed.cpu(), expected.cpu()), \"Packed scale mismatch\"\n+\n+\n @pytest.mark.parametrize(\"shape\", [(32, 128), (64, 256), (16, 512)])\n @pytest.mark.parametrize(\"group_size\", [64, 128])\n @pytest.mark.skipif(not torch.cuda.is_available(), reason=\"CUDA not available\")"
+        }
+      ]
+    },
+    {
+      "sha": "0fbf42af841993ab1c189efca34de6b9799526b7",
+      "author": {
+        "name": "djramic",
+        "email": "djoramic@amd.com"
+      },
+      "date": "2026-06-20T06:20:59+08:00",
+      "message": "[ROCm] Fix VRAM not freed in test_phi3v (#46046)\n\nSigned-off-by: Djordje Ramic <djoramic@amd.com>",
+      "parents": [
+        "e6cd8913ddfe63b4620e45ff8c2da1d37318dbe5"
+      ],
+      "stats": {
+        "total_additions": 2,
+        "total_deletions": 1,
+        "files_changed": 3
+      },
+      "files": [
+        {
+          "filename": ".buildkite/test_areas/models_multimodal.yaml",
+          "status": "modified",
+          "additions": 0,
+          "deletions": 1,
+          "patch": "@@ -68,7 +68,6 @@ steps:\n     - cd .. && VLLM_WORKER_MULTIPROC_METHOD=spawn pytest -v -s tests/models/multimodal/generation/test_whisper.py -m core_model  # Otherwise, mp_method=\"spawn\" doesn't work\n   mirror:\n     amd:\n-      soft_fail: true\n       device: mi325_1\n       depends_on:\n       - image-build-amd"
+        },
+        {
+          "filename": "tests/models/multimodal/pooling/test_phi3v.py",
+          "status": "modified",
+          "additions": 2,
+          "deletions": 0,
+          "patch": "@@ -2,6 +2,7 @@\n # SPDX-FileCopyrightText: Copyright contributors to the vLLM project\n \n import pytest\n+import torch\n import torch.nn.functional as F\n import transformers.utils\n from PIL import Image\n@@ -52,6 +53,7 @@ def _get_cherry_blossom_image() -> Image.Image:\n     )\n \n \n+@torch.inference_mode()\n def _run_test(\n     hf_runner: type[HfRunner],\n     vllm_runner: type[VllmRunner],"
+        }
+      ]
+    },
+    {
+      "sha": "e6cd8913ddfe63b4620e45ff8c2da1d37318dbe5",
+      "author": {
+        "name": "Charlie Fu",
+        "email": "charlifu@amd.com"
+      },
+      "date": "2026-06-20T06:20:10+08:00",
+      "message": "[ROCm][CI] Skip Qwen3.5-35B-A3B-MXFP4-AITER-TP2 for non gfx950 (#46109)\n\nSigned-off-by: charlifu <charlifu@amd.com>",
+      "parents": [
+        "859e4d436ba0fb0da8a655a80d5c4fab12adc82e"
+      ],
+      "stats": {
+        "total_additions": 18,
+        "total_deletions": 0,
+        "files_changed": 18
+      },
+      "files": [
+        {
+          "filename": ".buildkite/test_areas/lm_eval.yaml",
+          "status": "modified",
+          "additions": 9,
+          "deletions": 0,
+          "patch": "@@ -101,6 +101,15 @@ steps:\n   num_devices: 8\n   commands:\n     - pytest -s -v evals/gsm8k/test_gsm8k_correctness.py --config-list-file=configs/models-h200.txt\n+  mirror:\n+    amd:\n+      device: mi300_8\n+      timeout_in_minutes: 180\n+      depends_on:\n+      - image-build-amd\n+      commands:\n+      - export VLLM_WORKER_MULTIPROC_METHOD=spawn\n+      - pytest -s -v evals/gsm8k/test_gsm8k_correctness.py --config-list-file=configs/models-mi3xx.txt\n \n - label: MoE Refactor Integration Test (H100 - TEMPORARY)\n   key: moe-refactor-integration-test-h100-temporary"
+        },
+        {
+          "filename": "tests/evals/gsm8k/test_gsm8k_correctness.py",
+          "status": "modified",
+          "additions": 9,
+          "deletions": 0,
+          "patch": "@@ -78,7 +78,16 @@ def test_gsm8k_correctness(config_filename):\n             \"Skipping DeepSeek-V3.2 and DeepSeek-R1 on ROCm platforms \"\n             \"due to agent pool disk space issues and pod evictions.\"\n         )\n+    if current_platform.is_rocm() and (\n+        \"Qwen3.5-35B-A3B-MXFP4-AITER-TP2\" in config_filename.name\n+    ):\n+        from vllm.platforms.rocm import on_gfx950\n \n+        if not on_gfx950():\n+            pytest.skip(\n+                \"Skipping Qwen3.5-35B-A3B-MXFP4-AITER-TP2 on non-GFX950 platforms. \"\n+                \"The quantization scheme is not supported on non-GFX950 platforms.\"\n+            )\n     # Parse server arguments from config (use shlex to handle quoted strings)\n     server_args_str = eval_config.get(\"server_args\", \"\")\n     server_args = shlex.split(server_args_str) if server_args_str else []"
+        }
+      ]
+    },
+    {
+      "sha": "859e4d436ba0fb0da8a655a80d5c4fab12adc82e",
+      "author": {
+        "name": "Ben Browning",
+        "email": "bbrownin@redhat.com"
+      },
+      "date": "2026-06-20T06:09:28+08:00",
+      "message": "[Bugfix][Parser] Fix U+FFFD leak at reasoning-to-content transition in engine parsers (#46159)\n\nSigned-off-by: Ben Browning <bbrownin@redhat.com>",
+      "parents": [
+        "4a083cc858f075209dd964ade48c0f8ec87c3393"
+      ],
+      "stats": {
+        "total_additions": 191,
+        "total_deletions": 7,
+        "files_changed": 198
+      },
+      "files": [
+        {
+          "filename": "tests/parser/engine/replay_harness.py",
+          "status": "modified",
+          "additions": 3,
+          "deletions": 0,
+          "patch": "@@ -96,6 +96,9 @@ def decode(self, ids: list[int], skip_special_tokens: bool = False) -> str:\n         return \"\".join(parts)\n \n \n+CHUNK_SIZES = [1, 2, 3, 5, 11, 23, None]\n+\n+\n def make_mock_tokenizer(sample: Sample) -> MockTokenizer:\n     \"\"\"Build a mock tokenizer from a sample's vocab and token data.\"\"\"\n     return MockTokenizer("
+        },
+        {
+          "filename": "tests/parser/engine/test_delegating_replay.py",
+          "status": "modified",
+          "additions": 1,
+          "deletions": 2,
+          "patch": "@@ -19,6 +19,7 @@\n from pydantic import TypeAdapter\n \n from tests.parser.engine.replay_harness import (\n+    CHUNK_SIZES,\n     MockTokenizer,\n     assert_parse_output,\n     collect_output,\n@@ -113,8 +114,6 @@ def _discover_pairings() -> list[_PairingInfo]:\n \n _ALL_SAMPLES = [(p.parser_cls, s) for p in _PAIRINGS for s in p.samples]\n \n-CHUNK_SIZES = [1, 2, 3, 5, 11, 23, None]\n-\n \n @pytest.mark.parametrize(\"chunk_size\", CHUNK_SIZES, ids=lambda c: f\"chunk={c}\")\n @pytest.mark.parametrize("
+        },
+        {
+          "filename": "tests/parser/engine/test_ufffd_reasoning_transition.py",
+          "status": "added",
+          "additions": 181,
+          "deletions": 0,
+          "patch": "@@ -0,0 +1,181 @@\n+# SPDX-License-Identifier: Apache-2.0\n+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project\n+\"\"\"Regression test for U+FFFD leak at reasoning→content transition.\n+\n+When byte-fallback tokens span the reasoning/content boundary,\n+decoding isolated content-side token IDs via tokenizer.decode()\n+produces U+FFFD (Unicode replacement character).  The fix flushes\n+the reasoning parser's engine lexer instead.\n+\n+Reproduces the bug at various chunk sizes and validates that the\n+fix prevents U+FFFD from leaking into streamed content.\n+\"\"\"\n+\n+from __future__ import annotations\n+\n+import pytest\n+\n+from tests.parser.engine.replay_harness import (\n+    CHUNK_SIZES,\n+    MockTokenizer,\n+    collect_output,\n+    replay_streaming,\n+)\n+from vllm.parser.abstract_parser import DelegatingParser\n+from vllm.parser.engine.registered_adapters import (\n+    Glm47MoeParserReasoningAdapter,\n+    Glm47MoeParserToolAdapter,\n+    Qwen3ParserReasoningAdapter,\n+    Qwen3ParserToolAdapter,\n+)\n+\n+\n+class ByteFallbackMockTokenizer(MockTokenizer):\n+    \"\"\"MockTokenizer that returns U+FFFD for specified token IDs.\n+\n+    Simulates byte-fallback tokenizer behavior where isolated\n+    partial-byte tokens decode to the Unicode replacement character.\n+    \"\"\"\n+\n+    def __init__(\n+        self,\n+        vocab: dict[str, int],\n+        tokens: list[tuple[int, str]],\n+        ufffd_token_ids: set[int],\n+    ) -> None:\n+        super().__init__(vocab, tokens)\n+        self._ufffd_token_ids = frozenset(ufffd_token_ids)\n+\n+    def decode(self, ids: list[int], skip_special_tokens: bool = False) -> str:\n+        parts: list[str] = []\n+        for tid in ids:\n+            if skip_special_tokens and tid in self._special_ids:\n+                continue\n+            if tid in self._ufffd_token_ids:\n+                parts.append(\"�\")\n+            else:\n+                text = self._token_decode_map.get(tid, f\"?{tid}?\")\n+                parts.append(text)\n+        return \"\".join(parts)\n+\n+\n+# ── Model-specific DelegatingParser subclasses ───────────────────────\n+\n+\n+class _Glm47Delegating(DelegatingParser):\n+    reasoning_parser_cls = Glm47MoeParserReasoningAdapter\n+    tool_parser_cls = Glm47MoeParserToolAdapter\n+\n+\n+class _Qwen3Delegating(DelegatingParser):\n+    reasoning_parser_cls = Qwen3ParserReasoningAdapter\n+    tool_parser_cls = Qwen3ParserToolAdapter\n+\n+\n+# ── Shared test data ─────────────────────────────────────────────────\n+\n+_SHARED_TOKENS: list[tuple[int, str]] = [\n+    (100, \"Let me\"),\n+    (101, \" think\"),\n+    (102, \" about\"),\n+    (103, \" Samsung.\"),\n+    (51, \"</think>\"),\n+    (200, \"삼성\"),\n+    (201, \"전자의\"),\n+    (202, \" 주가를\"),\n+    (203, \" 분석합니다.\"),\n+]\n+\n+_SHARED_UFFFD_IDS: set[int] = {200}\n+\n+EXPECTED_REASONING = \"Let me think about Samsung.\"\n+EXPECTED_CONTENT = \"삼성전자의 주가를 분석합니다.\"\n+\n+_MODEL_CONFIGS = [\n+    pytest.param(\n+        {\n+            \"<think>\": 50,\n+            \"</think>\": 51,\n+            \"<tool_call>\": 60,\n+            \"</tool_call>\": 61,\n+            \"<arg_key>\": 62,\n+            \"</arg_key>\": 63,\n+            \"<arg_value>\": 64,\n+            \"</arg_value>\": 65,\n+        },\n+        _Glm47Delegating,\n+        id=\"glm47\",\n+    ),\n+    pytest.param(\n+        {\n+            \"<think>\": 50,\n+            \"</think>\": 51,\n+            \"<tool_call>\": 60,\n+            \"</tool_call>\": 61,\n+        },\n+        _Qwen3Delegating,\n+        id=\"qwen3\",\n+    ),\n+]\n+\n+\n+# ── Tests ────────────────────────────────────────────────────────────\n+\n+\n+class TestUfffdReasoningTransition:\n+    \"\"\"U+FFFD must not appear at the reasoning→content transition.\"\"\"\n+\n+    @pytest.mark.parametrize(\"vocab,delegating_cls\", _MODEL_CONFIGS)\n+    @pytest.mark.parametrize(\"chunk_size\", CHUNK_SIZES, ids=lambda c: f\"chunk={c}\")\n+    def test_no_ufffd(self, chunk_size, vocab, delegating_cls):\n+        tokenizer = ByteFallbackMockTokenizer(vocab, _SHARED_TOKENS, _SHARED_UFFFD_IDS)\n+        parser = delegating_cls(tokenizer)\n+        deltas = replay_streaming(\n+            parser,\n+            _SHARED_TOKENS,\n+            chunk_size=chunk_size,\n+            finished_on_last=True,\n+        )\n+        output = collect_output(deltas)\n+\n+        assert \"�\" not in output.content, (\n+            f\"U+FFFD leaked into content: {output.content!r}\"\n+        )\n+        assert output.content == EXPECTED_CONTENT\n+        assert output.reasoning == EXPECTED_REASONING\n+\n+    def test_byte_fallback_tokenizer_produces_ufffd(self):\n+        \"\"\"Validate the fixture: decode() returns U+FFFD for isolated\n+        byte-fallback token IDs, proving the old code path would leak.\"\"\"\n+        vocab = dict(_MODEL_CONFIGS[0].values[0])\n+        tokenizer = ByteFallbackMockTokenizer(vocab, _SHARED_TOKENS, _SHARED_UFFFD_IDS)\n+        assert tokenizer.decode([200]) == \"�\"\n+\n+    @pytest.mark.parametrize(\"chunk_size\", CHUNK_SIZES, ids=lambda c: f\"chunk={c}\")\n+    def test_multiple_ufffd_tokens_at_boundary(self, chunk_size):\n+        \"\"\"Multiple consecutive byte-fallback tokens at the boundary.\"\"\"\n+        tokens: list[tuple[int, str]] = [\n+            (100, \"Reasoning.\"),\n+            (51, \"</think>\"),\n+            (200, \"삼\"),\n+            (201, \"성\"),\n+            (202, \"전자\"),\n+        ]\n+        ufffd_ids: set[int] = {200, 201}\n+        vocab = dict(_MODEL_CONFIGS[0].values[0])\n+\n+        tokenizer = ByteFallbackMockTokenizer(vocab, tokens, ufffd_ids)\n+        parser = _Glm47Delegating(tokenizer)\n+        deltas = replay_streaming(\n+            parser,\n+            tokens,\n+            chunk_size=chunk_size,\n+            finished_on_last=True,\n+        )\n+        output = collect_output(deltas)\n+\n+        assert \"�\" not in output.content, (\n+            f\"U+FFFD leaked into content: {output.content!r}\"\n+        )\n+        assert output.content == \"삼성전자\"\n+        assert output.reasoning == \"Reasoning.\""
+        },
+        {
+          "filename": "vllm/parser/abstract_parser.py",
+          "status": "modified",
+          "additions": 3,
+          "deletions": 4,
+          "patch": "@@ -794,11 +794,10 @@ def parse_delta(\n                 reasoning_transitioned = True\n                 current_token_ids = self.extract_content_ids(delta_token_ids)\n                 if self._engine_based:\n+                    flush_delta = reasoning_parser.finish_streaming()  # type: ignore[union-attr, attr-defined]\n                     current_text = (\n-                        self.model_tokenizer.decode(current_token_ids)\n-                        if current_token_ids\n-                        else \"\"\n-                    )\n+                        (delta_message.content if delta_message else None) or \"\"\n+                    ) + ((flush_delta.content if flush_delta else None) or \"\")\n                     if delta_message and self._tool_parser is not None:\n                         delta_message.content = None\n                 else:"
+        },
+        {
+          "filename": "vllm/parser/engine/parser_engine.py",
+          "status": "modified",
+          "additions": 3,
+          "deletions": 1,
+          "patch": "@@ -172,7 +172,9 @@ def adjust_initial_state_from_prompt(self, prompt_token_ids: Sequence[int]) -> N\n \n     def finish_streaming(self) -> DeltaMessage | None:\n         events = self._engine.finish()\n-        return self._events_to_delta(events) if events else None\n+        if events or self._deferred_content:\n+            return self._events_to_delta(events, finished=True)\n+        return None\n \n     def _reset(self, initial_state: ParserState | None = None) -> None:\n         self._engine.reset(initial_state=initial_state)"
+        }
+      ]
+    },
+    {
+      "sha": "4a083cc858f075209dd964ade48c0f8ec87c3393",
+      "author": {
+        "name": "Micah Williamson",
+        "email": "micah.williamson@amd.com"
+      },
+      "date": "2026-06-20T04:20:06+08:00",
+      "message": "[ROCm][CI] Pin `test_rocm_compressed_tensors_w8a8` to TRITON_ATTN (#46180)\n\nSigned-off-by: Micah Williamson <micah.williamson@amd.com>",
+      "parents": [
+        "ca7e1f2c43834d1e720b7377e2832097978c1e35"
+      ],
+      "stats": {
+        "total_additions": 5,
+        "total_deletions": 2,
+        "files_changed": 7
+      },
+      "files": [
+        {
+          "filename": ".buildkite/test_areas/kernels.yaml",
+          "status": "modified",
+          "additions": 1,
+          "deletions": 0,
+          "patch": "@@ -104,6 +104,7 @@ steps:\n       source_file_dependencies:\n       - csrc/quantization/\n       - vllm/model_executor/layers/quantization\n+      - vllm/config/\n       - tests/kernels/quantization\n       - tests/kernels/quantization/test_rocm_skinny_gemms.py\n       - vllm/_aiter_ops.py"
+        },
+        {
+          "filename": "tests/kernels/quantization/test_triton_scaled_mm.py",
+          "status": "modified",
+          "additions": 4,
+          "deletions": 2,
+          "patch": "@@ -60,8 +60,10 @@ def test_rocm_compressed_tensors_w8a8(\n     vllm_runner, example_prompts, model_path, max_tokens, num_logprobs\n ):\n     dtype = \"bfloat16\"\n-\n-    with vllm_runner(model_path, dtype=dtype) as vllm_model:\n+    # Pin to TRITON_ATTN, see https://github.com/vllm-project/vllm/issues/46179\n+    with vllm_runner(\n+        model_path, dtype=dtype, attention_backend=\"TRITON_ATTN\"\n+    ) as vllm_model:\n         vllm_model.generate_greedy_logprobs(example_prompts, max_tokens, num_logprobs)\n \n "
+        }
+      ]
+    },
+    {
+      "sha": "ca7e1f2c43834d1e720b7377e2832097978c1e35",
+      "author": {
+        "name": "Vadim Gimpelson",
+        "email": "156319763+vadiklyutiy@users.noreply.github.com"
+      },
+      "date": "2026-06-20T04:12:40+08:00",
+      "message": "Move CI failure diagnosis docs into ci-fails-buildkite skill (#45975)\n\nSigned-off-by: Vadim Gimpelson <vadim.gimpelson@gmail.com>",
+      "parents": [
+        "dec860fb19fcd8a39c62a2204c5939feb4781f14"
+      ],
+      "stats": {
+        "total_additions": 40,
+        "total_deletions": 15,
+        "files_changed": 55
+      },
+      "files": [
+        {
+          "filename": ".claude/skills/ci-fails-buildkite/SKILL.md",
+          "status": "added",
+          "additions": 35,
+          "deletions": 0,
+          "patch": "@@ -0,0 +1,35 @@\n+---\n+name: ci-fails-buildkite\n+description: Fetch and diagnose vLLM Buildkite CI failure logs. Use when investigating failing CI jobs on a PR or build, when the user pastes a buildkite.com URL, or asks to fetch/diagnose CI logs.\n+---\n+\n+# Diagnosing vLLM Buildkite CI Failures\n+\n+Buildkite logs are public; no login needed.\n+\n+`.buildkite/scripts/ci-fetch-log.sh` saves each log as `ci-<build>-<job-name>.log`, stripped of timestamps and ANSI codes. Existing files are kept; set `CI_FETCH_LOG_FORCE=1` to refetch.\n+\n+## Fetching logs\n+\n+```bash\n+# All failed jobs in a PR's latest build (current branch's PR if omitted):\n+.buildkite/scripts/ci-fetch-log.sh --pr <PR>\n+\n+# All failed jobs in a build (--soft also includes soft-failed jobs;\n+# --all fetches every finished job):\n+.buildkite/scripts/ci-fetch-log.sh \"https://buildkite.com/vllm/ci/builds/<N>\"\n+\n+# One job — `gh pr checks` URLs (#<job_uuid>) and web UI URLs (?sid=) both\n+# work; pass \"-\" as a second argument to stream to stdout:\n+.buildkite/scripts/ci-fetch-log.sh \"https://buildkite.com/vllm/ci/builds/<N>#<job_uuid>\"\n+```\n+\n+To clean an already-downloaded log with `.buildkite/scripts/ci-clean-log.sh`:\n+\n+```bash\n+./ci-clean-log.sh ci.log\n+```\n+\n+## Reference\n+\n+See [docs/contributing/ci/failures.md](../../../docs/contributing/ci/failures.md) for the full guide: filing CI failure issues, investigating/bisecting, reproducing flaky tests, and daily triage."
+        },
+        {
+          "filename": ".github/CODEOWNERS",
+          "status": "modified",
+          "additions": 2,
+          "deletions": 3,
+          "patch": "@@ -2,15 +2,14 @@\n # for more info about CODEOWNERS file\n \n # This lists cover the \"core\" components of vLLM that require careful review\n-/vllm/compilation @zou3519 @youkaichao @ProExpertProg @BoyuanFeng @vadiklyutiy\n+/vllm/compilation @zou3519 @youkaichao @ProExpertProg @BoyuanFeng\n /vllm/distributed/kv_transfer @NickLucche @ApostaC @orozery @xuechendi\n /vllm/lora @jeejeelee\n /vllm/model_executor/layers/attention @LucasWilkinson @MatthewBonanni\n /vllm/model_executor/layers/fused_moe @mgoin @pavanimajety @zyongye\n /vllm/model_executor/layers/quantization @mgoin @robertgshaw2-redhat @tlrmchlsmth @yewentao256 @pavanimajety @zyongye\n /vllm/model_executor/layers/mamba @tdoublep @tomeras91\n-/vllm/model_executor/layers/mamba/gdn_linear_attn.py @tdoublep @ZJY0516 @vadiklyutiy\n-/vllm/model_executor/layers/rotary_embedding.py @vadiklyutiy\n+/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py @tdoublep @ZJY0516 @vadiklyutiy\n /vllm/model_executor/model_loader @22quinn\n /vllm/model_executor/layers/batch_invariant.py @yewentao256 \n /vllm/ir @ProExpertProg"
+        },
+        {
+          "filename": ".gitignore",
+          "status": "modified",
+          "additions": 3,
+          "deletions": 1,
+          "patch": "@@ -199,7 +199,9 @@ cython_debug/\n .vscode/\n \n # Claude\n-.claude/\n+.claude/*\n+!.claude/skills/\n+!.claude/skills/**\n \n # Codex\n .codex/"
+        },
+        {
+          "filename": "AGENTS.md",
+          "status": "modified",
+          "additions": 0,
+          "deletions": 11,
+          "patch": "@@ -114,17 +114,6 @@ Follow these rules for all code changes in this repository:\n - Keep comments and docstrings minimal and concise.\n - Assume the reader is familiar with vLLM.\n \n-### Diagnosing CI failures\n-\n-Buildkite logs are public; no login needed. Details: [docs/contributing/ci/failures.md](docs/contributing/ci/failures.md).\n-\n-```bash\n-# All failed-job logs for a PR's latest build (current branch's PR if omitted):\n-.buildkite/scripts/ci-fetch-log.sh --pr <PR>\n-# Any Buildkite build or job URL also works:\n-.buildkite/scripts/ci-fetch-log.sh \"<buildkite_url>\"\n-```\n-\n ### Commit messages\n \n Add attribution using commit trailers such as `Co-authored-by:` (other projects use `Assisted-by:` or `Generated-by:`). For example:"
+        }
+      ]
+    }
+  ]
+}

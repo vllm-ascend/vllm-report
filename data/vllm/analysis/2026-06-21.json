@@ -1,0 +1,380 @@
+{
+  "date": "2026-06-21",
+  "repo": "vllm-project/vllm",
+  "generated_at": "2026-06-22T03:27:28.082032+08:00",
+  "daily_summary": "当日变更涉及多个方面：1) 推测解码支持混合KV页面大小（DFlash），通过引入indexes_kv_by_block_stride机制实现padding对齐；2) 分布式KV传输MoRIIO连接器重构，支持混合KV布局（分离式、交错式、MLA）；3) 修复多个bug，包括Mamba状态缓冲区指针溢出、V2采样器min_tokens off-by-one、NVFP4/OCP MX MoE仿真、DeepSeek V3.2 extract_layer_index作用域等；4) 性能优化：确保异步H2D拷贝前内存已pinned、调度器跳过V2 runner的all_token_ids拷贝、Mooncake存储紧凑chunk-hash键和零拷贝查找；5) 前端增强：Anthropic API报告缓存使用、/derender端点支持推理和工具调用解析；6) 架构变更：停止内部设置CUDA_VISIBLE_DEVICES，改用device_ids参数和assigned_physical_gpu_ids映射；7) 其他：修复文档URL、暴露CPU缓存使用率指标、SimpleCPUOffload连接器支持PCP+DCP、支持packed HMA KV缓存布局。",
+  "ascend_impact_summary": "当日变更对vllm-ascend有显著影响。核心影响包括：1) AttentionBackend新增indexes_kv_by_block_stride抽象方法，vllm-ascend的AscendAttentionBackend必须实现；2) GPUModelRunner的_reshape_kv_cache逻辑重构为_reshape_attention_kv_cache，NPUModelRunner需同步更新；3) Sampler的pin_memory逻辑从is_pin_memory_available()迁移到PIN_MEMORY常量，AscendSampler需同步；4) Platform接口新增device_control_id_to_physical_device_id、logical_device_id_to_visible_device_id、visible_device_id_to_physical_device_id方法，NPUPlatform需实现；5) WorkerBase的init_worker新增assigned_physical_gpu_ids处理，NPUWorker需同步；6) 多个模块的pin_memory引用从platform_utils迁移到torch_utils，vllm-ascend的patch需更新。",
+  "commits": [
+    {
+      "sha": "2cac89f9da865dfaceb6d337d97aaff5c9195e48",
+      "comment": "该commit为DFlash推测解码场景支持混合KV页面大小。核心变更：1) 在AttentionSpec中新增indexes_kv_by_block_stride字段，标识后端是否支持按块步长索引KV页面；2) AttentionBackend新增indexes_kv_by_block_stride类方法，通过get_kv_cache_stride_order判断；3) unify_kv_cache_spec_page_size逻辑扩展：当页面大小不可整除时，若后端支持则使用padding对齐，否则抛出NotImplementedError；4) _reshape_kv_cache重构为_reshape_attention_kv_cache，支持padded页面的strided view；5) use_uniform_kv_cache简化为直接检查kv_cache_spec.indexes_kv_by_block_stride。潜在风险：新增抽象方法需要所有AttentionBackend子类实现或继承默认行为。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "attention",
+        "spec-decode",
+        "kv-cache"
+      ],
+      "ascend_impact": {
+        "ascend_affected": true,
+        "functionality": "1) AttentionBackend新增indexes_kv_by_block_stride类方法，vllm-ascend的AscendAttentionBackend需实现此方法，否则默认返回False；2) AttentionSpec新增indexes_kv_by_block_stride字段，所有AttentionSpec子类（包括vllm-ascend使用的）需处理此字段；3) _reshape_kv_cache逻辑重构为_reshape_attention_kv_cache，NPUModelRunner中重写的_reshape_kv_cache_tensors方法需同步更新；4) use_uniform_kv_cache方法签名变更（移除cache_dtype参数），vllm-ascend的patch中若重写了此方法需同步。",
+        "testing": "新增test_reshape_padded_*系列测试用例验证padded KV cache的strided view行为，vllm-ascend需确保其NZ格式KV cache的reshape逻辑与此兼容。",
+        "needs_test_update": true,
+        "suggested_test_areas": [
+          "vllm_ascend/attention/",
+          "vllm_ascend/worker/model_runner_v1.py"
+        ]
+      }
+    },
+    {
+      "sha": "3e6e33526da729fbe30ebec86be9049e1899ce67",
+      "comment": "该commit在disagg协议的GenerateResponseStreamChoice中新增routed_experts字段，用于在流式生成响应中返回路由专家信息。变更范围小，仅涉及协议定义和序列化。",
+      "tags": [
+        "feature",
+        "low-risk",
+        "disagg",
+        "protocol"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。该变更仅涉及disagg协议层，vllm-ascend不依赖此协议。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "b91b7726e068d5eed2aa3bd084cdeee9456da424",
+      "comment": "该commit为MoRIIO READ模式支持MiniMax-M3混合KV布局。核心变更：1) 新增moriio_layout模块，抽象出LayerTransferGeometry和compute_block_transfer_offsets等函数，支持分离式(KV轴为dim0)、交错式(块轴为dim0)和MLA三种布局；2) MoRIIOConnectorWorker重构，使用布局模块替代硬编码的偏移计算；3) 测试用例覆盖三种布局的偏移计算和注册区域。潜在风险：布局抽象增加了代码复杂度，但提高了可维护性。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "kv-connector",
+        "moriio",
+        "roc"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。该变更仅涉及MoRIIO KV连接器（ROCm专用），vllm-ascend不使用此连接器。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "d3ad8e8bcd1a015026981e479d5537549fba3e97",
+      "comment": "该commit修复了offloading连接器中pending传输导致的前缀查找问题。当请求被抢占后重新调度时，如果之前的store传输尚未完成，调度器应延迟该请求而不是执行前缀查找，避免后续加载操作与正在进行的store冲突。变更在get_num_new_matched_tokens中增加检查：如果req_status.transfer_jobs非空，则返回None延迟请求。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "kv-offload",
+        "scheduler"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。该变更仅涉及offloading连接器调度器，vllm-ascend不使用此连接器。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "b80ce9dd2f30913b3b054308a09bd2d86ec6202f",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "chore"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "b5495cc5f9099cf77571524a9af88ad26814f324",
+      "comment": "该commit修复了Mamba状态缓冲区中的指针溢出问题。将src_ptrs和dst_ptrs的dtype从torch.int64改为torch.uint64，避免在64位系统上指针值超过int64最大值时出现溢出。这是一个低风险的bug修复。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "mamba",
+        "worker"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。该变更仅涉及Mamba状态缓冲区，vllm-ascend不使用Mamba模型。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "183a430c137db3d5cd0b9025b816f26ee87328e7",
+      "comment": "该commit修复了V2 GPU采样器中min_tokens的off-by-one错误。在_bias_kernel中，将条件从pos < min_len改为pos + 1 < min_len，因为pos是0-based索引，而min_len是1-based计数。这是一个典型的off-by-one bug修复。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "sampler",
+        "model-runner"
+      ],
+      "ascend_impact": {
+        "ascend_affected": true,
+        "functionality": "该变更修改了vllm/v1/worker/gpu/sample/logit_bias.py中的_bias_kernel Triton内核。vllm-ascend的AscendSampler如果使用了类似的Triton内核实现min_tokens逻辑，需要同步修复此off-by-one错误。如果vllm-ascend使用独立的采样器实现，则不受影响。",
+        "testing": "无直接影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "a346d589f5932d4234bf5bf8718f10e26d187021",
+      "comment": "该commit修复了NVFP4/OCP MX MoE仿真中的双重量化问题。移除nvfp4_emulation_moe.py和ocp_mx_emulation_moe.py中重复的moe_kernel_quantize_input调用，因为TritonExperts.apply中已经包含了激活量化/反量化逻辑。同时在triton_moe.py中修复了a1_scale回退到a1_gscale的逻辑。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "moe",
+        "quantization"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。该变更仅涉及NVFP4/OCP MX量化仿真（CUDA专用），vllm-ascend不使用这些量化方法。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "7df3d7dada840c68b85b26b79de7f59f676d58e3",
+      "comment": "该commit是一次大规模重构，确保所有异步H2D拷贝前内存已pinned。核心变更：1) 将PIN_MEMORY常量的定义从platform_utils迁移到torch_utils，统一使用is_pin_memory_available()；2) 新增async_tensor_h2d和np_to_pinned_tensor工具函数，封装pinning和异步拷贝逻辑；3) 所有模块中的pin_memory引用从is_pin_memory_available()迁移到PIN_MEMORY常量；4) 移除InputBatch的pin_memory参数，统一使用PIN_MEMORY；5) 多处手动pin_memory()调用改为使用async_tensor_h2d。潜在风险：大规模重构可能引入回归，但逻辑等价。",
+      "tags": [
+        "refactor",
+        "performance",
+        "high-risk",
+        "core",
+        "memory"
+      ],
+      "ascend_impact": {
+        "ascend_affected": true,
+        "functionality": "1) PIN_MEMORY常量从vllm.utils.platform_utils迁移到vllm.utils.torch_utils，vllm-ascend中所有引用is_pin_memory_available()的代码需改为引用PIN_MEMORY；2) async_tensor_h2d函数签名变更（参数顺序调整，新增np.ndarray和torch.Tensor支持），vllm-ascend中重写的async_tensor_h2d（如vllm/v1/worker/cpu/shm.py）需同步更新；3) InputBatch构造函数移除pin_memory参数，NPUModelRunner中创建InputBatch的代码需移除该参数；4) Sampler的pin_memory初始化从is_pin_memory_available()改为PIN_MEMORY，AscendSampler需同步；5) ThinkingBudgetStateHolder的maybe_create_thinking_budget_state_holder函数移除is_pin_memory参数，vllm-ascend中相关调用需更新。",
+        "testing": "多个测试文件移除了pin_memory参数传递，vllm-ascend的测试用例若直接创建InputBatch需同步更新。",
+        "needs_test_update": true,
+        "suggested_test_areas": [
+          "vllm_ascend/worker/",
+          "vllm_ascend/sample/",
+          "vllm_ascend/patch/"
+        ]
+      }
+    },
+    {
+      "sha": "8dd1b702f27edeed24a4336f531b01c346e04253",
+      "comment": "该commit修复了两个文档问题：1) 更新env_vars文档URL从/en/stable/到/en/latest/；2) 修复tool_parsers模块文档中的模块路径（kimi_k2_parser -> kimi_k2_tool_parser）。低风险变更。",
+      "tags": [
+        "docs",
+        "low-risk",
+        "documentation"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。纯文档变更。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "f57ac274b24cbb5a4e079a529175eef5c0745606",
+      "comment": "该commit增强了/derender端点，支持推理和工具调用解析。核心变更：1) derender_chat_response新增parser路径，当提供chat_request时使用parser.parse()提取reasoning、content和tool_calls；2) 新增_correct_decoded_token函数修复字节回退导致的U+FFFD问题；3) 新增HarmonyParser（GPT-OSS）的E2E测试。潜在风险：parser路径增加了对chat_request的依赖，缺少时回退到纯detokenization。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "render",
+        "api",
+        "reasoning",
+        "tool-calls"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。该变更仅涉及render/derender API端点，vllm-ascend不依赖此功能。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "6e919960af42f79d6811d84b2d4316212fcf59cb",
+      "comment": "该commit优化了调度器中all_token_ids的拷贝逻辑。对于V2模型运行器，跳过all_token_ids的拷贝，因为V2运行器不使用此数据。变更包括：1) _make_cached_request_data中仅在非V2运行器时拷贝all_token_ids；2) schedule()中合并scheduled_new_reqs和scheduled_resumed_reqs时使用extend/clear替代+操作；3) 仅在非V2运行器时更新prev_step_scheduled_req_ids。",
+      "tags": [
+        "performance",
+        "low-risk",
+        "scheduler",
+        "model-runner"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。该变更仅优化V2模型运行器的调度器行为，vllm-ascend使用V1模型运行器，不受影响。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "c88d3d4775c41793543e97f1609d3161a5689905",
+      "comment": "该commit为SimpleCPUOffload连接器添加了PCP（Prefill Context Parallel）和DCP（Decode Context Parallel）支持。核心变更：1) Manager中新增cp_world_size属性，用于缩放虚拟块大小；2) update_state_after_alloc中块大小计算乘以cp_world_size；3) _estimate_lazy_target_blocks接受cp_world_size参数；4) 新增测试用例验证CP块大小缩放、eager store-and-load roundtrip和lazy target blocks缩放。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "kv-offload",
+        "context-parallel"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。该变更仅涉及SimpleCPUOffload连接器，vllm-ascend不使用此连接器。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "ab7fcbdd5dbcb457c61f722e0a854de29491cf4d",
+      "comment": "该commit优化了Mooncake存储的chunk-hash键和查找线格式。核心变更：1) 新增BlobBlockHashes类，提供对扁平缓冲区的惰性视图，避免物化所有哈希；2) 新增_CompactChunkHashList类，使用chunk的最后一个子哈希作为键（而非拼接所有子哈希），减少键大小；3) 查找协议从msgpack编码的hex字符串列表改为二进制blob（hash_len + 原始哈希数据），实现零拷贝；4) 相关测试用例更新。",
+      "tags": [
+        "performance",
+        "medium-risk",
+        "kv-connector",
+        "mooncake"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。该变更仅涉及Mooncake KV连接器，vllm-ascend不使用此连接器。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "3b4a76b63fb1a6bbf8641fa87f4ecbc9a229ac94",
+      "comment": "该commit在CPU offloading管理器中暴露了CPU缓存使用率指标。核心变更：1) CPUOffloadingMetrics类新增CPU_CACHE_USAGE_PERC指标；2) get_stats()方法始终返回stats对象（不再因store_threshold < 2返回None），并计算缓存使用率；3) 指标定义从条件性返回改为始终包含CPU_CACHE_USAGE_PERC。",
+      "tags": [
+        "feature",
+        "low-risk",
+        "kv-offload",
+        "metrics"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。该变更仅涉及CPU offloading管理器指标，vllm-ascend不使用此功能。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "cc22621b51207e1af96269a840108ea654af9b42",
+      "comment": "该commit支持packed HMA KV缓存布局。核心变更：1) 新增VLLM_USE_PACKED_HMA_KV_CACHE环境变量，用于多组attention-only HMA模型（如gpt-oss、Gemma 3/4）的packed per-block KV缓存分配；2) _use_packed_kv_cache_groups函数判断是否使用packed布局；3) _get_kv_cache_config_deepseek_v4重命名为_get_kv_cache_config_packed并复用；4) offloading worker和simple_kv_offload manager支持packed tensor的注册和CPU配置推导。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "kv-cache",
+        "memory"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。该变更涉及packed HMA KV缓存布局（用于gpt-oss等模型），vllm-ascend不使用此布局。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "77148992cfc905ded5fbd34d746553aa7f099da4",
+      "comment": "该commit修复了DeepSeek V3.2中extract_layer_index的作用域问题。将extract_layer_index调用移回is_v32守卫内部，避免在非V3.2模型上调用此函数。这是一个低风险的bug修复。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "model",
+        "deepseek"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。该变更仅涉及DeepSeek V3.2模型实现，vllm-ascend不使用此模型。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "891cc4b9c58fa0ab7e4b29ee1df90724647229fd",
+      "comment": "该commit在Anthropic /v1/messages API中报告缓存使用情况。核心变更：1) 新增_build_anthropic_usage函数，将OpenAI风格的UsageInfo转换为AnthropicUsage，包含cache_read_input_tokens和cache_creation_input_tokens字段；2) 在full和streaming响应中使用_build_anthropic_usage替代直接构造AnthropicUsage；3) 流式场景中，message_start省略缓存字段（因为vLLM的OpenAI流式仅在最终chunk携带prompt_tokens_details），message_delta携带解析后的值。",
+      "tags": [
+        "feature",
+        "low-risk",
+        "api",
+        "anthropic",
+        "cache"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。该变更仅涉及Anthropic API端点，vllm-ascend不依赖此API。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "1bdf9810aae30ae0b7002ac9f98bb9520b34e631",
+      "comment": "该commit修复了ROCm Sparse Indexer中的整数溢出问题。将block_id计算中的除法结果显式转换为tl.int64，避免packed KV布局下block_id * stride超过32位范围。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "attention",
+        "roc",
+        "mla"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。该变更仅涉及ROCm Aiter MLA Sparse内核，vllm-ascend不使用此内核。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "ebfbcfe46aa895d428933244908bae08b1ca6397",
+      "comment": "该commit是一次重大架构变更，停止在vLLM内部设置CUDA_VISIBLE_DEVICES，改用device_ids参数和assigned_physical_gpu_ids映射。核心变更：1) EngineArgs新增--device-ids参数，支持整数索引和UUID；2) ParallelConfig新增assigned_physical_gpu_ids字段；3) Platform接口新增device_control_id_to_physical_device_id、logical_device_id_to_visible_device_id、visible_device_id_to_physical_device_id方法；4) 所有CUDA_VISIBLE_DEVICES的读写操作迁移为使用assigned_physical_gpu_ids映射；5) WorkerBase的init_worker新增assigned_physical_gpu_ids处理；6) DP supervisor不再设置CUDA_VISIBLE_DEVICES，改为传递device_ids；7) Ray executor更新为传递assigned_physical_gpu_ids。潜在风险：大规模架构变更可能影响设备发现和分布式初始化流程。",
+      "tags": [
+        "refactor",
+        "high-risk",
+        "core",
+        "platform",
+        "distributed"
+      ],
+      "ascend_impact": {
+        "ascend_affected": true,
+        "functionality": "1) Platform接口新增三个方法：device_control_id_to_physical_device_id、logical_device_id_to_visible_device_id、visible_device_id_to_physical_device_id，NPUPlatform必须实现这些方法；2) set_assigned_physical_gpu_ids和get_assigned_physical_gpu_ids函数在vllm/platforms/interface.py中定义，vllm-ascend的patch中若修改了设备发现逻辑需同步；3) WorkerBase的init_worker新增assigned_physical_gpu_ids参数处理，NPUWorker需同步更新；4) GPUWorker的init_device中设备选择逻辑从直接使用local_rank改为通过logical_device_id_to_visible_device_id映射，NPUWorker需同步；5) 分布式通信器（CustomAllReduce、QuickAllReduce）中物理设备ID的获取方式变更，vllm-ascend的NPUCommunicator若使用了类似逻辑需同步；6) shm_broadcast中local_size计算方式变更，vllm-ascend若使用共享内存广播需同步。",
+        "testing": "新增TestDeviceIds和TestDpDeviceIdSharding测试类，vllm-ascend需确保其平台实现通过这些测试。",
+        "needs_test_update": true,
+        "suggested_test_areas": [
+          "vllm_ascend/platform.py",
+          "vllm_ascend/worker/worker.py",
+          "vllm_ascend/distributed/"
+        ]
+      }
+    },
+    {
+      "sha": "e9de72fe6c56cfc7117768f671d2a1ff1f3bfb02",
+      "comment": "该commit修复了_log_compilation_config中model_config访问的潜在空指针问题。使用getattr(self.vllm_config.model_config, \"model\", \"unknown\")替代直接访问，避免model_config为None时抛出AttributeError。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "compilation"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。该变更仅涉及编译配置日志记录，vllm-ascend不依赖此功能。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    }
+  ]
+}

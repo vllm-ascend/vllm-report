@@ -1,0 +1,431 @@
+{
+  "date": "2026-06-22",
+  "repo": "vllm-project/vllm-ascend",
+  "generated_at": "2026-06-23T04:45:26.016535+08:00",
+  "daily_summary": "当日变更集中在三大方向：1) 新增 Recompute CPU Offload 功能，用于 PD 分离解码节点的请求抢占 KV 缓存卸载，减少重计算开销；2) 修复和增强 Eagle3 投机解码在 Pipeline Parallelism 下的支持，包括辅助隐藏状态传播和 PP 层数计算；3) 大量 CI 基础设施优化，包括工作流迁移、依赖升级、缓存构建扩展和测试时间自动更新。此外还包括多项 Bug 修复（CPP 挂起、RFork 量化传输、W4A8 量化、结构化输出调度等）、文档翻译更新和新模型支持（SwigluStepAndMul 激活函数、NPU IPC 权重传输引擎）。",
+  "test_impact_summary": "当日变更对测试看护有显著影响。新增的 Recompute CPU Offload 功能（commit 6329838）引入了全新的 KV 卸载模块，需要完整的单元测试和端到端测试覆盖，包括调度器侧的状态管理、Worker 侧的 D2H/H2D 传输、以及 PD 分离场景下的集成测试。Eagle3 PP 辅助状态传播（commit 5823a10）和 RFork 量化传输（commit 24249a3）也引入了新的代码路径，需要相应的单元测试和集成测试。CI 基础设施的优化（commit a206c06）改进了测试选择逻辑，支持纯测试变更的优化路径，这本身是对测试流程的改进。整体来看，当日变更增加了多个需要测试看护的新功能模块，建议在后续 PR 中补充端到端测试用例。",
+  "commits": [
+    {
+      "sha": "6329838c9fa47becfc05aa65ada8a03208cf037c",
+      "comment": "新增 RecomputeCPUOffloadConnector，用于 PD 分离解码节点的请求抢占 KV 缓存卸载。当解码节点因 HBM KV 缓存不足而抢占请求时，调度器可以将被抢占请求的 KV 缓存块从 HBM 卸载到 CPU DRAM，请求重新调度时再加载回 HBM。主要变更包括：1) 新增 recompute_cpu_offload 子模块，包含调度器侧管理器（RecomputeCPUOffloadScheduler）、Worker 侧处理器（RecomputeCPUOffloadWorker）、元数据类和连接器实现；2) 扩展 RecomputeScheduler 的重计算抢占逻辑，支持卸载路径；3) 在 AscendMultiConnector 中增加对重计算卸载的优先级支持；4) 在 model_runner 中增加 preemption store 的执行时机。该功能旨在解决解码节点重计算时的 OOM 和性能问题，同时避免工具调用和函数调用在提示词重组时的精度问题。",
+      "tags": [
+        "feature",
+        "high-risk",
+        "scheduler",
+        "kv-offload",
+        "distributed"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "新增了完整的 KV 卸载模块，包括调度器状态管理、Worker 传输、元数据传递等核心逻辑，需要单元测试和端到端测试覆盖。",
+        "suggested_test_areas": [
+          "tests/ut/kv_offload/test_recompute_cpu_offload.py",
+          "tests/ut/core/test_recompute_scheduler.py",
+          "tests/e2e/pull_request/ 相关 PD 分离测试"
+        ]
+      }
+    },
+    {
+      "sha": "5823a10614cbb235399630f2bb935ac27a2d554e",
+      "comment": "支持 Eagle3 辅助隐藏状态在 Pipeline Parallelism 管道中的传播。当 Eagle3 的辅助隐藏状态层跨越多个 PP 阶段时，最后一个 PP rank（drafter 所在）只能看到部分辅助状态，导致 combine_hidden_states 失败。该补丁通过包装模型的 forward 和 make_empty_intermediate_tensors 方法，透明地在 IntermediateTensors 中传递辅助隐藏状态。同时修复了 Eagle3 草稿模型在 PP 下的 target_layer_num 计算问题，使用 get_total_num_hidden_layers() 替代 get_num_layers() 以获取全局层数。",
+      "tags": [
+        "feature",
+        "bugfix",
+        "medium-risk",
+        "spec-decode",
+        "patch"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "新增了 Eagle3 PP 辅助状态传播的补丁逻辑和初始化补丁，需要单元测试验证辅助状态传递的正确性。",
+        "suggested_test_areas": [
+          "tests/ut/patch/worker/test_patch_eagle3_pp_aux.py",
+          "tests/e2e/pull_request/ 相关 Eagle3 投机解码测试"
+        ]
+      }
+    },
+    {
+      "sha": "047db47f4b51121a4b7abdcd83887f49e7b5d781",
+      "comment": "修复 Chunk Prefill Predictor (CPP) 在 profiling 失败时导致调度挂起的问题。当预测的 chunk 大小为 None 或 <= 0 时，调度循环会中断。修复方案：1) 调度器在 profiling 失败时退化为固定 chunk 大小；2) 引入可配置的 max_fit_chunk 参数；3) 移除对拟合二次项系数的负值钳制，允许基于实际拟合关系进行计算。同时更新了相关文档。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "scheduler",
+        "performance"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "修复了调度器的退化路径，现有测试应能覆盖正常路径，退化路径的测试可通过现有 profiling 测试验证。",
+        "suggested_test_areas": [
+          "tests/ut/core/test_profiling_chunk_predictor.py",
+          "tests/e2e/pull_request/four_card/test_profiling_chunk_performance.py"
+        ]
+      }
+    },
+    {
+      "sha": "682cc2b938446b73a67e9ddfcc5ca2203a3f8088",
+      "comment": "标准化 vllm_ascend 各模块的日志记录，包括：1) 统一使用 vllm.logger 替代各模块自定义的 logging.getLogger；2) 添加模块特定的日志前缀（如 [ProfilingChunk]、[RecomputeScheduler]）；3) 将字符串格式化转换为标准 logger 参数；4) 优化 debug 日志的包装条件；5) 调整 check_health 的日志级别。同时修复了 profiling_chunk_predictor.py 中 clamp_quadratic_and_linear_if_negative 方法的 bug——由于浮点数不可变且只返回 fitted_a，fitted_b 的钳制值丢失。",
+      "tags": [
+        "refactor",
+        "bugfix",
+        "low-risk",
+        "logging"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "主要是日志格式和级别的调整，不涉及功能逻辑变更，现有测试应能覆盖。",
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "f7d396bf97f882a7bbdef59fa8c3fbdcb7dbe4f3",
+      "comment": "更新 A3 节点的 PVC 名称，从 nv-action-vllm-benchmarks-v2 改为 gy005-az5-vllm-ascend。同时将 OBS 访问密钥的环境变量名从 OBS_ACCESS_KEY/OBS_SECRET_KEY 改为 OBS_ACCESS_KEY_ID/OBS_SECRET_ACCESS_KEY。",
+      "tags": [
+        "ci",
+        "low-risk",
+        "infrastructure"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "仅 CI 配置变更，不影响代码逻辑。",
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "2539c015aa9754951e99c8478424b96bb329b8c5",
+      "comment": "为 Step-3.7-Flash MoE 层（layers 43-44）添加 SwigluStepAndMul 自定义激活函数支持。该激活函数计算 silu(gate).clamp(max=limit) * up.clamp(-limit, limit)，通过 clamp 截断防止数值溢出。变更包括：1) activation.py 中添加 swiglustep_and_mul 算子；2) moe_mlp.py 中添加 swiglustep 分支；3) 添加单元测试。",
+      "tags": [
+        "feature",
+        "low-risk",
+        "ops",
+        "activation"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "新增了激活函数实现，需要单元测试验证数值正确性。",
+        "suggested_test_areas": [
+          "tests/ut/ops/a3_2/test_activation.py"
+        ]
+      }
+    },
+    {
+      "sha": "4356efc3d77761fa4e8724b134b445d6835bb62a",
+      "comment": "将 GLM5_1-W8A8-A3-dual-nodes 配置中 aime2025 基准测试的阈值从 5 提高到 10，以适应性能波动。",
+      "tags": [
+        "test",
+        "low-risk",
+        "ci"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "仅调整测试阈值，不涉及代码逻辑变更。",
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "d97a8b17016ff65da577ddd9d59ab76dd5a4c2e8",
+      "comment": "扩展 CI 镜像构建的缓存策略，增加 openeuler 操作系统和 x86 架构的缓存支持。现在缓存覆盖 3 种芯片（a3, a2, 310p）、2 种架构（x86, arm）、2 种操作系统（ubuntu, euler），共 12 种缓存类型。同时修复了缓存键的架构标识问题。",
+      "tags": [
+        "ci",
+        "low-risk",
+        "infrastructure"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "仅 CI 配置变更，不影响代码逻辑。",
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "b83e9c1aaa51a175d5b2c0430a358c36fddad486",
+      "comment": "更新安装指南中的 Ascend CANN 环境搭建链接，指向官方 HiAscend 下载页面。",
+      "tags": [
+        "docs",
+        "low-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "仅文档链接更新。",
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "2c88d67f465c6578c1d653c2523f7d52d8966cba",
+      "comment": "更新 Qwen3-ASR-1.7B 模型文档，增加 Ascend 310P 的支持说明和部署命令。",
+      "tags": [
+        "docs",
+        "feature",
+        "low-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "仅文档更新。",
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "24249a3032f461543308b1bb9eb1c2c9572d70f9",
+      "comment": "增强 RFork 权重传输以支持量化模型和草稿模型。主要变更：1) 新增 post-load RFork 传输路径，接收方先构建与 seed 相同的 Ascend 张量布局，然后复制推理使用的 NPU 张量；2) 扫描可传输的 post-load 参数、缓冲区和运行时张量属性；3) 添加分块权重传输避免单次请求过大；4) 暴露 seed 张量形状元数据并在接收方进行 reshape；5) 为 MTP 草稿模型添加独立的 RFork worker 状态；6) 当启用 layer_sharding 时绕过 RFork 使用默认加载器。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "model-loader",
+        "distributed"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "新增了 RFork 量化传输和草稿模型支持的核心逻辑，需要单元测试和集成测试覆盖。",
+        "suggested_test_areas": [
+          "tests/ut/model_loader/rfork/test_rfork_loader.py",
+          "tests/ut/model_loader/rfork/test_transfer_backend.py",
+          "tests/e2e/pull_request/ 相关 RFork 测试"
+        ]
+      }
+    },
+    {
+      "sha": "f2e2f466f26764ad621c2242bcf967530e959fbe",
+      "comment": "修复 mooncake_hybrid_connector.py 中环境变量引用错误，将 VLLM_NIXL_ABORT_REQUEST_TIMEOUT 改为 VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT，以适配 vLLM 0.22.1 的变更。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "distributed"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "仅修复环境变量名称，不涉及功能逻辑变更。",
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "7f3686527c1c947a476c12ffe5db0a68ca239c66",
+      "comment": "修复 patch_kv_coordinator 中的版本检查逻辑错误。原代码中 vllm_version_is(\"0.22.1\") 被错误地放在 vllm_version_is(\"0.21.0\") 分支下，导致死代码。修正为正确的 elif 逻辑。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "patch"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "修复了版本检查逻辑，现有测试应能覆盖。",
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "6d428b6f9da98ded43837d60a04b95668eb9106e",
+      "comment": "新增 NPU IPC 权重传输引擎（NPUIPCWeightTransferEngine），支持通过共享内存在训练器和推理 worker 之间进行零拷贝权重同步。主要变更：1) 实现 WeightTransferEngine 接口，包括 receive_weights 和 trainer_send_weights；2) 支持 Ray RPC 和 HTTP 两种传输模式；3) 通过 ASCEND_RT_VISIBLE_DEVICES 映射生成 UUID 用于 IPC 句柄匹配；4) 在 patch_weight_transfer_engine 中注册 \"ipc\" 后端映射；5) 添加 RLHF 示例脚本。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "distributed",
+        "weight-transfer"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "新增了完整的 NPU IPC 权重传输引擎，需要单元测试和集成测试覆盖。",
+        "suggested_test_areas": [
+          "tests/ut/distributed/test_npu_ipc_weight_transfer.py",
+          "examples/rl/rlhf_http_npu_ipc.py"
+        ]
+      }
+    },
+    {
+      "sha": "5dc65ddfb0aa66cb7f61e8d24c7720e519cee9c1",
+      "comment": "自动翻译 27 个文档文件为中文，包括版本策略、上下文并行设计文档、CPU 绑定、EPLB、优化调优、FAQ、安装指南、动态分块流水线并行、多个模型教程、功能指南等。",
+      "tags": [
+        "docs",
+        "low-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "仅文档翻译更新。",
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "5b5ab8092c44799fcd640f7583b966fc957896a9",
+      "comment": "将 actions/setup-python 从 v5 升级到 v6。",
+      "tags": [
+        "ci",
+        "low-risk",
+        "dependencies"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "仅 CI 依赖升级。",
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "8024fff4e5a5c5bcd3839d8c6d299baf2a258a2a",
+      "comment": "将 actions/checkout 从 v6 升级到 v7。",
+      "tags": [
+        "ci",
+        "low-risk",
+        "dependencies"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "仅 CI 依赖升级。",
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "8f27fcdc05d00077c2ace493ae089d980713bc2a",
+      "comment": "删除 bot_pr_create.yaml 中错误的 pull_request 触发器。",
+      "tags": [
+        "ci",
+        "low-risk",
+        "bugfix"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "仅 CI 配置修复。",
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "23653e030db94c3ee4d5ca1d06ae65b53b8e1fc7",
+      "comment": "出于代码安全考虑，删除 _e2e_nightly_multi_node.yaml 中硬编码的 kubeconfig 路径。",
+      "tags": [
+        "ci",
+        "low-risk",
+        "security"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "仅 CI 配置安全修复。",
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "fc9230c42d142972f3ad11a71716c1ac06aa41b4",
+      "comment": "修复 BalanceScheduler 和 SchedulerDynamicBatch 与 vLLM 0.18+ 的 skipped_waiting 队列不兼容的问题。原代码只迭代 self.waiting，忽略了 self.skipped_waiting，导致结构化输出请求在启用平衡调度或动态批次调度时可能无限挂起。修复方案：1) 使用 while (self.waiting or self.skipped_waiting) 循环；2) 使用 _select_waiting_queue_for_scheduling() 选择队列；3) 使用 _is_blocked_waiting_status() 和 _try_promote_blocked_waiting_request() 处理阻塞状态；4) 将跳过的请求重新入队到 self.skipped_waiting。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "scheduler"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "修复了调度器的核心逻辑，需要测试验证结构化输出在平衡调度和动态批次调度下的正确性。",
+        "suggested_test_areas": [
+          "tests/ut/core/test_scheduler_dynamic_batch.py",
+          "tests/e2e/pull_request/ 相关调度测试"
+        ]
+      }
+    },
+    {
+      "sha": "5a9c2f8c616dca6a65ce8cb643ac99ea1920e601",
+      "comment": "修复 BlockTable.get_device_tensor() 参数数量不匹配的错误。vLLM 0.22.1 中该函数新增了 num_reqs 参数，但 Ascend 的 block_table.py 未同步更新。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "worker"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "修复了与上游 vLLM 的接口兼容性问题，现有测试应能覆盖。",
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "faeb2ccd1f7960b47e96009eb8bf0e9e6063f095",
+      "comment": "更新模型部署教程模板，增加使用 tab-set 标记语法处理多硬件系列（如 A3/A2）的指南和示例。同时修复中文模板中的拼写错误。",
+      "tags": [
+        "docs",
+        "low-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "仅文档模板更新。",
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "4f87db4e0499717ebd36e1925723a18ebf689a99",
+      "comment": "支持选择性收集 EPLB 热度的阶段（prefill/decode）。在 PD 共置场景中，prefill 和 decode 请求可能产生不同的专家工作负载。通过 eplb_heat_collection_stage 配置项，可以选择仅在 prefill 或 decode 阶段收集热度，更有效地减少专家不均衡。",
+      "tags": [
+        "feature",
+        "low-risk",
+        "eplb",
+        "performance"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "新增了 EPLB 热度收集阶段选择功能，需要单元测试验证不同阶段的热度收集逻辑。",
+        "suggested_test_areas": [
+          "tests/ut/ops/test_fused_moe.py",
+          "tests/ut/eplb/ 相关测试"
+        ]
+      }
+    },
+    {
+      "sha": "a206c06674726b3d8e2429c3aa2f6a26b96f801b",
+      "comment": "大量 CI 工作流优化：1) 将 bot/pr 工作流从 cpu-8-hk 迁移到更小的 cpu-2/4-hk runner，使用预构建的 act-environments-ubuntu 容器镜像，减少冗余步骤；2) select_tests 增加纯测试变更检测优化，当 PR 只修改 tests/ 下的文件时，跳过源码驱动的模块匹配，只运行 default_cpu_ut 和变更的测试文件；3) bot_pr_create 增加标题驱动的 issue/RFC 提醒；4) bot_merge_conflict 增加重试机制减少不稳定。",
+      "tags": [
+        "ci",
+        "refactor",
+        "low-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "select_tests 的测试选择逻辑有重要变更，需要更新相关单元测试。",
+        "suggested_test_areas": [
+          ".github/workflows/scripts/test_select_tests.py",
+          ".github/workflows/scripts/conftest.py"
+        ]
+      }
+    },
+    {
+      "sha": "92eeab2fe9a73394d2118de3c8459d69cc9d8e62",
+      "comment": "优化 sleep 模式的内存释放，增加额外清理路径。主要变更：1) 新增 SleepWakeupManager 管理 ACL graph 和 HCCL 的 sleep/wakeup；2) sleep 时清理 ACL graph attention workspaces、重置 graph 状态、销毁 HCCL 进程组；3) wakeup 时恢复 HCCL 进程组、刷新 MoE MC2 通信器元数据、重新捕获 ACL graphs；4) 新增 enable_sleep_mode_extra_cleanup 配置项控制是否启用额外清理。优化后 sleep 模式可释放更多 NPU 内存（EP 场景从 3.2GB 降至 0.7GB）。",
+      "tags": [
+        "feature",
+        "performance",
+        "medium-risk",
+        "device-allocator",
+        "sleep-mode"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "新增了 sleep/wakeup 的额外清理和恢复逻辑，需要单元测试和集成测试覆盖。",
+        "suggested_test_areas": [
+          "tests/ut/device_allocator/test_sleep_mem_optimized.py",
+          "tests/ut/compilation/a2/test_acl_graph.py",
+          "tests/ut/patch/worker/patch_common/test_patch_distributed.py",
+          "tests/ut/worker/a2/test_worker_v1.py"
+        ]
+      }
+    },
+    {
+      "sha": "633104e982541808c800878d339d4adb8b37ccf0",
+      "comment": "自动更新 test_config.yaml 中的 estimated_times 值，基于 CI 工作流运行的实际耗时数据。使用中位数计算并增加 10% 安全缓冲。",
+      "tags": [
+        "ci",
+        "test",
+        "low-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "仅更新测试时间估计值，不影响测试逻辑。",
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "dcdf6d3bfb7d6b3884936be7b2e2c6baeac2aca1",
+      "comment": "修复 W4A8 量化方法中 compressed_tensors 的 per-channel bug。为 process_scale_compressed_tensors 辅助函数添加 squeeze 参数（默认 True），在处理 w2_weight_scale 时禁用 squeeze，以保持 torch_npu.npu_grouped_matmul 所需的未压缩形状。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "quantization"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "修复了量化权重处理的形状问题，需要更新单元测试验证 per-channel 路径。",
+        "suggested_test_areas": [
+          "tests/ut/quantization/methods/a2/test_w4a8.py"
+        ]
+      }
+    }
+  ]
+}

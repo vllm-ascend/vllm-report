@@ -46,6 +46,15 @@ def clean_stale_data(data_dir, repo):
         d = f.replace(".json", "")
         if d not in analyzed_dates:
             path = os.path.join(commits_dir, f)
+            # Keep empty commit files (no commits on that day) — they don't need analysis
+            try:
+                with open(path, "r") as fh:
+                    data = json.load(fh)
+                if len(data.get("commits", [])) == 0:
+                    kept_dates.add(d)
+                    continue
+            except (json.JSONDecodeError, IOError):
+                pass
             os.remove(path)
             print(f"  Removed {f} (no analysis for {d})")
             removed += 1

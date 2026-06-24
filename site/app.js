@@ -676,8 +676,21 @@
   }
 
   function render() {
-    if (!commitsData || !commitsData.commits || commitsData.commits.length === 0) {
+    if (!commitsData || !commitsData.commits) {
       $('#emptyState').style.display = 'block';
+      $('#emptyState').querySelector('.title').textContent = 'No data available';
+      $('#emptyState').querySelector('.subtitle').textContent = 'Try selecting a different date or repository';
+      $('#commitList').innerHTML = '';
+      renderStats([]);
+      renderSummary();
+      renderDateBar();
+      return;
+    }
+
+    if (commitsData.commits.length === 0) {
+      $('#emptyState').style.display = 'block';
+      $('#emptyState').querySelector('.title').textContent = '当日无提交';
+      $('#emptyState').querySelector('.subtitle').textContent = currentRepo + ' 在 ' + (commitsData.date || availableDates[currentDateIndex]) + ' 没有新的 commit 记录';
       $('#commitList').innerHTML = '';
       renderStats([]);
       renderSummary();

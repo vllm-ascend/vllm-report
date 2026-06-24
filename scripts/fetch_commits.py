@@ -599,7 +599,11 @@ def fetch_commits(repo, branch, data_dir, token, local_repo=None, date=None):
             })
             return
         if not commits_list:
-            print("No new commits found")
+            if date:
+                print(f"No new commits found for date {date}, writing empty file")
+                write_daily_commits(data_dir, repo, date, [], branch=branch)
+            else:
+                print("No new commits found")
             return
 
         print(f"Found {len(commits_list)} new commits via GitHub API, fetching details...")
@@ -625,7 +629,8 @@ def fetch_commits(repo, branch, data_dir, token, local_repo=None, date=None):
     if date:
         groups = {day: commits for day, commits in groups.items() if day == date}
         if not groups:
-            print(f"No commits found for date {date}, skipping")
+            print(f"No commits found for date {date}, writing empty file")
+            write_daily_commits(data_dir, repo, date, [], branch=branch)
             return
 
     total_new = 0

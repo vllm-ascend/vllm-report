@@ -765,7 +765,12 @@
       return;
     }
 
-    renderCommitList(filtered, null);
+    var html = filtered.map(renderCommitCard).join('');
+    if (searchQuery) {
+      html += '<div style="text-align:center;padding:16px 0;"><button class="cross-search-btn" id="crossSearchBtn">Search across all dates</button></div>';
+    }
+    $('#commitList').innerHTML = html;
+    restoreExpanded();
   }
 
   function renderCommitList(commits, analysisMap) {

@@ -25,6 +25,7 @@
   let activeFilter = 'all';
   let searchQuery = '';
   let analysisDates = [];
+  let crossDayResults = null; // { commits: [...], analysis: {...} } from cross-day search
 
   const $ = (sel) => document.querySelector(sel);
   const $$ = (sel) => document.querySelectorAll(sel);
@@ -128,6 +129,9 @@
     showLoading(true);
     commitsData = null;
     analysisData = null;
+    crossDayResults = null;
+    searchQuery = '';
+    $('#searchInput').value = '';
 
     const [commits, analysis] = await Promise.all([
       fetchJSON(dataUrl(currentRepo, 'commits', date)),
@@ -301,10 +305,10 @@
     return analysisData.commits.find((c) => c.sha === sha);
   }
 
-  function filterCommits(commits) {
+  function filterCommits(commits, analysisMap) {
     if (!commits) return [];
     return commits.filter((c) => {
-      const a = getAnalysisForSha(c.sha);
+      var a = analysisMap ? analysisMap[c.sha] : getAnalysisForSha(c.sha);
       const q = searchQuery.toLowerCase();
       const matchesSearch =
         !q ||
@@ -739,6 +743,11 @@
       return;
     }
 
+    if (crossDayResults) {
+      renderCommitList(crossDayResults.commits, crossDayResults.analysis);
+      return;
+    }
+
     $('#emptyState').style.display = 'none';
     renderSummary();
     renderStats(commitsData.commits);
@@ -748,13 +757,71 @@
     updateFilterChips(commitsData.commits);
     const filtered = filterCommits(commitsData.commits);
     if (filtered.length === 0) {
-      $('#commitList').innerHTML = `<div class="empty-state"><div class="title">No matching commits</div><div class="subtitle">Try adjusting your filter or search</div></div>`;
+      if (searchQuery) {
+        $('#commitList').innerHTML = '<div class="empty-state"><div class="title">No matching commits today</div><div class="subtitle">Try adjusting your filter or <button class="cross-search-btn" id="crossSearchBtn">Search across all dates</button></div></div>';
+      } else {
+        $('#commitList').innerHTML = '<div class="empty-state"><div class="title">No matching commits</div><div class="subtitle">Try adjusting your filter or search</div></div>';
+      }
       return;
     }
 
-    const html = filtered.map(renderCommitCard).join('');
+    renderCommitList(filtered, null);
+  }
+
+  function renderCommitList(commits, analysisMap) {
+    const html = commits.map(function (c) {
+      if (analysisMap) {
+        var savedAnalysis = analysisData;
+        analysisData = { commits: Object.values(analysisMap) };
+        var card = renderCommitCard(c);
+        analysisData = savedAnalysis;
+        return card;
+      }
+      return renderCommitCard(c);
+    }).join('');
     $('#commitList').innerHTML = html;
     restoreExpanded();
+  }
+
+  async function searchAcrossDates() {
+    if (!searchQuery) return;
+    showLoading(true);
+
+    var allCommits = [];
+    var allAnalysis = {};
+    var dates = availableDates.slice();
+
+    // Fetch in parallel batches of 10
+    var batchSize = 10;
+    for (var i = 0; i < dates.length; i += batchSize) {
+      var batch = dates.slice(i, i + batchSize);
+      var results = await Promise.all(batch.map(function (date) {
+        return Promise.all([
+          fetchJSON(dataUrl(currentRepo, 'commits', date)),
+          fetchJSON(dataUrl(currentRepo, 'analysis', date)),
+        ]);
+      }));
+      for (var j = 0; j < results.length; j++) {
+        var commitsData = results[j][0];
+        var analysisData = results[j][1];
+        if (commitsData && commitsData.commits) {
+          for (var k = 0; k < commitsData.commits.length; k++) {
+            commitsData.commits[k]._date = batch[j];
+            allCommits.push(commitsData.commits[k]);
+          }
+        }
+        if (analysisData && analysisData.commits) {
+          for (var m = 0; m < analysisData.commits.length; m++) {
+            allAnalysis[analysisData.commits[m].sha] = analysisData.commits[m];
+          }
+        }
+      }
+    }
+
+    var filtered = filterCommits(allCommits, allAnalysis);
+    crossDayResults = { commits: filtered, analysis: allAnalysis };
+    showLoading(false);
+    render();
   }
 
   function init() {
@@ -765,6 +832,7 @@
         currentRepo = tab.dataset.repo;
         activeFilter = 'all';
         searchQuery = '';
+        crossDayResults = null;
         $('#searchInput').value = '';
         $$('.filter-chip').forEach((c) => c.classList.remove('active'));
         $$('.filter-chip')[0].classList.add('active');
@@ -817,6 +885,7 @@
 
     $('#searchInput').addEventListener('input', (e) => {
       searchQuery = e.target.value;
+      crossDayResults = null;
       render();
     });
 
@@ -831,6 +900,12 @@
           expanded.push(c.dataset.sha);
         });
         sessionStorage.setItem('vllmExpanded', JSON.stringify(expanded));
+        return;
+      }
+
+      const crossBtn = e.target.closest('#crossSearchBtn');
+      if (crossBtn) {
+        searchAcrossDates();
         return;
       }
 

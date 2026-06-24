@@ -24,7 +24,6 @@
   let analysisData = null;
   let activeFilter = 'all';
   let searchQuery = '';
-  let dateOffset = 0;
   let analysisDates = [];
 
   const $ = (sel) => document.querySelector(sel);
@@ -556,42 +555,78 @@
     return html;
   }
 
-  function renderDateBar() {
-    var days = 14;
-    var today = new Date(cnDateStr(new Date()) + 'T00:00:00+08:00');
-    today.setDate(today.getDate() - dateOffset);
-    var start = new Date(today);
-    start.setDate(start.getDate() - days + 1);
+  var currentMonth = null;
 
+  function renderDateBar() {
+    var targetDate;
+    if (currentMonth) {
+      targetDate = cnDateStr(currentMonth);
+    } else if (availableDates.length > 0 && currentDateIndex < availableDates.length) {
+      targetDate = availableDates[currentDateIndex];
+    } else {
+      targetDate = cnDateStr(new Date());
+    }
+    var ref = new Date(targetDate + 'T00:00:00+08:00');
+    var year = ref.getFullYear();
+    var mon = ref.getMonth(); // 0-indexed
+
+    var firstDay = new Date(year, mon, 1);
+    var lastDay = new Date(year, mon + 1, 0);
+    var startDow = firstDay.getDay(); // 0=Sun
+
+    var monthNames = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
     var weekdayNames = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
     var currentDate = availableDates[currentDateIndex];
+    var todayStr = cnDateStr(new Date());
     var html = '';
 
-    // Prev button
-    var prevDisabled = dateOffset >= 90;
-    html += '<button class="date-nav" id="datePrev"' + (prevDisabled ? ' disabled' : '') + '>◀</button>';
+    // Header: prev + month label + next
+    var prevMonth = mon - 1;
+    var prevYear = year;
+    if (prevMonth < 0) { prevMonth = 11; prevYear--; }
+    var nextMonth = mon + 1;
+    var nextYear = year;
+    if (nextMonth > 11) { nextMonth = 0; nextYear++; }
+    var nextDisabled = nextYear > new Date().getFullYear() || (nextYear === new Date().getFullYear() && nextMonth > new Date().getMonth());
 
-    var d = new Date(start);
-    for (var i = 0; i < days; i++) {
+    html += '<div class="calendar-header">';
+    html += '<button class="date-nav" id="datePrev" data-offset="' + prevYear + '-' + String(prevMonth + 1).padStart(2, '0') + '">◀</button>';
+    html += '<span class="month-label">' + monthNames[mon] + ' ' + year + '</span>';
+    html += '<button class="date-nav" id="dateNext" data-offset="' + nextYear + '-' + String(nextMonth + 1).padStart(2, '0') + '"' + (nextDisabled ? ' disabled' : '') + '>▶</button>';
+    html += '</div>';
+
+    // Weekday headers
+    html += '<div class="calendar-grid">';
+    for (var w = 0; w < 7; w++) {
+      html += '<div class="calendar-weekday">' + weekdayNames[w] + '</div>';
+    }
+
+    // Fill leading empty cells
+    for (var i = 0; i < startDow; i++) {
+      html += '<div class="calendar-cell empty"></div>';
+    }
+
+    // Days of the month
+    var d = new Date(firstDay);
+    while (d <= lastDay) {
       var ds = cnDateStr(d);
-      var wd = weekdayNames[d.getDay()];
+      var dayNum = d.getDate();
       var hasData = availableDates.indexOf(ds) !== -1;
       var hasAnalysis = analysisDates.indexOf(ds) !== -1;
       var isActive = ds === currentDate;
-      var cls = 'date-chip';
+      var isToday = ds === todayStr;
+      var cls = 'calendar-cell';
       if (hasData) cls += ' has-data';
       if (hasAnalysis && hasData) cls += ' has-analysis';
       if (isActive) cls += ' active';
-      html += '<div class="' + cls + '" data-date="' + ds + '"><span class="chip-weekday">' + wd + '</span><span class="chip-date">' + ds.slice(5) + '</span></div>';
+      if (isToday) cls += ' today';
+      html += '<div class="' + cls + '" data-date="' + ds + '">' + dayNum + '</div>';
       d.setDate(d.getDate() + 1);
     }
 
-    html += '<button class="date-nav" id="dateNext"' + (dateOffset === 0 ? ' disabled' : '') + '>▶</button>';
+    html += '</div>'; // .calendar-grid
 
     $('#dateBar').innerHTML = html;
-
-    var active = $('#dateBar .active');
-    if (active) active.scrollIntoView({ behavior: 'smooth', inline: 'center', block: 'nearest' });
   }
 
   function restoreExpanded() {
@@ -606,9 +641,9 @@
   }
 
   function renderCoverageBar() {
-    var el = $('#coverageBar');
+    var el = $('#sideCoverageBar');
     if (!availableDates.length || !analysisDates.length) {
-      el.style.display = 'none';
+      el.innerHTML = '<span class="coverage-text">No data</span>';
       return;
     }
     var total = availableDates.length;
@@ -621,7 +656,6 @@
     var pct = Math.round(analyzed / total * 100);
     var missing = total - analyzed;
     var color = missing === 0 ? 'var(--accent)' : (missing < 5 ? 'var(--accent-orange)' : 'var(--accent-red)');
-    el.style.display = 'flex';
     el.innerHTML = '<span class="coverage-label">Analysis Coverage</span>' +
       '<div class="coverage-track"><div class="coverage-fill" style="width:' + pct + '%;background:' + color + '"></div></div>' +
       '<span class="coverage-text">' + analyzed + '/' + total + ' days</span>';
@@ -675,12 +709,18 @@
     bar.innerHTML = html;
   }
 
+  function renderSidebar(commits) {
+    renderCoverageBar();
+    renderHeatmap(commits);
+  }
+
   function render() {
     if (!commitsData || !commitsData.commits) {
       $('#emptyState').style.display = 'block';
       $('#emptyState').querySelector('.title').textContent = 'No data available';
       $('#emptyState').querySelector('.subtitle').textContent = 'Try selecting a different date or repository';
       $('#commitList').innerHTML = '';
+      $('#heatmapSection').style.display = 'none';
       renderStats([]);
       renderSummary();
       renderDateBar();
@@ -692,6 +732,7 @@
       $('#emptyState').querySelector('.title').textContent = '当日无提交';
       $('#emptyState').querySelector('.subtitle').textContent = currentRepo + ' 在 ' + (commitsData.date || availableDates[currentDateIndex]) + ' 没有新的 commit 记录';
       $('#commitList').innerHTML = '';
+      $('#heatmapSection').style.display = 'none';
       renderStats([]);
       renderSummary();
       renderDateBar();
@@ -702,8 +743,7 @@
     renderSummary();
     renderStats(commitsData.commits);
     renderDateBar();
-    renderCoverageBar();
-    renderHeatmap(commitsData.commits);
+    renderSidebar(commitsData.commits);
 
     updateFilterChips(commitsData.commits);
     const filtered = filterCommits(commitsData.commits);
@@ -730,6 +770,7 @@
         $$('.filter-chip')[0].classList.add('active');
         await loadAvailableDates();
         currentDateIndex = 0;
+        currentMonth = null;
         if (availableDates.length > 0) {
           await loadDate(availableDates[0]);
         }
@@ -737,26 +778,29 @@
     });
 
     $('#dateBar').addEventListener('click', (e) => {
-      const chip = e.target.closest('.date-chip');
+      const chip = e.target.closest('.calendar-cell:not(.empty)');
       if (chip) {
         const date = chip.dataset.date;
         const idx = availableDates.indexOf(date);
         if (idx !== -1) {
           currentDateIndex = idx;
-          dateOffset = 0;
+          var parts = date.split('-');
+          currentMonth = new Date(parseInt(parts[0]), parseInt(parts[1]) - 1, 1);
           loadDate(date);
         }
         return;
       }
       const prev = e.target.closest('#datePrev');
       if (prev && !prev.disabled) {
-        dateOffset += 14;
+        var parts = prev.dataset.offset.split('-');
+        currentMonth = new Date(parseInt(parts[0]), parseInt(parts[1]) - 1, 1);
         renderDateBar();
         return;
       }
       const next = e.target.closest('#dateNext');
       if (next && !next.disabled) {
-        dateOffset = Math.max(0, dateOffset - 14);
+        var parts = next.dataset.offset.split('-');
+        currentMonth = new Date(parseInt(parts[0]), parseInt(parts[1]) - 1, 1);
         renderDateBar();
         return;
       }

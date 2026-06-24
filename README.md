@@ -102,7 +102,15 @@ python scripts/analyze_commits.py --repo vllm-project/vllm --force
 
 ### 5. View Dashboard
 
-Open `site/index.html` locally, or deploy via GitHub Pages (auto-deployed when `site/` or `data/` changes).
+```bash
+# Start local dev server (auto-opens browser)
+python scripts/serve.py
+
+# Custom port, don't open browser
+python scripts/serve.py --port 8080 --no-open
+```
+
+Or open `site/index.html` directly (data paths auto-detect local vs GitHub Pages).
 
 ## GitHub Actions Setup
 

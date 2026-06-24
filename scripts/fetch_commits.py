@@ -232,7 +232,7 @@ def update_dates_index(data_dir, repo):
     dates = sorted(
         f.replace(".json", "")
         for f in os.listdir(commits_dir)
-        if f.endswith(".json") and f != "meta.json"
+        if f.endswith(".json") and f != "meta.json" and re.match(r"^\d{4}-\d{2}-\d{2}$", f.replace(".json", ""))
     )
 
     save_json_atomic(dates_path, {"dates": dates})

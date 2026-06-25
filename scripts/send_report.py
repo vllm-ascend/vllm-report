@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-Send daily analysis report via email as plain-text table.
+Send daily analysis report via email as a markdown-styled block list.
 """
 import json
 import os
+import re
 import smtplib
 import sys
 from email.mime.text import MIMEText
@@ -24,99 +25,180 @@ def load_json(path):
         return None
 
 
-def truncate(s, width):
+# Display width of a character: CJK / fullwidth = 2, others = 1
+_CJK_RE = re.compile(r"[\u3000-\u303f\u4e00-\u9fff\uff00-\uffef\u2014\u2018\u2019\u201c\u201d\u2026]")
+
+
+def _char_width(ch):
+    return 2 if _CJK_RE.match(ch) else 1
+
+
+def wrap_text(s, width):
+    """Wrap text by display width, breaking freely on CJK chars.
+    Returns a list of lines."""
     if not s:
-        return "-"
-    if len(s) > width:
-        return s[:width - 3] + "..."
-    return s
+        return [""]
+    out = []
+    cur = ""
+    cur_w = 0
+    for ch in s:
+        ch_w = _char_width(ch)
+        if cur_w + ch_w > width and cur:
+            out.append(cur)
+            cur = ch
+            cur_w = ch_w
+        else:
+            cur += ch
+            cur_w += ch_w
+    if cur:
+        out.append(cur)
+    return out or [""]
+
+
+def _get_impact_fields(commit, repo):
+    """Extract (ascend_info, test_info, test_areas) per repo schema.
+
+    vllm repo uses ascend_impact.{functionality, testing, suggested_test_areas}.
+    vllm-ascend repo uses test_impact.{reason, suggested_test_areas}.
+    """
+    if "ascend" in repo:
+        ti = commit.get("test_impact") or {}
+        return ("", ti.get("reason", "") or "", ti.get("suggested_test_areas") or [])
+    ai = commit.get("ascend_impact") or {}
+    ascend_info = ai.get("functionality", "") or "" if ai.get("ascend_affected") else ""
+    test_info = ai.get("testing", "") or "" if ai.get("needs_test_update") else ""
+    return (ascend_info, test_info, ai.get("suggested_test_areas") or [])
 
 
 def build_table(repos, date_str, data_dir="data"):
-    lines = []
-    lines.append(f"vLLM Commit Report — {date_str}")
-    lines.append("=" * 120)
+    out = []
+    out.append(f"vLLM Commit Report — {date_str}")
+    out.append("=" * 80)
 
     for repo in repos:
         repo_dir = repo_dir_name(repo)
         analysis = load_json(f"{data_dir}/{repo_dir}/analysis/{date_str}.json")
         commits_data = load_json(f"{data_dir}/{repo_dir}/commits/{date_str}.json") or {}
         short = repo.split("/")[-1]
-        is_vllm = "ascend" not in repo
+
+        out.append("")
+        out.append("## " + short)
+        out.append("-" * 60)
 
         if not analysis:
-            lines.append(f"\n[{short}] 暂无分析数据")
+            out.append("  (暂无分析数据)")
             continue
 
         commits = analysis.get("commits", [])
         daily_summary = analysis.get("daily_summary", "")
 
-        # Build commit message map
         message_map = {}
         for c in commits_data.get("commits", []):
             msg = c.get("message", "") or ""
             message_map[c["sha"]] = msg.split("\n")[0]
 
-        # Filter out auto-skipped commits
+        # Filter out auto-skipped (Chores)
         visible = [c for c in commits if "自动判定" not in c.get("comment", "")]
 
-        ascend_count = sum(1 for c in visible if c.get("ascend_impact", {}).get("ascend_affected"))
-        high_risk_count = sum(1 for c in visible if "high-risk" in c.get("tags", []))
-        needs_test_count = sum(1 for c in visible if c.get("test_impact", {}).get("needs_test_update") or c.get("ascend_impact", {}).get("needs_test_update"))
-        auto_count = len(commits) - len(visible)
-
-        lines.append(f"\n[{short}]  {len(commits)} commits  |  高风险: {high_risk_count}  |  昇腾影响: {ascend_count}  |  需测试: {needs_test_count}  |  自动跳过: {auto_count}")
-
-        if daily_summary:
-            lines.append(f"\n  每日总结: {daily_summary}")
+        # All visible commits are categorized as either "primary" (needs attention)
+        # or "other". Grouping is per-repo because the schema differs.
+        if "ascend" in repo:
+            primary = [c for c in visible if (c.get("test_impact") or {}).get("needs_test_update")]
+            other = [c for c in visible if not (c.get("test_impact") or {}).get("needs_test_update")]
+        else:
+            primary = [
+                c for c in visible
+                if (c.get("ascend_impact") or {}).get("ascend_affected")
+                or (c.get("ascend_impact") or {}).get("needs_test_update")
+            ]
+            other = [c for c in visible if c not in primary]
 
         if not visible:
-            lines.append("\n  (所有 commit 均为自动跳过)")
+            auto_count = len(commits)
+            out.append(f"统计: 总计 {len(commits)}  |  全部为自动跳过")
+            if daily_summary:
+                out.append("")
+                out.append("每日总结:")
+                for ln in wrap_text(daily_summary, 70):
+                    out.append("  " + ln)
+            out.append("")
+            out.append("  (所有 commit 均为自动跳过)")
             continue
 
-        # Table header
-        cols = ["Commit", "AI分析", "昇腾影响", "测试影响"]
-        widths = [52, 30, 30, 24]
-        header = "  " + "  ".join(f"{c:<{w}}" for c, w in zip(cols, widths))
-        sep = "  " + "  ".join("-" * w for w in widths)
-        lines.append(f"\n{header}")
-        lines.append(f"  {sep}")
+        ascend_count = sum(1 for c in visible if (c.get("ascend_impact") or {}).get("ascend_affected"))
+        high_risk_count = sum(1 for c in visible if "high-risk" in c.get("tags", []))
+        needs_test_count = sum(1 for c in visible if _get_impact_fields(c, repo)[1])
+        auto_count = len(commits) - len(visible)
 
-        for c in visible:
+        if "ascend" in repo:
+            stats_line = (
+                f"统计: 总计 {len(commits)}  |  高风险 {high_risk_count}  |  "
+                f"需新增测试 {needs_test_count}  |  自动跳过 {auto_count}"
+            )
+        else:
+            stats_line = (
+                f"统计: 总计 {len(commits)}  |  高风险 {high_risk_count}  |  "
+                f"昇腾影响 {ascend_count}  |  需新增测试 {needs_test_count}  |  "
+                f"自动跳过 {auto_count}"
+            )
+        out.append(stats_line)
+
+        if daily_summary:
+            out.append("")
+            out.append("每日总结:")
+            for ln in wrap_text(daily_summary, 70):
+                out.append("  " + ln)
+
+        def render_block(c, idx):
             sha_full = c.get("sha", "")
-            sha = sha_full[:12]
+            sha = sha_full[:8]
             gh_url = f"https://github.com/{repo}/commit/{sha_full}"
             commit_title = message_map.get(sha_full, sha)
-            if len(commit_title) > 50:
-                commit_title = commit_title[:47] + "..."
+            tags = c.get("tags", [])
+            comment = c.get("comment", "") or ""
+            ai_first = comment.split("\n")[0] if comment else ""
+            ascend_info, test_info, test_areas = _get_impact_fields(c, repo)
 
-            comment = c.get("comment", "")
-            ai_title = comment.split("\n")[0] if comment else ""
+            lines = []
+            tag_str = " ".join(f"[{t}]" for t in tags)
+            lines.append(f"{idx}. {commit_title}" + (f"  {tag_str}" if tag_str else ""))
+            lines.append(f"   🔗 {sha}  →  {gh_url}")
+            if ai_first:
+                lines.append("   AI 分析:")
+                for ln in wrap_text(ai_first, 70):
+                    lines.append("     " + ln)
+            if ascend_info and ascend_info not in ("无影响", "无影响。", "无直接影响", "无直接影响。"):
+                lines.append("   昇腾影响:")
+                for ln in wrap_text(ascend_info, 70):
+                    lines.append("     " + ln)
+            if test_info and test_info not in ("无影响", "无影响。", "无直接影响", "无直接影响。"):
+                lines.append("   ⚠ 需新增测试:")
+                for ln in wrap_text(test_info, 70):
+                    lines.append("     " + ln)
+                if test_areas:
+                    lines.append("   建议范围: " + ", ".join(test_areas))
+            return lines
 
-            ascend_info = ""
-            test_info = ""
-            if is_vllm:
-                ai_impact = c.get("ascend_impact", {})
-                if ai_impact and ai_impact.get("ascend_affected"):
-                    ascend_info = ai_impact.get("functionality", "")
-                test_impact = c.get("test_impact", {})
-                if test_impact and test_impact.get("needs_test_update"):
-                    test_info = test_impact.get("reason", "")
-            else:
-                test_impact = c.get("test_impact", {})
-                if test_impact and test_impact.get("needs_test_update"):
-                    test_info = test_impact.get("reason", "")
+        if primary:
+            out.append("")
+            out.append("▎昇腾影响 / 需新增测试" if "ascend" not in repo else "▎需新增测试")
+            for i, c in enumerate(primary, 1):
+                for ln in render_block(c, i):
+                    out.append(ln)
+                out.append("")
 
-            row = "  " + "  ".join(
-                f"{truncate(v, w):<{w}}" for v, w in zip(
-                    [f"{commit_title} ({gh_url})", ai_title, ascend_info, test_info], widths
-                )
-            )
-            lines.append(row)
+        if other:
+            out.append("")
+            out.append("▎其他变更")
+            for i, c in enumerate(other, 1):
+                for ln in render_block(c, i):
+                    out.append(ln)
+                out.append("")
 
-    lines.append("\n" + "=" * 120)
-    lines.append(f"Generated by vLLM Report Bot · {datetime.now(TZ_CN).strftime('%Y-%m-%d %H:%M CST')}")
-    return "\n".join(lines)
+    out.append("")
+    out.append("=" * 80)
+    out.append(f"Generated by vLLM Report Bot · {datetime.now(TZ_CN).strftime('%Y-%m-%d %H:%M CST')}")
+    return "\n".join(out)
 
 
 def send_email(subject, body):
@@ -138,9 +220,6 @@ def send_email(subject, body):
     msg["To"] = ", ".join(recipients)
 
     print(f"From: {user}, To: {recipients}")
-    if not recipients or not recipients[0]:
-        print("No recipients configured, skipping")
-        return
 
     last_err = None
     for try_port in (465, 587):
@@ -174,7 +253,7 @@ def main():
     date_str = args.date or datetime.now(TZ_CN).strftime("%Y-%m-%d")
 
     body = build_table(repos, date_str, data_dir=args.data_dir)
-    print(body[:500] + "...")
+    print(body)
     subject = f"vLLM Report — {date_str}"
     send_email(subject, body)
 

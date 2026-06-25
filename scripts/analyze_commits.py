@@ -766,14 +766,19 @@ def analyze_commits(repo, date, data_dir, confirm, force, local_repo=None):
         print(f"  └ {len(llm_shas)} commits sent to LLM for analysis")
 
     # Phase 2: call LLM only for non-triaged commits
-    if llm_shas:
+    llm_analysis = None  # Will hold the accumulated LLM results
+    max_retries = 3
+    retry_count = 0
+    missing_shas = set()
+
+    while llm_shas and retry_count < max_retries:
         llm_set = set(llm_shas)
         prompt = build_prompt(repo, date, commits_data, data_dir, local_repo=local_repo, commit_subset=llm_set)
         if not prompt:
             print("ERROR: empty prompt after subset filter")
             return False
 
-        print("Calling LLM...")
+        print(f"Calling LLM (attempt {retry_count + 1}, {len(llm_shas)} commits)...")
         output = call_llm(prompt)
         if output is None:
             print("Failed to get response from LLM")
@@ -782,11 +787,9 @@ def analyze_commits(repo, date, data_dir, confirm, force, local_repo=None):
         analysis = extract_json_from_output(output)
         if analysis is None:
             print("Failed to parse JSON from LLM output")
-            # Show diagnostic info about the output
             print(f"Output length: {len(output)} chars")
             print(f"First 100 chars: {output[:100]!r}")
             print(f"Last 100 chars: {output[-100:]!r}")
-            # Save full output to a file for inspection
             dump_path = os.path.join(data_dir, "llm_raw_output.txt")
             try:
                 with open(dump_path, "w", encoding="utf-8") as f:
@@ -795,15 +798,12 @@ def analyze_commits(repo, date, data_dir, confirm, force, local_repo=None):
             except OSError:
                 print("(could not save raw output to file)")
 
-            # Fallback: LLM agent may have written the JSON to a file
-            # instead of outputting it to stdout. Check for it.
             fallback_path = os.path.join(data_dir, "_llm_result.json")
             if os.path.exists(fallback_path):
                 print(f"Trying fallback: reading {fallback_path}...")
                 try:
                     with open(fallback_path, "r", encoding="utf-8") as f:
                         analysis = json.load(f)
-                    # Remove the fallback file so it doesn't accumulate
                     os.unlink(fallback_path)
                 except (json.JSONDecodeError, OSError) as e:
                     print(f"Fallback also failed: {e}")
@@ -812,9 +812,42 @@ def analyze_commits(repo, date, data_dir, confirm, force, local_repo=None):
         if analysis is None:
             return False
 
+        # Accumulate LLM results across retries
+        if llm_analysis is None:
+            llm_analysis = analysis
+        else:
+            existing_shas = {ac["sha"] for ac in llm_analysis.get("commits", [])}
+            for ac in analysis.get("commits", []):
+                if ac["sha"] not in existing_shas:
+                    llm_analysis["commits"].append(ac)
+
+        # Check for missing shas
+        analyzed_shas = {ac["sha"] for ac in llm_analysis.get("commits", [])}
+        missing_shas = llm_set - analyzed_shas
+
+        if not missing_shas:
+            print(f"  ✓ All {len(llm_set)} commits analyzed")
+            break
+
+        print(f"  ⚠ {len(missing_shas)} commits missing from LLM response, retrying...")
+        for sha in sorted(missing_shas):
+            print(f"    - {sha[:8]}")
+
+        llm_shas = list(missing_shas)
+        retry_count += 1
+
+    if missing_shas and retry_count >= max_retries:
+        print(f"  ✗ Still {len(missing_shas)} commits missing after {max_retries} retries")
+
+    analysis = llm_analysis
+
+    # Validate the accumulated analysis
+    if analysis and "commits" in analysis:
+        # Only validate LLM-analyzed commits, not auto triaged ones
+        all_llm_shas = {c["sha"] for c in all_commits if not is_vllm or not triage_ascend(c)}
         errors = validate_analysis(analysis, commits_data, repo)
         if errors:
-            print(f"Validation errors:")
+            print("Validation errors:")
             for e in errors:
                 print(f"  - {e}")
             if not confirm and not force:
@@ -825,9 +858,6 @@ def analyze_commits(repo, date, data_dir, confirm, force, local_repo=None):
                 if answer != "y":
                     print("Skipped.")
                     return False
-    else:
-        # All commits were triaged — no LLM call needed
-        analysis = None
 
     # ── Phase 3: merge auto + LLM results ─────────────────────────
     merged_shas = {}

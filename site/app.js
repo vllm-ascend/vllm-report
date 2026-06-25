@@ -26,6 +26,7 @@
   let searchQuery = '';
   let analysisDates = [];
   let crossDayResults = null; // { commits: [...], analysis: {...} } from cross-day search
+  let sectionsExpanded = { ascend: true, code: false, chore: false, 'needs-test': true, other: false }; // per-section collapse state
 
   const $ = (sel) => document.querySelector(sel);
   const $$ = (sel) => document.querySelectorAll(sel);
@@ -131,7 +132,9 @@
     analysisData = null;
     crossDayResults = null;
     searchQuery = '';
+    sectionsExpanded = { ascend: true, code: false, chore: false, 'needs-test': true, other: false };
     $('#searchInput').value = '';
+    $('#searchClear').style.display = 'none';
 
     const [commits, analysis] = await Promise.all([
       fetchJSON(dataUrl(currentRepo, 'commits', date)),
@@ -303,6 +306,35 @@
   function getAnalysisForSha(sha) {
     if (!analysisData || !analysisData.commits) return null;
     return analysisData.commits.find((c) => c.sha === sha);
+  }
+
+  // vllm: 'ascend' | 'code' | 'chore'
+  // vllm-ascend: 'needs-test' | 'chore'
+  function classifyCommit(commit) {
+    var a = getAnalysisForSha(commit.sha);
+    if (currentRepo === 'vllm-project/vllm-ascend') {
+      if (a && a.test_impact && a.test_impact.needs_test_update) return 'needs-test';
+      return 'chore';
+    }
+    // vllm repo
+    if (a && a.ascend_impact && a.ascend_impact.ascend_affected === true) return 'ascend';
+    // Check if auto-triaged (comment starts with "（自动判定）")
+    if (a && a.comment && a.comment.indexOf('（自动判定）') === 0) return 'chore';
+    if (a && a.ascend_impact && a.ascend_impact.ascend_affected === false) return 'code';
+    // No analysis at all — treat as code (needs attention)
+    return 'code';
+  }
+
+  function classifyCrossDay(commit, analysisMap) {
+    var a = analysisMap ? analysisMap[commit.sha] : null;
+    if (currentRepo === 'vllm-project/vllm-ascend') {
+      if (a && a.test_impact && a.test_impact.needs_test_update) return 'needs-test';
+      return 'chore';
+    }
+    if (a && a.ascend_impact && a.ascend_impact.ascend_affected === true) return 'ascend';
+    if (a && a.comment && a.comment.indexOf('（自动判定）') === 0) return 'chore';
+    if (a && a.ascend_impact && a.ascend_impact.ascend_affected === false) return 'code';
+    return 'code';
   }
 
   function filterCommits(commits, analysisMap) {
@@ -744,7 +776,7 @@
     }
 
     if (crossDayResults) {
-      renderCommitList(crossDayResults.commits, crossDayResults.analysis);
+      renderGroupedCommitList(crossDayResults.commits, crossDayResults.analysis);
       return;
     }
 
@@ -755,8 +787,15 @@
     renderSidebar(commitsData.commits);
 
     updateFilterChips(commitsData.commits);
-    const filtered = filterCommits(commitsData.commits);
-    if (filtered.length === 0) {
+    renderGroupedCommitList(commitsData.commits);
+  }
+
+  function renderGroupedCommitList(commits, analysisMap) {
+    // Classify all commits
+    var groups = {};
+    var allFiltered = filterCommits(commits, analysisMap);
+
+    if (allFiltered.length === 0) {
       if (searchQuery) {
         $('#commitList').innerHTML = '<div class="empty-state"><div class="title">No matching commits today</div><div class="subtitle">Try adjusting your filter or <button class="cross-search-btn" id="crossSearchBtn">Search across all dates</button></div></div>';
       } else {
@@ -765,27 +804,101 @@
       return;
     }
 
-    var html = filtered.map(renderCommitCard).join('');
+    // Group by classification
+    for (var i = 0; i < allFiltered.length; i++) {
+      var c = allFiltered[i];
+      var cls = analysisMap ? classifyCrossDay(c, analysisMap) : classifyCommit(c);
+      if (!groups[cls]) groups[cls] = [];
+      groups[cls].push(c);
+    }
+
+    var isVllm = currentRepo === 'vllm-project/vllm';
+    var primaryKey = isVllm ? 'ascend' : 'needs-test';
+    var primaryCommits = groups[primaryKey] || [];
+    var codeCommits = isVllm ? (groups['code'] || []) : [];
+    var choreCommits = groups['chore'] || [];
+    var otherCount = codeCommits.length + choreCommits.length;
+
+    // Build HTML
+    var html = '';
+
+    // Primary section (collapsible)
+    if (primaryCommits.length > 0) {
+      var primaryLabel = isVllm ? 'Ascend Impact' : 'Needs Test Update';
+      var primaryExpanded = sectionsExpanded[primaryKey];
+      html += '<div class="commit-section">';
+      html += '<div class="section-header section-primary" data-section="' + primaryKey + '">';
+      html += '<span class="section-arrow">' + (primaryExpanded ? '▼' : '▶') + '</span> ';
+      html += primaryLabel + ' (' + primaryCommits.length + ')';
+      html += '</div>';
+      html += '<div class="section-body" style="' + (primaryExpanded ? '' : 'display:none') + '">';
+      for (var j = 0; j < primaryCommits.length; j++) {
+        html += renderCommitCardForCommit(primaryCommits[j], analysisMap);
+      }
+      html += '</div></div>';
+    }
+
+    // Other Changes section (collapsible, contains sub-sections)
+    if (otherCount > 0) {
+      var otherExpanded = sectionsExpanded['other'];
+      html += '<div class="commit-section">';
+      html += '<div class="section-header section-other" data-section="other">';
+      html += '<span class="section-arrow">' + (otherExpanded ? '▼' : '▶') + '</span> ';
+      html += 'Other Changes (' + otherCount + ')';
+      html += '</div>';
+      html += '<div class="section-body" style="' + (otherExpanded ? '' : 'display:none') + '">';
+
+      // Sub-section: Code Changes (vllm only, collapsible)
+      if (isVllm && codeCommits.length > 0) {
+        var codeExpanded = sectionsExpanded['code'];
+        html += '<div class="subsection-block">';
+        html += '<div class="subsection-header collapsible" data-section="code">';
+        html += '<span class="section-arrow">' + (codeExpanded ? '▼' : '▶') + '</span> ';
+        html += 'Code Changes (' + codeCommits.length + ')';
+        html += '</div>';
+        html += '<div class="section-body" style="' + (codeExpanded ? '' : 'display:none') + '">';
+        for (var k = 0; k < codeCommits.length; k++) {
+          html += renderCommitCardForCommit(codeCommits[k], analysisMap);
+        }
+        html += '</div></div>';
+      }
+
+      // Sub-section: Chores (collapsible)
+      if (choreCommits.length > 0) {
+        var choreExpanded = sectionsExpanded['chore'];
+        var choreLabel = isVllm ? 'Chores' : 'Other';
+        html += '<div class="subsection-block">';
+        html += '<div class="subsection-header collapsible" data-section="chore">';
+        html += '<span class="section-arrow">' + (choreExpanded ? '▼' : '▶') + '</span> ';
+        html += choreLabel + ' (' + choreCommits.length + ')';
+        html += '</div>';
+        html += '<div class="section-body" style="' + (choreExpanded ? '' : 'display:none') + '">';
+        for (var m = 0; m < choreCommits.length; m++) {
+          html += renderCommitCardForCommit(choreCommits[m], analysisMap);
+        }
+        html += '</div></div>';
+      }
+
+      html += '</div></div>';
+    }
+
     if (searchQuery) {
       html += '<div style="text-align:center;padding:16px 0;"><button class="cross-search-btn" id="crossSearchBtn">Search across all dates</button></div>';
     }
+
     $('#commitList').innerHTML = html;
     restoreExpanded();
   }
 
-  function renderCommitList(commits, analysisMap) {
-    const html = commits.map(function (c) {
-      if (analysisMap) {
-        var savedAnalysis = analysisData;
-        analysisData = { commits: Object.values(analysisMap) };
-        var card = renderCommitCard(c);
-        analysisData = savedAnalysis;
-        return card;
-      }
-      return renderCommitCard(c);
-    }).join('');
-    $('#commitList').innerHTML = html;
-    restoreExpanded();
+  function renderCommitCardForCommit(commit, analysisMap) {
+    if (analysisMap) {
+      var savedAnalysis = analysisData;
+      analysisData = { commits: Object.values(analysisMap) };
+      var card = renderCommitCard(commit);
+      analysisData = savedAnalysis;
+      return card;
+    }
+    return renderCommitCard(commit);
   }
 
   async function searchAcrossDates() {
@@ -825,6 +938,7 @@
 
     var filtered = filterCommits(allCommits, allAnalysis);
     crossDayResults = { commits: filtered, analysis: allAnalysis };
+    sectionsExpanded = { ascend: true, code: true, chore: true, 'needs-test': true, other: true }; // cross-day search expands all
     showLoading(false);
     render();
   }
@@ -838,7 +952,9 @@
         activeFilter = 'all';
         searchQuery = '';
         crossDayResults = null;
+        sectionsExpanded = { ascend: true, code: false, chore: false, 'needs-test': true, other: false };
         $('#searchInput').value = '';
+        $('#searchClear').style.display = 'none';
         $$('.filter-chip').forEach((c) => c.classList.remove('active'));
         $$('.filter-chip')[0].classList.add('active');
         await loadAvailableDates();
@@ -890,6 +1006,16 @@
 
     $('#searchInput').addEventListener('input', (e) => {
       searchQuery = e.target.value;
+      $('#searchClear').style.display = searchQuery ? 'flex' : 'none';
+      crossDayResults = null;
+      render();
+    });
+
+    $('#searchClear').addEventListener('click', () => {
+      searchQuery = '';
+      $('#searchInput').value = '';
+      $('#searchClear').style.display = 'none';
+      $('#searchInput').focus();
       crossDayResults = null;
       render();
     });
@@ -899,12 +1025,20 @@
       if (header) {
         const card = header.closest('.commit-card');
         card.classList.toggle('expanded');
-        // Save expanded state to sessionStorage
         var expanded = [];
         document.querySelectorAll('.commit-card.expanded').forEach(function (c) {
           expanded.push(c.dataset.sha);
         });
         sessionStorage.setItem('vllmExpanded', JSON.stringify(expanded));
+        return;
+      }
+
+      // Section header click (any section/sub-section)
+      const sectionHeader = e.target.closest('[data-section]');
+      if (sectionHeader && (sectionHeader.classList.contains('section-header') || sectionHeader.classList.contains('subsection-header'))) {
+        var key = sectionHeader.dataset.section;
+        sectionsExpanded[key] = !sectionsExpanded[key];
+        render();
         return;
       }
 

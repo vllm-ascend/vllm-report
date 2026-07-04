@@ -1,0 +1,213 @@
+{
+  "date": "2026-07-04",
+  "repo": "vllm-project/vllm-ascend",
+  "generated_at": "2026-07-05T03:08:35.310010+08:00",
+  "daily_summary": "当日变更主要集中在 Ascend 310P 平台的 Bug 修复和功能增强，包括：修复 MTP 投机解码中 index_fill 和 GatherV2 越界导致的崩溃问题；修复 310P RC 模式下 ACL Graph 推理错误，引入 RC 设备检测和专用元数据构建器；修复 MoE Gating 算子在 token 数超过 1024 时的精度问题；新增 W4A16-MXFP4 量化方案支持；优化 310P 上 FlashAttention 算子的近似计算支持；修复 Mamba align 后处理在 310P 上的挂起问题；以及 CI 配置更新（新增 Kimi EP 周级测试用例、升级 vLLM 主分支版本、回退导致 CI 失败的 MC2 重构）。",
+  "test_impact_summary": "当日变更对测试看护有显著影响。新增了 W4A16-MXFP4 量化方案的单元测试和 310P Mamba align fallback 的源码级回归测试，但同时也因上游 API 变更跳过了 GLM4.7/MiniMax M2 工具调用解析器的测试，并因已知问题跳过了 W4A16-MXFP4 的部分测试用例。MC2 重构回退导致大量相关测试被删除或简化，需要关注后续是否重新引入。整体上，测试覆盖了新增功能的核心路径，但部分测试因环境或上游变更被临时跳过，需持续跟踪修复。",
+  "commits": [
+    {
+      "sha": "721933a35f58d948a4e90c5e57353cdada66ab11",
+      "comment": "此提交为 310P 平台的 MMEncoderAttention 引入了对近似 FlashAttention 计算的支持。核心变更是在 `AscendMMEncoderAttention310` 类中添加了 `support_approximate_calculation` 属性，该属性通过检查 `torch_npu._npu_flash_attention_unpad_v2` 函数是否存在来动态判断。在 `forward_oot` 方法中，根据该标志位选择调用 `_npu_flash_attention_unpad_v2`（带 `kernel_type=2` 参数）或原有的 `_npu_flash_attention_unpad`。这是一个性能优化，允许在支持新算子的环境（如 torch_npu 2.10.0 及以上）中使用更高效的近似计算。风险较低，因为通过运行时检测实现了优雅降级，且测试用例中显式设置了 `support_approximate_calculation = False` 以保持向后兼容。",
+      "tags": [
+        "performance",
+        "low-risk",
+        "attention",
+        "310p"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "新增了动态算子选择逻辑，需要测试在支持和不支持 `_npu_flash_attention_unpad_v2` 的环境下的行为。现有测试仅覆盖了不支持的情况（`support_approximate_calculation = False`），缺少对新算子路径的验证。",
+        "suggested_test_areas": [
+          "vllm_ascend/_310p/ops/mm_encoder_attention.py",
+          "tests/ut/_310p/ops/test_mm_encoder_attention_310.py"
+        ]
+      }
+    },
+    {
+      "sha": "9d4fdcaa8357c14018a11bc6b4baceacd5073e8c",
+      "comment": "此提交修复了 310P 平台上 MTP/EAGLE 投机解码的两个关键 Bug。1) 将 `index_fill_` 调用路由到 `DeviceOperator.index_fill`，并新增 `Ascend310PDeviceAdaptor` 类，为 310P 提供基于 `torch.where` 的 `index_fill` 实现，因为 310P 不支持原生的 `index_fill_`。2) 在 `AscendSpecDecodeBaseProposer310` 中重写了 `set_inputs_first_pass` 方法，通过 `clone()` 保存和恢复 `input_ids` 缓冲区的尾部元素，防止切片赋值操作破坏持久化的 drafter `input_ids` 缓冲区，从而避免 `GatherV2` 越界崩溃。这是一个重要的 Bug 修复，风险中等，因为引入了新的设备适配器类和 310P 特定的逻辑分支，需要确保不影响其他设备类型。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "spec_decode",
+        "310p",
+        "device"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "修复了特定的 310P 投机解码崩溃问题，但未提供针对 `Ascend310PDeviceAdaptor.index_fill` 和 `set_inputs_first_pass` 的单元测试。需要添加测试来验证这些修复的正确性，并确保回归。",
+        "suggested_test_areas": [
+          "vllm_ascend/device/device_op.py",
+          "vllm_ascend/_310p/spec_decode/llm_base_proposer_310.py",
+          "tests/ut/_310p/spec_decode/"
+        ]
+      }
+    },
+    {
+      "sha": "67f754a39e32c215685ccb0da588f7c2b8d349fc",
+      "comment": "此提交修复了 310P RC（Root Complex）模式下 ACL Graph 推理错误的问题。主要变更包括：1) 将 RC 设备检测逻辑从 `worker_310p.py` 提取到 `utils.py` 的 `is_rc_device()` 函数中，并添加了单元测试。2) 在 `model_runner_310p.py` 中，根据 `is_rc_device()` 调整了 `query_start_loc`、`num_accepted_tokens` 和 `seq_lens` 的填充和复制逻辑，避免在 RC 设备上执行不支持的 `fill_` 操作。3) 新增 `GDNAttentionMetadataBuilder310` 类，用于在 RC 设备上安全地构建 prefill 元数据，避免设备端 `fill_` 和 `torch.full` 操作。4) 新增 `compute_causal_conv1d_metadata` 函数，用于在 CPU 上计算 causal conv1d 元数据。5) 在 `gdn_attn_builder.py` 中重构了 `build` 方法，提取出 `_build_prefill_has_initial_state_and_causal_conv1d_meta` 方法，便于子类重写。这是一个重要的 Bug 修复，风险中等，因为引入了新的 RC 设备检测和专用代码路径，需要确保不影响 EP 模式。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "compilation",
+        "310p",
+        "attention"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "新增了 `is_rc_device` 函数和 `GDNAttentionMetadataBuilder310` 类，但缺少对 RC 模式下 ACL Graph 捕获和重放流程的集成测试。现有单元测试覆盖了 `is_rc_device` 的逻辑，但未覆盖其在模型运行器中的实际影响。",
+        "suggested_test_areas": [
+          "vllm_ascend/utils.py",
+          "vllm_ascend/_310p/model_runner_310p.py",
+          "vllm_ascend/_310p/ops/gdn_attn_builder_310.py",
+          "tests/ut/_310p/"
+        ]
+      }
+    },
+    {
+      "sha": "0dc58f8e814f33eee64f4c652bb653ad05cfac73",
+      "comment": "此提交修复了 310P 平台上 `MoEGatingTopkSoftmax` 算子在输入 token 数超过 1024 时可能产生 INF 值导致精度下降的问题。修复方式是在 `select_experts` 函数中，当 `router_logits` 的第一个维度（token 数）大于 1024 时，将输入按 1024 切分，分别调用 `npu_moe_gating_top_k_softmax`，然后将结果拼接起来。这是一个针对特定算子限制的临时 workaround，风险较低，因为逻辑清晰且仅在 310P 上生效。测试用例验证了切分逻辑的正确性。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "ops",
+        "310p",
+        "moe"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "已添加单元测试 `test_select_experts_chunks_large_token_batch` 来验证切分逻辑，覆盖了 token 数超过 1024 的场景。现有测试足以覆盖此修复。",
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "4756a9ad6fddf1ac28d4697b2e9297bdb5a32805",
+      "comment": "此提交临时跳过了 `test_w4a16_mxfp4.py` 中的三个测试用例，原因是 PR #11014 引入的问题尚未修复。这是一个临时性的 CI 修复，风险极低，但需要跟踪后续修复并重新启用这些测试。",
+      "tags": [
+        "test",
+        "low-risk",
+        "ci",
+        "quantization"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "跳过了三个测试用例，需要在根本问题修复后重新启用它们。这本身就是一个测试更新。",
+        "suggested_test_areas": [
+          "tests/ut/quantization/methods/test_w4a16_mxfp4.py"
+        ]
+      }
+    },
+    {
+      "sha": "4f53ab73440266d93707943e10f7d1857fe90649",
+      "comment": "此提交为 Kimi-K2.5-W4A8 模型添加了一个新的端到端周级性能测试配置。该配置使用 PD 分离部署（disaggregated prefill-decode）和外部数据并行（EP），在 4 节点、每节点 16 卡的环境下运行。这是一个 CI 配置变更，风险较低，但需要确保测试环境满足配置要求（如 Mooncake 连接器、特定模型权重等）。",
+      "tags": [
+        "ci",
+        "low-risk",
+        "test"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "新增的是 CI 配置文件，不涉及代码逻辑变更。测试影响在于需要确保 CI 环境能够正确加载和执行此配置。",
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "059611dc1e625feaf9f88f909d6ba1851adb8f56",
+      "comment": "此提交修复了因 `w4a16_mxfp4.py` 引入的 Ruff 代码格式检查错误。主要修改了 `moe_runtime_args.py` 和 `w4a16_mxfp4.py` 中的代码格式，如参数换行、函数调用格式等。这是一个纯代码风格修复，无功能变更，风险极低。",
+      "tags": [
+        "chore",
+        "low-risk",
+        "quantization"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "仅涉及代码格式调整，不影响功能逻辑，无需更新测试。",
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "434afac207679d6447095d819abd6528713480c7",
+      "comment": "此提交修复了 310P 平台上 MTP 投机解码与 Mamba align 模式结合使用时可能导致的挂起问题。根本原因是 310P 不支持 Triton 融合的 `postprocess_mamba_align_gpu` 内核。修复方式是在 `patch_mamba_utils.py` 中添加了一个 CPU fallback 函数 `_postprocess_mamba_align_gpu_cpu_fallback`，该函数在 310P 上替换原有的 Triton 路径。fallback 函数通过 CPU 张量操作模拟了上游后处理的语义，包括更新 accepted-token 计数、处理块对齐和复制 Mamba 状态。这是一个重要的 Bug 修复，风险中等，因为引入了复杂的 CPU fallback 逻辑，需要确保其与上游语义完全一致。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "spec_decode",
+        "310p",
+        "mamba"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "新增了源码级回归测试 `test_310p_mamba_align_fallback_310p_source.py`，通过 AST 解析验证 fallback 函数的语义。这是一个创新的测试方法，但缺少实际的运行时集成测试来验证在 310P 上 MTP + Mamba align 场景不再挂起。",
+        "suggested_test_areas": [
+          "vllm_ascend/patch/worker/patch_mamba_utils.py",
+          "tests/ut/_310p/test_mamba_align_fallback_310p_source.py"
+        ]
+      }
+    },
+    {
+      "sha": "f81dd51845185d18ea26cfbef2042f9b3bc0de2e",
+      "comment": "此提交为 vllm-ascend 添加了 W4A16-MXFP4 量化方案的支持。这是一个重要的功能特性，涉及多个模块的修改：1) 新增 `w4a16_mxfp4.py` 量化方法类，实现了权重解包、格式转换、动态量化参数生成和 `apply` 方法。2) 在 `device_op.py` 中为 `npu_grouped_matmul_swiglu_quant` 和 `npu_grouped_matmul_gmm2` 添加了 W4A16-MXFP4 的处理分支。3) 在 `moe_mlp.py`、`moe_runtime_args.py`、`moe_stage_params.py` 中更新了 MXFP 相关判断逻辑。4) 在 `quant_type.py` 中添加了新的 `QuantType.W4A16MXFP4` 枚举值。5) 在 `quant_parser.py` 中注册了新的量化类型。这是一个中等风险的变更，因为涉及新的量化路径，需要确保与其他量化方案和 MoE 通信方法的兼容性。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "quantization",
+        "ops",
+        "moe"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "新增了单元测试文件 `test_w4a16_mxfp4.py`，覆盖了权重获取、动态量化参数生成和权重后处理。但缺少端到端集成测试来验证 W4A16-MXFP4 量化模型的实际推理正确性和性能。",
+        "suggested_test_areas": [
+          "vllm_ascend/quantization/methods/w4a16_mxfp4.py",
+          "tests/ut/quantization/methods/test_w4a16_mxfp4.py",
+          "tests/e2e/"
+        ]
+      }
+    },
+    {
+      "sha": "8c28b0eb1383c12635c78f2f00bcf0cd6f7a5417",
+      "comment": "此提交将 vLLM 主分支的验证提交从 `a30addc` 升级到 `b9a7cd4`，并适配了上游 API 变更。这是一个大规模的兼容性更新，涉及多个模块：1) 在 `__init__.py` 中为 v2 model runner 设置环境变量。2) 更新了调度器补丁以适配上游 `throttle_prefills` 参数。3) 更新了 Ngram 和 Suffix 投机解码 proposer 以适配上游 Dynamic SD 的签名变更。4) 更新了 encoder ACL Graph 以适配上游图集（graph set）存储。5) 更新了 fused_moe 以适配上游 `get_current_vllm_config`。6) 更新了 v2 model runner 的 ACL Graph 管理器以适配 LoRA 捕获参数。7) 更新了 Eagle ACL Graph 以适配上游注意力状态重命名。8) 由于上游解析器重构，跳过了 GLM4.7 和 MiniMax M2 的补丁和测试。这是一个高风险变更，因为涉及大量上游 API 适配，需要确保所有适配路径的正确性。",
+      "tags": [
+        "chore",
+        "high-risk",
+        "ci",
+        "compilation",
+        "spec_decode",
+        "scheduler",
+        "distributed"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "由于上游 API 变更，跳过了 GLM4.7 和 MiniMax M2 工具调用解析器的测试。需要确保这些测试在后续上游版本中恢复。同时，Ngram 和 Suffix proposer 的适配需要新的测试来验证 Dynamic SD 路径。",
+        "suggested_test_areas": [
+          "vllm_ascend/spec_decode/ngram_proposer.py",
+          "vllm_ascend/spec_decode/suffix_proposer.py",
+          "vllm_ascend/worker/encoder_acl_graph.py",
+          "tests/ut/patch/platform/"
+        ]
+      }
+    },
+    {
+      "sha": "29894920f062ea0d164157a917fb70cda913f892",
+      "comment": "此提交回退了之前的 MC2 容量和 MoE 通信选择重构（commit aabec5ef），原因是该重构导致 CI 测试失败。回退内容包括：1) 将 `ascend_forward_context.py` 中的 `select_moe_comm_method` 恢复为内联逻辑，移除提取出的辅助函数。2) 将 `token_dispatcher.py` 中的 `global_bs` 计算恢复为基于 `scheduler_config` 和 `compilation_config` 的本地计算，移除对 `get_mc2_tokens_capacity` 的依赖。3) 简化了 `test_ascend_forward_context.py` 的测试。4) 修复了多个测试文件中的 mock 问题（如添加 `decode_max_num_seqs`）。5) 修复了 shell 脚本中的 lint 问题。这是一个高风险的回退操作，虽然修复了 CI，但丢失了 MC2 重构带来的改进，需要后续重新引入。",
+      "tags": [
+        "revert",
+        "high-risk",
+        "refactor",
+        "ci",
+        "moe",
+        "distributed"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "回退删除了大量针对 MC2 容量和 MoE 通信选择的单元测试，并将 `test_ascend_forward_context.py` 简化为一个占位符。这显著降低了测试覆盖率，需要在后续重新引入 MC2 重构时恢复这些测试。",
+        "suggested_test_areas": [
+          "vllm_ascend/ascend_forward_context.py",
+          "vllm_ascend/ops/fused_moe/token_dispatcher.py",
+          "tests/ut/test_ascend_forward_context.py",
+          "tests/ut/ops/a2/test_token_dispatcher.py"
+        ]
+      }
+    }
+  ]
+}

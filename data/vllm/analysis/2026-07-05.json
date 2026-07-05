@@ -1,0 +1,163 @@
+{
+  "date": "2026-07-05",
+  "repo": "vllm-project/vllm",
+  "generated_at": "2026-07-06T03:13:43.448393+08:00",
+  "daily_summary": "当日变更主要集中在多模态推理的Prefix-LM双向注意力支持、Voxtral Realtime模型的token反馈超时修复、Mamba/Mamba2模型加载崩溃修复、序列并行与专家并行解耦优化、TurboQuant的KV cache dtype修复、Jina Reranker V3的指令转发支持以及Run:ai内存限制哨兵值修复。这些变更涉及模型配置、注意力后端、模型执行器、分布式通信、模型加载等多个核心模块。",
+  "ascend_impact_summary": "当日变更对vllm-ascend项目有显著影响。主要影响包括：1) `vllm/v1/worker/gpu/attn_utils.py`中新增`compute_mm_prefix_ranges`函数和`build_attn_metadata`参数变更，影响AscendAttentionBackend的元数据构建；2) `vllm/v1/worker/gpu/model_states/default.py`中调用`compute_mm_prefix_ranges`，影响NPUModelRunner的注意力准备逻辑；3) `vllm/config/model.py`中`is_mm_prefix_lm`属性从`@property`改为`@cached_property`，影响模型配置缓存行为；4) `vllm/distributed/device_communicators/base_device_communicator.py`中all2all管理器初始化逻辑变更，影响NPUCommunicator的初始化；5) `vllm/forward_context.py`中DPMetadata创建逻辑变更，影响Ascend的分布式上下文设置。",
+  "commits": [
+    {
+      "sha": "cc1d020d01949d11b7ef70dabb0eb196b3f39f53",
+      "comment": "该commit为MRV2（多模态推理V2）启用mm prefix双向注意力支持。核心变更包括：1) 在`vllm/v1/worker/gpu/attn_utils.py`中新增`compute_mm_prefix_ranges`函数，用于计算多模态token的PrefixLM双向注意力范围，并支持滑动窗口过滤；2) 修改`build_attn_metadata`函数，新增`mm_req_doc_ranges`参数，将多模态前缀范围传递给注意力元数据构建器；3) 在`vllm/v1/worker/gpu/model_states/default.py`的`prepare_attn`方法中，当模型支持多模态输入且为mm_prefix_lm时，调用`compute_mm_prefix_ranges`计算范围并传递给`build_attn_metadata`；4) 将`vllm/config/model.py`中的`is_mm_prefix_lm`属性从`@property`改为`@cached_property`，避免重复计算；5) 新增测试文件`tests/models/multimodal/generation/test_mm_prefix_lm.py`，验证Gemma3的prefix-LM mask正确性。实现方式是通过在注意力元数据构建时传入多模态token的文档范围，使注意力后端能够为这些token应用双向注意力mask。潜在风险：新增的`mm_req_doc_ranges`参数需要所有注意力后端的元数据构建器支持，否则可能导致兼容性问题。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "attention",
+        "model-runner",
+        "multimodal"
+      ],
+      "ascend_impact": {
+        "ascend_affected": true,
+        "functionality": "1) `vllm/v1/worker/gpu/attn_utils.py`中`build_attn_metadata`函数新增`mm_req_doc_ranges`参数，AscendAttentionBackend的元数据构建器（`AscendAttentionMetadataBuilder`）需要支持该参数以正确处理多模态前缀双向注意力。2) `vllm/v1/worker/gpu/attn_utils.py`中新增`compute_mm_prefix_ranges`函数，NPUModelRunner在`prepare_attn`方法中需要调用此函数计算多模态前缀范围。3) `vllm/v1/worker/gpu/model_states/default.py`中`prepare_attn`方法新增对`compute_mm_prefix_ranges`的调用逻辑，NPUModelRunner需要同步更新其注意力准备逻辑。4) `vllm/config/model.py`中`is_mm_prefix_lm`从`@property`改为`@cached_property`，NPUPlatform或相关配置补丁需要确保缓存行为一致。",
+        "testing": "新增的`test_mm_prefix_lm.py`测试验证Gemma3的prefix-LM mask正确性，vllm-ascend需要在Ascend NPU上运行此测试以确保兼容性。",
+        "needs_test_update": true,
+        "suggested_test_areas": [
+          "tests/models/multimodal/generation/test_mm_prefix_lm.py"
+        ]
+      }
+    },
+    {
+      "sha": "8974ed89cd0b17615ae48cf09ef824cd8e3ec521",
+      "comment": "该commit修复Voxtral Realtime模型中的token反馈超时静默挂起问题。变更内容：移除`feed_tokens`协程中的`asyncio.wait_for`超时包装，直接使用`input_stream.get()`等待。原因是空闲等待是正常行为，请求清理通过finally块取消任务，不需要超时机制。同时移除对`VLLM_ENGINE_ITERATION_TIMEOUT_S`环境变量的导入。这是一个低风险的bug修复，仅影响Voxtral Realtime模型的特定实现。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "model"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。变更仅涉及`vllm/model_executor/models/voxtral_realtime.py`，该文件是Voxtral Realtime模型的特定实现，不被Ascend使用。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "fb2faceacd7af2ea6aa51eed90f295c421c00ec5",
+      "comment": "该commit修复加载Mamba/Mamba2检查点时因缺少`architectures`字段导致的崩溃问题。变更内容：在`vllm/config/vllm.py`的`try_verify_and_update_config`方法中，当`MODELS_CONFIG_MAP`中找不到架构时，通过`ModelRegistry._normalize_arch`将HF基础模型名称（如\"Mamba2Model\"）标准化为已解析的架构名称，然后再次查找配置类。这确保了即使检查点省略了`architectures`字段，per-arch配置钩子也能正确应用。这是一个低风险的bug修复，仅影响Mamba/Mamba2模型的加载流程。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "model",
+        "config"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。变更仅涉及`vllm/config/vllm.py`中的模型配置验证逻辑，不影响Ascend平台的核心接口或抽象基类。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "b6cc46ec3b903c71405f4355c1e9ecb47ae54bb2",
+      "comment": "该commit支持无需数据并行（DP）的序列并行，实现1.9%~5.0%的端到端吞吐量提升。核心变更包括：1) 在`vllm/config/parallel.py`中移除`use_sequence_parallel_moe`对`data_parallel_size > 1`的依赖，使序列并行可以在无DP时独立启用；2) 在`vllm/distributed/device_communicators/base_device_communicator.py`中，all2all管理器的初始化条件扩展为包含`use_sequence_parallel_moe`，确保序列并行EP时也初始化all2all通信；3) 在`vllm/forward_context.py`中，DPMetadata的创建逻辑扩展为支持序列并行场景，当无DP时直接使用本地token数量；4) 在`vllm/model_executor/layers/fused_moe/config.py`和`runner/moe_runner.py`中，all2all kernel和naive dispatch/combine的条件扩展为包含序列并行；5) 在`vllm/model_executor/models/deepseek_v2.py`中优化了序列并行的padding逻辑，使用更简洁的`(-hidden_states.shape[0]) % tp_world_size`计算padding大小；6) 在`vllm/model_executor/models/gpt_oss.py`中，当使用LoRA时禁用序列并行。这是一个性能优化变更，涉及分布式通信、MoE层和模型执行等多个模块。潜在风险：序列并行与LoRA的兼容性需要额外关注。",
+      "tags": [
+        "performance",
+        "medium-risk",
+        "distributed",
+        "moe",
+        "model-runner"
+      ],
+      "ascend_impact": {
+        "ascend_affected": true,
+        "functionality": "1) `vllm/distributed/device_communicators/base_device_communicator.py`中all2all管理器初始化条件变更，NPUCommunicator的`__init__`方法需要同步更新，确保在`use_sequence_parallel_moe`为True时也初始化all2all通信。2) `vllm/forward_context.py`中DPMetadata创建逻辑变更，Ascend的分布式上下文设置（如`set_forward_context`的patch）需要支持无DP时的序列并行场景。3) `vllm/config/parallel.py`中`use_sequence_parallel_moe`属性变更，NPUPlatform或相关配置补丁需要确保序列并行可以在无DP时独立启用。4) `vllm/model_executor/layers/fused_moe/config.py`和`runner/moe_runner.py`中all2all和dispatch/combine条件变更，Ascend的MoE实现需要同步更新这些条件判断。",
+        "testing": "需要验证在Ascend NPU上无DP时的序列并行功能是否正常工作，包括all2all通信、MoE层执行和端到端吞吐量。",
+        "needs_test_update": true,
+        "suggested_test_areas": [
+          "tests/distributed/test_sequence_parallel.py",
+          "tests/models/test_moe.py"
+        ]
+      }
+    },
+    {
+      "sha": "fa4321de3d894c50c5ca0766dffa352d3fb07423",
+      "comment": "该commit修复TurboQuant注意力后端中KV cache dtype丢失的问题。变更内容：在`vllm/v1/worker/gpu/attn_utils.py`的`_reshape_kv_cache`和`_update_hybrid_attention_layout`函数中，当KV cache spec是`TQFullAttentionSpec`类型时，即使`kv_quant_mode`为`NONE`，也强制使用`cache_dtype`而非`\"auto\"`。这是因为TurboQuant后端需要明确的dtype信息来正确计算KV cache形状。这是一个低风险的bug修复，仅影响TurboQuant注意力后端。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "attention",
+        "quantization"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。变更仅涉及`vllm/v1/worker/gpu/attn_utils.py`中的TurboQuant特定逻辑，`TQFullAttentionSpec`是TurboQuant后端的专用spec类，不被Ascend使用。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "922661304357313700340e787cfe19d58b8c0a2f",
+      "comment": "该commit为Jina Reranker V3模型添加指令（instruction）转发支持，使评分和重排序请求可以包含任务指令。核心变更包括：1) 在`vllm/entrypoints/pooling/scoring/io_processor.py`的`JinaRankingIOProcessorMixin`中，重构`sanitize_input`为局部函数，并在`format_docs_prompts_func`中支持`instruction`参数，将指令插入到prompt模板中；2) 在`_pre_process`方法中，从`prompt_extras`的`chat_template_kwargs`中提取`instruction`并传递给`format_docs_prompts_func`；3) 新增示例文件`examples/pooling/token_embed/jina_reranker_v3_online.py`；4) 更新测试文件`tests/models/language/pooling/test_jina_reranker_v3.py`，添加指令测试用例。这是一个功能增强变更，仅影响Jina Reranker V3模型的评分/重排序入口。",
+      "tags": [
+        "feature",
+        "low-risk",
+        "entrypoints",
+        "pooling"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。变更仅涉及`vllm/entrypoints/pooling/scoring/io_processor.py`中的Jina Reranker V3特定IO处理器，不影响Ascend平台的核心接口或抽象基类。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "34b560b725b401f33477464163244b4744d1c40f",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "bugfix",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "91b56473005ccc9a0d009619b5494a9c306380ee",
+      "comment": "该commit修复Run:ai模型加载器中内存限制（memory_limit）哨兵值的问题。变更内容：在`vllm/model_executor/model_loader/runai_streamer_loader.py`中，将`memory_limit`的验证逻辑从统一的正整数验证改为独立验证，允许`memory_limit`为`-1`（表示无限制）。同时更新错误消息和测试用例。这是一个低风险的bug修复，仅影响Run:ai模型加载器。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "model-loader"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。变更仅涉及`vllm/model_executor/model_loader/runai_streamer_loader.py`中的Run:ai特定加载逻辑，不被Ascend使用。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "4a6bf3c77f05b398b46fe4207ea1ee715d56c64f",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "bugfix",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    }
+  ]
+}

@@ -1,0 +1,339 @@
+{
+  "date": "2026-07-05",
+  "repo": "vllm-project/vllm",
+  "branch": "main",
+  "commits": [
+    {
+      "sha": "cc1d020d01949d11b7ef70dabb0eb196b3f39f53",
+      "author": {
+        "name": "Isotr0py",
+        "email": "mozf@mail2.sysu.edu.cn"
+      },
+      "date": "2026-07-05T22:45:29+08:00",
+      "message": "[MRV2] Enable mm prefix bidi attention support on MRV2 (#46942)\n\nSigned-off-by: Isotr0py <mozf@mail2.sysu.edu.cn>\nSigned-off-by: Isotr0py <2037008807@qq.com>\nCo-authored-by: Nick Hill <nickhill123@gmail.com>",
+      "parents": [
+        "8974ed89cd0b17615ae48cf09ef824cd8e3ec521"
+      ],
+      "stats": {
+        "total_additions": 165,
+        "total_deletions": 3,
+        "files_changed": 168
+      },
+      "files": [
+        {
+          "filename": ".buildkite/test_areas/models_multimodal.yaml",
+          "status": "modified",
+          "additions": 2,
+          "deletions": 1,
+          "patch": "@@ -27,6 +27,7 @@ steps:\n   - tests/models/multimodal\n   commands:\n     - pytest -v -s models/multimodal/generation/test_common.py -m core_model -k \"qwen3 or gemma\"\n+    - pytest -v -s models/multimodal/generation/test_mm_prefix_lm.py -m core_model\n     - pytest -v -s models/multimodal/generation/test_qwen2_5_vl.py -m core_model\n   mirror:\n     amd:\n@@ -58,7 +59,7 @@ steps:\n   - vllm/\n   - tests/models/multimodal\n   commands:\n-    - pytest -v -s models/multimodal -m core_model --ignore models/multimodal/generation/test_common.py --ignore models/multimodal/generation/test_ultravox.py --ignore models/multimodal/generation/test_qwen2_5_vl.py --ignore models/multimodal/generation/test_qwen2_vl.py --ignore models/multimodal/generation/test_whisper.py  --ignore models/multimodal/generation/test_memory_leak.py --ignore models/multimodal/generation/test_vit_cudagraph.py --ignore models/multimodal/processing\n+    - pytest -v -s models/multimodal -m core_model --ignore models/multimodal/generation/test_common.py --ignore models/multimodal/generation/test_ultravox.py --ignore models/multimodal/generation/test_qwen2_5_vl.py --ignore models/multimodal/generation/test_qwen2_vl.py --ignore models/multimodal/generation/test_whisper.py --ignore models/multimodal/generation/test_mm_prefix_lm.py --ignore models/multimodal/generation/test_memory_leak.py --ignore models/multimodal/generation/test_vit_cudagraph.py --ignore models/multimodal/processing\n     - pytest -v -s models/multimodal/generation/test_vit_cudagraph.py -m core_model\n     - pytest models/multimodal/generation/test_memory_leak.py -m core_model\n     - cd .. && VLLM_WORKER_MULTIPROC_METHOD=spawn pytest -v -s tests/models/multimodal/generation/test_whisper.py -m core_model  # Otherwise, mp_method=\"spawn\" doesn't work"
+        },
+        {
+          "filename": "tests/models/multimodal/generation/test_mm_prefix_lm.py",
+          "status": "added",
+          "additions": 119,
+          "deletions": 0,
+          "patch": "@@ -0,0 +1,119 @@\n+# SPDX-License-Identifier: Apache-2.0\n+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project\n+\n+from typing import Any\n+\n+import pytest\n+import torch\n+from transformers import AutoModelForImageTextToText\n+\n+from vllm.platforms import current_platform\n+\n+from ....conftest import HfRunner, ImageTestAssets, VllmRunner\n+from .vlm_utils import model_utils\n+\n+MODEL = \"google/gemma-3-4b-it\"\n+PROMPT = (\n+    \"<bos><start_of_turn>user\\n\"\n+    \"<start_of_image>What is the content in the center of the image?\"\n+    \"<end_of_turn>\\n<start_of_turn>model\\n\"\n+)\n+\n+\n+def _install_prefill_hidden_capture(model):\n+    model = getattr(model, \"module\", model)\n+    model._prefill_hidden = None\n+\n+    language_model = model.language_model.model\n+    original_forward = language_model.forward\n+\n+    def forward(*args, **kwargs):\n+        hidden_states = original_forward(*args, **kwargs)\n+        if model._prefill_hidden is None and torch.is_tensor(hidden_states):\n+            model._prefill_hidden = hidden_states.detach().float().cpu()\n+        return hidden_states\n+\n+    language_model.forward = forward\n+\n+\n+def _get_prefill_hidden(model):\n+    model = getattr(model, \"module\", model)\n+    hidden = getattr(model, \"_prefill_hidden\", None)\n+    assert hidden is not None\n+    return hidden\n+\n+\n+def _get_hf_prefill_hidden(hf_model: HfRunner, image: Any):\n+    inputs = hf_model.get_inputs([PROMPT], images=[image])[0]\n+    with torch.no_grad():\n+        outputs = hf_model.model.model(\n+            **hf_model.wrap_device(inputs),\n+            use_cache=False,\n+        )\n+    return outputs.last_hidden_state[0].detach().float().cpu()\n+\n+\n+def _get_vllm_prefill_hidden(\n+    vllm_runner: type[VllmRunner],\n+    image: Any,\n+    vllm_runner_kwargs: dict[str, Any],\n+):\n+    with vllm_runner(\n+        MODEL,\n+        max_model_len=4096,\n+        max_num_seqs=2,\n+        enforce_eager=True,\n+        limit_mm_per_prompt={\"image\": 1},\n+        **vllm_runner_kwargs,\n+    ) as vllm_model:\n+        vllm_model.apply_model(_install_prefill_hidden_capture)\n+        vllm_model.generate_greedy([PROMPT], max_tokens=1, images=[image])\n+        return vllm_model.apply_model(_get_prefill_hidden)[0]\n+\n+\n+@pytest.mark.core_model\n+@pytest.mark.skipif(\n+    current_platform.is_rocm(), reason=\"ROCm attention has accuracy issue for this test\"\n+)\n+def test_mm_prefix_lm_e2e(\n+    hf_runner: type[HfRunner],\n+    vllm_runner: type[VllmRunner],\n+    image_assets: ImageTestAssets,\n+    monkeypatch: pytest.MonkeyPatch,\n+):\n+    \"\"\"Regression: Gemma3 native prefill must apply image prefix-LM mask.\"\"\"\n+    monkeypatch.setenv(\"VLLM_ALLOW_INSECURE_SERIALIZATION\", \"1\")\n+    image = image_assets[0].pil_image\n+\n+    vllm_runner_kwargs: dict[str, Any] = {\n+        \"mm_processor_cache_gb\": 0,\n+        \"mm_processor_kwargs\": {\"do_pan_and_scan\": True},\n+    }\n+    vllm_hidden = _get_vllm_prefill_hidden(vllm_runner, image, vllm_runner_kwargs)\n+\n+    hf_model = hf_runner(\n+        MODEL,\n+        auto_cls=AutoModelForImageTextToText,\n+    )\n+    hf_model = model_utils.gemma3_patch_hf_runner(hf_model)\n+\n+    with hf_model:\n+        hf_hidden = _get_hf_prefill_hidden(hf_model, image)\n+\n+    assert vllm_hidden.shape == hf_hidden.shape\n+\n+    full_cos = torch.nn.functional.cosine_similarity(\n+        vllm_hidden.flatten(), hf_hidden.flatten(), dim=0\n+    )\n+    image_cos = torch.nn.functional.cosine_similarity(\n+        vllm_hidden[1:769].flatten(), hf_hidden[1:769].flatten(), dim=0\n+    )\n+\n+    assert full_cos > 0.9, (\n+        \"Gemma3 mm-prefix-LM full prefill hidden states should be close to HF; \"\n+        f\"got {full_cos=}\"\n+    )\n+    assert image_cos > 0.9, (\n+        \"Gemma3 mm-prefix-LM image prefill hidden states should be close to HF; \"\n+        f\"got {image_cos=}\"\n+    )"
+        },
+        {
+          "filename": "vllm/config/model.py",
+          "status": "modified",
+          "additions": 1,
+          "deletions": 1,
+          "patch": "@@ -1252,7 +1252,7 @@ def get_inputs_embeds_size(self) -> int:\n     def is_deepseek_mla(self) -> bool:\n         return self.model_arch_config.is_deepseek_mla\n \n-    @property\n+    @cached_property\n     def is_mm_prefix_lm(self) -> bool:\n         return self.model_arch_config.is_mm_prefix_lm\n "
+        },
+        {
+          "filename": "vllm/v1/worker/gpu/attn_utils.py",
+          "status": "modified",
+          "additions": 27,
+          "deletions": 0,
+          "patch": "@@ -14,6 +14,7 @@\n )\n from vllm.model_executor.layers.attention import Attention\n from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase\n+from vllm.multimodal.inputs import MultiModalFeatureSpec\n from vllm.utils.torch_utils import get_dtype_size\n from vllm.v1.attention.backend import (\n     AttentionCGSupport,\n@@ -487,6 +488,7 @@ def build_attn_metadata(\n     seq_lens_cpu_upper_bound: torch.Tensor | None = None,\n     dcp_local_seq_lens: torch.Tensor | None = None,\n     positions: torch.Tensor | None = None,\n+    mm_req_doc_ranges: dict[int, list[tuple[int, int]]] | None = None,\n     model_specific_attn_metadata: ModelSpecificAttnMetadata | None = None,\n     for_cudagraph_capture: bool = False,\n     causal: bool = True,\n@@ -523,6 +525,7 @@ def build_attn_metadata(\n             causal=causal,\n             dcp_local_seq_lens=dcp_local_seq_lens,\n             positions=positions,\n+            mm_req_doc_ranges=mm_req_doc_ranges,\n             rswa_prefix_lens=rswa_prefix_lens,\n             **common_attn_metadata_extra_kwargs,\n         )\n@@ -550,3 +553,27 @@ def build_attn_metadata(\n             for layer_name in attn_group.layer_names:\n                 attn_metadata[layer_name] = metadata\n     return attn_metadata\n+\n+\n+def compute_mm_prefix_ranges(\n+    req_ids: list[str],\n+    mm_features: dict[str, list[MultiModalFeatureSpec]],\n+    sliding_window: int | None = None,\n+) -> dict[int, list[tuple[int, int]]]:\n+    \"\"\"Compute PrefixLM bidirectional ranges for multimodal tokens.\n+\n+    Ranges exceeding sliding_window are skipped to prevent early tokens\n+    from attending across the entire image span.\n+    \"\"\"\n+    req_doc_ranges: dict[int, list[tuple[int, int]]] = {}\n+    for req_idx, req_id in enumerate(req_ids):\n+        image_doc_ranges = []\n+        for mm_feature in mm_features.get(req_id, ()):\n+            if mm_feature.modality not in (\"image\", \"video\"):\n+                continue\n+            for r in mm_feature.mm_position.extract_embeds_range():\n+                if sliding_window is not None and (r[1] - r[0] + 1) > sliding_window:\n+                    continue\n+                image_doc_ranges.append(r)\n+        req_doc_ranges[req_idx] = image_doc_ranges\n+    return req_doc_ranges"
+        },
+        {
+          "filename": "vllm/v1/worker/gpu/model_states/default.py",
+          "status": "modified",
+          "additions": 16,
+          "deletions": 1,
+          "patch": "@@ -9,7 +9,10 @@\n from vllm.config.compilation import CUDAGraphMode\n from vllm.v1.core.sched.output import NewRequestData\n from vllm.v1.kv_cache_interface import KVCacheConfig\n-from vllm.v1.worker.gpu.attn_utils import build_attn_metadata\n+from vllm.v1.worker.gpu.attn_utils import (\n+    build_attn_metadata,\n+    compute_mm_prefix_ranges,\n+)\n from vllm.v1.worker.gpu.input_batch import InputBatch\n from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache\n from vllm.v1.worker.gpu.mm.rope import get_rope_state\n@@ -152,6 +155,17 @@ def prepare_attn(\n             max_seq_len = self.max_model_len\n         else:\n             max_seq_len = seq_lens_cpu_upper_bound[:num_reqs].max().item()\n+        req_doc_ranges: dict[int, list[tuple[int, int]]] | None = None\n+        if (\n+            self.supports_mm_inputs\n+            and self.encoder_cache is not None\n+            and self.model_config.is_mm_prefix_lm\n+        ):\n+            req_doc_ranges = compute_mm_prefix_ranges(\n+                req_ids=input_batch.req_ids,\n+                mm_features=self.encoder_cache.mm_features,\n+                sliding_window=self.model_config.get_sliding_window(),\n+            )\n         attn_metadata = build_attn_metadata(\n             attn_groups=attn_groups,\n             num_reqs=num_reqs,\n@@ -167,6 +181,7 @@ def prepare_attn(\n             seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,\n             dcp_local_seq_lens=input_batch.dcp_local_seq_lens,\n             positions=input_batch.positions,\n+            mm_req_doc_ranges=req_doc_ranges,\n             for_cudagraph_capture=for_capture,\n             rswa_prefix_lens=input_batch.prompt_lens,\n         )"
+        }
+      ]
+    },
+    {
+      "sha": "8974ed89cd0b17615ae48cf09ef824cd8e3ec521",
+      "author": {
+        "name": "Ting SUN",
+        "email": "suntcrick@gmail.com"
+      },
+      "date": "2026-07-05T20:42:36+08:00",
+      "message": "[Bugfix][Voxtral Realtime] Fix token feedback timeout silent hang (#44461)\n\nSigned-off-by: Ting Sun <suntcrick@gmail.com>",
+      "parents": [
+        "fb2faceacd7af2ea6aa51eed90f295c421c00ec5"
+      ],
+      "stats": {
+        "total_additions": 3,
+        "total_deletions": 6,
+        "files_changed": 9
+      },
+      "files": [
+        {
+          "filename": "vllm/model_executor/models/voxtral_realtime.py",
+          "status": "modified",
+          "additions": 3,
+          "deletions": 6,
+          "patch": "@@ -17,7 +17,6 @@\n from vllm.config import ModelConfig, SpeechToTextConfig, VllmConfig\n from vllm.config.speech_to_text import SpeechToTextParams\n from vllm.engine.protocol import StreamingInput\n-from vllm.envs import VLLM_ENGINE_ITERATION_TIMEOUT_S\n from vllm.inputs import PromptType, TokensPrompt\n from vllm.logger import init_logger\n from vllm.model_executor.models.interfaces import MultiModalEmbeddings, SupportsRealtime\n@@ -265,13 +264,11 @@ async def feed_audio():\n             await buffer.append_audio(right_pad.audio_array)\n             await buffer.append_audio(None)  # signal end\n \n-        # Feed output tokens back into buffer in background\n+        # Feed output tokens back into the buffer. Idle waits are normal here;\n+        # request cleanup still cancels this task through the finally block.\n         async def feed_tokens():\n             while True:\n-                all_outputs = await asyncio.wait_for(\n-                    input_stream.get(),\n-                    timeout=VLLM_ENGINE_ITERATION_TIMEOUT_S,\n-                )\n+                all_outputs = await input_stream.get()\n                 await buffer.append_tokens(all_outputs[-1:])\n \n         audio_task = asyncio.create_task(feed_audio())"
+        }
+      ]
+    },
+    {
+      "sha": "fb2faceacd7af2ea6aa51eed90f295c421c00ec5",
+      "author": {
+        "name": "Ting SUN",
+        "email": "suntcrick@gmail.com"
+      },
+      "date": "2026-07-05T20:42:32+08:00",
+      "message": "[Bugfix][Model] Fix crash loading Mamba/Mamba2 checkpoints without an `architectures` field (#46037)\n\nSigned-off-by: Ting Sun <suntcrick@gmail.com>\nSigned-off-by: Ting SUN <suntcrick@gmail.com>\nCo-authored-by: Wentao Ye <44945378+yewentao256@users.noreply.github.com>\nCo-authored-by: mergify[bot] <37929162+mergify[bot]@users.noreply.github.com>",
+      "parents": [
+        "b6cc46ec3b903c71405f4355c1e9ecb47ae54bb2"
+      ],
+      "stats": {
+        "total_additions": 9,
+        "total_deletions": 0,
+        "files_changed": 9
+      },
+      "files": [
+        {
+          "filename": "vllm/config/vllm.py",
+          "status": "modified",
+          "additions": 9,
+          "deletions": 0,
+          "patch": "@@ -1936,12 +1936,21 @@ def try_verify_and_update_config(self):\n         if architecture is None:\n             return\n \n+        from vllm.model_executor.models import ModelRegistry\n         from vllm.model_executor.models.config import (\n             MODELS_CONFIG_MAP,\n             HybridAttentionMambaModelConfig,\n         )\n \n         cls = MODELS_CONFIG_MAP.get(architecture, None)\n+        if cls is None:\n+            # `architecture` may be an HF base-model name (e.g. \"Mamba2Model\"\n+            # when `architectures` is omitted); normalize to the resolved arch\n+            # so per-arch config hooks are not skipped.\n+            architecture = ModelRegistry._normalize_arch(\n+                architecture, self.model_config\n+            )\n+            cls = MODELS_CONFIG_MAP.get(architecture, None)\n         if cls is not None:\n             cls.verify_and_update_config(self)\n "
+        }
+      ]
+    },
+    {
+      "sha": "b6cc46ec3b903c71405f4355c1e9ecb47ae54bb2",
+      "author": {
+        "name": "Wentao Ye",
+        "email": "44945378+yewentao256@users.noreply.github.com"
+      },
+      "date": "2026-07-05T20:41:30+08:00",
+      "message": "[Feature] Support sequence parallel without the need for DP, 1.9%~5.0% E2E Throughput Improvement (#47070)\n\nSigned-off-by: yewentao256 <zhyanwentao@126.com>\nSigned-off-by: gcanlin <canlinguosdu@gmail.com>\nCo-authored-by: Canlin Guo <canlinguosdu@gmail.com>",
+      "parents": [
+        "fa4321de3d894c50c5ca0766dffa352d3fb07423"
+      ],
+      "stats": {
+        "total_additions": 33,
+        "total_deletions": 22,
+        "files_changed": 55
+      },
+      "files": [
+        {
+          "filename": "vllm/config/parallel.py",
+          "status": "modified",
+          "additions": 2,
+          "deletions": 3,
+          "patch": "@@ -632,8 +632,8 @@ def stateless_init_dp_group(\n \n     # The all_reduce at the end of attention (during o_proj) means that\n     # inputs are replicated across each rank of the tensor parallel group.\n-    # If using expert-parallelism with DeepEP All2All ops, replicated\n-    # tokens results in useless duplicate computation and communication.\n+    # If using expert-parallelism, replicated tokens results in useless\n+    # duplicate computation and communication.\n     #\n     # In this case, ensure the input to the experts is sequence parallel\n     # to avoid the excess work.\n@@ -652,7 +652,6 @@ def use_sequence_parallel_moe(self) -> bool:\n             )\n             and self.enable_expert_parallel\n             and self.tensor_parallel_size > 1\n-            and self.data_parallel_size > 1\n         )\n \n     @property"
+        },
+        {
+          "filename": "vllm/distributed/device_communicators/base_device_communicator.py",
+          "status": "modified",
+          "additions": 5,
+          "deletions": 4,
+          "patch": "@@ -175,10 +175,11 @@ def __init__(\n \n         config = get_current_vllm_config_or_none()\n         if config is not None:\n-            # as long as we use data parallel (coupled data parallel\n-            # where all data parallel ranks execute forward together),\n-            # we initialize the all2all manager used in expert parallel.\n-            use_ep = config.parallel_config.data_parallel_size > 1\n+            # initialize the all2all manager for DP or sequence-parallel EP.\n+            use_ep = (\n+                config.parallel_config.data_parallel_size > 1\n+                or config.parallel_config.use_sequence_parallel_moe\n+            )\n             all2all_backend = config.parallel_config.all2all_backend\n \n         self.is_ep_communicator = unique_name.split(\":\")[0] == \"ep\""
+        },
+        {
+          "filename": "vllm/forward_context.py",
+          "status": "modified",
+          "additions": 15,
+          "deletions": 3,
+          "patch": "@@ -83,7 +83,10 @@ def make(\n         num_tokens_across_dp_cpu: torch.Tensor,\n     ) -> \"DPMetadata\":\n         assert num_tokens_across_dp_cpu is not None\n-        assert parallel_config.data_parallel_size > 1\n+        assert (\n+            parallel_config.data_parallel_size > 1\n+            or parallel_config.use_sequence_parallel_moe\n+        )\n         assert parallel_config.is_moe_model is not False\n         dp_rank = parallel_config.data_parallel_rank\n         batchsize = num_tokens\n@@ -277,14 +280,20 @@ def set_forward_context(\n \n     dp_metadata: DPMetadata | None = None\n     if (\n-        vllm_config.parallel_config.data_parallel_size > 1\n+        (\n+            vllm_config.parallel_config.data_parallel_size > 1\n+            or vllm_config.parallel_config.use_sequence_parallel_moe\n+        )\n         and vllm_config.parallel_config.is_moe_model is not False\n         and (attn_metadata is not None or num_tokens is not None)\n     ):\n         # If num_tokens_across_dp hasn't already been initialized, then\n         # initialize it here. Both DP padding and Microbatching will be\n         # disabled.\n-        if num_tokens_across_dp is None:\n+        if (\n+            num_tokens_across_dp is None\n+            and vllm_config.parallel_config.data_parallel_size > 1\n+        ):\n             assert ubatch_slices is None\n             assert num_tokens is not None\n             _, num_tokens_across_dp, _ = coordinate_batch_across_dp(\n@@ -293,6 +302,9 @@ def set_forward_context(\n                 allow_microbatching=False,\n             )\n             assert num_tokens_across_dp is not None\n+        elif num_tokens_across_dp is None:\n+            assert num_tokens is not None\n+            num_tokens_across_dp = torch.tensor([num_tokens], dtype=torch.int32)\n         dp_metadata = DPMetadata.make(\n             vllm_config.parallel_config, num_tokens or 0, num_tokens_across_dp\n         )"
+        },
+        {
+          "filename": "vllm/model_executor/layers/fused_moe/config.py",
+          "status": "modified",
+          "additions": 1,
+          "deletions": 1,
+          "patch": "@@ -1038,7 +1038,7 @@ def is_sequence_parallel(self) -> bool:\n \n     @property\n     def use_all2all_kernels(self):\n-        return self.dp_size > 1 and self.use_ep\n+        return self.use_ep and (self.dp_size > 1 or self.is_sequence_parallel)\n \n     @property\n     def use_deepep_ht_kernels(self):"
+        },
+        {
+          "filename": "vllm/model_executor/layers/fused_moe/runner/moe_runner.py",
+          "status": "modified",
+          "additions": 2,
+          "deletions": 2,
+          "patch": "@@ -725,8 +725,8 @@ def forward(\n     @property\n     def do_naive_dispatch_combine(self) -> bool:\n         return (\n-            self.moe_config.dp_size > 1 and not self._quant_method.supports_internal_mk\n-        )\n+            self.moe_config.dp_size > 1 or self.moe_config.is_sequence_parallel\n+        ) and not self._quant_method.supports_internal_mk\n \n     def _maybe_dispatch(\n         self,"
+        },
+        {
+          "filename": "vllm/model_executor/models/deepseek_v2.py",
+          "status": "modified",
+          "additions": 4,
+          "deletions": 8,
+          "patch": "@@ -1305,15 +1305,11 @@ def forward(\n                 residual *= 1.0 / self.routed_scaling_factor\n \n         if self.use_sequence_parallel_moe:\n-            sp_remainder = (\n-                hidden_states.shape[0] % get_tensor_model_parallel_world_size()\n-            )\n+            tp_world_size = get_tensor_model_parallel_world_size()\n+            # small trick using minus, eg. -17 % 8 = 7\n+            sp_pad = (-hidden_states.shape[0]) % tp_world_size\n             # pad if not divisible by world size\n-            if sp_remainder:\n-                sp_pad = get_tensor_model_parallel_world_size() - sp_remainder\n-                hidden_states = torch.nn.functional.pad(\n-                    hidden_states, (0, 0, 0, sp_pad)\n-                )\n+            hidden_states = torch.nn.functional.pad(hidden_states, (0, 0, 0, sp_pad))\n             hidden_states = tensor_model_parallel_reduce_scatter(hidden_states, 0)\n             if not input_is_sequence_parallel:\n                 residual = sequence_parallel_chunk(residual)"
+        },
+        {
+          "filename": "vllm/model_executor/models/gpt_oss.py",
+          "status": "modified",
+          "additions": 4,
+          "deletions": 1,
+          "patch": "@@ -192,7 +192,10 @@ def __init__(\n         quant_config = vllm_config.quant_config\n         parallel_config = vllm_config.parallel_config\n \n-        self.is_sequence_parallel = parallel_config.use_sequence_parallel_moe\n+        self.is_sequence_parallel = (\n+            parallel_config.use_sequence_parallel_moe\n+            and vllm_config.lora_config is None\n+        )\n \n         self.layer_idx = layer_idx\n         self.num_experts = config.num_local_experts"
+        }
+      ]
+    },
+    {
+      "sha": "fa4321de3d894c50c5ca0766dffa352d3fb07423",
+      "author": {
+        "name": "Lucas Wilkinson",
+        "email": "LucasWilkinson@users.noreply.github.com"
+      },
+      "date": "2026-07-05T16:20:48+08:00",
+      "message": "[Bugfix][TurboQuant] Preserve KV cache dtype in backend shape (#47609)",
+      "parents": [
+        "922661304357313700340e787cfe19d58b8c0a2f"
+      ],
+      "stats": {
+        "total_additions": 6,
+        "total_deletions": 1,
+        "files_changed": 7
+      },
+      "files": [
+        {
+          "filename": "vllm/v1/worker/gpu/attn_utils.py",
+          "status": "modified",
+          "additions": 6,
+          "deletions": 1,
+          "patch": "@@ -25,6 +25,7 @@\n     KVCacheSpec,\n     KVQuantMode,\n     MambaSpec,\n+    TQFullAttentionSpec,\n     UniformTypeKVCacheSpecs,\n )\n from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata\n@@ -307,6 +308,7 @@ def _reshape_kv_cache(\n                 layer_cache_dtype = (\n                     \"auto\"\n                     if kv_cache_spec.kv_quant_mode == KVQuantMode.NONE\n+                    and not isinstance(kv_cache_spec, TQFullAttentionSpec)\n                     else cache_dtype\n                 )\n                 kv_cache_shape = group.backend.get_kv_cache_shape(\n@@ -391,7 +393,10 @@ def _update_hybrid_attention_layout(\n         # (quantization only changes the last dim), so this is a no-op today,\n         # but it keeps both call sites consistent for skip layers.\n         layer_cache_dtype = (\n-            \"auto\" if kv_cache_spec.kv_quant_mode == KVQuantMode.NONE else cache_dtype\n+            \"auto\"\n+            if kv_cache_spec.kv_quant_mode == KVQuantMode.NONE\n+            and not isinstance(kv_cache_spec, TQFullAttentionSpec)\n+            else cache_dtype\n         )\n         block_dim = group.backend.get_kv_cache_block_dim(\n             kernel_block_sizes[group.kv_cache_group_id],"
+        }
+      ]
+    },
+    {
+      "sha": "922661304357313700340e787cfe19d58b8c0a2f",
+      "author": {
+        "name": "Ting SUN",
+        "email": "suntcrick@gmail.com"
+      },
+      "date": "2026-07-05T13:39:13+08:00",
+      "message": "[Bugfix][Pooling] Forward instruction to Jina reranker scoring prompts (#47590)\n\nSigned-off-by: Ting Sun <suntcrick@gmail.com>",
+      "parents": [
+        "34b560b725b401f33477464163244b4744d1c40f"
+      ],
+      "stats": {
+        "total_additions": 179,
+        "total_deletions": 22,
+        "files_changed": 201
+      },
+      "files": [
+        {
+          "filename": "examples/pooling/token_embed/jina_reranker_v3_online.py",
+          "status": "added",
+          "additions": 73,
+          "deletions": 0,
+          "patch": "@@ -0,0 +1,73 @@\n+# SPDX-License-Identifier: Apache-2.0\n+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project\n+# ruff: noqa: E501\n+\n+\"\"\"\n+Example online usage of the Jina Reranker v3 score and rerank APIs with a task\n+instruction.\n+\n+Run `vllm serve jinaai/jina-reranker-v3 --runner pooling` to start up the\n+server in vLLM.\n+\"\"\"\n+\n+import argparse\n+import json\n+\n+import requests\n+\n+\n+def post_http_request(prompt: dict, api_url: str) -> requests.Response:\n+    headers = {\"User-Agent\": \"Test Client\"}\n+    response = requests.post(api_url, headers=headers, json=prompt)\n+    return response\n+\n+\n+def print_response(name: str, prompt: dict, response: requests.Response) -> None:\n+    print(f\"\\n{name} request:\")\n+    print(json.dumps(prompt, indent=2))\n+    print(f\"\\n{name} response:\")\n+    print(json.dumps(response.json(), indent=2))\n+\n+\n+def parse_args():\n+    parser = argparse.ArgumentParser()\n+    parser.add_argument(\"--host\", type=str, default=\"localhost\")\n+    parser.add_argument(\"--port\", type=int, default=8000)\n+    parser.add_argument(\"--model\", type=str, default=\"jinaai/jina-reranker-v3\")\n+    return parser.parse_args()\n+\n+\n+def main(args):\n+    score_url = f\"http://{args.host}:{args.port}/score\"\n+    rerank_url = f\"http://{args.host}:{args.port}/rerank\"\n+    model_name = args.model\n+\n+    query = \"Which passage is about sports?\"\n+    documents = [\n+        \"Basketball is played by two teams on a court.\",\n+        \"Green tea contains antioxidants and may support metabolism.\",\n+    ]\n+    instruction = \"Rank passages about sports higher than passages about nutrition.\"\n+\n+    score_prompt = {\n+        \"model\": model_name,\n+        \"queries\": query,\n+        \"documents\": documents,\n+        \"instruction\": instruction,\n+    }\n+    score_response = post_http_request(prompt=score_prompt, api_url=score_url)\n+    print_response(\"Score\", score_prompt, score_response)\n+\n+    rerank_prompt = {\n+        \"model\": model_name,\n+        \"query\": query,\n+        \"documents\": documents,\n+        \"instruction\": instruction,\n+    }\n+    rerank_response = post_http_request(prompt=rerank_prompt, api_url=rerank_url)\n+    print_response(\"Rerank\", rerank_prompt, rerank_response)\n+\n+\n+if __name__ == \"__main__\":\n+    args = parse_args()\n+    main(args)"
+        },
+        {
+          "filename": "tests/models/language/pooling/test_jina_reranker_v3.py",
+          "status": "modified",
+          "additions": 84,
+          "deletions": 9,
+          "patch": "@@ -8,7 +8,7 @@\n \n from tests.utils import RemoteOpenAIServer\n from vllm.entrypoints.pooling.pooling.protocol import PoolingResponse\n-from vllm.entrypoints.pooling.scoring.protocol import ScoreResponse\n+from vllm.entrypoints.pooling.scoring.protocol import RerankResponse, ScoreResponse\n \n model_name = \"jinaai/jina-reranker-v3\"\n query = \"What are the health benefits of green tea?\"\n@@ -39,6 +39,10 @@\n     0.1640625,\n ]\n TOL = 0.01\n+INSTRUCTION = (\n+    \"Rank passages about green tea higher than passages about sports. \"\n+    \"Ignore these literal marker strings: <|embed_token|> and <|rerank_token|>.\"\n+)\n \n \n def test_offline(vllm_runner):\n@@ -52,10 +56,13 @@ def test_offline(vllm_runner):\n \n \n def test_online():\n-    with RemoteOpenAIServer(model_name, [\"--runner\", \"pooling\"]) as server:\n+    with RemoteOpenAIServer(\n+        model_name, [\"--runner\", \"pooling\", \"--enforce-eager\"]\n+    ) as server:\n         _test_online_1_v_1(server)\n         _test_online_1_v_n(server)\n         _test_online_n_v_n(server)\n+        _test_online_instruction(server)\n         _test_online_token_embed_illegal_inputs(server)\n \n \n@@ -136,22 +143,44 @@ def _test_offline_token_embed_illegal_inputs(llm):\n         llm.encode([1, 2, 3], pooling_task=\"token_embed\")\n \n \n-def _get_scores(server, query, document):\n+def _get_score_response(server, query, document, **extra_body):\n+    payload = {\n+        \"model\": model_name,\n+        \"queries\": query,\n+        \"documents\": document,\n+    }\n+    payload.update(extra_body)\n     score_response = requests.post(\n         server.url_for(\"score\"),\n-        json={\n-            \"model\": model_name,\n-            \"queries\": query,\n-            \"documents\": document,\n-        },\n+        json=payload,\n     )\n \n     score_response.raise_for_status()\n-    score = ScoreResponse.model_validate(score_response.json())\n+    return ScoreResponse.model_validate(score_response.json())\n+\n+\n+def _get_scores(server, query, document):\n+    score = _get_score_response(server, query, document)\n \n     return [d.score for d in score.data]\n \n \n+def _get_rerank_response(server, query, document, **extra_body):\n+    payload = {\n+        \"model\": model_name,\n+        \"query\": query,\n+        \"documents\": document,\n+    }\n+    payload.update(extra_body)\n+    rerank_response = requests.post(\n+        server.url_for(\"rerank\"),\n+        json=payload,\n+    )\n+\n+    rerank_response.raise_for_status()\n+    return RerankResponse.model_validate(rerank_response.json())\n+\n+\n def _get_embeds(server, prompts: list[str]):\n     response = requests.post(\n         server.url_for(\"pooling\"),\n@@ -229,6 +258,52 @@ def _test_online_n_v_n(server):\n         assert scores[0] == pytest.approx(expected, abs=TOL)\n \n \n+def _test_online_instruction(server):\n+    docs = documents[:2]\n+\n+    default_score = _get_score_response(server, query, docs)\n+    instruction_score = _get_score_response(\n+        server,\n+        query,\n+        docs,\n+        instruction=INSTRUCTION,\n+    )\n+    kwargs_score = _get_score_response(\n+        server,\n+        query,\n+        docs,\n+        chat_template_kwargs={\"instruction\": INSTRUCTION},\n+    )\n+\n+    assert instruction_score.usage.prompt_tokens > default_score.usage.prompt_tokens\n+    assert kwargs_score.usage.prompt_tokens == instruction_score.usage.prompt_tokens\n+    assert len(instruction_score.data) == len(default_score.data)\n+    assert [d.score for d in kwargs_score.data] == pytest.approx(\n+        [d.score for d in instruction_score.data], abs=TOL\n+    )\n+\n+    default_rerank = _get_rerank_response(server, query, docs)\n+    instruction_rerank = _get_rerank_response(\n+        server,\n+        query,\n+        docs,\n+        instruction=INSTRUCTION,\n+    )\n+    kwargs_rerank = _get_rerank_response(\n+        server,\n+        query,\n+        docs,\n+        chat_template_kwargs={\"instruction\": INSTRUCTION},\n+    )\n+\n+    assert instruction_rerank.usage.prompt_tokens > default_rerank.usage.prompt_tokens\n+    assert kwargs_rerank.usage.prompt_tokens == instruction_rerank.usage.prompt_tokens\n+    assert len(instruction_rerank.results) == len(default_rerank.results)\n+    assert [r.relevance_score for r in kwargs_rerank.results] == pytest.approx(\n+        [r.relevance_score for r in instruction_rerank.results], abs=TOL\n+    )\n+\n+\n def _test_online_token_embed_illegal_inputs(server):\n     response = requests.post(\n         server.url_for(\"pooling\"),"
+        },
+        {
+          "filename": "vllm/entrypoints/pooling/scoring/io_processor.py",
+          "status": "modified",
+          "additions": 22,
+          "deletions": 13,
+          "patch": "@@ -618,12 +618,6 @@ def default_tokenizer_encode():\n \n \n class JinaRankingIOProcessorMixin:\n-    @staticmethod\n-    def sanitize_input(text: str, special_tokens: dict[str, str]) -> str:\n-        for token in special_tokens.values():\n-            text = text.replace(token, \"\")\n-        return text\n-\n     @staticmethod\n     def format_docs_prompts_func(\n         query: str,\n@@ -641,11 +635,13 @@ def format_docs_prompts_func(\n         if special_tokens is None:\n             special_tokens = default_special_tokens\n \n-        query = JinaRankingIOProcessorMixin.sanitize_input(query, special_tokens)\n-        docs = [\n-            JinaRankingIOProcessorMixin.sanitize_input(doc, special_tokens)\n-            for doc in docs\n-        ]\n+        def sanitize_input(text: str) -> str:\n+            for token in special_tokens.values():\n+                text = text.replace(token, \"\")\n+            return text\n+\n+        query = sanitize_input(query)\n+        docs = [sanitize_input(doc) for doc in docs]\n \n         prefix = (\n             \"<|im_start|>system\\n\"\n@@ -668,6 +664,7 @@ def format_docs_prompts_func(\n         )\n \n         if instruction:\n+            instruction = sanitize_input(instruction)\n             prompt += f\"<instruct>\\n{instruction}\\n</instruct>\\n\"\n \n         doc_prompts = [\n@@ -703,12 +700,24 @@ def _pre_process(\n     ) -> Sequence[EngineInput]:\n         queries = self.ensure_str(scoring_data.data_1)\n         docs = self.ensure_str(scoring_data.data_2)\n+        chat_template_kwargs = (\n+            prompt_extras.get(\"chat_template_kwargs\") if prompt_extras else None\n+        )\n+        instruction = (\n+            chat_template_kwargs.get(\"instruction\") if chat_template_kwargs else None\n+        )\n \n         if len(queries) == 1:\n-            prompts = [self.format_docs_prompts_func(query=queries[0], docs=docs)]\n+            prompts = [\n+                self.format_docs_prompts_func(\n+                    query=queries[0], docs=docs, instruction=instruction\n+                )\n+            ]\n         else:\n             prompts = [\n-                self.format_docs_prompts_func(query=q, docs=[d])\n+                self.format_docs_prompts_func(\n+                    query=q, docs=[d], instruction=instruction\n+                )\n                 for q, d in zip(queries, docs)\n             ]\n "
+        }
+      ]
+    },
+    {
+      "sha": "34b560b725b401f33477464163244b4744d1c40f",
+      "author": {
+        "name": "Luciano Martins",
+        "email": "22145370+lucianommartins@users.noreply.github.com"
+      },
+      "date": "2026-07-05T08:46:40+08:00",
+      "message": "[Bugfix][Gemma4] Fix FA4 mm_prefix mask: add sliding window and absolute q_idx (#47332)\n\nSigned-off-by: Luciano Martins <lucianommartins@users.noreply.github.com>\nCo-authored-by: Luciano Martins <lucianommartins@users.noreply.github.com>",
+      "parents": [
+        "91b56473005ccc9a0d009619b5494a9c306380ee"
+      ],
+      "stats": {
+        "total_additions": 90,
+        "total_deletions": 50,
+        "files_changed": 140
+      },
+      "files": [
+        {
+          "filename": "vllm/v1/attention/backends/flash_attn.py",
+          "status": "modified",
+          "additions": 90,
+          "deletions": 50,
+          "patch": "@@ -892,21 +892,28 @@ def forward(\n                     and self.vllm_flash_attn_version == 4\n                 ):\n                     max_ranges = mm_prefix_ranges.shape[1]\n-                    # Gemma4: clamp the bidirectional block to the sliding\n-                    # window (HF (causal OR blockwise) AND sliding_window on\n-                    # local layers). Other mm-prefix models pass sliding_window=0\n-                    # -> unclamped, behavior unchanged. sliding_window_size[0]+1\n-                    # is the window (self.sliding_window = (sw-1, 0) on sliding\n-                    # layers); causal mm_prefix never hits the symmetric path.\n+                    # Sliding window value in Triton convention\n+                    # (1 + window_size[0]).  Global-attention layers\n+                    # store (-1, -1) → sw stays None / 0.\n+                    sw_val = (\n+                        1 + sliding_window_size[0]\n+                        if sliding_window_size is not None\n+                        and sliding_window_size[0] >= 0\n+                        else None\n+                    )\n+                    # Gemma4: also clamp the bidirectional block to the\n+                    # sliding window when the layer opts in\n+                    # (mm_prefix_clamp_sliding_window flag from PR #47217).\n                     mm_clamp_sw = 0\n                     if (\n                         getattr(layer, \"mm_prefix_clamp_sliding_window\", False)\n-                        and sliding_window_size is not None\n-                        and sliding_window_size[0] >= 0\n+                        and sw_val is not None\n                     ):\n-                        mm_clamp_sw = sliding_window_size[0] + 1\n+                        mm_clamp_sw = sw_val\n                     mm_mask_mod = _make_mm_prefix_mask_mod(\n-                        max_ranges, sliding_window=mm_clamp_sw\n+                        max_ranges,\n+                        sliding_window=mm_clamp_sw,\n+                        sliding_window_left=sw_val,\n                     )\n                     mm_aux = [mm_prefix_ranges]\n \n@@ -1204,23 +1211,26 @@ def _forward_encoder_attention(\n         return output\n \n \n-def _make_mm_prefix_mask_mod(max_ranges: int, sliding_window: int = 0):\n-    \"\"\"Build a CuTE-DSL mask_mod implementing (causal OR mm_prefix).\n-\n-    Returns a @cute.jit callable that evaluates:\n-      keep = (kv_idx <= q_idx) OR\n-             (q_idx in [r_start,r_end] AND kv_idx in [r_start,r_end]\n-              [AND (q_idx - kv_idx) < sliding_window])\n-    for each mm_prefix range stored in aux_tensors[0].\n-\n-    When sliding_window > 0 (Gemma4 sliding layers), the bidirectional block is\n-    clamped to the sliding window, matching HF's\n-    (causal OR blockwise) AND sliding_window (== sliding_window_overlay\n-    kv > q - sw; future kv passes since q - kv < 0). sliding_window <= 0\n-    (default) leaves the block unclamped, so other mm-prefix models are\n-    unchanged. q_idx/kv_idx are local offsets, but their difference is\n-    frame-invariant and image bidirectional attention only matters during\n-    prefill (where local == absolute).\n+def _make_mm_prefix_mask_mod(\n+    max_ranges: int,\n+    sliding_window: int = 0,\n+    sliding_window_left: int | None = None,\n+):\n+    \"\"\"Build a CuTE-DSL mask_mod implementing\n+    ``(causal AND sliding_window) OR mm_prefix``.\n+\n+    The FA4 kernel passes *local* ``q_idx`` (0-based within the current\n+    prefill chunk) while ``kv_idx`` is absolute (0-based over the full\n+    KV cache).  We recover the absolute Q position via\n+    ``q_abs = q_idx + seqlen_k - seqlen_q`` (the context-length offset)\n+    so that causal, sliding-window, and mm_prefix range comparisons all\n+    use consistent absolute positions.  This matches the Triton\n+    reference path (``compute_kv_seq_mask``).\n+\n+    ``sliding_window_left`` enforces the sliding window on the causal\n+    term (None = full causal, no window).  ``sliding_window`` clamps the\n+    bidirectional block to the window (0 = unclamped; >0 = Gemma4 local\n+    layers via ``mm_prefix_clamp_sliding_window``).\n     \"\"\"\n     import cutlass\n     import cutlass.cute as cute\n@@ -1230,29 +1240,59 @@ def _make_mm_prefix_mask_mod(max_ranges: int, sliding_window: int = 0):\n         scalar_to_ssa,\n     )\n \n-    @cute.jit\n-    def mm_prefix_mask_mod(\n-        batch_idx: cute.TensorSSA,\n-        head_idx: cute.TensorSSA,\n-        q_idx: cute.TensorSSA,\n-        kv_idx: cute.TensorSSA,\n-        seqlen_info,\n-        aux_tensors,\n-    ):\n-        keep = kv_idx <= q_idx\n-        ranges = aux_tensors[0]\n-        b = batch_idx[0]\n-        for i in cutlass.range_constexpr(max_ranges):  # type: ignore[attr-defined]\n-            r_start = scalar_to_ssa(ranges[b, i, 0], Int32)\n-            r_end = scalar_to_ssa(ranges[b, i, 1], Int32)\n-            valid = r_start < r_end\n-            q_in = (q_idx >= r_start) & (q_idx <= r_end) & valid\n-            k_in = (kv_idx >= r_start) & (kv_idx <= r_end) & valid\n-            mm = q_in & k_in\n-            if sliding_window > 0:\n-                mm = mm & ((q_idx - kv_idx) < sliding_window)\n-            keep = keep | mm\n-        return keep\n+    if sliding_window_left is not None:\n+\n+        @cute.jit\n+        def mm_prefix_mask_mod(\n+            batch_idx: cute.TensorSSA,\n+            head_idx: cute.TensorSSA,\n+            q_idx: cute.TensorSSA,\n+            kv_idx: cute.TensorSSA,\n+            seqlen_info,\n+            aux_tensors,\n+        ):\n+            ctx_off = scalar_to_ssa(seqlen_info.seqlen_k - seqlen_info.seqlen_q, Int32)\n+            q_abs = q_idx + ctx_off\n+            sw = scalar_to_ssa(Int32(sliding_window_left), Int32)\n+            keep = (kv_idx <= q_abs) & ((q_abs - kv_idx) < sw)\n+            ranges = aux_tensors[0]\n+            b = batch_idx[0]\n+            for i in cutlass.range_constexpr(max_ranges):  # type: ignore[attr-defined]\n+                r_start = scalar_to_ssa(ranges[b, i, 0], Int32)\n+                r_end = scalar_to_ssa(ranges[b, i, 1], Int32)\n+                valid = r_start < r_end\n+                q_in = (q_abs >= r_start) & (q_abs <= r_end) & valid\n+                k_in = (kv_idx >= r_start) & (kv_idx <= r_end) & valid\n+                mm = q_in & k_in\n+                if sliding_window > 0:\n+                    mm = mm & ((q_abs - kv_idx) < sw)\n+                keep = keep | mm\n+            return keep\n+\n+    else:\n+\n+        @cute.jit\n+        def mm_prefix_mask_mod(\n+            batch_idx: cute.TensorSSA,\n+            head_idx: cute.TensorSSA,\n+            q_idx: cute.TensorSSA,\n+            kv_idx: cute.TensorSSA,\n+            seqlen_info,\n+            aux_tensors,\n+        ):\n+            ctx_off = scalar_to_ssa(seqlen_info.seqlen_k - seqlen_info.seqlen_q, Int32)\n+            q_abs = q_idx + ctx_off\n+            keep = kv_idx <= q_abs\n+            ranges = aux_tensors[0]\n+            b = batch_idx[0]\n+            for i in cutlass.range_constexpr(max_ranges):  # type: ignore[attr-defined]\n+                r_start = scalar_to_ssa(ranges[b, i, 0], Int32)\n+                r_end = scalar_to_ssa(ranges[b, i, 1], Int32)\n+                valid = r_start < r_end\n+                q_in = (q_abs >= r_start) & (q_abs <= r_end) & valid\n+                k_in = (kv_idx >= r_start) & (kv_idx <= r_end) & valid\n+                keep = keep | (q_in & k_in)\n+            return keep\n \n     mm_prefix_mask_mod.use_fast_sampling = True\n     return mm_prefix_mask_mod"
+        }
+      ]
+    },
+    {
+      "sha": "91b56473005ccc9a0d009619b5494a9c306380ee",
+      "author": {
+        "name": "Ting SUN",
+        "email": "suntcrick@gmail.com"
+      },
+      "date": "2026-07-05T08:08:34+08:00",
+      "message": "[Bugfix][Model] Allow Run:ai memory_limit sentinel values (#47337)\n\nSigned-off-by: Ting Sun <suntcrick@gmail.com>",
+      "parents": [
+        "4a6bf3c77f05b398b46fe4207ea1ee715d56c64f"
+      ],
+      "stats": {
+        "total_additions": 24,
+        "total_deletions": 16,
+        "files_changed": 40
+      },
+      "files": [
+        {
+          "filename": "tests/model_executor/model_loader/runai_streamer_loader/test_runai_model_streamer_loader.py",
+          "status": "modified",
+          "additions": 1,
+          "deletions": 1,
+          "patch": "@@ -119,6 +119,6 @@ def test_runai_invalid_extra_config_leaves_environ_untouched():\n     # os.environ (all values are validated before any global mutation).\n     with patch.dict(os.environ, {}, clear=False):\n         os.environ.pop(\"RUNAI_STREAMER_CONCURRENCY\", None)\n-        with pytest.raises(ValueError, match=\"memory_limit must be a positive integer\"):\n+        with pytest.raises(ValueError, match=\"memory_limit must be an integer >= -1\"):\n             _runai_loader({\"concurrency\": 16, \"memory_limit\": -5})\n         assert \"RUNAI_STREAMER_CONCURRENCY\" not in os.environ"
+        },
+        {
+          "filename": "vllm/model_executor/model_loader/runai_streamer_loader.py",
+          "status": "modified",
+          "additions": 23,
+          "deletions": 15,
+          "patch": "@@ -47,21 +47,29 @@ def __init__(self, load_config: LoadConfig):\n             # Validate every value before mutating os.environ, so a later\n             # invalid key cannot leave an earlier one partially applied.\n             env_updates: dict[str, str] = {}\n-            for key, env_var in (\n-                (\"concurrency\", \"RUNAI_STREAMER_CONCURRENCY\"),\n-                (\"memory_limit\", \"RUNAI_STREAMER_MEMORY_LIMIT\"),\n-            ):\n-                if key in extra_config:\n-                    value = extra_config[key]\n-                    if (\n-                        isinstance(value, bool)\n-                        or not isinstance(value, int)\n-                        or value <= 0\n-                    ):\n-                        raise ValueError(\n-                            f\"{key} must be a positive integer, got {value!r}\"\n-                        )\n-                    env_updates[env_var] = str(value)\n+            if \"concurrency\" in extra_config:\n+                concurrency = extra_config[\"concurrency\"]\n+                if (\n+                    isinstance(concurrency, bool)\n+                    or not isinstance(concurrency, int)\n+                    or concurrency <= 0\n+                ):\n+                    raise ValueError(\n+                        f\"concurrency must be a positive integer, got {concurrency!r}\"\n+                    )\n+                env_updates[\"RUNAI_STREAMER_CONCURRENCY\"] = str(concurrency)\n+\n+            if \"memory_limit\" in extra_config:\n+                memory_limit = extra_config[\"memory_limit\"]\n+                if (\n+                    isinstance(memory_limit, bool)\n+                    or not isinstance(memory_limit, int)\n+                    or memory_limit < -1\n+                ):\n+                    raise ValueError(\n+                        f\"memory_limit must be an integer >= -1, got {memory_limit!r}\"\n+                    )\n+                env_updates[\"RUNAI_STREAMER_MEMORY_LIMIT\"] = str(memory_limit)\n             os.environ.update(env_updates)\n \n             runai_streamer_s3_endpoint = os.getenv(\"RUNAI_STREAMER_S3_ENDPOINT\")"
+        }
+      ]
+    },
+    {
+      "sha": "4a6bf3c77f05b398b46fe4207ea1ee715d56c64f",
+      "author": {
+        "name": "Carl Persson",
+        "email": "carl.persson@amd.com"
+      },
+      "date": "2026-07-05T04:59:51+08:00",
+      "message": "[ROCm][CI] Fix Kernels and Kernels attention test failures (#47519)\n\nSigned-off-by: Carl Persson <carl.persson@amd.com>",
+      "parents": [
+        "d2afe39647d2386fd8c3ff19a7f9ad73b820a2ba"
+      ],
+      "stats": {
+        "total_additions": 11,
+        "total_deletions": 2,
+        "files_changed": 13
+      },
+      "files": [
+        {
+          "filename": "tests/kernels/attention/test_rocm_aiter_mla_decode_metadata.py",
+          "status": "modified",
+          "additions": 1,
+          "deletions": 1,
+          "patch": "@@ -113,7 +113,7 @@ def _build_decode_metadata():\n     # stub with the attribute is enough for metadata construction.\n     layer_name = \"placeholder\"\n     vllm_config.compilation_config.static_forward_context[layer_name] = (\n-        types.SimpleNamespace(prefill_backend=None)\n+        types.SimpleNamespace(prefill_backend=torch.empty((1,)))\n     )\n \n     init_workspace_manager(device)"
+        },
+        {
+          "filename": "tests/kernels/moe/test_ocp_mx_moe.py",
+          "status": "modified",
+          "additions": 10,
+          "deletions": 1,
+          "patch": "@@ -2,6 +2,7 @@\n # SPDX-FileCopyrightText: Copyright contributors to the vLLM project\n \n import importlib.metadata\n+import types\n from dataclasses import dataclass\n from importlib.util import find_spec\n \n@@ -10,7 +11,7 @@\n from packaging import version\n \n from tests.kernels.moe.utils import check_accuracy\n-from vllm._aiter_ops import is_aiter_found\n+from vllm._aiter_ops import is_aiter_found, rocm_aiter_ops\n from vllm.platforms import current_platform\n from vllm.utils.flashinfer import has_flashinfer\n \n@@ -1247,6 +1248,7 @@ def test_rocm_mxfp4_moe_oracle(\n     num_tokens: int,\n     hidden_size: int,\n     intermediate_size: int,\n+    monkeypatch: pytest.MonkeyPatch,\n ):\n     \"\"\"\n     Test ROCm MXFP4 MoE using oracle functions.\n@@ -1268,6 +1270,7 @@ def test_rocm_mxfp4_moe_oracle(\n     if config[\"requires_gfx950\"] and not ROCM_GFX950:\n         pytest.skip(f\"Backend {backend_name} requires GFX950\")\n \n+    import vllm.distributed.parallel_state as ps\n     from vllm.config import VllmConfig, set_current_vllm_config\n     from vllm.model_executor.layers.fused_moe.activation import MoEActivation\n     from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import (\n@@ -1282,6 +1285,12 @@ def test_rocm_mxfp4_moe_oracle(\n     # Initialize workspace manager (needed for modular kernels)\n     init_workspace_manager(torch.accelerator.current_device_index())\n \n+    # Set up the TP Group to prevent failure on should_use_cdna4_mx_scale_swizzle check\n+    monkeypatch.setattr(ps, \"_TP\", types.SimpleNamespace(world_size=1))\n+\n+    # AITER must be enabled or aiter_mxfp4_w4a8_moe asserts before dispatch.\n+    monkeypatch.setattr(rocm_aiter_ops, \"_AITER_ENABLED\", True)\n+\n     # Map string to enum\n     backend = Mxfp4MoeBackend[backend_name]\n "
+        }
+      ]
+    }
+  ]
+}

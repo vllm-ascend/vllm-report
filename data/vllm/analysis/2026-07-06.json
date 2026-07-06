@@ -1,0 +1,757 @@
+{
+  "date": "2026-07-06",
+  "repo": "vllm-project/vllm",
+  "generated_at": "2026-07-07T03:53:26.087185+08:00",
+  "daily_summary": "当日变更主要集中在Transformers建模后端的性能优化（通过图融合实现与原生vLLM相同的性能）、Kimi K2.5/K2.6视觉处理的CPU融合优化、DeepSeek V4稀疏MLA的token_to_req_indices缓存、以及多项bug修复（包括MNNVL allreduce选择、int32溢出、异步调度下的placeholder下溢、Gemma4 MTP量化配置、XPU CUDA shim兼容性等）。此外，还新增了对Bailing混合模型MTP推测解码的支持、OpenAI Responses API的namespace tools支持、以及ROCm AITER自定义allreduce的CudaCommunicator集成。",
+  "ascend_impact_summary": "当日变更对vllm-ascend影响较小。主要影响包括：1) `CommonAttentionMetadata`新增`token_to_req_indices`方法，被DeepSeek V4的compressor和sparse_mla使用，vllm-ascend的对应patch可能需要适配；2) `torch.cuda.Event`回退变更影响多个模块，vllm-ascend的`NPUWorker`和`NPUModelRunner`中若使用了`torch.cuda.Event`需确认兼容性；3) `GPUModelRunner`中`_build_attn_group_metadata`新增对`BailingLinearAttentionMetadataBuilder`的支持，不影响Ascend；4) 其他变更（Transformers后端、Kimi视觉、ROCm AITER、HPC_ATTN、CPU/RISC-V等）均为平台特定或与Ascend无关。",
+  "commits": [
+    {
+      "sha": "3ee9eea9284c4fbe71459dec07063244e1b0ec75",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "bugfix",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "5bce653e09ca62c870ea18d01a4180dc48d3bacb",
+      "comment": "该commit对Transformers建模后端进行了重大性能优化，通过引入图融合（fuser）机制，将HF模型中的GLU（gate+up投影）、QKV投影和RMSNorm自动检测并融合为vLLM的原生算子（MergedColumnParallelLinear、QKVParallelLinear、RMSNorm/GemmaRMSNorm），使Transformers后端的性能与原生vLLM模型实现一致。核心实现包括：1) 新增`fuser.py`和`fusers/`子模块，包含`GLUFuser`、`QKVFuser`、`RMSNormFuser`等具体融合器；2) 新增`fx_utils.py`提供FX图追踪和AST源码重写引擎；3) 修改`base.py`中的`recursive_replace`方法，使用融合器替换子模块；4) MoE模块也支持通过`MoEBlockFuser`进行融合；5) 移除了旧的`replace_rms_norm_class`函数。该变更大幅提升了Transformers后端的推理速度，同时保持了与原生vLLM相同的精度。",
+      "tags": [
+        "feature",
+        "performance",
+        "model-runner",
+        "transformers",
+        "high-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。该变更为Transformers建模后端新增图融合功能，仅影响通过Transformers后端加载的模型。vllm-ascend使用自己的NPUModelRunner和AscendAttentionBackend，不依赖此融合机制。新增的`fusers/`模块和`fx_utils.py`均为Transformers后端专用，不影响Ascend平台。",
+        "testing": "无影响。新增的测试文件（`tests/models/transformers/fusers/`）为Transformers后端融合器的单元测试，与Ascend无关。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "5ad11172b791104f2d9df3c7877a53a5aeb28878",
+      "comment": "该commit为Kimi K2.5/K2.6模型添加了融合的CPU图像预处理，通过numba JIT编译的`_write_fused_patches`内核将图像resize、padding、patch提取和归一化合并为一次并行操作，显著提升CPU端图像处理性能。新增`KimiK25FusedVisionProcessor`类，当numba可用时替代默认的HF图像处理器。同时修改`processor.py`的`get_image_processor`函数以支持`processor_cls_overrides`参数，并在`jit_monitor.py`中添加了numba线程层管理上下文管理器以解决fork安全问题。",
+      "tags": [
+        "feature",
+        "performance",
+        "multimodal",
+        "kimi",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。该变更为Kimi K2.5/K2.6模型的CPU端图像预处理优化，使用numba JIT加速。vllm-ascend使用Ascend NPU进行推理，不依赖此CPU图像处理优化。新增的`KimiK25FusedVisionProcessor`和`is_numba_available`函数均为Kimi模型特定实现。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "f70caef48b9263e8f86fdf20a04a4933a5f75083",
+      "comment": "该commit为DeepSeek V4模型的稀疏MLA和compressor模块添加了`token_to_req_indices`缓存机制，通过将重复的`query_start_loc_cpu`到`token_to_req_indices`的计算逻辑提取到`CommonAttentionMetadata.token_to_req_indices()`方法中，并缓存结果，避免了每次build时的重复计算。这为DSv4的稀疏MLA kernel带来了5x~6x的性能提升。同时修改了`sparse_swa.py`中的SWA metadata builder以使用相同的缓存方法。",
+      "tags": [
+        "performance",
+        "attention",
+        "deepseek-v4",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": true,
+        "functionality": "影响。`CommonAttentionMetadata`新增了`token_to_req_indices`方法和`_token_to_req_indices_cache`属性。vllm-ascend的`AscendAttentionBackend`或相关metadata builder如果直接操作`query_start_loc_cpu`构建`token_to_req_indices`，应考虑使用此新方法以获取缓存优化。但vllm-ascend的DeepSeek V4相关实现（如`vllm_ascend/models/deepseek_v4/`）可能已有自己的实现，需确认是否适配。",
+        "testing": "无直接影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "8d8ec383619d956b25611a3312a431c9a6ca1c04",
+      "comment": "该commit为`DSparkDeepseekV4ForCausalLM`类添加了缺失的`draft_id_to_target_id`属性，设置为`None`，表示全词汇表draft模式下draft id与target id相同，无需重映射。这是一个简单的bug修复，确保推测解码在DSpark DeepSeek V4模型上正常工作。",
+      "tags": [
+        "bugfix",
+        "spec-decode",
+        "deepseek-v4",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。该变更为NVIDIA特定的DSpark DeepSeek V4模型添加属性，vllm-ascend不使用此模型实现。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "b1c6dba558a5fec95fa1586b0b824755a367a93c",
+      "comment": "该commit清理了多个模块中的死代码，包括：1) CMakeLists.txt中重复的`cache_kernels.cu`条目；2) Helion配置管理器中未使用的`has_config`和`config_exists`方法；3) FLA层中的`LayerNormGated`类；4) FlashInfer工具中的`FlashinferMoeBackend`枚举和`is_flashinfer_supporting_global_sf`函数；5) INT8量化工具中的`apply_w8a8_block_int8_linear`和`input_to_int8`函数；6) Machete工具中的`query_machete_supported_act_types`函数；7) Marlin工具中的`apply_awq_marlin_linear`函数。这些代码均未被引用，删除后不影响功能。",
+      "tags": [
+        "refactor",
+        "cleanup",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。删除的均为未使用的死代码，不影响任何功能。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "598d51153a15ff4a803037dade1c4ea43d1ea9bc",
+      "comment": "该commit修复了MNNVL（多节点NVLink）环境下FlashInfer allreduce one-shot选择的问题。将one-shot选择逻辑从`call_trtllm_fused_allreduce_norm`函数中提取为独立的`_select_flashinfer_allreduce_use_oneshot`函数，当workspace backend为\"mnnvl\"时返回`None`（由MNNVL自行决定），避免vLLM的per-rank阈值请求超过MNNVL one-shot workspace大小的tensor。同时添加了单元测试验证不同场景下的选择逻辑。",
+      "tags": [
+        "bugfix",
+        "distributed",
+        "allreduce",
+        "flashinfer",
+        "medium-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。该变更为FlashInfer allreduce的MNNVL后端修复，仅影响NVIDIA多节点NVLink环境。vllm-ascend使用Hccl通信库，不涉及FlashInfer allreduce。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "095adf1fdc93d5554a3afbf26e97b399309c80db",
+      "comment": "该commit修复了Triton decode attention kernel中page offsets的int32溢出问题。当`page_number * page stride`超过int32范围时，计算结果会溢出。通过在计算后添加`.to(tl.int64)`转换，确保使用64位整数存储page offsets，避免溢出。修复涉及`_fwd_kernel_stage1`和`_fwd_grouped_kernel_stage1`两个kernel。",
+      "tags": [
+        "bugfix",
+        "attention",
+        "triton",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。该变更为Triton attention kernel的int32溢出修复，仅影响使用Triton attention后端的CUDA平台。vllm-ascend使用AscendAttentionBackend，不依赖此Triton kernel。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "51ee564e56312a8b3a17db4614f3e95cc33eb7f3",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "chore"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "373eb314af66559f9ef9d6b50bc2cb835012ef34",
+      "comment": "该commit修复了异步调度与推测解码同时启用时`num_output_placeholders`可能下溢的问题。当`async_tokens_to_discard > 0`时（表示有未完成的discard操作），跳过对`scheduled_spec_token_ids`的处理，避免在pre-reset状态下错误地减少计数器。同时添加了单元测试验证修复。",
+      "tags": [
+        "bugfix",
+        "scheduler",
+        "spec-decode",
+        "medium-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": true,
+        "functionality": "影响。`Scheduler.update_from_output`方法中新增了对`request.async_tokens_to_discard == 0`的检查。vllm-ascend的`NPUWorker`或相关patch如果直接调用或覆盖了此方法，需确认是否受此逻辑变更影响。但vllm-ascend的scheduler patch（`vllm_ascend.patch.platform.scheduler_patch`）可能已覆盖此逻辑。",
+        "testing": "无直接影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "641cb595928a8914a7020e60125ed94496421801",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "chore"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "07f9baf7564b42ba7218ce9167bfcc4128028473",
+      "comment": "该commit回退了之前将`torch.cuda.Event`替换为`torch.Event`的变更（PR #47140）。原因是`torch.Event`在某些平台上（如XPU）可能不兼容，导致`RuntimeError: dummy base class`。回退后，所有使用`torch.Event`的地方恢复为`torch.cuda.Event`，同时在XPU平台上通过`torch.cuda.Event = torch.xpu.Event`进行适配。涉及多个模块，包括benchmarks、分布式通信、KV transfer、LoRA、MoE、DeepSeek V4 attention等。",
+      "tags": [
+        "bugfix",
+        "refactor",
+        "distributed",
+        "attention",
+        "lora",
+        "high-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": true,
+        "functionality": "影响。`torch.cuda.Event`的回退影响多个模块。vllm-ascend的`NPUWorker`、`NPUModelRunner`、`AscendAttentionBackend`等组件中如果使用了`torch.Event`（来自PR #47140的变更），需要确认是否已回退为`torch.cuda.Event`。vllm-ascend的`NPUPlatform`中可能已有对`torch.cuda.Event`的适配（如重定向到`torch.npu.Event`），需确保兼容。",
+        "testing": "无直接影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "7a90eb98ab70dcca8360214eb3cc08c999137861",
+      "comment": "该commit修复了Gemma4 MTP（Multi-Token Prediction）draft模型层忽略`quant_config`的问题。在`Gemma4MTPDecoderLayer`、`Gemma4MTPModel`和`Gemma4MTP`中，将`quant_config=None`改为使用正确的量化配置，包括从`get_draft_quant_config`获取draft模型的量化配置。修复涉及q_proj、o_proj、mlp、embed_tokens、pre_projection、post_projection和lm_head等所有线性层。",
+      "tags": [
+        "bugfix",
+        "quantization",
+        "spec-decode",
+        "gemma4",
+        "medium-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。该变更为Gemma4 MTP模型的量化配置修复，仅影响Gemma4模型。vllm-ascend不使用此模型实现。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "8f4c69b22293424690ea5956d536c20c3d4ec393",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "chore"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "8b79971bb9f97ca0dd59203c628f52de4664de10",
+      "comment": "该commit优化了Triton unified attention kernel中未使用参数的传递方式。当`USE_PER_TOKEN_HEAD_SCALES`为false时，将per-token-head scale strides和pointers从传递`0`和占位指针改为传递`None`，使Triton JIT可以跳过这些参数的materialization，减少寄存器使用。同时将`segm_output_ptr`、`segm_max_ptr`、`segm_expsum_ptr`在2D模式下也改为传递`None`。参数类型从`tl.int64`改为`int | None`以支持None值。",
+      "tags": [
+        "performance",
+        "attention",
+        "triton",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。该变更为Triton unified attention kernel的优化，仅影响使用Triton attention后端的CUDA平台。vllm-ascend使用AscendAttentionBackend，不依赖此Triton kernel。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "f676808ba005f7d042d0db967f8dbe19a29c4b09",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "chore"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "98e4726a147f37666e1e9adc468e673b32373e21",
+      "comment": "该commit修复了`run_batch`中下载媒体URL时未尊重代理环境变量的问题。将直接使用`aiohttp.ClientSession`下载改为使用`global_http_connection.async_get_bytes`，该连接器已配置为使用系统代理设置。",
+      "tags": [
+        "bugfix",
+        "entrypoints",
+        "run-batch",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。该变更为OpenAI入口点的run_batch功能修复，不影响模型推理核心逻辑。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "740f379faefd1ddeb47c85ebd600af3ccae77b7a",
+      "comment": "该commit将ROCm AITER自定义allreduce直接集成到`CudaCommunicator`中，替代了之前通过`rocm_aiter_ops`全局单例管理的方式。主要变更包括：1) 新增`AiterCustomAllreduce`包装类，封装AITER的`CustomAllreduce`；2) 在`CudaCommunicator`中新增`aiter_ar_comm`属性，在`all_reduce`方法中优先尝试AITER custom allreduce；3) 将`rocm_aiter_ops`中的AITER allreduce相关方法改为通过`CudaCommunicator`获取；4) 融合pass（`RocmAiterAllReduceFusionPass`）改为从`CudaCommunicator`获取AITER实例；5) 新增环境变量`VLLM_ROCM_USE_AITER_CUSTOM_AR`控制是否启用。",
+      "tags": [
+        "feature",
+        "performance",
+        "distributed",
+        "rocm",
+        "aiter",
+        "high-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。该变更为ROCm平台的AITER自定义allreduce集成，仅影响AMD GPU。vllm-ascend使用Hccl通信库，不涉及AITER或CudaCommunicator。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "40cc2e83278f9280d80c2527fe03be1c5aa8c91f",
+      "comment": "该commit修复了无法处理的图片URL返回HTTP 500而非422的问题。新增`VLLMUnprocessableEntityError`异常类，在`MediaConnector`中捕获4xx（除408/429外）和无效URL等客户端错误，转换为422 Unprocessable Entity错误。同时添加了相应的异常处理器和单元测试。",
+      "tags": [
+        "bugfix",
+        "entrypoints",
+        "multimodal",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。该变更为OpenAI API入口点的错误处理改进，不影响模型推理核心逻辑。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "ba22152096b2484faa3579624a253d54804d876d",
+      "comment": "该commit修复了安全漏洞：阻止请求级别的GPU视频后端选择（如pynvvideocodec），除非该后端已在启动时静态配置。在`VideoMediaIO.merge_kwargs`中，如果运行时请求的GPU视频后端与静态配置不匹配，则将其从kwargs中移除。同时修改`gpu_worker.py`中的内存预留逻辑，使用`VIDEO_LOADER_REGISTRY.backend_requires_gpu`通用方法替代硬编码的pynvvideocodec检查。",
+      "tags": [
+        "bugfix",
+        "security",
+        "multimodal",
+        "video",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。该变更为视频后端的请求级安全修复，仅影响GPU视频解码后端选择。vllm-ascend使用Ascend NPU，不涉及pynvvideocodec等GPU视频后端。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "90ce3a09bef2fd7203369b3f7aeabee15ea6f0f8",
+      "comment": "该commit修复了MOSS-Audio模型在流水线并行（PP）模式下`deepstack_input_embeds`初始化的问题。在`make_empty_intermediate_tensors`中，对于非首PP rank，跳过`layer_idx < self.model.start_layer`的DeepStack层，避免为不存在的层创建中间张量。",
+      "tags": [
+        "bugfix",
+        "model",
+        "pipeline-parallel",
+        "moss-audio",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。该变更为MOSS-Audio模型的PP模式修复，仅影响MOSS-Audio模型。vllm-ascend不使用此模型实现。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "26c754d8475e753928d57b71c2398515eabe0a0d",
+      "comment": "该commit修复了XPU平台上FP8 block scaled MM的权重scale处理问题。移除了`process_weights_after_loading`中对`weight_scale_inv`的转置操作，改为在`apply_block_scaled_mm`中动态转置`Bs`（weight scale）。同时移除了e8m0到float32的转换逻辑，因为oneDNN kernel现在可以正确处理e8m0格式。",
+      "tags": [
+        "bugfix",
+        "quantization",
+        "xpu",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。该变更为XPU平台的FP8量化修复，仅影响Intel GPU。vllm-ascend使用Ascend NPU，不涉及XPU特定的量化实现。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "3d7f357ebf4db408b71786b517aaca6db21f6bde",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "bugfix",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "736f1a590714d4f1286fcc764439ad39cca2e8f5",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "bugfix",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "344609ab170a040fe5cfec74eac8db66cd344b6f",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "bugfix",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "d039c171144bdc6e19d14d3dd9b0625f84f16d1c",
+      "comment": "该commit修复了GLM MTP（Multi-Token Prediction）模型中post-final-norm hidden的回收问题。将`DeepseekV32MultiTokenPredictorLayer.forward`的返回值从`residual + hidden_states`（pre-norm）改为`hidden_states, hidden_states`（post-norm），确保回收的hidden是经过final norm的。同时修改`compute_logits`以跳过重复的RMSNorm计算。",
+      "tags": [
+        "bugfix",
+        "spec-decode",
+        "deepseek-v3",
+        "glm",
+        "medium-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。该变更为DeepSeek V3.2/GLM MTP模型的修复，仅影响特定模型架构。vllm-ascend不使用此模型实现。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "cdab28319f5ea9521f93a31c7e5f14e4d2c194be",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "feature",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "2fa10566e3b9a50e56e6464a3469091b073ab592",
+      "comment": "该commit修复了数据并行（DP）负载均衡器在平局时的系统偏差问题。在`get_core_engine_for_request`中，每次选择后旋转扫描起始索引（`eng_start_index`），使得当多个engine得分相同时，不会系统性地偏向同一个engine。",
+      "tags": [
+        "bugfix",
+        "distributed",
+        "data-parallel",
+        "load-balancing",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。该变更为DP负载均衡器的平局处理优化，不影响Ascend平台。vllm-ascend的分布式相关patch（如`distributed_parallel_state_patch`）不涉及此逻辑。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "fb265fc8fb4e35b5160938bb2ad909be0e0ab4d3",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "chore"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "8f0e75e16b96e07ae58283e440128b491f729972",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "feature",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "98ba9b9583cc98dc49039a1353c6ad158f678d64",
+      "comment": "该commit为OpenAI Responses API添加了namespace tools支持。新增`NamespaceTool`类型的处理逻辑，包括：1) 在`responses/protocol.py`中验证namespace tool的tool_choice；2) 在`responses/utils.py`中构建namespace tool的output items和tool call name映射；3) 在`streaming_events.py`中处理namespace tool的流式事件；4) 在`tool_parsers/utils.py`中添加namespace tool的工具函数（`flat_namespace_tool_name`、`iter_response_function_tool_info`、`build_responses_tool_call_name_map`等）。",
+      "tags": [
+        "feature",
+        "entrypoints",
+        "openai-api",
+        "tools",
+        "medium-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。该变更为OpenAI Responses API的namespace tools支持，仅影响HTTP服务入口点。不影响模型推理核心逻辑或Ascend平台适配。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "990c2a0187228b6596e355a7045f7acf3f2f0ca1",
+      "comment": "该commit为RISC-V VLEN=256硬件启用了BF16支持。主要变更包括：1) 在`cpu_extension.cmake`中添加`VLLM_CPU_RVV_BF16`环境变量覆盖检测；2) 修复`cpu_types_riscv_impl.hpp`中`BF16Vec32`的构造逻辑，使其在VLEN=256下也能正确工作（通过LMUL扩展和vslideup操作）。",
+      "tags": [
+        "feature",
+        "cpu",
+        "risc-v",
+        "bf16",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。该变更为RISC-V CPU平台的BF16支持，仅影响RISC-V架构。vllm-ascend使用Ascend NPU，不涉及CPU平台。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "e433634c781dce7ee55563424b8136ad3495c1be",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "performance",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "16f81109357041f844aebfd4cb35e95600e2dda9",
+      "comment": "该commit修复了RISC-V CPU上RVV attention路径的VLEN检测问题。主要变更包括：1) 在`cpu_extension.cmake`中，当交叉编译时跳过`/proc/cpuinfo`的VLEN自动检测；2) 将VLEN>256的值钳位到256；3) 在`cpu_attn.cpp`中，将RVV attention的编译条件从`__riscv_v_min_vlen == 128`扩展为`128 || 256`；4) 在`cpu_attn.py`中，将C++编译时检查作为ground truth，`/proc/cpuinfo`仅作为快速路径。",
+      "tags": [
+        "bugfix",
+        "cpu",
+        "risc-v",
+        "attention",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。该变更为RISC-V CPU平台的RVV attention路径修复，仅影响RISC-V架构。vllm-ascend使用Ascend NPU，不涉及CPU平台。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "d9c1767cd47f2744bd855597f3145d944572e329",
+      "comment": "该commit为INC（Intel Neural Compressor）量化方案添加了ARK算子的直接注册支持。主要变更包括：1) 新增`inc_ark_ops.py`模块，通过`direct_register_custom_op`注册`inc_ark_woq_linear`自定义算子；2) 将`get_ark_state`函数从`inc_wna16_linear.py`移动到`inc_ark_ops.py`；3) 修改`INCARKLinearMethod`，从直接调用`ark_linear.forward()`改为调用`torch.ops.vllm.inc_ark_woq_linear`自定义算子；4) 更新依赖版本到`auto_round_lib>=0.14.0`。",
+      "tags": [
+        "feature",
+        "quantization",
+        "inc",
+        "xpu",
+        "cpu",
+        "medium-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。该变更为Intel平台的INC量化方案添加ARK算子支持，仅影响Intel GPU/CPU。vllm-ascend使用Ascend NPU，不涉及INC或ARK。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "e9cc1fd0934ac115a14a69aebfbebf7ffeea85ee",
+      "comment": "该commit移除了CPU Docker镜像和安装文档中的全局extra index URL（`https://download.pytorch.org/whl/cpu`），改为使用`uv pip install --torch-backend cpu`参数。同时更新了相关文档和Dockerfile。",
+      "tags": [
+        "chore",
+        "ci",
+        "cpu",
+        "docker",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。该变更为CPU平台的CI和Docker配置变更，不影响Ascend平台。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "f1073c050c1c0149430738fd1c7cc078d4883900",
+      "comment": "该commit修复了CPU W4A8 INT8 MoE路径的多个问题。主要变更包括：1) 修复C++ kernel中的参数命名（`H`→`hidden_size`，`I`→`intermediate_size`，移除`I2`参数）；2) 支持fp16和bf16输入dtype（自动upcast到fp32）；3) 修复gate weights的dtype处理；4) 在`CPUExpertsInt4`中添加`is_supported_config`方法进行更严格的配置验证；5) 添加channel-wise量化支持（`kInt4W4A8StaticChannelSym`）；6) 修复测试用例，使用`convert_to_w4a8_int8_moe_format`工具函数。",
+      "tags": [
+        "bugfix",
+        "performance",
+        "cpu",
+        "moe",
+        "quantization",
+        "medium-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。该变更为CPU平台的W4A8 INT4 MoE路径修复，仅影响Arm CPU。vllm-ascend使用Ascend NPU，不涉及CPU MoE实现。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "394edc81082c04cb38e3455fc0c03d62ba403b72",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "chore"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "69715823df89b11ee684b84066390cbb9092d5c1",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "chore"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "6569df6a3ecf2f59313a40aaf001e1b208fcd2f7",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "refactor",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "f2aaf5915102cd56b3a60f8e6e59c4a7f31268dd",
+      "comment": "该commit为Bailing混合模型添加了MTP（Multi-Token Prediction）推测解码支持。主要变更包括：1) 新增`bailing_moe_mtp.py`模型实现，包含`BailingMoeV25MTPModel`、`BailingMoeV25MultiTokenPredictor`和`BailingMoeV25MultiTokenPredictorLayer`；2) 在`linear_attn.py`中添加`BailingLinearAttentionBackend`和`BailingLinearAttentionMetadataBuilder`，支持MTP下的spec decode metadata构建；3) 在`bailing_linear_attn.py`中添加`bailing_linear_attention_decode_spec` Triton kernel，支持多步draft token的线性注意力解码；4) 在`speculative.py`中添加Bailing模型的hf_config_override；5) 在`model_arch_config_convertor.py`中添加`BailingHybridMTPModelArchConfigConvertor`。",
+      "tags": [
+        "feature",
+        "spec-decode",
+        "bailing",
+        "attention",
+        "high-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。该变更为Bailing混合模型的MTP推测解码支持，仅影响Bailing模型架构。vllm-ascend不使用此模型实现。新增的`BailingLinearAttentionBackend`和`BailingLinearAttentionMetadataBuilder`为Bailing模型特定实现。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "95a248faed6781360eedcd37d6132a23f2c787da",
+      "comment": "该commit为HPC_ATTN后端添加了MTP（Multi-Token Prediction）和动态调度attention支持。主要变更包括：1) 在`HpcAttnMetadata`中添加`decode_query_len`、`qo_indptr_decode`和`task_map`字段；2) 在`HpcAttnMetadataBuilder`中初始化`task_map`并调用`hpc.assign_attention_decode_task`进行动态任务分配；3) 在`HpcAttentionImpl.forward`中传递`mtp`参数给HPC kernel；4) 在`HPCRopeNorm`中支持动态decode query length和FP8量化类型。",
+      "tags": [
+        "feature",
+        "performance",
+        "attention",
+        "hpc",
+        "medium-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。该变更为HPC_ATTN后端的MTP和动态调度支持，仅影响使用HPC attention后端的NVIDIA GPU平台。vllm-ascend使用AscendAttentionBackend，不涉及HPC attention。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "d2ec433e3795ad3ef7314c8c0f87f03d24d47960",
+      "comment": "该commit修复了XPU上Eagle3初始化的问题。主要变更包括：1) 在`llama_eagle3.py`中将`assert`语句改为`torch._assert`，避免在`torch.compile`下被优化掉；2) 在`llm_base_proposer.py`中添加embedding维度检查，当target和draft模型的embedding维度不同时，不共享embedding权重。",
+      "tags": [
+        "bugfix",
+        "spec-decode",
+        "eagle3",
+        "xpu",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。该变更为XPU平台的Eagle3初始化修复，仅影响Intel GPU。vllm-ascend使用Ascend NPU，不涉及XPU特定的Eagle3实现。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "78a04c208d1f6fad27a949aa1a7f53ae638e86e3",
+      "comment": "该commit修复了XPU上CUDA API shims破坏Torch Dynamo AOT编译的问题。将`_torch_cuda_wrapper`中的直接别名（如`torch.cuda.current_stream = torch.xpu.current_stream`）改为使用`functools.partial`创建独立的callable，避免Dynamo的`_get_handlers()`因重复注册相同的函数对象而报错。",
+      "tags": [
+        "bugfix",
+        "xpu",
+        "torch-compile",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。该变更为XPU平台的CUDA shim修复，仅影响Intel GPU。vllm-ascend使用Ascend NPU，不涉及XPU的CUDA shim机制。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "b71218107fac12bdbbffed3aa597b508347365b9",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "bugfix",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    }
+  ]
+}

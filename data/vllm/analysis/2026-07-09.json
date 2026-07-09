@@ -1,0 +1,468 @@
+{
+  "date": "2026-07-09",
+  "repo": "vllm-project/vllm",
+  "generated_at": "2026-07-10T03:42:47.311195+08:00",
+  "daily_summary": "当日变更以Bug修复和模型架构迁移为主。核心修复包括：1) 修复FlashInfer MLA workspace数据类型为int8以支持Blackwell autotune；2) 修复KVBlockZeroer的竞态条件，通过轮换pinned buffer避免并发H2D拷贝覆盖；3) 修复PD分离中MTP推测解码的lookahead token分配问题；4) 修复Qwen3-ASR流式转录的prefix stripping。模型架构方面，移除了Olmo/Olmo2、Persimmon、Fuyu、TeleChat等旧架构，迁移至Transformers modeling backend。性能方面，集成了TRTLLM BF16 MoE Modular kernel，支持标准all2all后端。此外，新增了KV offloading的GSM8K集成测试、TileLang JIT编译监控、NIXL Push Connector的PP prefill支持等。",
+  "ascend_impact_summary": "当日变更对vllm-ascend影响较小。主要影响包括：1) KVBlockZeroer的max_concurrency参数变更，vllm-ascend的NPUModelRunner在_init_kv_zero_meta中需传递此参数；2) FlashInfer MLA workspace数据类型变更（uint8->int8），vllm-ascend的AscendAttentionBackend不涉及此路径；3) 模型注册表移除Olmo/Olmo2/Persimmon/Fuyu/TeleChat架构，vllm-ascend的model_registry_patch需同步更新；4) 采样器接口新增get_streaming_post_processor_cls方法，vllm-ascend的AscendSampler需实现此方法。",
+  "commits": [
+    {
+      "sha": "429f4057487076d569f4a80413738462513dbe5a",
+      "comment": "修复非CUDA构建中rms_norm_per_block_quant算子的编译问题。原代码在FUSED_OPS字典中直接引用了torch.ops._C.rms_norm_per_block_quant，该算子仅在CUDA平台可用，导致非CUDA构建（如CPU、XPU、Ascend）时导入失败。修复方式与已有的per_token_group_fp8_quant保护模式一致：通过hasattr检查算子是否存在，仅在存在时注册到FUSED_OPS字典中。这是一个低风险的防御性修复。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "compilation"
+      ],
+      "ascend_impact": {
+        "ascend_affected": true,
+        "functionality": "影响vllm/compilation/passes/fusion/rms_quant_fusion.py中的FUSED_OPS字典。vllm-ascend的AscendPlatform如果使用此融合pass，需确保其编译pass管理器正确处理rms_norm_per_block_quant的缺失情况。由于vllm-ascend有自己的编译pass管理器（GraphFusionPassManager），此变更不会直接影响Ascend编译流程，但vllm-ascend的patch模块（pass_manager_patch）需确认是否引用了此FUSED_OPS字典。",
+        "testing": "无直接影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "753c5039f04fa77060585f822ed68985e1b89491",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "chore"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "299d2b565517044847f7300c11b9eb4c41931c36",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "chore"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "85b3a7264b6c4e4e89a1c45a2c4ccfd1b8c342dc",
+      "comment": "修复Model Runner V2中推测解码请求被错误分类为prefill的问题。原排序逻辑使用sorted(num_tokens_per_req, key=num_tokens_per_req.get)按token数量升序排列，当推测解码的decode_query_len>1时，chunked-prefill的尾部（1个token）会排在uniform decodes（2个token）前面，导致split_decodes_and_prefills将所有decode误判为prefill。修复方式：新增sort_batch_req_ids函数，将decode_query_len作为排序键，确保uniform decodes（query_len == decode_query_len）排在前面，然后是short_extend，最后是prefill。同时修复了DeepSeek V2 MTP层的skip_topk初始化问题。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "model-runner",
+        "spec-decode"
+      ],
+      "ascend_impact": {
+        "ascend_affected": true,
+        "functionality": "影响vllm/v1/worker/gpu/model_runner.py中的prepare_inputs方法。vllm-ascend的NPUModelRunner继承自GPUModelRunner，如果NPUModelRunner重写了prepare_inputs方法，需同步应用sort_batch_req_ids的排序逻辑。如果NPUModelRunner未重写prepare_inputs，则自动继承此修复。此外，vllm-ascend的block_table_patch需检查是否覆盖了prepare_inputs。",
+        "testing": "新增tests/v1/worker/test_gpu_batch_ordering.py测试，vllm-ascend可参考此测试验证NPUModelRunner的batch排序行为。",
+        "needs_test_update": true,
+        "suggested_test_areas": [
+          "vllm_ascend/worker/test_batch_ordering.py"
+        ]
+      }
+    },
+    {
+      "sha": "b83be00cddf03387bf740acfe6b9ca07ec1a3c08",
+      "comment": "将Olmo和Olmo2模型架构从vLLM原生实现迁移到Transformers modeling backend。移除了vllm/model_executor/models/olmo.py（378行）和olmo2.py（重命名为olmo3.py），在registry.py中将OlmoForCausalLM和Olmo2ForCausalLM映射到transformers后端。olmo3.py文件被重命名并更新为仅支持Olmo3Config。这是一个模型架构迁移的常规操作，降低了维护成本。",
+      "tags": [
+        "refactor",
+        "low-risk",
+        "model-registry"
+      ],
+      "ascend_impact": {
+        "ascend_affected": true,
+        "functionality": "影响vllm/model_executor/models/registry.py中的模型注册表。vllm-ascend的model_registry_patch如果引用了OlmoForCausalLM或Olmo2ForCausalLM的映射，需同步更新。由于Olmo/Olmo2已迁移到Transformers后端，vllm-ascend无需为这些架构提供特定实现。",
+        "testing": "无直接影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "412414d8e081e7057768714d37670728dc8cb363",
+      "comment": "移除PersimmonForCausalLM和FuyuForCausalLM模型架构。删除了persimmon.py（373行）和fuyu.py（368行）两个模型文件，以及相关的聊天模板、测试配置、示例代码等。这两个架构被标记为已弃用（deprecated），在registry.py中添加到_OOT_SUPPORTED_MODELS字典并标注版本为0.25.0。这是一个清理旧架构的常规操作。",
+      "tags": [
+        "refactor",
+        "low-risk",
+        "model-registry"
+      ],
+      "ascend_impact": {
+        "ascend_affected": true,
+        "functionality": "影响vllm/model_executor/models/registry.py中的模型注册表。vllm-ascend的model_registry_patch如果引用了PersimmonForCausalLM或FuyuForCausalLM的映射，需同步更新。由于这两个架构已被移除，vllm-ascend无需为它们提供特定实现。",
+        "testing": "无直接影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "ae6170f874a7c66512bd24aa714b3a02f8a61838",
+      "comment": "修复PD分离中异步KV加载的lookahead处理问题。当PD分离与推测解码（MTP）同时使用时，原代码在load_kv_async时仅检查self.use_eagle来决定是否限制lookahead tokens，但未考虑其他推测解码场景。修复方式：将条件改为self.num_lookahead_tokens > 0，更通用地处理所有推测解码场景。同时新增get_block_ids_for_computed_tokens方法，在connector完成时只发送已计算token对应的block IDs，避免发送多余的lookahead blocks。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "scheduler",
+        "kv-cache",
+        "pd-disagg"
+      ],
+      "ascend_impact": {
+        "ascend_affected": true,
+        "functionality": "影响vllm/v1/core/kv_cache_manager.py和vllm/v1/core/sched/scheduler.py。vllm-ascend的scheduler_patch和kv_cache_manager_patch需检查是否覆盖了相关方法。新增的get_block_ids_for_computed_tokens方法在KVCacheManager中，vllm-ascend的patch如果修改了KVCacheManager，需确保此方法可用。",
+        "testing": "无直接影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "e87521626febe2763f997691d1599de4175f4324",
+      "comment": "修复验证错误响应中泄露服务器文件路径的安全问题。FastAPI的RequestValidationError在错误消息中包含endpoint_file、endpoint_line等服务器内部路径信息。修复方式：1) 在sanitize_message函数中增加正则表达式，剥离文件路径和traceback帧；2) 修改validation_exception_handler，使用exc.errors()构建消息而非str(exc)，避免FastAPI注入的路径信息泄露。这是一个安全修复，防止攻击者通过错误消息获取服务器文件结构。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "security",
+        "entrypoints"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。变更仅涉及vllm/entrypoints/serve/utils/目录下的API工具函数，vllm-ascend不修改这些文件。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "1cd75b3dd4b3bf90e4ef81831b6f0dd91fde2fe1",
+      "comment": "修复KVBlockZeroer中的竞态条件。原实现使用单个pinned buffer和单个GPU buffer来传输block IDs，当多个并发batch同时调用zero_block_ids时，后一个调用会覆盖前一个调用的pinned buffer内容，而前一个调用的非阻塞H2D拷贝可能尚未完成，导致错误的block IDs被写入GPU内存。修复方式：引入max_concurrency参数，创建多个pinned buffer和GPU buffer，通过轮换索引（round-robin）分配buffer，确保每个并发batch使用独立的buffer。同时，当buffer需要扩容时，先同步设备确保所有in-flight拷贝完成。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "kv-cache",
+        "model-runner"
+      ],
+      "ascend_impact": {
+        "ascend_affected": true,
+        "functionality": "影响vllm/v1/worker/utils.py中的KVBlockZeroer类和vllm/v1/worker/gpu/model_runner.py中的_init_kv_zero_meta方法。vllm-ascend的NPUModelRunner在_init_kv_zero_meta中需传递max_concurrency参数（来自self.vllm_config.max_concurrent_batches）。如果vllm-ascend有自定义的KVBlockZeroer实现，需同步应用此竞态修复。",
+        "testing": "新增tests/v1/worker/test_kv_block_zeroer.py测试，vllm-ascend可参考此测试验证NPU上的KVBlockZeroer行为。",
+        "needs_test_update": true,
+        "suggested_test_areas": [
+          "vllm_ascend/worker/test_kv_block_zeroer.py"
+        ]
+      }
+    },
+    {
+      "sha": "0206f10871468bcb9b23f7e8f51320e3cd7ca096",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "feature",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "ab7961a14a59be9a0170f1654315d5c2be44c015",
+      "comment": "移除TeleChatForCausalLM模型架构。从registry.py中删除TeleChatForCausalLM的映射（之前映射到telechat2模块），将其添加到_OOT_SUPPORTED_MODELS字典并标注版本为0.25.0。TeleChat2ForCausalLM和TeleChat3ForCausalLM不受影响。这是一个清理旧架构的常规操作。",
+      "tags": [
+        "refactor",
+        "low-risk",
+        "model-registry"
+      ],
+      "ascend_impact": {
+        "ascend_affected": true,
+        "functionality": "影响vllm/model_executor/models/registry.py中的模型注册表。vllm-ascend的model_registry_patch如果引用了TeleChatForCausalLM的映射，需同步更新。由于TeleChatForCausalLM已被移除，vllm-ascend无需为它提供特定实现。",
+        "testing": "无直接影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "a07765c6bd102bc1beaa5226d0fe5291b30a8524",
+      "comment": "修复Qwen3-ASR流式转录的postprocessing问题。原实现中，流式转录的delta可能将\"language X<asr_text>\"前缀分割到多个chunk中，导致prefix stripping失败。修复方式：1) 新增StreamingTranscriptionPostProcessor接口和Qwen3ASRStreamingPostProcessor实现，维护状态（raw_text、emitted_text、is_structured_output）来正确处理跨chunk的prefix；2) 在SupportsTranscription接口中新增get_streaming_post_processor_cls类方法；3) 修改流式转录生成器，使用post_processor处理每个delta。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "multimodal",
+        "speech-to-text"
+      ],
+      "ascend_impact": {
+        "ascend_affected": true,
+        "functionality": "影响vllm/model_executor/models/interfaces.py中的SupportsTranscription接口，新增了get_streaming_post_processor_cls类方法。vllm-ascend如果实现了支持转录的模型，需实现此方法。同时影响vllm/entrypoints/speech_to_text/base/serving.py中的流式转录逻辑，vllm-ascend的patch如果覆盖了此文件，需同步更新。",
+        "testing": "新增tests/entrypoints/speech_to_text/transcription/test_transcription_inter_chunk_spacing.py测试，vllm-ascend可参考此测试验证流式转录postprocessing。",
+        "needs_test_update": true,
+        "suggested_test_areas": [
+          "vllm_ascend/worker/test_transcription.py"
+        ]
+      }
+    },
+    {
+      "sha": "1171467e91b3a1f334ad99df934ce35b9fb7255c",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "bugfix",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "529af888425040e7424b10237ad5909a71558b99",
+      "comment": "为CPU offload调度添加free block迭代器。在KVCacheBlockFreeList中新增iter_blocks_after方法，返回从指定cursor开始的free block迭代器。SimpleCPUOffloadManager中的_prepare_lazy_store_specs方法被重构，使用新的迭代器替代手动链表遍历。这是一个代码重构，提高了可读性和可维护性。",
+      "tags": [
+        "refactor",
+        "low-risk",
+        "kv-cache",
+        "offloading"
+      ],
+      "ascend_impact": {
+        "ascend_affected": true,
+        "functionality": "影响vllm/v1/core/kv_cache_utils.py中的KVCacheBlockFreeList类。vllm-ascend的kv_cache_manager_patch如果修改了free list相关逻辑，需确保与新的iter_blocks_after方法兼容。vllm-ascend的kv_offload模块如果使用了SimpleCPUOffloadManager，将自动受益于此重构。",
+        "testing": "无直接影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "b8c7c86533d52e70433d9718ddafdd26542191f1",
+      "comment": "修复XPU平台上LoRA shrink操作中torch.compile导致的DEVICE_LOST错误。原实现中，bgmv_shrink直接写入输出张量y，当y是view时，torch.compile可能无法正确处理view-mutation。修复方式：创建一个临时buffer buf，将bgmv_shrink结果写入buf，然后通过y.copy_(buf)拷贝到输出。同时修复了add_lora_fused_moe中当没有LoRA请求时的提前返回逻辑。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "lora",
+        "xpu"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。变更仅涉及vllm/lora/punica_wrapper/punica_xpu.py，这是XPU平台的LoRA实现，vllm-ascend不使用此路径。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "2c17d33f4291a55b447317640c81eb61077b1b00",
+      "comment": "修复ROCm平台上Triton MLA的CUDA Graph支持类型。将TritonMLAMetadataBuilder的_cudagraph_support从UNIFORM_BATCH改为UNIFORM_SINGLE_TOKEN_DECODE。UNIFORM_BATCH要求所有请求的query_len相同，而Triton MLA的decode kernel实际上只支持单token decode（每个请求1个token），因此使用UNIFORM_SINGLE_TOKEN_DECODE更准确。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "attention",
+        "rocm",
+        "mla"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。变更仅涉及vllm/v1/attention/backends/mla/triton_mla.py，这是ROCm平台的Triton MLA实现，vllm-ascend不使用此路径。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "bc44f9feb7ab8e0c0be68a8c6e2656e9be053236",
+      "comment": "修复ROCm平台上fused w3 expert权重的双重转置问题。在加载fused权重时，w1和w3共享一个fused tensor，原代码直接对loaded_weight进行transpose操作，导致w3的权重被转置两次（第一次在w1处理时，第二次在w3处理时），造成chunk错误。修复方式：使用本地副本fused_weight = loaded_weight，避免修改原始loaded_weight。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "moe",
+        "rocm"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。变更仅涉及vllm/model_executor/layers/fused_moe/routed_experts.py中的ROCm特定逻辑，vllm-ascend不使用此路径。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "7802c20c4e02d1c403fc4140d9b8e7b971e99d20",
+      "comment": "支持NIXL Push Connector的pipeline-parallel prefill。这是一个大型变更，涉及多个文件：1) 在push worker中支持PP>1的producer，每个PP stage写入自己的layer slice到decoder的对应区域；2) 在base worker中新增pp_size、_remote_region_offset等属性，支持region slicing；3) 在scheduler中传递pp_size信息；4) 在metadata中新增pp_size字段；5) 修复MLA异构图TP时push worker的write fan-out逻辑；6) 新增push集成测试配置。",
+      "tags": [
+        "feature",
+        "high-risk",
+        "distributed",
+        "kv-transfer",
+        "pd-disagg"
+      ],
+      "ascend_impact": {
+        "ascend_affected": true,
+        "functionality": "影响vllm/distributed/kv_transfer/kv_connector/v1/nixl/目录下的多个文件。vllm-ascend的kv_transfer_patch如果覆盖了NIXL connector相关逻辑，需同步更新以支持PP prefill。具体影响：1) base_worker.py中新增pp_size、_remote_region_offset等属性；2) base_scheduler.py中set_xfer_handshake_metadata的key从int变为tuple[int, int]；3) metadata.py中HeartbeatInfo和ReqMeta新增pp_size字段；4) push_worker.py中新增consumer_notification_counts_by_req用于PP stage计数。",
+        "testing": "新增tests/v1/kv_connector/nixl_push_integration/目录和测试，vllm-ascend可参考此测试验证PP prefill场景。",
+        "needs_test_update": true,
+        "suggested_test_areas": [
+          "vllm_ascend/distributed/test_nixl_push_pp.py"
+        ]
+      }
+    },
+    {
+      "sha": "95d6d6f4bba8234088e62124ff20a482acd98714",
+      "comment": "修复FlashInfer MLA decode workspace数据类型问题。FlashInfer的CuteDSL MLA-decode tactic要求workspace buffer为int8类型，而原代码使用uint8。当autotune启用时，CuteDSL tactic会断言workspace_buffer.dtype == torch.int8，导致Blackwell GPU上的DeepSeek MLA测试失败。修复方式：将workspace buffer的dtype从torch.uint8改为torch.int8，int8对trtllm-gen路径也是安全的（它将其视为uint8）。同时更新了flashinfer_mla_sparse.py中的对应代码。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "attention",
+        "mla",
+        "flashinfer"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。变更仅涉及vllm/v1/attention/backends/mla/flashinfer_mla.py和flashinfer_mla_sparse.py，这是FlashInfer CUDA实现，vllm-ascend不使用此路径。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "56da398dac3d86de643f7c12b2bdf68e4cec6d33",
+      "comment": "修复Transformers modeling backend中embed scaling与CUDA Graph的兼容性问题。原实现中，embed_scale在embed_input_ids中应用，但CUDA Graph捕获时embed_input_ids可能被编译为常量，导致scale不生效。修复方式：创建ScaledVocabParallelEmbedding子类，将scale集成到forward中，确保在CUDA Graph中也能正确应用。同时简化了forward逻辑，移除了冗余的embed_scale检查。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "model-runner",
+        "compilation"
+      ],
+      "ascend_impact": {
+        "ascend_affected": true,
+        "functionality": "影响vllm/model_executor/models/transformers/base.py中的Base类。vllm-ascend如果使用Transformers modeling backend（通过model_registry_patch），将自动受益于此修复。如果vllm-ascend有自定义的embedding实现，需确保embed_scale在CUDA Graph（或ACL Graph）中正确工作。",
+        "testing": "无直接影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "26831949b48a0d81fba379dcaf7e378206fd9087",
+      "comment": "修复ROCm平台上pooling启动时的workspace锁问题。主要修复包括：1) 在ROCm attention的encoder attention中传递sinks参数；2) 在Triton prefill attention kernel中支持sinks参数，用于初始化m_i和l_i；3) 在GPUWorker的compile_or_warm_up_model中，为ROCm MRV1添加max_num_reqs的warmup。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "attention",
+        "rocm",
+        "pooling"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。变更涉及ROCm特定代码（rocm_attn.py）和Triton kernel（triton_prefill_attention.py），vllm-ascend不使用这些路径。GPUWorker的变更也仅影响ROCm平台。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "6cf7b26bd4bff60bf378e1af14044280ac0d214c",
+      "comment": "修复文档构建问题。修复了FusedMoE函数文档字符串中的缩进问题，以及P2P tiering manager中**kwargs的类型注解。",
+      "tags": [
+        "docs",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。变更仅涉及文档字符串和类型注解修复。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "5f8597562467d3b0495e300ebd902ba1aa781914",
+      "content": "新增TileLang JIT编译运行时监控。在jit_monitor中新增对TileLang JIT编译的监控支持，包括：1) 监控JITKernel的__init__（首次编译）；2) 监控JITImpl的__call__（缓存未命中时的编译）；3) 支持warn和error两种模式；4) 支持verbose模式输出详细编译信息。",
+      "tags": [
+        "feature",
+        "low-risk",
+        "compilation",
+        "monitoring"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。变更仅涉及vllm/utils/jit_monitor.py，这是通用的JIT监控工具，vllm-ascend不使用TileLang。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "dcdd756d75a9a2cdc9ff257c7d44c67b9b9fee68",
+      "comment": "新增KV offloading的GSM8K集成测试。在CI中添加了KV offloading的正确性测试，覆盖OffloadingConnector和SimpleCPUOffloadConnector两种connector，以及四种架构族（Nemotron-H、Gemma 4、Qwen 3.5、DeepSeek-V4-Flash）。测试流程：运行GSM8K评估两次，第一次后重置GPU prefix cache（保留CPU cache），第二次验证从CPU reload的KV数据正确性。同时修复了reset_prefix_cache API返回JSON响应而非空body。",
+      "tags": [
+        "test",
+        "ci",
+        "medium-risk",
+        "kv-cache",
+        "offloading"
+      ],
+      "ascend_impact": {
+        "ascend_affected": true,
+        "functionality": "影响vllm/entrypoints/serve/dev/cache/api_router.py中的reset_prefix_cache端点，现在返回{\"success\": bool}而非空响应。vllm-ascend的engine_core_patch如果覆盖了此端点，需同步更新。同时影响rust/src/server/src/routes/cache.rs中的Rust路由。",
+        "testing": "新增tests/evals/gsm8k/test_gsm8k_offloading.py测试，vllm-ascend可参考此测试验证NPU上的KV offloading正确性。",
+        "needs_test_update": true,
+        "suggested_test_areas": [
+          "vllm_ascend/kv_offload/test_gsm8k_offloading.py"
+        ]
+      }
+    },
+    {
+      "sha": "0d2f4e7c9c88d27fdfbb46dc4e2458d615102cb5",
+      "comment": "允许FlashInfer A2A后端使用TRTLLM FP8 MoE Modular kernel。在TRTLLM FP8 MoE的_supports_parallel_config中，新增对flashinfer_nvlink_one_sided和flashinfer_nvlink_two_sided两种A2A后端的支持。",
+      "tags": [
+        "feature",
+        "low-risk",
+        "moe",
+        "performance"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。变更仅涉及vllm/model_executor/layers/fused_moe/experts/trtllm_fp8_moe.py，这是CUDA TRTLLM实现，vllm-ascend不使用此路径。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "49abadaedba2d88c6f35216ebef235edac8c1e82",
+      "comment": "修复ROCm AITER FA中空张量的.max()崩溃。当num_chunks为0时（如Whisper encoder的第一次pass），cu_seq_lens_cpu[:, -1]是空张量，调用.max()会崩溃。修复方式：在调用.max()前检查num_chunks > 0。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "attention",
+        "rocm"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。变更仅涉及vllm/v1/attention/backends/rocm_aiter_fa.py，这是ROCm AITER实现，vllm-ascend不使用此路径。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "089e41287824763fc2024c715f2e2c5b4276f8e3",
+      "comment": "集成TRTLLM BF16 MoE Modular kernel。新增TrtLlmBf16ExpertsModular类，支持标准all2all后端（如flashinfer_nvlink_one_sided/two_sided、mori_high_throughput/low_latency）。原TrtLlmBf16Experts类被重命名为TrtLlmBf16ExpertsMonolithic，仅支持no-all2all和AG/RS路径。后端选择逻辑更新为：先尝试Monolithic，如果不支持则回退到Modular。新增了Modular kernel的测试和backend selection测试。",
+      "tags": [
+        "feature",
+        "performance",
+        "medium-risk",
+        "moe"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。变更仅涉及vllm/model_executor/layers/fused_moe/experts/trtllm_bf16_moe.py和oracle/unquantized.py，这是CUDA TRTLLM实现，vllm-ascend不使用此路径。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    }
+  ]
+}

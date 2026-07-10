@@ -1,0 +1,538 @@
+{
+  "date": "2026-07-10",
+  "repo": "vllm-project/vllm",
+  "generated_at": "2026-07-11T03:24:30.255989+08:00",
+  "daily_summary": "当日变更主要集中在多个方面：1) 为ROCm平台启用DeepSeek-V4 DSpark推测解码支持，新增AMD专用dspark.py实现；2) 新增LongCat-Flash-Lite模型（n-gram embedding变体），包含自定义CUDA kernel和MRV2模型状态管理；3) 修复权重加载的完整性检查逻辑，确保index.json中引用的文件都存在；4) 修复TurboQuant FP8在Ampere GPU上对BF16模型的类型转换失败问题；5) 清理ROCm平台未使用的`combine_topk_swa_indices_ragged` kernel；6) 将MistralLarge3模型迁移到AutoWeightsLoader；7) 修复DFlash推测解码中draft/target层数不匹配问题；8) 新增DeepStream GPU视频解码后端；9) 优化Qwen3.5 GDN线性注意力层的RMSNorm与all-reduce融合；10) 支持非Harmony模型的`include_reasoning`参数；11) 在KV事件全报告模式下报告前缀缓存重用块；12) DCP支持混合注意力模型；13) KV卸载的FS/OBJ二级存储层可发布BlockStored事件；14) 修复Marlin MoE在专家并行下的M size计算；15) 修正ModernBERT模型层别名映射；16) ROCm稀疏MLA元数据在graph replay前同步；17) Mooncake KV连接器在哈希/键构建前应用SWA查找掩码。",
+  "ascend_impact_summary": "当日变更对vllm-ascend的影响较小。主要影响包括：1) `vllm/config/speculative.py`中新增DSpark的`num_speculative_tokens`校验逻辑，vllm-ascend的DSpark实现需确保满足此约束；2) `vllm/config/vllm.py`中将`LongcatFlashNgramForCausalLM`加入`_UNSUPPORTED_MODELS`，vllm-ascend无需处理；3) `vllm/model_executor/models/config.py`新增`LongcatFlashNgramForCausalLMConfig`，vllm-ascend无需处理；4) `vllm/model_executor/models/registry.py`新增`LongcatFlashNgramForCausalLM`注册，vllm-ascend无需处理；5) `vllm/v1/worker/gpu/attn_utils.py`中`init_kv_cache`新增对dual-attention模型的支持，vllm-ascend的`AscendAttentionBackend`需确认是否兼容；6) `vllm/v1/worker/gpu_model_runner.py`中`may_reinitialize_input_batch`新增`slot_mapping_modes`和`max_num_blocks_per_req`参数，vllm-ascend的`NPUModelRunner`需同步更新；7) `vllm/v1/worker/block_table.py`中`MultiGroupBlockTable`构造函数移除`max_model_len`参数，改为强制要求`max_num_blocks`，vllm-ascend的`NPUModelRunner`需同步更新；8) `vllm/v1/worker/gpu_input_batch.py`中`InputBatch`构造函数移除`max_model_len`参数，改为强制要求`max_num_blocks_per_req`，vllm-ascend的`NPUModelRunner`需同步更新。",
+  "commits": [
+    {
+      "sha": "c227aaa3f8edd02dae4583e27246430eebabfb25",
+      "comment": "为ROCm平台启用DeepSeek-V4 DSpark推测解码支持。主要变更：1) 新增`vllm/models/deepseek_v4/amd/dspark.py`，这是NVIDIA dspark.py的ROCm移植，使用AMD的aiter/triton attention路径和HCHeadOp CustomOp分发器；2) 修改`vllm/models/deepseek_v4/__init__.py`，在ROCm分支导入AMD的DSpark实现；3) 修改`vllm/models/deepseek_v4/amd/model.py`，为DeepseekV4Model添加`EagleModelMixin`和`SupportsEagle3`接口支持，并在forward中收集aux_hidden_states；4) 修改`vllm/models/deepseek_v4/amd/rocm.py`，调整SWA ragged索引缓冲区大小以支持非因果（DSpark）路径；5) 修改`vllm/config/speculative.py`，添加DSpark的`num_speculative_tokens`校验，要求其至少等于dspark_block_size；6) 修改测试跳过条件，允许DSpark在ROCm上运行。实现方式：ROCm移植遵循与amd/mtp.py相同的模式——从AMD model导入DeepseekV4DecoderLayer，通过HCHeadOp分发器路由MHC head，并在aiter unfused路径上跳过hc_post。潜在风险：DSpark在ROCm上为首次启用，可能存在未发现的兼容性问题；SWA索引缓冲区大小的调整可能影响内存使用。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "spec_decode",
+        "rocm",
+        "deepseek_v4"
+      ],
+      "ascend_impact": {
+        "ascend_affected": true,
+        "functionality": "1) `vllm/config/speculative.py`中新增DSpark的`num_speculative_tokens`校验逻辑，要求`num_speculative_tokens >= dspark_block_size`。vllm-ascend的DSpark实现（`vllm_ascend/spec_decode/`）需确保满足此约束，否则会抛出ValueError。2) `vllm/models/deepseek_v4/__init__.py`中，XPU分支的`DSparkDeepseekV4ForCausalLM`仍为None，vllm-ascend需在Ascend平台分支中导入自己的DSpark实现。",
+        "testing": "无直接影响。vllm-ascend的DSpark测试需确保满足新的`num_speculative_tokens`校验。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "08dfd68610d2e05a0d8ddc99c23488da6163df3f",
+      "comment": "新增LongCat-Flash-Lite（n-gram embedding）模型支持。主要变更：1) 新增`vllm/model_executor/models/longcat_flash_ngram.py`，包含`NgramEmbedding`、`FlashNgramModel`、`LongcatFlashNgramForCausalLM`和`LongcatNgramModelState`类；2) 新增CUDA kernel `csrc/libtorch_stable/ngram_embedding_kernels.cu`，用于计算哈希n-gram embedding id；3) 在`vllm/_custom_ops.py`中暴露`ngram_compute_n_gram_ids` Python接口；4) 注册模型到registry和config；5) 修改`vllm/model_executor/models/longcat_flash.py`和`longcat_flash_mtp.py`，修复MLA LoRA缩放重复应用问题（添加`_mla_q_lora_scaled`和`_mla_kv_lora_scaled`守卫标志）；6) 修改`vllm/v1/worker/gpu/attn_utils.py`，支持dual-attention模型的KV cache绑定（每个decoder层有两个Attention模块）。实现方式：n-gram embedding通过哈希函数将前n个token的embedding融合到当前token的embedding中，使用CUDA kernel并行计算。模型要求V2 model runner（MRV2-only），通过`LongcatNgramModelState`管理per-request的token历史。潜在风险：新模型可能与其他组件（如prefix caching、CUDA graph）存在兼容性问题；`LongcatFlashNgramForCausalLMConfig`强制设置`CompilationMode.NONE`和`CUDAGraphMode.FULL`，可能影响性能。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "model",
+        "cuda_kernel",
+        "longcat"
+      ],
+      "ascend_impact": {
+        "ascend_affected": true,
+        "functionality": "1) `vllm/config/vllm.py`中将`LongcatFlashNgramForCausalLM`加入`_UNSUPPORTED_MODELS`集合，vllm-ascend无需处理此模型。2) `vllm/model_executor/models/config.py`新增`LongcatFlashNgramForCausalLMConfig`，vllm-ascend无需处理。3) `vllm/model_executor/models/registry.py`新增`LongcatFlashNgramForCausalLM`注册，vllm-ascend无需处理。4) `vllm/v1/worker/gpu/attn_utils.py`中`init_kv_cache`新增对dual-attention模型的支持（`num_attn_module`参数），vllm-ascend的`AscendAttentionBackend`需确认是否兼容dual-attention布局。5) `vllm/model_executor/models/longcat_flash.py`和`longcat_flash_mtp.py`中MLA LoRA缩放添加了`_mla_q_lora_scaled`和`_mla_kv_lora_scaled`守卫标志，vllm-ascend的MLA实现若使用相同的`load_weights`逻辑，需同步此修复以避免重复缩放。",
+        "testing": "无直接影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "978a6dfa3f79470e4459a454816202e78c1d2108",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "chore"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "85c09e9885e346ea1612da30ebff5a75f67d2350",
+      "comment": "修复权重加载的完整性检查逻辑。在`filter_duplicate_safetensors_files`函数中，新增对`model.safetensors.index.json`中引用的权重文件是否实际存在的检查。如果index.json中引用了某个文件但实际不存在，则抛出`FileNotFoundError`。同时新增了对应的单元测试。实现方式：在过滤重复文件之前，先计算index.json中引用的文件集合与实际的权重文件集合的差集，如果差集非空则报错。潜在风险：低风险，这是一个增强性的完整性检查，不会影响正常加载路径。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "model_loader",
+        "weight_loading"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。变更仅涉及`vllm/model_executor/model_loader/weight_utils.py`中的`filter_duplicate_safetensors_files`函数，该函数是模型加载工具函数，vllm-ascend使用相同的加载路径，此变更增强了健壮性，不会破坏现有功能。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "b12cca6a2352ea6926864c925246eeb581be8caa",
+      "comment": "修复TurboQuant FP8在Ampere GPU上对BF16模型的类型转换失败问题。在`_tq_fused_store_fp8` Triton kernel中，从Key_ptr加载的k_vals需要先转换为float32再转换为FP8，否则当输入为BF16时，直接从BF16转换为FP8会失败。实现方式：在`tl.load`后添加`.to(tl.float32)`显式转换。潜在风险：低风险，这是一个单行修复，仅影响TurboQuant注意力后端的FP8存储路径。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "attention",
+        "quantization",
+        "triton"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。变更仅涉及`vllm/v1/attention/ops/triton_turboquant_store.py`中的Triton kernel，该文件是CUDA平台特定的TurboQuant实现，vllm-ascend不使用此路径。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "e257faf87d8e003451e8693262c2f90df4acea45",
+      "comment": "清理ROCm平台未使用的`combine_topk_swa_indices_ragged` kernel。移除了`vllm/models/deepseek_v4/amd/rocm.py`中的`_compute_combined_lens_kernel`、`_combine_topk_swa_indices_ragged_kernel`和`combine_topk_swa_indices_ragged`函数，以及对应的测试用例。实现方式：直接删除未使用的代码。潜在风险：低风险，这些函数已被更优的实现替代，删除不会影响功能。",
+      "tags": [
+        "refactor",
+        "low-risk",
+        "rocm",
+        "deepseek_v4",
+        "cleanup"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。变更仅涉及ROCm平台特定的代码（`vllm/models/deepseek_v4/amd/rocm.py`），vllm-ascend不使用此文件。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "fabec87f63cdf0725d48e3eb6fdef9799837bcaf",
+      "comment": "将MistralLarge3ForCausalLM迁移到AutoWeightsLoader。主要变更：1) 将`mistral_large_3.py`中的`remapping`字典重构为`hf_to_vllm_mapper`（`WeightsMapper`实例），使用锚定的正则表达式（`\\A...\\Z`）替代`re.fullmatch`；2) 重写`load_weights`方法，直接构造`AutoWeightsLoader(self)`并调用`load_weights(weights, mapper=self.hf_to_vllm_mapper)`；3) 同步更新`mistral_large_3_eagle.py`中的`EagleMistralLarge3ForCausalLM`，使用`WeightsMapper`的`|`操作符合并映射规则。实现方式：使用`WeightsMapper`替代手动的`_remap_mistral_to_ds`方法，利用AutoWeightsLoader的自动权重分发机制。潜在风险：低风险，这是代码重构，功能等价。",
+      "tags": [
+        "refactor",
+        "low-risk",
+        "model",
+        "weight_loading",
+        "mistral"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。变更仅涉及MistralLarge3模型实现（`vllm/model_executor/models/mistral_large_3.py`和`mistral_large_3_eagle.py`），vllm-ascend不使用此模型。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "7614b88ebdd9739cd126daf6f33e867e27ce52a7",
+      "comment": "修复DFlash推测解码中draft/target层数不匹配问题。主要变更：1) 在`qwen3_dflash.py`的`combine_hidden_states`方法中添加输入维度校验，当draft模型的`target_layer_ids`引用了target模型中不存在的层时，抛出明确的ValueError；2) 将DFlash测试模型从`Qwen/Qwen3.5-4B`改为`Qwen/Qwen3-4B`。实现方式：在`combine_hidden_states`中检查`hidden_states.shape[-1]`是否等于`self.model.fc.input_size`，如果不匹配则报错。潜在风险：低风险，这是一个增强性的错误检查，有助于用户快速定位draft/target模型不兼容的问题。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "spec_decode",
+        "dflash"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。变更仅涉及DFlash推测解码实现（`vllm/model_executor/models/qwen3_dflash.py`），vllm-ascend的DFlash实现（`vllm_ascend/spec_decode/`）需自行确保类似的维度校验。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "68ea76e78005bb53d9ef6b855b6c23411f5bb1e1",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "chore"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "c241c7a2b015f8168d1c75e80cee15e45c18ba94",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "bugfix",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "e23b19309b8705b21c3b3ff4129c9974ba15a419",
+      "comment": "新增DeepStream GPU视频解码后端。主要变更：1) 在`vllm/multimodal/video.py`中新增`DeepStreamVideoBackendMixin`类，提供基于NVIDIA DeepStream（NVDEC）的GPU视频解码能力；2) 将`DeepStreamVideoBackendMixin`混入`VideoBackend`类，支持`\"deepstream\"`作为`backend`参数；3) 更新所有视频加载器子类的`backend`类型注解，添加`\"deepstream\"`选项；4) 在`setup.py`中添加`deepstream`可选依赖；5) 更新文档。实现方式：DeepStream后端使用进程级共享的`DecodePool`（来自`nvidia-deepstream-videodecode`包），通过GStreamer `appsrc`管道从内存字节流解码，支持GPU->CPU pinned memory传输以优化带宽。潜在风险：仅支持Linux x86-64平台；需要系统安装GStreamer和libv4l；`DecodePool`是进程级单例，第一个请求的`pool_size`值决定后续所有请求。",
+      "tags": [
+        "feature",
+        "low-risk",
+        "multimodal",
+        "video",
+        "cuda"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。变更仅涉及NVIDIA DeepStream GPU视频解码后端，vllm-ascend不使用此功能。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "f36284a8d21d3748df30c8f1b30357be711350b5",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "feature",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "424df4f65df39a6e91f70e031e3c32b479501b25",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "chore"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "074bdd0d9961fb7f81c9311e00c00cfd5aff77a3",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "feature",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "216ee58780a85470971ac9be02d0fd2eabc942b7",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "feature",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "433f291195ded3ca8d278bc78da9280c5d4e5329",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "chore"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "28eaf05d5690a0c0d20e0999e3aa03a81102dfab",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "chore"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "300e33797fac8a949a0ed89fab2633de96e65fa8",
+      "comment": "优化Qwen3.5 GDN线性注意力层的RMSNorm与all-reduce融合。主要变更：1) 修改`qwen_gdn_linear_attn.py`中`GDNLinearAttention`类的`forward`、`forward_hip`、`forward_cuda`、`forward_xpu`、`forward_cpu`和`_output_projection`方法，移除`output`参数，改为直接返回输出张量；2) 同步更新`qwen3_next.py`中`Qwen3NextDecoderLayer`的forward逻辑，移除`self_attention_output`中间张量，直接使用`hidden_states`接收注意力输出。实现方式：通过消除不必要的中间张量分配和拷贝，减少内存开销并可能使编译器更好地融合操作。潜在风险：低风险，这是一个性能优化重构，功能等价。",
+      "tags": [
+        "performance",
+        "low-risk",
+        "model",
+        "attention",
+        "qwen3"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。变更仅涉及Qwen3.5 GDN线性注意力层（`vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py`和`vllm/model_executor/models/qwen3_next.py`），vllm-ascend不使用这些文件（使用自己的Ascend实现）。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "5715fde12c1e28eccd08a2394a114339b12a96c1",
+      "comment": "支持非Harmony模型的`include_reasoning`参数。主要变更：1) 在`vllm/parser/abstract_parser.py`的`parse_delta`方法中添加推理内容抑制逻辑；2) 在`vllm/parser/engine/parser_engine.py`的`parse_delta`方法中添加推理内容抑制逻辑；3) 在`vllm/parser/harmony.py`的`parse_delta`方法中添加推理内容抑制逻辑；4) 在`vllm/entrypoints/openai/chat_completion/serving.py`中，当`include_reasoning=False`时，抑制推理内容、logprobs和token_ids；5) 在`vllm/entrypoints/openai/responses/context.py`和`serving.py`中添加推理内容抑制逻辑；6) 在`vllm/entrypoints/openai/responses/protocol.py`中添加`include_reasoning`字段；7) 新增E2E测试和单元测试。实现方式：在parser的`parse_delta`中，如果`request.include_reasoning`为False，将`delta_message.reasoning`设为None，如果delta_message只有推理内容则跳过整个chunk。在非流式路径中，在`build_response_output_items`前将`reasoning`设为None。同时抑制logprobs和token_ids以防止通过元数据泄露推理内容。潜在风险：低风险，这是一个可选功能，默认行为不变（`include_reasoning=True`）。",
+      "tags": [
+        "feature",
+        "low-risk",
+        "entrypoints",
+        "reasoning",
+        "openai_api"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。变更仅涉及vLLM的OpenAI API入口点和parser模块，vllm-ascend不修改这些模块。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "e5588e49bc2642670116664a7fc4096e27adb179",
+      "comment": "在KV事件全报告模式下报告前缀缓存重用块。主要变更：1) 在`vllm/v1/core/block_pool.py`中新增`emit_cached_block_events`方法，为从前缀缓存重用的块生成`BlockStored`事件；2) 新增`_build_block_stored_event`辅助方法，与`cache_full_blocks`共享事件构建逻辑；3) 在`vllm/v1/core/kv_cache_manager.py`的`get_computed_blocks`中，当`kv_cache_report_mode`为`\"full\"`时调用`emit_cached_block_events`；4) 在`vllm/v1/core/kv_cache_utils.py`中新增`resolve_block_hashes`辅助函数；5) 在`vllm/v1/request.py`中为Request添加`kv_cache_report_mode`属性；6) 新增单元测试。实现方式：与`cache_full_blocks`不同，`emit_cached_block_events`不修改block状态（块已缓存），仅生成事件供外部消费者（如gateway）了解重用块的信息。潜在风险：低风险，仅在`enable_kv_cache_events`为True且`kv_cache_report_mode`为`\"full\"`时生效。",
+      "tags": [
+        "feature",
+        "low-risk",
+        "kv_cache",
+        "prefix_caching",
+        "events"
+      ],
+      "ascend_impact": {
+        "ascend_affected": true,
+        "functionality": "1) `vllm/v1/core/block_pool.py`中新增`emit_cached_block_events`方法，vllm-ascend的patch（`vllm_ascend.patch.platform.kv_cache_manager_patch`）需确认是否覆盖了此方法。2) `vllm/v1/core/kv_cache_utils.py`中新增`resolve_block_hashes`辅助函数，vllm-ascend的patch需确认是否使用了此函数。3) `vllm/v1/request.py`中为Request添加`kv_cache_report_mode`属性，vllm-ascend的patch需确认是否兼容。",
+        "testing": "无直接影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "95ed0feaa5cd7fb16d72c53ce04950aaf07c4698",
+      "comment": "DCP支持混合注意力模型。这是一个大型变更，涉及多个模块：1) 在`vllm/v1/attention/backends/flash_attn.py`中，为FlashAttention后端添加DCP混合batch支持，包括split FA2 DCP context attention、skip gate等；2) 在`vllm/v1/worker/cp_utils.py`中新增多个DCP辅助函数；3) 在`vllm/v1/core/kv_cache_coordinator.py`中，移除DCP不支持混合注意力的断言，添加对FullAttentionSpec和MambaSpec的支持；4) 在`vllm/v1/core/kv_cache_utils.py`中，`resolve_kv_cache_block_sizes`支持DCP/PCP缩放注意力组的block size；5) 在`vllm/v1/core/single_type_kv_cache_manager.py`中，MambaSpec管理器撤销DCP/PCP的block size缩放；6) 在`vllm/v1/kv_cache_interface.py`中，为AttentionSpec和MambaSpec添加`max_num_blocks_per_req`方法；7) 在`vllm/v1/worker/block_table.py`中，重构slot mapping计算以支持不同block size的KV cache组；8) 在`vllm/v1/worker/gpu_model_runner.py`中，更新`may_reinitialize_input_batch`以支持`slot_mapping_modes`和`max_num_blocks_per_req`；9) 在`vllm/v1/worker/gpu_input_batch.py`中，InputBatch构造函数移除`max_model_len`参数，改为强制要求`max_num_blocks_per_req`；10) 在`vllm/config/model.py`中，启用混合模型的prefix caching支持；11) 在`vllm/engine/arg_utils.py`中，混合模型的prefix caching保持opt-in；12) 在`vllm/model_executor/layers/attention_layer_base.py`和`mamba/abstract.py`中添加`supports_dcp`属性；13) 在`vllm/distributed/device_communicators/cuda_communicator.py`中，优化`all_gather`支持非零维度；14) 更新多个测试。实现方式：DCP通过token-interleaving将full attention KV shard到多个rank，Mamba state则复制到所有rank。FlashAttention后端通过split FA2 DCP context attention处理混合batch（decode + prefill）。潜在风险：高风险，这是一个大型重构，涉及多个核心模块的接口变更，可能引入回归。",
+      "tags": [
+        "feature",
+        "high-risk",
+        "distributed",
+        "attention",
+        "dcp",
+        "hybrid_attention"
+      ],
+      "ascend_impact": {
+        "ascend_affected": true,
+        "functionality": "1) `vllm/v1/worker/gpu_model_runner.py`中`may_reinitialize_input_batch`新增`slot_mapping_modes`和`max_num_blocks_per_req`参数，vllm-ascend的`NPUModelRunner`需同步更新。2) `vllm/v1/worker/gpu_input_batch.py`中`InputBatch`构造函数移除`max_model_len`参数，改为强制要求`max_num_blocks_per_req`，vllm-ascend的`NPUModelRunner`需同步更新。3) `vllm/v1/worker/block_table.py`中`MultiGroupBlockTable`构造函数移除`max_model_len`参数，改为强制要求`max_num_blocks`，vllm-ascend的`NPUModelRunner`需同步更新。4) `vllm/v1/worker/block_table.py`中`BlockTable`新增`slot_mapping_mode`参数，vllm-ascend的patch（`vllm_ascend.patch.worker.block_table_patch`）需确认是否覆盖了此变更。5) `vllm/v1/worker/cp_utils.py`中新增多个DCP辅助函数，vllm-ascend的patch（`vllm_ascend.patch.worker.engine_core_patch`）需确认是否兼容。6) `vllm/v1/kv_cache_interface.py`中为`AttentionSpec`和`MambaSpec`添加`max_num_blocks_per_req`方法，vllm-ascend的patch（`vllm_ascend.patch.worker.kv_cache_interface_patch`）需确认是否覆盖。7) `vllm/v1/core/kv_cache_utils.py`中`resolve_kv_cache_block_sizes`支持DCP/PCP缩放，vllm-ascend的patch（`vllm_ascend.patch.platform.kv_cache_manager_patch`）需确认是否兼容。8) `vllm/v1/core/kv_cache_coordinator.py`中移除DCP不支持混合注意力的断言，vllm-ascend的patch（`vllm_ascend.patch.platform.kv_cache_manager_patch`）需确认是否覆盖。9) `vllm/v1/core/single_type_kv_cache_manager.py`中MambaSpec管理器撤销DCP/PCP缩放，vllm-ascend的patch需确认是否兼容。10) `vllm/v1/worker/tpu_input_batch.py`中`TPUInputBatch`构造函数新增`max_num_blocks_per_req`参数，vllm-ascend的`NPUModelRunner`需确认是否使用TPUInputBatch。",
+        "testing": "无直接影响。",
+        "needs_test_update": true,
+        "suggested_test_areas": [
+          "vllm_ascend/worker/model_runner_v1.py",
+          "vllm_ascend/patch/worker/block_table_patch.py",
+          "vllm_ascend/patch/worker/kv_cache_interface_patch.py",
+          "vllm_ascend/patch/platform/kv_cache_manager_patch.py"
+        ]
+      }
+    },
+    {
+      "sha": "2d814a00820daec7082599bea75ae1d0959a346c",
+      "comment": "KV卸载的FS/OBJ二级存储层可发布BlockStored事件。主要变更：1) 在`vllm/v1/kv_offload/tiering/fs/manager.py`中，为`FileSystemTierManager`添加KV事件支持，成功存储的块发布`OffloadingEvent`（medium为`FS`）；2) 在`vllm/v1/kv_offload/tiering/obj/manager.py`中，为`ObjectStoreSecondaryTierManager`添加KV事件支持（medium为`OBJ`）；3) 在`vllm/distributed/kv_events.py`中添加`MEDIUM_FS`和`MEDIUM_OBJ`常量；4) 更新文档和测试。实现方式：通过`enable_kv_events`参数控制，仅在全局KV事件启用时生效。跟踪in-flight store job的keys，在job完成时生成事件。潜在风险：低风险，这是一个可选功能，默认不启用。",
+      "tags": [
+        "feature",
+        "low-risk",
+        "kv_offload",
+        "events",
+        "storage"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。变更仅涉及KV卸载的FS/OBJ二级存储层，vllm-ascend不使用这些存储后端。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "88e5e2c57be8ce6e25510c1249352a23b8a85ec4",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "bugfix",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "feb384ada2a1da1981ccb713ea6bd3f90c44f7b4",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "bugfix",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "a0f6d767e42acf09f94e7af2bacca7f4c268c264",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "chore"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "f1a5adddb815610db46cae81f2a1d5a4609bf99d",
+      "comment": "修复Marlin MoE在专家并行下的M size计算。在`fused_marlin_moe`函数中，当`global_num_experts != -1`时，将M调整为`math.ceil(M * E / global_num_experts)`，以估计每个rank的有效token数。同时将`global_num_experts`的默认值检查移到M调整之前。实现方式：在M block size选择逻辑之前，根据专家并行度调整M值，使Marlin kernel的block size选择更准确。潜在风险：低风险，这是一个性能优化修复。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "moe",
+        "marlin",
+        "expert_parallel"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。变更仅涉及Marlin MoE实现（`vllm/model_executor/layers/fused_moe/experts/marlin_moe.py`），vllm-ascend不使用此实现。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "cac3e70cd4f522eaab9d28323285d5e31238f907",
+      "comment": "修正ModernBERT模型层别名映射。主要变更：1) 在`modernbert.py`中，更新`hf_to_vllm_mapper`的`orig_to_new_prefix`映射，添加`\"model.layers.\"`和`\"model.\"`前缀映射；2) 在`load_weights`中添加`if name not in params_dict: continue`跳过未知参数；3) 在`deep_gemm_warmup.py`中修复`_fp8_linear_may_use_deep_gemm`的FIXME注释，将`block_size`计算移到条件检查之后。实现方式：通过更完整的权重名称映射，支持不同格式的checkpoint。潜在风险：低风险，修复了权重加载的兼容性问题。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "model",
+        "modernbert",
+        "weight_loading"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。变更仅涉及ModernBERT模型实现（`vllm/model_executor/models/modernbert.py`）和DeepGEMM warmup（`vllm/model_executor/warmup/deep_gemm_warmup.py`），vllm-ascend不使用这些文件。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "e12b91b032daed2afc34d77cca20902cef957b3c",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "bugfix",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "766469a4c460043ae52cda19b1c52f0dc87e555c",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "bugfix",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "ea0fa34f4992c09fc5aa4ae9a12e67e03125289c",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "chore"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "bbb0f945ff348d25d4107e935e54c63a9d3b3ddb",
+      "comment": "ROCm稀疏MLA元数据在graph replay前同步。在`rocm_aiter_mla_sparse.py`的`build`方法中，在调用`aiter.get_mla_metadata_v1`后添加`torch.cuda.current_stream(self.device).synchronize()`，确保异步元数据写入在graph-captured decode kernel之前完成。新增单元测试验证同步行为。实现方式：在metadata recompute路径后添加stream同步，确保持久化元数据缓冲区在graph replay时已就绪。潜在风险：低风险，同步操作可能引入微小性能开销，但确保了正确性。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "rocm",
+        "attention",
+        "mla",
+        "cuda_graph"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。变更仅涉及ROCm平台特定的稀疏MLA元数据构建（`vllm/v1/attention/backends/mla/rocm_aiter_mla_sparse.py`），vllm-ascend不使用此文件。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "2ded1b24e7ef48e21f71f51fc923a352deefbde2",
+      "comment": "Mooncake KV连接器在哈希/键构建前应用SWA查找掩码。在`mooncake/store/worker.py`的`lookup`方法中，将SWA查找掩码（`lookup_mask`）的应用移到哈希访问和键构建之前，避免为被掩码的chunk执行不必要的操作。同时优化了循环逻辑，使用`range(mask_limit)`替代`enumerate`。实现方式：在循环中先检查`lookup_mask`，如果当前chunk被掩码则跳过，不访问`group_hashes`。潜在风险：低风险，这是一个性能优化，不影响功能正确性。",
+      "tags": [
+        "performance",
+        "low-risk",
+        "kv_transfer",
+        "mooncake",
+        "swa"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。变更仅涉及Mooncake KV连接器实现（`vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py`），vllm-ascend不使用此连接器。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    }
+  ]
+}

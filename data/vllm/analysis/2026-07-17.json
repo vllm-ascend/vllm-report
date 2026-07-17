@@ -1,0 +1,597 @@
+{
+  "date": "2026-07-17",
+  "repo": "vllm-project/vllm",
+  "generated_at": "2026-07-18T03:04:23.020798+08:00",
+  "daily_summary": "当日变更以 Bug 修复、性能优化和新模型支持为主。核心修复包括：KV Offloading 中请求结束时最后一块的卸载与竞态条件修复、FlashInfer 注意力后端权重重载后 attention sinks 的刷新、Chunked Prefill 下 torch.compile 的池化分数错误、以及 Transformer 后端参数初始化错误。性能优化方面，将多处 `clamp` 替换为 `clamp_` 以减少内存分配，并为 FlashInfer MXFP4 量化引入 CuTe-DSL 后端。新模型支持方面，新增了 TranslateGemma-12b-it 模型、Gemma4 DSpark 投机解码草稿模型、Inkling LoRA 支持、Inkling MTP=1 支持，以及 MiniMax M3 的 CuteDSL 索引解码分数内核。此外，还引入了状态化 Trainer 发送的新抽象、KV 事件的可选 tier locality 字段、以及 QK-Norm+RoPE+KVCache 融合编译 pass。",
+  "ascend_impact_summary": "当日变更对 vllm-ascend 有中等影响。核心影响包括：`AttentionBackend` 接口新增了 `fused_qk_norm_rope_kvcache_supported` 和 `do_qk_norm_rope_kvcache_update` 抽象方法，需要 AscendAttentionBackend 实现；`AttentionLayer` Protocol 新增了 `_k_scale_cpu` 和 `_v_scale_cpu` 属性，需要 Ascend 的注意力实现同步更新；`GPUModelRunner` 中 `_pool` 方法新增了 `_sync_device` 调用，可能影响 Ascend 的池化行为。此外，`Sampler` 接口的 `clamp` 到 `clamp_` 优化、`Scheduler` 和 `KVCacheManager` 的补丁逻辑、以及 `config.py` 中 `LoRAConfig` 的新增字段，都需要 vllm-ascend 的补丁模块进行相应调整。",
+  "commits": [
+    {
+      "sha": "877dae9c684cd8cb2f66eed33f1c3261c6792c10",
+      "comment": "该 commit 清理了 DeepSeek 模型中的死代码，包括移除未使用的 `logger` 导入、未使用的辅助函数（如 `_compute_mhc_pre_num_split`、`tool_calls_to_openai_format`、`decode_dsml_to_arguments`、`parse_tool_calls`、`parse_message_from_completion_text` 等）以及未使用的 `regex` 导入。这些代码在之前的重构中已被替代或不再需要。变更涉及 `deepseek_eagle3.py`、`deepseek_mtp.py`、`deepseek_v4_mhc_warmup.py`、`deepseek_v32.py`、`deepseek_v4.py` 渲染器、以及 `deepseek_v32_encoding.py` 和 `deepseek_v4_encoding.py` 编码文件。风险较低，主要是代码清理。",
+      "tags": [
+        "refactor",
+        "low-risk",
+        "model"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "c4dd6d78fd6485e103d71ba815b0a530e5c49439",
+      "comment": "修复了 `use_sequence_parallel_moe` 属性的逻辑，在条件中增加了 `self.data_parallel_size > 1` 的检查。之前的实现缺少此条件，导致在数据并行大小为 1 时（即未启用数据并行）错误地启用了序列并行 MoE。此修复确保序列并行 MoE 仅在数据并行大小大于 1 时生效，符合预期行为。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "distributed"
+      ],
+      "ascend_impact": {
+        "ascend_affected": true,
+        "functionality": "影响 `vllm/config/parallel.py` 中的 `ParallelConfig.use_sequence_parallel_moe` 属性。vllm-ascend 的补丁模块 `vllm_ascend.patch.platform.model_config_patch` 可能覆盖了此属性，需要检查补丁逻辑是否与此修复一致。如果补丁中也有类似的 `data_parallel_size` 检查，则无需变更；否则需要更新补丁以包含此条件。",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "ce2aecc4dc42151d63f65d51c675edf28d40d671",
+      "comment": "为 FlashInfer MXFP4 量化引入了 CuTe-DSL 后端。变更了 `flashinfer.py` 中的 `apply_weights` 方法，在调用 `flashinfer_mxfp4_quantize` 时传递 `backend=\"cute-dsl\"` 参数。同时更新了 `vllm/utils/flashinfer.py` 中的 `flashinfer_mxfp4_quantize` 函数及其 fake 实现，新增 `backend` 参数。这是一个性能优化，CuTe-DSL 后端可能提供更好的性能。",
+      "tags": [
+        "performance",
+        "low-risk",
+        "attention",
+        "kernels"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "f38f3d11fb7b180c4d66f4af82cf770f335391cc",
+      "comment": "修复了 KV Offloading 中的两个 Bug：1) 请求结束时，最后一块（可能因异步调度而延迟）现在会被正确卸载；2) 修复了块重用时的竞态条件，通过在 `_build_store_jobs` 中处理 `finished_req_ids`，确保请求结束后 `req_status` 保持存活，以便后续步骤可以处理存储任务。主要变更在 `offloading/scheduler.py` 中，包括新增 `_calc_num_offloadable_tokens` 和 `_maybe_cleanup_finished_req` 辅助方法，以及修改 `_build_store_jobs` 和 `request_finished` 方法。同时更新了 `offloading/worker.py` 中的 `handle_preemptions` 方法以处理 `jobs_to_flush`。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "kv-cache",
+        "distributed"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "d4b45629172dfb792b44bd142982563a8c8bba9d",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "chore"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "7b3192523e194e20077017ed104caff37c1ad691",
+      "comment": "修复了 Transformer 后端初始化参数时的 `AttributeError: 'Parameter' object has no attribute 'weight_loader'` 错误。在 `init_parameters` 方法中，当遇到已经具有 `weight_loader` 属性的 vLLM 参数时，跳过初始化，避免了对非 vLLM 标准 `Parameter` 对象调用 `weight_loader`。同时优化了代码结构，将 `dtype` 和 `device` 的获取移到循环外部。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "model"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "4c6e2e4b308c15fc2bcdf10e278f2591c9cec0dc",
+      "comment": "修复了 XPU 平台上 `_POSSIBLE_KERNELS` 和 `possible_kernels` 字典访问时的 KeyError。将直接索引 `possible_kernels[current_platform._enum]` 改为使用 `.get()` 方法，当平台不在字典中时返回空列表，避免崩溃。这是一个针对 XPU 平台的兼容性修复。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "kernels",
+        "xpu"
+      ],
+      "ascend_impact": {
+        "ascend_affected": true,
+        "functionality": "影响 `vllm/model_executor/kernels/linear/__init__.py` 中的 `choose_scaled_mm_linear_kernel` 和 `choose_mp_linear_kernel` 函数。这两个函数现在使用 `possible_kernels.get(current_platform._enum, [])` 和 `_POSSIBLE_KERNELS.get(current_platform._enum, [])` 替代直接索引。对于 Ascend 平台，如果 `current_platform._enum` 不在这些字典中，将返回空列表，这可能导致线性内核选择失败。vllm-ascend 需要确保其平台枚举已注册到这些字典中，或者通过补丁覆盖这些函数以提供 Ascend 特定的内核选择逻辑。",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "850295881041754184717804104fcaadd2b2129e",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "feature",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "ce4bdcbda4f3c2da67b2fe241e80937ccdcc1fc6",
+      "comment": "为 FlashAttention MLA prefill 增加了对 Mistral Small 4 模型 head dims 的支持。新增了 `dims_mistral_s4 = MLADimensions(qk_nope_head_dim=64, qk_rope_head_dim=64, v_head_dim=128)` 维度配置，并在 `supports_mla_dimensions` 方法中将其添加到支持的维度列表中。同时更新了文档和测试用例。",
+      "tags": [
+        "feature",
+        "low-risk",
+        "attention",
+        "mla"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "d5b1ec268431f394efd6bad0f1b2adec657c31af",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "bugfix",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "867ff69733dd32467a18fed288592373225d8db1",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "chore"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "109b736b8681dff6e2f547d89362afc3a9c77c00",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "chore"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "69d4f5ef6323a44621b10e0f269c2775db510cc5",
+      "comment": "修复了 Qwen3-Omni 模型中 `use_audio_in_video` 与混合图像/视频输入一起使用时的 Bug。主要变更包括：1) 重写了 `check_interleaved_audio_video` 函数，改为按每个视频跨度独立检查，而不是要求整个序列形成一个全局密集范围，以支持多视频请求；2) 重写了 `merge_interleaved_embeddings` 函数，通过 `modality` 属性（在编码器收集时设置）来分组嵌入，而不是通过 token 计数来推断模态，从而正确支持图像、视频和音频的混合输入；3) 在 `vllm/multimodal/utils.py` 中新增了 `set_mm_embedding_modality`、`copy_mm_embedding_modality` 和 `get_mm_embedding_modalities` 工具函数；4) 更新了编码器运行器和模型运行器以在收集嵌入时设置模态属性。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "multimodal",
+        "model"
+      ],
+      "ascend_impact": {
+        "ascend_affected": true,
+        "functionality": "影响 `vllm/multimodal/utils.py` 中新增的 `set_mm_embedding_modality`、`copy_mm_embedding_modality` 和 `get_mm_embedding_modalities` 函数。这些函数用于在多模态嵌入张量上附加和读取 `modality` 属性。vllm-ascend 的补丁模块 `vllm_ascend.patch.worker.multimodal_patch` 如果覆盖了多模态处理逻辑，需要确保与这些新函数兼容。此外，`vllm/v1/worker/gpu_model_runner.py` 中的 `_gather_mm_embeddings` 方法也调用了这些新函数，如果 Ascend 的模型运行器覆盖了此方法，需要同步更新。",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "426d48bfa149582664d48f89df21ec9beae5c37b",
+      "comment": "为 KV 事件（`BlockStored` 和 `BlockRemoved`）添加了可选的 `locality` 字段，用于描述存储层的本地性（`LOCAL` 或 `REMOTE`）。变更涉及多个文件：1) 在 `vllm/distributed/kv_events.py` 的 `BlockStored` 和 `BlockRemoved` 类中新增 `locality` 字段；2) 在 `vllm/v1/kv_offload/base.py` 中新增 `Locality` 枚举；3) 在 FS 和 OBJ 层管理器中新增 `locality` 参数，并在事件中传递；4) 更新了事件追踪器以转发 `locality`；5) 添加了向后兼容性测试。",
+      "tags": [
+        "feature",
+        "low-risk",
+        "kv-cache",
+        "distributed"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "26c909ed74a6298952d0c3191fbfdf2b513d9e1d",
+      "comment": "新增了对 TranslateGemma-12b-it 模型的支持。主要变更在 `vllm/entrypoints/chat_utils.py` 中：1) 新增 `_collect_known_content_part_fields` 函数，用于收集 OpenAI ChatCompletionContentPartParam 的所有已知字段；2) 新增 `_collect_extra_fields` 函数，用于提取内容部分中的额外字段（如 `source_lang_code` 和 `target_lang_code`）；3) 在 `_parse_chat_message_content_part` 函数中，对文本和图像内容部分都调用 `_collect_extra_fields`，确保这些额外字段能传递到聊天模板中。同时添加了端到端测试。",
+      "tags": [
+        "feature",
+        "low-risk",
+        "model",
+        "entrypoints"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "fb1d8ccaf5bc46935031ef074950eaa8232cd15e",
+      "comment": "引入了状态化 Trainer 发送权重的新抽象。这是 [1/N] 系列 PR，主要变更包括：1) 在 `vllm/distributed/weight_transfer/base.py` 中新增 `WeightSource` 抽象基类和 `ModuleSource` 实现，用于提供可重迭代的权重源；2) 新增 `VLLMWeightSyncClient` Protocol，定义训练器端与推理引擎权重同步控制平面的接口；3) 新增 `TrainerWeightTransferEngine` 抽象基类，对称于 `WeightTransferEngine`，但位于训练进程中；4) 新增 `HTTPVLLMWeightSyncClient` 和 `RayVLLMWeightSyncClient` 两个内置客户端实现；5) 新增 `WeightTransferTrainerFactory` 工厂类；6) 简化了 `async_llm.py` 中的 `init_weight_transfer_engine` 和 `update_weights` 方法，直接接受 `WeightTransferInitRequest` 和 `WeightTransferUpdateRequest` 对象。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "distributed",
+        "rl"
+      ],
+      "ascend_impact": {
+        "ascend_affected": true,
+        "functionality": "影响 `vllm/distributed/weight_transfer/` 模块的多个文件。新增了 `WeightSource`、`ModuleSource`、`VLLMWeightSyncClient`、`TrainerWeightTransferEngine`、`HTTPVLLMWeightSyncClient`、`RayVLLMWeightSyncClient`、`WeightTransferTrainerFactory` 等类和接口。vllm-ascend 的补丁模块 `vllm_ascend.patch.worker.weight_transfer_patch` 如果覆盖了权重传输逻辑，需要评估这些新抽象是否与现有补丁兼容。特别是 `TrainerWeightTransferEngine` 的引入可能改变了训练器端权重传输的架构。",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "9354f222042986addf20709e5274fc26e0d09745",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "chore"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "17fdd421009092a569e9ed22346b932e55824fb5",
+      "comment": "修复了注意力后端在权重重载后 attention sinks 未刷新的问题。主要变更：1) 在 `flashinfer.py` 的 `FlashInferImpl` 中，新增 `_sinks_source` 属性保存原始 sinks 张量的引用，并在 `process_weights_after_loading` 方法中根据源张量的 dtype 决定是直接引用、创建新张量还是原地复制，确保在权重重载后 sinks 张量能正确更新；2) 在 `mla_attention.py` 中，使用 `replace_parameter` 函数并设置 `prefer_copy=True` 来替换 `W_UV` 和 `W_UK_T` 参数，确保在权重重载时保持张量的内存地址不变。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "attention"
+      ],
+      "ascend_impact": {
+        "ascend_affected": true,
+        "functionality": "影响 `vllm/v1/attention/backends/flashinfer.py` 中的 `FlashInferImpl` 类。新增了 `_sinks_source` 属性，并修改了 `process_weights_after_loading` 方法。vllm-ascend 的 `AscendAttentionBackend` 如果实现了类似的 `process_weights_after_loading` 方法，需要检查是否需要类似的 sinks 刷新逻辑。此外，`vllm/model_executor/layers/attention/mla_attention.py` 中使用了 `replace_parameter` 函数，如果 Ascend 的 MLA 注意力层覆盖了 `process_weights_after_loading`，需要同步更新。",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "472d330c214f88c1a2ba4ade75d21f25782e8bf5",
+      "comment": "为 KV Offloading 添加了 `blocks_per_chunk` 配置，以支持异构 KV 缓存组。在 `build_offloading_config` 函数中，新增了对 `blocks_per_chunk` 配置项的支持，该配置与现有的 `block_size` 配置互斥。当指定 `blocks_per_chunk` 时，直接使用该值作为每个块的块数；否则回退到通过 `block_size` 计算。同时添加了参数验证和测试。",
+      "tags": [
+        "feature",
+        "low-risk",
+        "kv-cache"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "3b6c96a101651c78737b23b2bd8f1026c02f22e2",
+      "comment": "修复了在 `torch.compile` 下 Chunked Prefill 的池化分数错误。在 `gpu_model_runner.py` 的 `_pool` 方法中，当 `raw_pooler_output` 为 `None` 或没有已完成的请求时，增加了 `self._sync_device()` 调用。此修复确保在 Chunked Prefill 场景下，当某些请求尚未完成时，设备同步不会导致错误的池化输出。同时添加了回归测试。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "model-runner",
+        "compilation"
+      ],
+      "ascend_impact": {
+        "ascend_affected": true,
+        "functionality": "影响 `vllm/v1/worker/gpu_model_runner.py` 中的 `_pool` 方法。新增了 `self._sync_device()` 调用。vllm-ascend 的 `NPUModelRunner` 继承自 `GPUModelRunner`，如果覆盖了 `_pool` 方法，需要检查是否需要添加类似的设备同步调用。如果未覆盖，则继承的修改会自动生效。",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "4d4e04f45221709079316599f01b33a5233deaf2",
+      "comment": "为 Derender API 添加了往返一致性测试和文档。主要变更：1) 新增 `docs/serving/online_serving/derenderer.md` 文档，详细介绍了 Derender API 的用途、管道和示例；2) 新增 `tests/entrypoints/scale_out/derender/test_derender_parity.py` 测试，验证 render -> generate -> derender 往返路径与标准 GPU 服务器输出的一致性；3) 更新了 `vllm/renderers/online_derenderer.py`，修复了当 `tool_choice` 为命名工具或 `required` 时，`content` 可能为 `None` 的问题；4) 更新了协议定义和文档引用。",
+      "tags": [
+        "test",
+        "docs",
+        "low-risk",
+        "entrypoints"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "67fe73b2b47e2927af1e5ec6fb91e16e3b075940",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "chore"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "ee8f36d0b3dc36ad1751c2193b30feb2ba11e0da",
+      "comment": "为 CuTeDSL 编译添加了进度条显示。在 `cutedsl_warmup.py` 的 `_compile_cutedsl_warmup_units` 函数中，当当前进程是全局第一个 rank 时，使用 `tqdm` 包装编译单元迭代器，显示编译进度。",
+      "tags": [
+        "feature",
+        "low-risk",
+        "compilation",
+        "kernels"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "f3e9497e921a16741401c5e93af0c2c29ea74907",
+      "comment": "为 Inkling 模型添加了 LoRA 支持。主要变更包括：1) 在 `LoRAConfig` 中新增 `enable_moe_shared_loras` 配置项，支持共享外布局的 MoE 适配器；2) 在 `FusedMoEWithLoRA` 中实现共享 LoRA 逻辑，包括 `_w13_a_num_experts` 和 `_w2_b_num_experts` 属性，以及 `_match_expert_dim` 方法；3) 新增 `PackedLoRALayerWeights.pack_moe_stacked` 类方法，用于打包预堆叠的 3D 专家 LoRA；4) 更新 `LoRAModelManager` 以支持共享 LoRA 的 EP 切片；5) 更新 `process_packed_modules_mapping` 以处理共享 LoRA 的打包映射；6) 在 `MoELoRAContext` 中新增 `enable_moe_shared_loras` 字段；7) 在 `LoRAExpertsMixin` 中实现共享 LoRA 的广播逻辑；8) 更新 Inkling 的 logits processor 以支持 LoRA 感知的 muP 输出缩放；9) 在 Inkling 模型中添加 `SupportsLoRA` 接口和 `packed_modules_mapping`/`embedding_modules`；10) 新增 `InklingSinkExpertsLinear` 类作为 LoRA 兼容的 sink experts 实现。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "lora",
+        "model"
+      ],
+      "ascend_impact": {
+        "ascend_affected": true,
+        "functionality": "影响 `vllm/config/lora.py` 中的 `LoRAConfig` 类，新增了 `enable_moe_shared_loras` 字段。vllm-ascend 的补丁模块 `vllm_ascend.patch.platform.model_config_patch` 如果覆盖了 LoRA 配置，需要同步更新。此外，`vllm/lora/` 模块中的多个文件（`fused_moe.py`、`lora_weights.py`、`model_manager.py`、`utils.py`）以及 `vllm/model_executor/layers/fused_moe/experts/` 中的 `lora_context.py` 和 `lora_experts_mixin.py` 都进行了修改，vllm-ascend 的补丁模块 `vllm_ascend.patch.worker.lora_patch` 需要评估这些变更是否与现有补丁兼容。",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "fe784ff22e630a31fd798f392b01e0a75c18f047",
+      "comment": "改进了 MiniMax M3 模型在长上下文解码场景下的索引器性能。主要变更：1) 新增 CuteDSL 实现的 `minimax_m3_index_decode_score_cutedsl` 内核，使用 TMA + `mma.sync` 计算解码时的索引块分数，支持 BF16 和 FP8 E4M3 输入；2) 更新 `cute_utils/__init__.py`，将 `mma_bf16` 函数泛化为 `mma_sync`，支持多种数据类型（BF16、FP16、FP8 E4M3）；3) 新增 `fp8x4_to_fp16x4` 转换函数；4) 更新 `indexer_msa.py`，在 `num_index_heads * max_decode_query_len <= 32` 时使用 CuteDSL 内核，否则回退到 Triton 内核；5) 更新 GDN chunk 内核以使用新的 `mma_sync` API。",
+      "tags": [
+        "performance",
+        "medium-risk",
+        "attention",
+        "kernels",
+        "model"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "b88abb5036aa6b7191a3e9341ab652e6562a49d2",
+      "comment": "清理了废弃的环境变量和过时的环境变量引用。移除了多个不再使用的环境变量，包括 `VLLM_ROCM_USE_AITER_PAGED_ATTN`、`VLLM_TPU_BUCKET_PADDING_GAP`、`VLLM_TPU_MOST_MODEL_LEN`、`VLLM_CI_USE_S3`、`VLLM_FLASHINFER_ALLREDUCE_FUSION_THRESHOLDS_MB` 等。同时更新了文档，移除了对 `VLLM_MOE_DP_CHUNK_SIZE` 的引用。",
+      "tags": [
+        "refactor",
+        "low-risk",
+        "chore"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "67f9046e4a12d939ffad0abc917585a00ef5b42d",
+      "comment": "为 Sparse MLA 启用了 fp8_ds_mla 密集 prefill。主要变更：1) 修改 `cp_gather_and_upconvert_fp8_kv_cache` 内核，新增可选的 `seq_starts` 参数，支持从缓存中的任意位置开始收集；2) 在 `mla_attention.py` 的 `_compute_prefill_context` 和 `_context_parallel_compute_prefill_context` 方法中，当 `kv_cache_dtype == \"fp8_ds_mla\"` 时，使用 `cp_gather_and_upconvert_fp8_kv_cache` 替代 `gather_and_maybe_dequant_cache`；3) 在 `flashmla_sparse.py` 中重构 FP8 元数据构建逻辑，修复了 `req_id_per_token` 切片问题，确保在密集 MHA prefill 路径下只传递 MQA token 的 req_id；4) 在 `sparse_utils.py` 中添加了 `req_id` 和 `token_indices` 形状匹配的断言；5) 在 `sparse_mla_attention.py` 中添加 `require_uniform_decodes` 类变量。",
+      "tags": [
+        "feature",
+        "bugfix",
+        "medium-risk",
+        "attention",
+        "mla"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "f17be06fbe42bab61522868a78d044fd0d2e3547",
+      "comment": "性能优化：将多处 `clamp` 调用替换为 `clamp_` 原地操作，以减少内存分配。涉及的文件包括 `mla_attention.py`、`deepseek_v4/sparse_mla.py`、`mamba_attn.py`、`rocm_aiter_fa.py`、`utils.py`、`ngram_proposer_gpu.py`、`step3p5.py` 等。这是一个低风险的性能优化，`clamp_` 在原地修改张量，避免了创建新的张量。",
+      "tags": [
+        "performance",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": true,
+        "functionality": "影响多个文件中的 `clamp` 到 `clamp_` 替换。vllm-ascend 的补丁模块如果覆盖了这些文件中的相关函数（如 `vllm_ascend.patch.worker.sampler_patch` 可能覆盖了采样器中的 clamp 逻辑），需要检查补丁是否与原地操作兼容。如果补丁中也有类似的 clamp 调用，建议同步更新为 `clamp_` 以获得性能提升。",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "2cab53ddeea3851a083beff8c192f068c4518b67",
+      "comment": "为 ROCm AITER 注意力后端启用了端到端的 QK Norm + RoPE + KV Cache 运行时融合。这是 Part 1/2，主要变更：1) 新增 `qk_norm_rope_kvcache_fusion.py` 编译 pass，将 QK-norm、RoPE 和 KV cache 更新融合为单个 AITER HIP 内核；2) 在 `_aiter_ops.py` 中新增 `fused_qk_norm_rope_and_cache` 和 `do_qk_norm_rope_kvcache_update` 方法；3) 在 `AttentionBackend` 接口中新增 `fused_qk_norm_rope_kvcache_supported` 和 `do_qk_norm_rope_kvcache_update` 抽象方法；4) 在 `rocm_aiter_fa.py` 和 `rocm_aiter_unified_attn.py` 中实现这些方法；5) 在 `attention.py` 中新增 `_k_scale_cpu` 和 `_v_scale_cpu` 属性，用于在 CPU 上保存 KV 缓存缩放因子；6) 更新 `PassConfig` 和编译配置以支持新的融合 pass；7) 添加了全面的测试。",
+      "tags": [
+        "feature",
+        "performance",
+        "medium-risk",
+        "compilation",
+        "attention",
+        "rocm"
+      ],
+      "ascend_impact": {
+        "ascend_affected": true,
+        "functionality": "影响多个核心接口和类：1) `vllm/v1/attention/backend.py` 中的 `AttentionBackend` 接口新增了 `fused_qk_norm_rope_kvcache_supported` 和 `do_qk_norm_rope_kvcache_update` 抽象方法，`AttentionLayer` Protocol 新增了 `_k_scale_cpu` 和 `_v_scale_cpu` 属性。vllm-ascend 的 `AscendAttentionBackend` 需要实现这些新方法，`AscendAttentionImpl` 需要确保 `_k_scale_cpu` 和 `_v_scale_cpu` 属性存在。2) `vllm/config/compilation.py` 中的 `PassConfig` 新增了 `fuse_qk_norm_rope_kvcache` 字段，vllm-ascend 的补丁模块 `vllm_ascend.patch.worker.pass_manager_patch` 需要评估是否需要支持此融合 pass。3) `vllm/model_executor/layers/attention/attention.py` 中的 `set_default_quant_scales` 和 `calc_kv_scales` 方法新增了 `_k_scale_cpu` 和 `_v_scale_cpu` 的初始化/更新，如果 Ascend 的注意力层覆盖了这些方法，需要同步更新。",
+        "testing": "无影响",
+        "needs_test_update": true,
+        "suggested_test_areas": [
+          "vllm_ascend/attention/attention_v1.py",
+          "vllm_ascend/patch/worker/attention_backend_patch.py"
+        ]
+      }
+    },
+    {
+      "sha": "ab0a20d15129b322f911db578b50c6b35b3167e7",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "feature",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "4a394bfcda817562af9a9e070e7c50ae57143b99",
+      "comment": "为 Gemma4 模型添加了 DSpark 投机解码草稿模型支持。主要变更：1) 新增 `gemma4_dspark.py` 模型文件，包含 `Gemma4DSparkAttention`、`Gemma4DSparkDecoderLayer`、`Gemma4DSparkModel` 和 `Gemma4DSparkForCausalLM` 类；2) 在模型注册表中注册 `Gemma4DSparkModel` 架构；3) 更新 `SpeculativeConfig` 以支持 Gemma4 DSpark 的配置规范化；4) 添加了端到端测试，验证 GSM8K 准确率和接受率。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "model",
+        "speculative-decoding"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "c95c6630499f96ddee97a87ba1ca4e6b85afe0fe",
+      "comment": "添加了 `nvfp4_per_token` 在线 MoE 量化方法。主要变更：1) 新增 `vllm/model_executor/layers/quantization/online/nvfp4.py`，包含 `Nvfp4OnlineMoEMethod` 类，实现在线 NVFP4 MoE 量化，在加载时将 fp16/bf16 专家权重量化为 NVFP4，并在运行时计算每 token 的激活缩放因子；2) 在量化配置中注册 `nvfp4_per_token` 方法；3) 更新 `trtllm_nvfp4_moe.py` 以支持每 token 激活量化；4) 更新 `make_nvfp4_moe_kernel` 以传递 `per_token_activation` 参数；5) 添加了测试。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "quantization",
+        "kernels"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "ab3c1aedf3b9677c1e43b391478554a4b110419e",
+      "comment": "修复了 WNA4Int/WNA8Int 的激活量化分发问题。主要变更：1) 在 `compressed_tensors_wNa4.py` 和 `compressed_tensors_wNa8.py` 中，将 `_build_input_quant_config` 方法中的 `format` 字段从 `self.quant_format` 改为 `\"int-quantized\"`，确保输入量化配置使用正确的格式；2) 在 `humming_utils.py` 的 `prepare_humming_layer` 函数中，使用 `BaseInputSchema` 替代 `HummingInputSchema` 来解析输入量化配置，并添加了输入 schema 的 `convert_humming` 调用。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "quantization"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "fb5ec0dc9edfdba54882575e33e2a4215bd295b9",
+      "comment": "为 Inkling 模型添加了 MTP=1 支持。主要变更：1) 新增 `vllm/models/inkling/nvidia/mtp.py`，包含 `InklingMTPDepthLayer`、`InklingMultiTokenPredictor` 和 `InklingMTP` 类；2) 在模型注册表中注册 `InklingMTPModel` 架构；3) 更新 `SpeculativeConfig` 以支持 Inkling MTP 的配置规范化；4) 在 `InklingModelConfig` 中新增 `num_nextn_predict_layers` 和 `chain_hidden_post_norm` 字段；5) 更新 `InklingDecoderLayer.forward` 方法，新增 `defer_mlp_add` 参数以支持 MTP 的延迟 MLP 加法；6) 在 `ops/norm.py` 中新增 `embed_dual_rmsnorm_cat` 和 `embed_rmsnorm` 函数，用于融合的 MTP 深度层输入构建；7) 添加了测试。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "model",
+        "speculative-decoding"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "971dac2caa827cb34dc682791ac6e15f6dbdab84",
+      "comment": "修复了 MoRIIO KV 传输中的 RDMA 发送队列满回退问题。主要变更：1) 在 `moriio_connector.py` 的 `_read_blocks` 方法中，当 `read_remote_data` 返回发送队列满（SQ full）状态时，进行指数退避重试，而不是直接失败；2) 新增 `_is_sq_full_status` 静态方法用于检测 SQ full 状态；3) 新增 `_pending_unmapped_acks` 列表，用于缓冲在 `transfer_id_to_request_id` 映射尚未填充时到达的 ACK，避免丢失导致 KV 泄漏；4) 在 `moriio_layout.py` 中，将 `local_block_ids` 和 `remote_block_ids` 长度必须相等的检查改为仅当 `local_block_ids` 更长时才报错，允许 `local_block_ids` 更短（READ 模式下解码拉取的块少于预填充持有的块）。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "distributed",
+        "kv-cache"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "efa2e424f659dd6bbc07982bc155f265e32532cd",
+      "comment": "修复了 Helion 内核输入生成器中 `scale_ub` 退化的问题。在多个内核的 `generate_inputs` 函数中，`scale_ub` 之前被设置为 `torch.mean(input)`，对于零均值的随机输入，这会导致 `scale_ub` 接近 0，使得所有缩放因子被钳位到最小值，输出饱和。修复后，`scale_ub` 被设置为输入绝对值均值和最大值的中间值，确保钳位部分激活，基线比较有意义。涉及的文件包括 `dynamic_per_token_scaled_fp8_quant.py`、`rms_norm_dynamic_per_token_quant.py`、`rms_norm_per_block_quant.py` 和 `silu_and_mul_per_block_quant.py`。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "kernels"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    }
+  ]
+}

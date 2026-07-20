@@ -1,0 +1,412 @@
+{
+  "date": "2026-07-20",
+  "repo": "vllm-project/vllm",
+  "generated_at": "2026-07-21T03:41:31.034072+08:00",
+  "daily_summary": "当日变更涉及多个方面：XPU 平台新增了 FP8 BMM 算子和 SYCL 路径的 MHC 算子优化，并修复了 GroupCoordinator 的 device_index 问题；多模态模块允许保留原始图像模式（如 RGBA 的 alpha 通道）；KV Offload 模块支持 TieringOffloadingSpec 的自描述 KV 事件，并修复了 EAGLE 模式传播问题；修复了 Gemma4 模型 ModelOpt 混合精度 MoE 的配置映射；修复了量化+滑动窗口混合缓存的 KV 块清零问题；OpenAI 入口点修复了非数值 logprobs 返回 500 的问题；Rust 基准测试工具集成到 vllm-rs 和 vllm CLI；CPU 平台新增了 Mamba 模型支持（causal_conv1d 和 selective_state_update 的 C++ 向量化内核）；修复了 SentencePiece 分词器 logprobs 的 token 字符串碰撞问题；修复了 CuteDSL 4.6.0 导致的 NVVM 编译问题。",
+  "ascend_impact_summary": "当日变更对 vllm-ascend 项目影响较小。主要影响来自：1) KVCacheConfig 新增 has_mixed_precision_kv_cache 属性，影响 KV 缓存清零逻辑，vllm-ascend 的 NPUModelRunner 需确认是否适配；2) CPU 平台的 pack_kv_cache 接口签名变更，但 Ascend 平台未使用该接口；3) 其他变更（XPU 特定优化、多模态图像模式、KV Offload、Gemma4 模型、Rust 基准测试、CPU Mamba 内核、分词器修复、NVVM 修复）均为平台特定或与 Ascend 无关的模块，不影响 vllm-ascend。",
+  "commits": [
+    {
+      "sha": "b23bd73f540175f9e117eaee5029cd7d8df63964",
+      "comment": "该 commit 为 XPU 平台优化 MHC（Multi-Head Cache）算子，将原本调用 forward_native 的 XPU 路径替换为直接调用 torch.ops._xpu_C 下的自定义算子（mhc_pre、mhc_post、hc_head_fused、mhc_fused_post_pre）。变更减少了参数传递（移除了 n_splits、norm_weight、norm_eps 等参数），表明这些参数在 XPU 自定义算子内部处理。这是 XPU 平台的性能优化，通过使用 SYCL 实现的专用算子替代通用 PyTorch 实现。",
+      "tags": [
+        "performance",
+        "xpu",
+        "model-layers"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。该 commit 仅修改 vllm/model_executor/layers/mhc.py 中的 XPU 路径（forward_xpu 方法），调用 torch.ops._xpu_C 下的自定义算子。Ascend 平台不使用 XPU 算子，且 MHC 层的 forward_native 方法未被修改。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "e2d7adeb642bd6e6bdb4f3305005e8608765d7cf",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "chore"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "15cb8e140dffd9d2a33737c083fcf1d696e1d1f6",
+      "comment": "该 commit 允许多模态图像处理时保留原始图像模式（如 RGBA 的 alpha 通道）。核心变更：1) ImageMediaIO 的 image_mode 参数类型从 str 改为 str | None，None 表示不转换模式；2) MediaConnector 的 fetch_image/fetch_image_async/fetch_video/fetch_video_async 方法支持通过 media_io_kwargs 覆盖 image_mode；3) encode_image_base64/encode_image_url 也支持 image_mode=None。实现方式：当 image_mode 为 None 时，_convert_image_mode 直接返回原始图像，跳过 RGB 转换。这解决了 RGBA 图像透明背景被错误合成白色背景的问题。",
+      "tags": [
+        "feature",
+        "multimodal",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。该 commit 仅修改 vllm/multimodal/ 下的多模态图像处理模块，不影响 Ascend 平台的 Worker、AttentionBackend、Sampler 等核心接口。vllm-ascend 的多模态补丁（vllm_ascend.patch.worker.multimodal_patch）不受此变更影响。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "f007cceb422599330495b202632d78c7b3b89e61",
+      "comment": "该 commit 为 KV Offload 的 TieringOffloadingSpec 添加自描述 KV 事件支持。核心变更：1) 移除 TieringOffloadingSpec 中禁止 self_describing_kv_events 的检查；2) OffloadingEventsTracker 新增 record_lookup 方法，在 primary-tier HIT 时记录元数据，使得 CPU 提升（promotion）也能产生自描述事件；3) OffloadingConnectorScheduler 的 _maximal_prefix_lookup 方法新增 req、group_config、start_chunk_idx 参数，用于传递请求信息和 chunk 索引；4) 更新测试用例验证提升场景的自描述事件。实现原理：当 primary-tier lookup 返回 HIT 时，record_lookup 会捕获请求的元数据（block_hashes、token_ids 等），后续的 BlockStored 事件就能使用这些元数据而非占位符。",
+      "tags": [
+        "feature",
+        "kv-offload",
+        "medium-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。该 commit 仅修改 KV Offload 模块（vllm/distributed/kv_transfer/kv_connector/v1/offloading/ 和 vllm/v1/kv_offload/tiering/），不影响 Ascend 平台的 Worker、AttentionBackend、Sampler 等核心接口。vllm-ascend 的 KV 传输补丁（vllm_ascend.patch.worker.kv_transfer_patch）不受此变更影响。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "0a5069e4e30996866d9d3cc5551f784b85408bb0",
+      "comment": "该 commit 修复 Gemma4 模型 ModelOpt 混合精度 MoE 的配置映射问题。核心变更：1) 新增 _GEMMA4_EXPERT_PARENT_MAPPER，将 .experts 映射为 .moe.experts（正则匹配确保不匹配已含 .moe 的路径）；2) Gemma4ForCausalLM 和 Gemma4ForConditionalGeneration 的 hf_to_vllm_mapper 使用该 mapper 与原有 mapper 组合。修复原因：Gemma4 的 MoE 层在 checkpoint 中可能以 .experts 命名，但 vLLM 内部使用 .moe.experts，导致 ModelOpt 的量化层映射无法正确匹配。",
+      "tags": [
+        "bugfix",
+        "model-registry",
+        "gemma4",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。该 commit 仅修改 Gemma4 模型（vllm/model_executor/models/gemma4.py 和 gemma4_mm.py），不影响 Ascend 平台的 Worker、AttentionBackend、Sampler 等核心接口。vllm-ascend 的模型注册表补丁（vllm_ascend.patch.worker.model_registry_patch）不受此变更影响。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "8ce53a616ebfc337edb73f847fcefe8af8ba769b",
+      "comment": "该 commit 修复量化+滑动窗口混合缓存场景下新 KV 块未清零的问题。核心变更：1) KVCacheConfig 新增 has_mixed_precision_kv_cache 属性，检查 attention 组是否使用多种精度；2) needs_kv_cache_zeroing 属性从仅检查 Mamba 层改为检查 Mamba 层或混合精度缓存。原因：当缓存块在不同精度组间复用时，旧数据可能被解释为 NaN/Inf，导致推理错误。",
+      "tags": [
+        "bugfix",
+        "kv-cache",
+        "medium-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": true,
+        "functionality": "KVCacheConfig 新增 has_mixed_precision_kv_cache 属性，needs_kv_cache_zeroing 逻辑变更。vllm-ascend 的 NPUModelRunner 在初始化 KV 缓存时需确认是否适配此变更。如果 Ascend 平台使用混合精度 KV 缓存，需要确保新分配的块被正确清零。",
+        "testing": "vllm-ascend 需验证在混合精度 KV 缓存场景下，新块是否被正确清零。",
+        "needs_test_update": true,
+        "suggested_test_areas": [
+          "vllm_ascend/worker/model_runner_v1.py",
+          "tests/ascend/test_kv_cache_zeroing.py"
+        ]
+      }
+    },
+    {
+      "sha": "ae10e855abf4ff5e24e2088aef16029ee1cb7de8",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "chore"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "530ee36a0d99869804c0af68b41007072b609480",
+      "comment": "该 commit 修复 OpenAI 入口点中非数值 logprobs 参数导致 HTTP 500 的问题。核心变更：在 ChatCompletionRequest 和 CompletionRequest 的 check_logprobs 验证器中，对 prompt_logprobs、top_logprobs、logprobs 字段添加类型检查，如果值不是 int 或 float 类型，则抛出 VLLMValidationError（返回 400）。修复原因：mode='before' 的验证器在原始请求数据上运行，字符串类型的值（如 \"2\"）会通过后续比较操作导致 TypeError，进而返回 HTTP 500。",
+      "tags": [
+        "bugfix",
+        "entrypoints",
+        "openai",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。该 commit 仅修改 OpenAI 入口点的请求验证逻辑（vllm/entrypoints/openai/chat_completion/protocol.py 和 completion/protocol.py），不影响 Ascend 平台的 Worker、AttentionBackend、Sampler 等核心接口。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "d835ad572ca76d8ed6308e81750813c814fb3343",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "bugfix",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "47d0597ca2259096f18c52029a47cf10f9d35e70",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "bugfix",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "818cf61e9149c3fdff302cddbb2d026090160aea",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "bugfix",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "c01618fdc81524ed4e91652bbf85ed23d6ddc448",
+      "comment": "该 commit 将 vllm-bench 基准测试工具集成到 vllm-rs 和 vllm CLI。核心变更：1) Rust 端：将 Cli 结构体重构为 BenchServeArgs，作为 vllm-bench 库的公共 API；vllm-rs 的 cmd 模块新增 Bench 子命令，支持 vllm bench serve 调用 Rust 基准测试；2) Python 端：vllm bench serve 命令新增 _maybe_exec_rust_bench 函数，检测 Rust 二进制文件是否存在，若存在则通过 os.execv 委托给 Rust 实现，否则回退到 Python 实现。这实现了 Python CLI 到 Rust 基准测试的无缝迁移。",
+      "tags": [
+        "feature",
+        "benchmark",
+        "rust",
+        "cli",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。该 commit 仅修改 Rust 基准测试工具和 Python CLI 入口点，不影响 Ascend 平台的 Worker、AttentionBackend、Sampler 等核心接口。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "823eaf667d33125259d2d280b0ed00747fa92440",
+      "comment": "该 commit 为 XPU 平台添加 FP8 BMM（批处理矩阵乘法）支持，用于 DeepSeek-V4 模型的 O-proj 路径。核心变更：1) vllm/_xpu_ops.py 新增 xpu_fp8_bmm 自定义算子注册；2) vllm/model_executor/kernels/linear/scaled_mm/xpu.py 的 XPUFp8BlockScaledMM 新增 process_weights_after_loading 方法，在加载时转置权重和缩放因子，并预计算 3D 权重和缩放因子用于 BMM；3) vllm/models/deepseek_v4/xpu/xpu_sparse.py 的 _o_proj 方法从使用 ROCm 的 rocm_inv_rope_einsum 改为使用 fused_inv_rope_fp8_quant + xpu_fp8_bmm；4) 移除 DeepseekV4Model 的 @support_torch_compile 装饰器。",
+      "tags": [
+        "performance",
+        "xpu",
+        "deepseek-v4",
+        "quantization"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。该 commit 仅修改 XPU 平台特定代码（vllm/_xpu_ops.py、vllm/model_executor/kernels/linear/scaled_mm/xpu.py、vllm/models/deepseek_v4/xpu/），不影响 Ascend 平台的 Worker、AttentionBackend、Sampler 等核心接口。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "f1f1259692004c909f8b7f8f371d42c7a7871fa3",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "chore"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "df13b5aef55c5cf6a3111b28e8d48b4a71575d8d",
+      "comment": "该 commit 为 XPU 平台的 FusedMoE 添加量化输入支持。核心变更：1) vllm/model_executor/layers/fused_moe/experts/xpu_moe.py 的 XPUExperts 新增 _expects_unquantized_inputs 属性，根据 Xe2/Xe3 架构决定是否期望未量化输入；新增 workspace_shapes 方法处理预量化输入的 K 维度变化；支持 kMxfp4Dynamic 激活量化方案；2) vllm/model_executor/layers/fused_moe/utils.py 的 _mxfp4_quantize 和 _mxfp8_e4m3_quantize 新增 XPU 路径，调用 xpu_mxfp4_quantize 和 xpu_mxfp8_quantize；moe_kernel_quantize_input 对 XPU 平台跳过量化模拟检查。",
+      "tags": [
+        "feature",
+        "xpu",
+        "moe",
+        "quantization"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。该 commit 仅修改 XPU 平台特定代码（vllm/model_executor/layers/fused_moe/experts/xpu_moe.py）和通用 MoE 工具函数（vllm/model_executor/layers/fused_moe/utils.py），但 utils.py 的变更通过 current_platform.is_xpu() 条件保护，不影响其他平台。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "4938d44a3b818fd443cf45aea92e670f16973ba0",
+      "comment": "该 commit 修复 CPU 平台 NIXL KV 传输到 CPU_ATTN decode worker 的异构注意力处理问题。核心变更：1) vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py 的 post_process_device_kv_on_receive_heterogeneous_attn 方法更新为使用新的 pack_kv_cache 接口；2) vllm/platforms/cpu.py 的 pack_kv_cache 方法签名从接收 key/value/key_cache/value_cache 改为接收 kv_cache 和 indices，内部通过 index_select 和 chunk 操作提取 key/value。这简化了异构注意力后处理的接口。",
+      "tags": [
+        "bugfix",
+        "cpu",
+        "kv-transfer",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": true,
+        "functionality": "Platform 类的 pack_kv_cache 方法签名变更。原接口接收 key、value、key_cache、value_cache、block_ids、indices 六个参数，新接口接收 kv_cache、indices 两个参数。虽然 Ascend 平台未实现 pack_kv_cache 方法（NPUPlatform 未重写此方法），但此变更修改了 Platform 基类的接口，如果未来 Ascend 需要实现此方法，需使用新签名。",
+        "testing": "vllm-ascend 无需立即更新测试，但需注意此接口变更。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "37bf988c2f8de10165e279fff652e9d818556fe8",
+      "comment": "该 commit 修复 XPU 平台 GroupCoordinator 的 device_index 问题。核心变更：移除对 _WORLD 全局变量的依赖，直接使用 local_rank 作为 device_index。修复原因：当 _WORLD 为 None 时，原代码会回退到 local_rank，但 _WORLD 存在时使用 _WORLD.device_index 可能导致 device_index 不正确。",
+      "tags": [
+        "bugfix",
+        "xpu",
+        "distributed",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": true,
+        "functionality": "GroupCoordinator 的 device_index 初始化逻辑变更。原代码优先使用 _WORLD.device_index，回退到 local_rank；新代码始终使用 local_rank。vllm-ascend 的分布式并行状态补丁（vllm_ascend.patch.platform.distributed_parallel_state_patch）需确认是否受此变更影响。如果 Ascend 的补丁覆盖了 GroupCoordinator 的 __init__ 方法，则需同步更新。",
+        "testing": "vllm-ascend 需验证分布式环境下 device_index 的正确性。",
+        "needs_test_update": true,
+        "suggested_test_areas": [
+          "vllm_ascend/patch/platform/distributed_parallel_state_patch.py",
+          "tests/ascend/test_distributed.py"
+        ]
+      }
+    },
+    {
+      "sha": "9459fc647105f10f754697b3bf136d194564d603",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "bugfix",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "5245c80564aff26bd8ee1594c053e668c5920222",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "chore"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "9bc266d923560f1c8bc1cd6f50e841f0fabacc71",
+      "comment": "该 commit 修复 SimpleCPU coordinator 未传播 EAGLE 模式的问题。核心变更：在 SimpleCPUOffloadManager 的 __init__ 中，从 vllm_config.speculative_config 获取 use_eagle 标志，并传递给 get_kv_cache_coordinator。修复原因：之前 hardcode 了 use_eagle=False，导致 EAGLE 模式下 KV 缓存协调器行为不正确。",
+      "tags": [
+        "bugfix",
+        "kv-offload",
+        "speculative-decoding",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。该 commit 仅修改 SimpleKVOffload 模块（vllm/v1/simple_kv_offload/manager.py），不影响 Ascend 平台的 Worker、AttentionBackend、Sampler 等核心接口。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "5c9f6557d7845b52917ef013011c83618439b17f",
+      "comment": "该 commit 为 CPU 平台添加 Mamba 模型支持。核心变更：1) 新增 csrc/cpu/mamba_cpu.cpp 和 csrc/cpu/mamba_kernels.hpp，实现 causal_conv1d_update、selective_state_update、mamba_chunk_scan_fwd 的 C++ 向量化内核（支持 VSX/AVX2/标量回退）；2) 注册自定义算子 causal_conv1d_update_cpu_vec、selective_state_update_cpu、mamba_chunk_scan_fwd_cpu；3) Python 端：新增 vllm/model_executor/layers/mamba/ops/cpu/mamba_ssm.py 实现 CPU 版 selective_state_update 和 mamba_chunk_scan_combined_fwd；4) 修改 causal_conv1d.py、mamba_ssm.py、ssd_combined.py、ssu_dispatch.py 等文件，在 CPU 平台自动切换到 CPU 实现；5) 修改 short_conv.py 和 gdn_attention.py 使用新的 CPU 内核；6) 更新测试配置和 CMake 构建。",
+      "tags": [
+        "feature",
+        "cpu",
+        "mamba",
+        "performance"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。该 commit 仅修改 CPU 平台特定代码（csrc/cpu/、vllm/model_executor/layers/mamba/ops/cpu/、vllm/model_executor/layers/mamba/ops/causal_conv1d.py 等），通过 current_platform.is_cpu() 条件保护，不影响其他平台。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "dcfebf93f4eccf30f71872283331eee757915daf",
+      "comment": "该 commit 修复 SentencePiece 分词器 logprobs 的 token 字符串碰撞问题。核心变更：1) 新增 _get_leading_space_marker 函数，从 tokenizer 的 backend_tokenizer 配置中读取 Metaspace pre_tokenizer 的 replacement 字符（默认 ▁）；2) 新增 _restore_leading_spaces 函数，根据原始 vocab piece 中的 marker 数量，恢复 decode() 剥离的前导空格；3) convert_ids_list_to_tokens 函数使用上述逻辑，确保 \"▁true\" 和 \"true\" 分别映射为 \" true\" 和 \"true\"，避免 logprobs 字典中的键碰撞。修复原因：SentencePiece 的 decode() 会剥离前导空格标记，导致不同 token 映射到相同字符串。",
+      "tags": [
+        "bugfix",
+        "tokenizer",
+        "logprobs",
+        "medium-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。该 commit 仅修改分词器工具函数（vllm/tokenizers/detokenizer_utils.py），不影响 Ascend 平台的 Worker、AttentionBackend、Sampler 等核心接口。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "752bd106477f1a72385fb38616abfe198dd67815",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "bugfix",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "2730b657c4aa92a1a342a243514bbbd68804866f",
+      "comment": "该 commit 修复 CuteDSL 4.6.0 版本导致的 NVVM 编译问题。核心变更：将 nvvm.Tcgen05GroupKind.CTA_1/CTA_2 替换为 nvvm.CTAGroupKind.CTA_1/CTA_2，将 nvvm.tcgen05_commit_arrive 替换为 nvvm.tcgen05_commit。修复原因：CuteDSL 4.6.0 可能重命名或移除了旧的 API。",
+      "tags": [
+        "bugfix",
+        "cuda",
+        "compilation",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。该 commit 仅修改 CUDA 特定代码（vllm/cute_utils/_tcgen05.py），不影响 Ascend 平台的 Worker、AttentionBackend、Sampler 等核心接口。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "1dcbbd9caca3ddabd99a22747e1a889304cbeab5",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "chore"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    }
+  ]
+}

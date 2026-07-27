@@ -66,7 +66,7 @@ Local repo discovery order:
 export LLM_API_KEY="sk-你的DeepSeekAPIKey"
 # Optional overrides:
 # export LLM_API_BASE="https://api.deepseek.com/v1"
-# export LLM_MODEL="deepseek-chat"
+# export LLM_MODEL="deepseek-v4-flash"
 ```
 
 ### 3. Generate Architecture Context

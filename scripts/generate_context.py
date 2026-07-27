@@ -401,7 +401,7 @@ def extract_json_from_output(output, required_key="overview"):
 DEFAULT_API_BASE = "https://api.deepseek.com/v1"
 
 
-def call_llm(prompt, max_tokens=16384):
+def call_llm(prompt, max_tokens=32768):
     prompt_bytes = len(prompt.encode("utf-8"))
     print(f"  [call] prompt size: {prompt_bytes:,} bytes")
 
@@ -411,7 +411,7 @@ def call_llm(prompt, max_tokens=16384):
         return None
 
     api_base = os.environ.get("LLM_API_BASE", DEFAULT_API_BASE).rstrip("/")
-    api_model = os.environ.get("LLM_MODEL", "deepseek-chat")
+    api_model = os.environ.get("LLM_MODEL", "deepseek-v4-flash")
 
     endpoint = f"{api_base}/chat/completions"
     body = json.dumps({

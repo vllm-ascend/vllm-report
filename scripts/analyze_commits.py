@@ -549,14 +549,14 @@ def call_llm(prompt):
         return None
 
     api_base = os.environ.get("LLM_API_BASE", DEFAULT_API_BASE).rstrip("/")
-    api_model = os.environ.get("LLM_MODEL", "deepseek-chat")
+    api_model = os.environ.get("LLM_MODEL", "deepseek-v4-flash")
 
     endpoint = f"{api_base}/chat/completions"
     body = json.dumps({
         "model": api_model,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.1,
-        "max_tokens": 16384,
+        "max_tokens": 32768,
     }).encode("utf-8")
 
     req = urllib.request.Request(

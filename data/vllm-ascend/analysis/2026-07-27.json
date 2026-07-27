@@ -1,0 +1,342 @@
+{
+  "date": "2026-07-27",
+  "repo": "vllm-project/vllm-ascend",
+  "generated_at": "2026-07-28T03:26:51.791496+08:00",
+  "daily_summary": "当日提交以功能增强和Bug修复为主，同时包含大量CI和文档改进。主要方向包括：修复npu_dequant_swiglu_quant算子的tiling精度问题；减少不必要的DP padding场景；优化ACL graph replay同步（MRV2）；为MiniMax M3添加AscendC和Triton稀疏注意力支持（重要新模型）；在MRV2中支持MTP eager模式（支持DeepSeek MLA）；移除MRV1中的PCP支持（重大重构）；优化AscendStore的key构建和miss路径；修复KV Pool PP阶段finalize问题；新增MiniMax M3的layer和model runner集成；以及多个CI流水线优化（csrc缓存预构建、gitleaks迁移、upstream测试更新等）。文档翻译和链接更新。",
+  "test_impact_summary": "当日变更对测试看护有显著影响。主要增加了MiniMax M3模型的正确定位测试（test_minimax_m3_sparse_attn）和MTP在MRV2中的集成测试（test_mtp_spec_decoding）。PCP移除涉及大量测试文件修改（删除PCP相关测试用例，更新DCP测试），需要确保现有DCP、PCP相关测试被正确覆盖。csrc缓存预构建及upstream测试更新涉及CI配置变更，不直接修改功能测试，但需要关注缓存命中/失败对CI稳定性的影响。npu_dequant_swiglu_quant修复添加了针对小形状的repro测试。总体而言，测试策略应重点验证MiniMax M3新模型的稀疏注意力路径、MRV2 MTP的eager模式、以及PCP移除后DCP功能不受影响。",
+  "commits": [
+    {
+      "sha": "32f577cd3f33c190a2e618c17a7cc089d6769eb0",
+      "comment": "修复npu_dequant_swiglu_quant算子在形状x.shape=[2,192]时的精度问题。原因是小形状tiling计算时UB空间分配不足和缩放因子广播处理不当。修改包含：添加UB中scaleBuf用于存储广播后的scale，修正WholeReduceMax和Brcb调用中的参数以正确计算对齐。同时重构测试用例，使用参数化覆盖多种小形状（[2,192]、[4,192]、[8,384]等），并移除无效的swiglu_limit检查逻辑。潜在风险：低风险，修复明确针对特定形状，且增加scaleBuf消耗额外UB空间，但UB分配在Init阶段动态计算，不会溢出。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "ops"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "已有测试文件被修改以覆盖新形状，但需要确保所有变体（尤其是边缘形状）在CI中运行通过，避免回归。",
+        "suggested_test_areas": [
+          "tests/e2e/nightly/single_node/ops/singlecard_ops/test_dequant_swiglu_quant.py"
+        ]
+      }
+    },
+    {
+      "sha": "a5b0ce10d84bf76dd9c5c9e7ab9a5ddeed5af7ca",
+      "comment": "修复覆盖率数据上传时缺少regex依赖的问题。在构建test_case_map.json的步骤中添加了pip install regex。纯CI修复，低风险。",
+      "tags": [
+        "ci",
+        "low-risk",
+        "chore"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "仅CI工作流增加依赖安装，不涉及功能代码变更。",
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "a8f7be637f30895ebc73f3b29912e557459f7661",
+      "comment": "减少需要DP padding的场景。原先padding的触发条件过于宽松（cudagraphmode非None、enable_sp为True或is_draft_model），现在收紧为仅当通信方式为ALLGATHER或MC2且层级通信启用或细粒度TP启用时才需要DP间padding。影响模块包括token_dispatcher中选择global_bs的决策逻辑、model_runner_v1中_sync_metadata_across_dp的padding判断、ascend_forward_context中select_moe_comm_method签名简化。同时添加get_max_finegrained_tp_size方法。风险：中等，padding减少可能影响某些配置下分布式MoE的通信正确性，但逻辑更符合实际需求。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "distributed",
+        "model-runner",
+        "ops"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "修改了token_dispatcher和model_runner中DP padding的条件，现有测试中关于skip_allreduce和hierarchical communication的mock需要更新。新增了finegrained TP size的测试场景。",
+        "suggested_test_areas": [
+          "tests/ut/ops/a2/test_token_dispatcher.py",
+          "tests/ut/spec_decode/a2/test_eagle_proposer.py",
+          "vllm_ascend/worker/model_runner_v1.py相关测试"
+        ]
+      }
+    },
+    {
+      "sha": "804317471ca4406451b04f3eb2b3cec431117f79",
+      "comment": "修复MRV2中ACL graph replay的全局同步问题。将full-graph参数更新流的所有权从NPUModelRunner迁移到ModelAclGraphManager，并使更新流等待当前graph replay流已完成的工作，而不是同步整个NPU设备。这避免了不必要的全局屏障，提高了性能。风险：低到中，需要确保update_stream.wait_stream正确序化，但逻辑较清晰。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "compilation",
+        "worker"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "仅内部流管理优化，不改变外部行为，现有测试应足以验证。",
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "9901d29a3cc1cae854a14fe5db29fabe8c08e905",
+      "comment": "为MiniMax M3添加稀疏注意力支持。新增AscendC SparseAttentionScore算子（host注册、tiling、kernel、build集成、Torch绑定、FP16/BF16参考测试），以及Triton实现的索引打分、top-k选择、解码处理和块稀疏GQA注意力。同时添加NPU适配器调用torch.ops._C_ascend.npu_sparse_attention_score，支持稀疏注意力prefill和decode路径（包括FP8 KV-cache处理）。注册MiniMax M3测试组到CI配置。此PR从repo复制过来，是大型功能添加。风险：高，涉及新算子、新kernel、新模型集成，需要大量测试验证。",
+      "tags": [
+        "feature",
+        "high-risk",
+        "ops",
+        "attention",
+        "models",
+        "ci"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "新添加了单算子测试（test_fp16.py, test_bf16.py）和单卡正确定位测试（test_minimax_m3_sparse_attn.py），需要在CI中执行这些新测试。同时现有SFA相关测试可能需要调整以应对新算子引入。",
+        "suggested_test_areas": [
+          "csrc/attention/sparse_attention_score/tests/",
+          "tests/e2e/pull_request/one_card/test_minimax_m3_sparse_attn.py"
+        ]
+      }
+    },
+    {
+      "sha": "0b30bacf34d8f1a29c39c0b3d5d85e3eef4afcf7",
+      "comment": "调整CI中自动标记stale/wait-feedback issue的定时器策略：频率从每日1次改为每日3次（6:00, 14:00, 22:00），操作数从200提升到1000。低风险，仅CI配置变更。",
+      "tags": [
+        "ci",
+        "low-risk",
+        "chore"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "仅调整CI定时任务调度，不影响测试逻辑。",
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "db44297862a85727d07ae8617f283c36545adf6c",
+      "comment": "自动化翻译文档文件（19个.po文件），更新至v0.23.0rc1相关版本信息，包含支持矩阵、发布说明、FAQ、安装指南等中文翻译更新。低风险，不涉及代码逻辑。",
+      "tags": [
+        "docs",
+        "low-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "纯文档翻译，不影响代码和测试。",
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "ae00dea127d36e04471db906b45c435849969b0c",
+      "comment": "CI重大改进：将csrc编译从NPU测试job中移出，改为在CPU runner上预构建缓存。新增_build_csrc_cache.yaml和_ensure_csrc_cache.yaml工作流，csrc缓存键升级为v2格式，并映射NPU runner标签到csrc缓存目标。PR和e2e测试均使用固定base snapshot以确保缓存一致性。移除NPU job中保存缓存的步骤（改为fallback编译）。风险：中，缓存机制变更需要验证缓存命中/不命中场景均正确，NPU jobs需要安装时设置COMPILE_CUSTOM_KERNELS=0。",
+      "tags": [
+        "ci",
+        "performance",
+        "medium-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "修改了测试工作流中csrc缓存的生命周期和依赖安装逻辑，需要验证缓存修复和回退编译均不破坏测试。新增了csrc缓存相关的CI测试（_build_csrc_cache.yaml），但不涉及现有功能测试变更。",
+        "suggested_test_areas": [
+          ".github/workflows/_selected_tests.yaml",
+          ".github/workflows/push_build_csrc_cache.yaml"
+        ]
+      }
+    },
+    {
+      "sha": "ddc85dda76d52fcb0ef4adb2f86fda64efb9a8b3",
+      "comment": "移除MLA注意力路径和文档中未使用的enable_shared_expert_dp属性。共享专家DP行为在MoE和线性并行路径中实现，因此在MLA attention类中缓存该配置是不必要的。文档更新删除了'Currently only DeepSeek series models are supported'的描述。低风险，清理无用代码。",
+      "tags": [
+        "refactor",
+        "low-risk",
+        "attention",
+        "docs"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "移除了mla.py、mla_v1.py、sfa_v1.py中的属性，相关单元测试中的mock需要更新。",
+        "suggested_test_areas": [
+          "tests/ut/ops/test_mla.py"
+        ]
+      }
+    },
+    {
+      "sha": "d567f6eeb9d9e7fd68fbf8f4d05d71591edfd07b",
+      "comment": "为MiniMax M3添加layer和model runner支持（从#12734迁移运行时变更）。包括：AscendConfig中新增packed_modules_model_mapping条目（minimax_m3和minimax_m3_vl）；ops/fused_moe中传递swiglu_alpha/beta参数并处理swigluoai_uninterleave激活函数；ops/linear_op中跳过多模态编码器前缀的SP列/行路径；ops/rotary_embedding中支持部分旋转维度（partial rotary）；quantization中为W8A8路径添加swigluoai_uninterleave的fused_scale禁用。风险：中，新增模型配置和激活函数分支，可能影响现有MoE和量化路径。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "models",
+        "ops",
+        "quantization"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "需要为MiniMax M3模型添加测试用例，并验证新激活函数路径（swigluoai_uninterleave）在MoE和量化环境中的正确性。现有linear_op的SP跳过逻辑也需要测试。",
+        "suggested_test_areas": [
+          "tests/ut/ops/test_linear.py",
+          "tests/e2e/pull_request/one_card/test_minimax_m3_sparse_attn.py"
+        ]
+      }
+    },
+    {
+      "sha": "ee618ae8fa9b2c8a3eca6d200f0fc8a96c50a2be",
+      "comment": "优化AscendStore的key构造和miss路径。主要改进：直接生成非逐层key的序列化字符串，缓存不可变前缀，延迟计算分组哈希；集中化token/chunk迭代，移除兼容性包装和重复key构建路径；通过lookup传播HBM hit token，在完全HBM命中时跳过外部lookup；在key构建前应用hybrid-cache reachable/store/load mask，并在适用时自动pre-shard。移除环境变量开关，行为默认启用。风险：中，性能优化改变内部路径，但功能逻辑应保持不变；异步save可能引起竞条件（相同的lookup在save可见前执行）。",
+      "tags": [
+        "performance",
+        "medium-risk",
+        "distributed",
+        "kv-cache"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "大量修改了config_data、kv_transfer、pool_scheduler、pool_worker等核心模块。现有单元测试已更新（新增key_strings匹配、pre-shard等测试），但需要集成测试验证异步save和全HBM命中场景。",
+        "suggested_test_areas": [
+          "tests/ut/distributed/ascend_store/",
+          "tests/e2e/pull_request/**/test_kv_pool*.py"
+        ]
+      }
+    },
+    {
+      "sha": "4a61031b3af993dc6a7e1883aa9a0e3629dc1f0b",
+      "comment": "修复KV Pool中PP stages finalize的问题，并增强后端错误日志。主要：使KV connector finalization rank-aware for PP+MTP/speculative decoding，非最后PP rank在target forward后finalize并存储其rank-local KV层；在后端错误日志中暴露真实异常类型和消息，同时保持大key细节在debug级别；显式忽略AscendStore中的PP xfer握手元数据（PP已通过rank-aware pool key处理）。风险：中，修改了PP+MTP场景的finalize时机和错误处理，需验证PP部署不影响。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "distributed",
+        "kv-cache",
+        "pp"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "新增了PP握手元数据忽略测试和backend错误日志测试。现有PP相关测试需要验证finalize行为。",
+        "suggested_test_areas": [
+          "tests/ut/distributed/ascend_store/test_ascend_store_connector.py",
+          "tests/ut/distributed/ascend_store/test_backend.py"
+        ]
+      }
+    },
+    {
+      "sha": "0a637d9c0c98811079a365a44d2a8d9873025a1c",
+      "comment": "完成逐层Memcache puts的后处理。在逐层GVA保存路径中，现在携带batch_alloc返回的keys，聚合每个key的层复制结果（保留第一个失败），并在最后一层后调用batch_write_finish。影响backend和kv_transfer模块。风险：低，是此前未完成的收尾工作，逻辑较明确。",
+      "tags": [
+        "feature",
+        "low-risk",
+        "distributed",
+        "kv-cache"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "现有逐层保存测试应覆盖此路径，无需新增。",
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "1ae2a6e9583db3627ac19049a8ad3217fa863e45",
+      "comment": "在MRV2中支持MTP eager模式。关键Ascend特定实现包括：build_wrapper注入positions到draft attention metadata以支持MLA头部RoPE；处理DP>1时的dummy run（使用getattr获取uniform_decode_query_len并调用_dummy_run）；重构Eagle和MTP共享的自动回归speculator逻辑到autoregressive/speculator.py，使得AscendEagleSpeculator和AscendMTPSpeculator共同使用。还修复了asdict()丢失Ascend特定字段的问题。风险：高，涉及MRV2推测解码核心路径，需要全面测试。",
+      "tags": [
+        "feature",
+        "high-risk",
+        "spec_decode",
+        "worker",
+        "model-runner"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "新增了MTP模型正确定位测试（test_mtp_spec_decoding）。新增了autoregressive speculator模块，Eagle相关测试需要确保不因重构而回归。MLADCP测试和ACL graph测试可能需要更新。",
+        "suggested_test_areas": [
+          "tests/e2e/pull_request/one_card/model_runner_v2/test_basic.py",
+          "tests/ut/spec_decode/a2/test_eagle_proposer.py",
+          "tests/ut/spec_decode/test_eagle_aclgraph_source_regression.py"
+        ]
+      }
+    },
+    {
+      "sha": "6728a6c116c9fed1761609f4aa1ae91a4b4aa0b6",
+      "comment": "更新upstream测试工作流至v0.25.1。调整了upstream_config.yaml中的测试列表（移除了一些测试，新增了一些测试），并更新了schedule_e2e_upstream_test.yaml中的依赖安装。风险：低，仅更新测试配置和依赖。",
+      "tags": [
+        "test",
+        "ci",
+        "low-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "仅更改了上游测试的选择和安装脚本，不影响vllm-ascend自身功能测试。",
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "8d375c6edf01963bb2518c4c9d0ed7cc414f70a0",
+      "comment": "将gitleaks secret扫描从CI中移除，改为仅通过pre-commit本地运行。更新gitleaks.sh脚本，当GITHUB_BASE_REF存在时直接跳过增量扫描（输出禁用信息），仅保留本地pre-commit模式的保护扫描。低风险，简化CI。",
+      "tags": [
+        "ci",
+        "low-risk",
+        "chore"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "CI中不再运行gitleaks，不影响功能测试。",
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "522c0f6d707f56b522366294564ba56874e766ba",
+      "comment": "更新using_mindie_motor.md文档中的MindIE-Motor仓库链接（从MindIE-PyMotor改为MindIE-Motor）。低风险，纯文档。",
+      "tags": [
+        "docs",
+        "low-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "纯文档更新。",
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "39d1cf9b3352f3f5b4571894295e64ca515b8ffb",
+      "comment": "支持dspark推测解码方法，并同步reorder_batch_threshold计算与vLLM。主要更改：在gdn_attn_builder中扩展对dspark方法的支持（与dflash相同，需要reorder_batch_threshold=num_speculative_tokens）；移除model_runner_v1中calculate_reorder_batch_threshold的检查（不再对不同attention backend的threshold一致性抛出错误，因为dspark speculative分支可能要求不同threshold）。风险：低，与vLLM社区保持一致。",
+      "tags": [
+        "feature",
+        "low-risk",
+        "spec_decode",
+        "ops"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "现有dflash和eagle测试应可间接覆盖此变更，无需新增专门测试。",
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "c628bdd4b19820052cc772a375931da44e27229b",
+      "comment": "修复CompressAttnManager缺少allocate_external_computed_blocks方法的问题。上游vLLM添加了该方法用于PD分离的D节点分配KV缓存块，CompressAttnManager需要重写以考虑compress_ratio（将tokens数除以compress_ratio）。如果不重写，基类会分配未压缩的block_id，导致PD remote-KV路径中block_table溢出。风险：低，修复明确且必要。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "kv-cache",
+        "core"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "需要为CompressAttnManager添加allocate_external_computed_blocks的单元测试，验证压缩比例下分配的正确性。",
+        "suggested_test_areas": [
+          "tests/ut/core/",
+          "vllm_ascend/core/single_type_kv_cache_manager.py"
+        ]
+      }
+    },
+    {
+      "sha": "69f72c642e79e2b68d075ca52b9f92e0862fad9e",
+      "comment": "从MRV1中移除PCP（Prefill Context Parallelism）支持。这是重大重构：移除pcp_utils.py（2403行），重写context_parallel模块（attention_cp.py从611行缩减到148行，mla_cp.py从411行缩减到85行，sfa_cp.py从627行缩减到74行），删除所有PCP相关的metadata类、collective调用、build逻辑。同时移除platform.py中对PCP+DP组合的检查（改为直接禁止PCP>1）。更新大量测试文件（删除PCP相关用例，调整DCP测试）。在MRV2中保留DCP。影响模块极广。风险：高，尽管功能逻辑简化，但删除大量代码可能漏掉仍被引用的路径。",
+      "tags": [
+        "refactor",
+        "high-risk",
+        "attention",
+        "worker",
+        "model-runner",
+        "distributed"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "大量测试文件被修改（删除PCP测试用例，更新DCP测试）。需要确保所有PCP相关测试已删除或替换，DCP测试继续通过。新添加了dcp_manager测试模块。需验证MRV2的DCP不依赖于MRV1的PCP代码。",
+        "suggested_test_areas": [
+          "tests/ut/attention/",
+          "tests/ut/worker/test_dcp_manager.py",
+          "tests/ut/compilation/a2/test_acl_graph.py",
+          "tests/e2e/pull_request/four_card/context_parallel/test_accuracy.py"
+        ]
+      }
+    }
+  ]
+}

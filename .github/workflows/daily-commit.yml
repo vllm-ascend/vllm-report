@@ -8,7 +8,6 @@ on:
 
 permissions:
   contents: write
-  actions: write
 
 jobs:
   fetch-and-analyze:
@@ -29,8 +28,24 @@ jobs:
       - name: Install Claude Code
         run: npm install -g @anthropic-ai/claude-code
 
+      - name: Configure Claude Code
+        run: |
+          mkdir -p ~/.claude
+          cat > ~/.claude/settings.json << 'EOF'
+          {
+            "env": {
+              "ANTHROPIC_AUTH_TOKEN": "${{ secrets.CLAUDE_AUTH_TOKEN }}",
+              "ANTHROPIC_BASE_URL": "${{ secrets.CLAUDE_BASE_URL }}",
+              "ANTHROPIC_MODEL": "${{ secrets.CLAUDE_MODEL }}",
+              "ANTHROPIC_SMALL_FAST_MODEL": "${{ secrets.CLAUDE_SMALL_FAST_MODEL }}",
+              "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+              "API_TIMEOUT_MS": "600000"
+            }
+          }
+          EOF
+
       - name: Install Python dependencies
-        run: pip install requests
+        run: pip install -r requirements.txt
 
       - name: Compute date (CST, previous day)
         id: date
@@ -38,45 +53,64 @@ jobs:
           TZ: Asia/Shanghai
         run: echo "date=$(date -d yesterday +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
 
-      - name: Fetch vllm commits
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: python scripts/fetch_commits.py --repo vllm-project/vllm --branch main --api-only --date "${{ steps.date.outputs.date }}"
-
-      - name: Checkout vllm source (for Phase 2 deep analysis)
-        if: hashFiles(format('data/vllm/commits/{0}.json', steps.date.outputs.date)) != ''
+      - name: Checkout vllm source
         uses: actions/checkout@v4
         with:
           repository: vllm-project/vllm
           path: repos/vllm
           fetch-depth: 1
 
-      - name: Analyze vllm commits
+      - name: Checkout vllm-ascend source
+        uses: actions/checkout@v4
+        with:
+          repository: vllm-project/vllm-ascend
+          path: repos/vllm-ascend
+          fetch-depth: 1
+
+      - name: Fetch vllm commits
+        run: python src/data/fetch_commits.py \
+          --repo vllm-project/vllm \
+          --local-repo repos/vllm \
+          --date "${{ steps.date.outputs.date }}" \
+          --force
+
+      - name: Analyze vllm commits (Phase 1)
         env:
           LLM_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
           if [ -f "data/vllm/commits/${{ steps.date.outputs.date }}.json" ]; then
-            python scripts/analyze_commits.py \
+            python src/data/analyze_commits.py \
               --repo vllm-project/vllm \
               --date "${{ steps.date.outputs.date }}" \
-              --force \
-              --local-repo repos/vllm
+              --local-repo repos/vllm \
+              --force
           else
             echo "No commit data for ${{ steps.date.outputs.date }}, skipping analysis"
           fi
 
+      - name: Deep analyze vllm commits (Phase 2)
+        run: |
+          if [ -f "data/vllm/analysis/${{ steps.date.outputs.date }}.json" ]; then
+            python src/data/deep_analyze_commits.py \
+              --repo vllm-project/vllm \
+              --date "${{ steps.date.outputs.date }}" \
+              --local-repo repos/vllm \
+              --data-dir data
+          fi
+
       - name: Fetch vllm-ascend commits
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: python scripts/fetch_commits.py --repo vllm-project/vllm-ascend --branch main --api-only --date "${{ steps.date.outputs.date }}"
+        run: python src/data/fetch_commits.py \
+          --repo vllm-project/vllm-ascend \
+          --local-repo repos/vllm-ascend \
+          --date "${{ steps.date.outputs.date }}" \
+          --force
 
       - name: Analyze vllm-ascend commits
         env:
           LLM_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
         run: |
           if [ -f "data/vllm-ascend/commits/${{ steps.date.outputs.date }}.json" ]; then
-            python scripts/analyze_commits.py \
+            python src/data/analyze_commits.py \
               --repo vllm-project/vllm-ascend \
               --date "${{ steps.date.outputs.date }}" \
               --force
@@ -85,17 +119,10 @@ jobs:
           fi
 
       - name: Build search index
-        run: python scripts/build_index.py
+        run: python src/data/build_index.py --data-dir data
 
       - name: Clean stale data (commits without analysis)
-        run: python scripts/clean_stale_data.py
-
-      - name: Send email report
-        env:
-          SMTP_USER: ${{ secrets.SMTP_USER }}
-          SMTP_PASS: ${{ secrets.SMTP_PASS }}
-          NOTIFY_EMAIL: ${{ secrets.NOTIFY_EMAIL }}
-        run: python scripts/send_report.py "${{ steps.date.outputs.date }}"
+        run: python .github/scripts/clean_stale_data.py
 
       - name: Commit and push changes
         run: |
@@ -106,10 +133,3 @@ jobs:
             git commit -m "chore: update data $(TZ=Asia/Shanghai date +%Y-%m-%d)" && \
             git push \
           )
-
-      - name: Trigger Pages deployment
-        if: ${{ ! cancelled() }}
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh workflow run Deploy\ GitHub\ Pages

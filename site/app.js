@@ -4,9 +4,9 @@
   let DATA_BASE = '/data';
 
   async function detectDataBase() {
-    // Under dev server (python serve.py), root path /data/ works.
-    // Under GitHub Pages, /data/ also works (site is deployed to root).
-    // Under direct file open, /data/ won't exist, fallback to relative paths.
+    // Strategy 1: Try absolute path from root (/data/vllm/index.json).
+    // Works under dev server at http://localhost:8000/ or
+    // when Pages site is at domain root (e.g. user.github.io).
     try {
       const resp = await fetch(`/data/vllm/index.json`, { method: 'HEAD' });
       if (resp.ok) {
@@ -14,6 +14,21 @@
         return;
       }
     } catch {}
+
+    // Strategy 2: Detect GitHub Pages sub-path (e.g. /vllm-report/).
+    // The page URL tells us the base path; append /data/ to it.
+    const pagePath = window.location.pathname;
+    const pageDir = pagePath.substring(0, pagePath.lastIndexOf('/') + 1);
+    const candidate = pageDir + 'data';
+    try {
+      const resp = await fetch(`${candidate}/vllm/index.json`, { method: 'HEAD' });
+      if (resp.ok) {
+        DATA_BASE = candidate;
+        return;
+      }
+    } catch {}
+
+    // Strategy 3: Relative path from page to repo-root data/ directory.
     try {
       const resp = await fetch(`../data/vllm/index.json`, { method: 'HEAD' });
       if (resp.ok) {
@@ -37,8 +52,6 @@
   // ── New data shared across enhancements ──
   let adaptationStatus = null;      // sha -> {status, ...} from adaptation-status.json
   let archImpactIndex = null;       // {sha: [interfaces...]} from index.json
-  let archKnowledge = null;         // architecture.json content
-  let archPanelOpen = false;
   let currentArchTab = 'modules';
   let cachedIndex = null;           // cached index.json content
 
@@ -383,8 +396,8 @@
         if (!adaptationStatus) return false;
         var adapt = adaptationStatus[c.sha];
         if (!adapt) return false;
-        if (activeFilter === 'adapt-pending') return adapt.status === 'pending' || adapt.status === 'unknown';
-        if (activeFilter === 'adapt-adapted') return adapt.status === 'adapted' || adapt.status === 'skipped';
+        if (activeFilter === 'adapt-pending') return adapt.status === 'pending';
+        if (activeFilter === 'adapt-adapted') return adapt.status === 'adapted';
         return false;
       }
 
@@ -484,11 +497,12 @@
 
   function renderMarkdown(str) {
     if (!str) return '';
-    // First escape HTML to prevent XSS
     var s = escapeHtml(str);
-    // Code blocks (```...```) - must be done before inline code
+    var blocks = [];
     s = s.replace(/```(\w*)\n([\s\S]*?)```/g, function (_, lang, code) {
-      return '<pre><code>' + code.trim() + '</code></pre>';
+      var placeholder = '%%CODEBLOCK' + blocks.length + '%%';
+      blocks.push('<pre><code>' + code.trim() + '</code></pre>');
+      return placeholder;
     });
     // Inline code `...`
     s = s.replace(/`([^`]+)`/g, '<code>$1</code>');
@@ -519,10 +533,27 @@
       }
       return match;
     });
+    // Protect list and code block contents from line break conversion
+    var listBlocks = [];
+    // Compress blank lines between list items before protection
+    s = s.replace(/(<li>[^<]*<\/li>)\n\n+/g, '$1\n');
+    s = s.replace(/(<[ou]l>[\s\S]*?<\/[ou]l>)/g, function (m) {
+      var p = '%%LISTBLOCK' + listBlocks.length + '%%';
+      listBlocks.push(m);
+      return p;
+    });
     // Double line breaks = new paragraph
     s = s.replace(/\n\n/g, '</p><p>');
     // Single line break
     s = s.replace(/\n/g, '<br>');
+    // Restore list blocks
+    for (var li = 0; li < listBlocks.length; li++) {
+      s = s.replace('%%LISTBLOCK' + li + '%%', listBlocks[li]);
+    }
+    // Restore code blocks
+    for (var bi = 0; bi < blocks.length; bi++) {
+      s = s.replace('%%CODEBLOCK' + bi + '%%', blocks[bi]);
+    }
     // Wrap in paragraph if not already wrapped
     if (!s.startsWith('<')) {
       s = '<p>' + s + '</p>';
@@ -550,13 +581,10 @@
     if (!adaptationStatus) return '';
     var adapt = adaptationStatus[sha];
     if (!adapt) return '';
-    var status = adapt.status || 'unknown';
+    var status = adapt.status || 'pending';
+    if (status === 'pending') return '';
     var labels = {
-      unknown: 'Unknown',
-      pending: 'Pending',
-      in_progress: 'In Progress',
-      adapted: 'Adapted',
-      skipped: 'Skipped'
+      adapted: 'Adapted'
     };
     var label = labels[status] || status;
     return `<span class="adapt-badge ${status}" data-adapt-sha="${sha}">${label}</span>`;
@@ -567,10 +595,10 @@
     if (!archImpactIndex) return '';
     var impact = archImpactIndex[sha];
     if (!impact) return '';
-    // impact can be a string[] of affected interfaces, or an object
-    if (Array.isArray(impact)) {
-      var interfaces = impact.join(', ');
-      return `<span class="arch-impact-marker" title="Affected interfaces: ${escapeHtml(interfaces)}">⚡ Arch Impact: ${escapeHtml(interfaces.substring(0, 60))}</span>`;
+    var interfaces = impact.affected_interfaces;
+    if (Array.isArray(interfaces) && interfaces.length > 0) {
+      var text = interfaces.join(', ');
+      return `<span class="arch-impact-marker" title="Affected interfaces: ${escapeHtml(text)}">⚡ Arch Impact: ${escapeHtml(text.substring(0, 60))}</span>`;
     }
     return '';
   }
@@ -612,8 +640,6 @@
         html += ' &nbsp;|&nbsp; ';
         html += '<span class="baseline-status pending">Pending: ' + (stats.pending || 0) + '</span> ';
         html += '<span class="baseline-status adapted">Adapted: ' + (stats.adapted || 0) + '</span> ';
-        if (stats.unknown) html += 'Unknown: ' + stats.unknown + ' ';
-        if (stats.skipped) html += 'Skipped: ' + stats.skipped;
       }
       html += '</span>';
 
@@ -636,335 +662,11 @@
       html += '<span class="baseline-text">Adaptation: ';
       html += '<span class="baseline-status pending">Pending: ' + (stats.pending || 0) + '</span> ';
       html += '<span class="baseline-status adapted">Adapted: ' + (stats.adapted || 0) + '</span> ';
-      if (stats.unknown) html += ' Unknown: ' + stats.unknown;
-      if (stats.in_progress) html += ' In Progress: ' + stats.in_progress;
       html += '</span>';
       $('#baselineText').innerHTML = html;
       $('#baselineBar').style.display = 'block';
     } catch {
       $('#baselineBar').style.display = 'none';
-    }
-  }
-
-  // ── Architecture Knowledge Drawer (P4) ─────────
-  async function loadArchKnowledge() {
-    const data = await fetchJSON(`${DATA_BASE}/${repoDir(currentRepo)}/context/architecture.json`);
-    archKnowledge = data;
-    return data;
-  }
-
-  function openArchDrawer() {
-    archPanelOpen = true;
-    var drawer = $('#archDrawer');
-    var btn = $('#archBtn');
-    drawer.classList.add('open');
-    btn.classList.add('active');
-    renderArchTab(currentArchTab);
-  }
-
-  function closeArchDrawer() {
-    archPanelOpen = false;
-    var drawer = $('#archDrawer');
-    var btn = $('#archBtn');
-    drawer.classList.remove('open');
-    btn.classList.remove('active');
-  }
-
-  function openArchDetail(title, html) {
-    var detailDrawer = $('#archDetailDrawer');
-    detailDrawer.querySelector('.arch-drawer-title').textContent = title;
-    $('#archDetailBody').innerHTML = html;
-    detailDrawer.style.display = 'flex';
-    requestAnimationFrame(function () {
-      detailDrawer.classList.add('open');
-    });
-  }
-
-  function closeArchDetail() {
-    var detailDrawer = $('#archDetailDrawer');
-    detailDrawer.classList.remove('open');
-    setTimeout(function () {
-      detailDrawer.style.display = 'none';
-    }, 250);
-  }
-
-  function renderArchTab(tab) {
-    currentArchTab = tab;
-    if (!archKnowledge) {
-      $('#archDrawerBody').innerHTML = '<div style="padding:40px;text-align:center;color:var(--text-muted)">No architecture data available</div>';
-      loadArchKnowledge().then(function () {
-        renderArchTab(currentArchTab);
-      });
-      return;
-    }
-
-    var html = '';
-    switch (tab) {
-      case 'modules':
-        html = renderArchModules();
-        break;
-      case 'patches':
-        html = renderArchPatches();
-        break;
-      case 'workflows':
-        html = renderArchWorkflows();
-        break;
-      case 'testing':
-        html = renderArchTesting();
-        break;
-      case 'mapping':
-        html = renderArchMapping();
-        break;
-    }
-    $('#archDrawerBody').innerHTML = html;
-  }
-
-  function renderArchModules() {
-    var modules = archKnowledge.modules || [];
-    var html = '';
-    for (var i = 0; i < modules.length; i++) {
-      var m = modules[i];
-      html += '<div class="arch-card arch-card-clickable" data-arch-detail="module-' + i + '">';
-      html += '<div class="arch-card-name">' + escapeHtml(m.name || '') + '</div>';
-      if (m.path) html += '<div class="arch-card-path">' + escapeHtml(m.path) + '</div>';
-      if (m.description) html += '<div class="arch-card-desc">' + escapeHtml(m.description) + '</div>';
-      if (m.key_classes && m.key_classes.length > 0) {
-        html += '<div style="font-size:0.72rem;color:var(--text-muted);margin-top:4px">Classes: ' + m.key_classes.join(', ') + '</div>';
-      }
-      html += '</div>';
-    }
-    if (!html) html = '<div style="padding:20px;text-align:center;color:var(--text-muted)">No modules found</div>';
-    return html;
-  }
-
-  function renderArchPatches() {
-    var kb = archKnowledge.knowledge_base || {};
-    var catalog = kb.patch_catalog || {};
-    var html = '';
-
-    var categories = [
-      { key: 'platform_patches', label: 'Platform Patches' },
-      { key: 'worker_patches', label: 'Worker Patches' },
-      { key: 'v2_worker_patches', label: 'V2 Worker Patches' }
-    ];
-
-    for (var ci = 0; ci < categories.length; ci++) {
-      var cat = categories[ci];
-      var patches = catalog[cat.key] || [];
-      if (patches.length === 0) continue;
-      html += '<div class="arch-section-title">' + cat.label + ' (' + patches.length + ')</div>';
-      for (var pi = 0; pi < patches.length; pi++) {
-        var p = patches[pi];
-        html += '<div class="arch-card arch-card-clickable" data-arch-detail="patch-' + cat.key + '-' + pi + '">';
-        html += '<div class="arch-card-name">' + escapeHtml(p.file || '') + '</div>';
-        if (p.targets && p.targets.length > 0) {
-          html += '<div class="arch-card-path">Targets: ' + p.targets.slice(0, 2).join(', ') + (p.targets.length > 2 ? '...' : '') + '</div>';
-        }
-        html += '</div>';
-      }
-    }
-
-    if (!html) html = '<div style="padding:20px;text-align:center;color:var(--text-muted)">No patches found</div>';
-    return html;
-  }
-
-  function renderArchWorkflows() {
-    var kb = archKnowledge.knowledge_base || {};
-    var workflows = kb.development_workflows || {};
-    var html = '';
-
-    var repoKey = currentRepo === 'vllm-project/vllm' ? 'vllm' : 'vllm-ascend';
-    var items = workflows[repoKey] || [];
-    if (items.length > 0) {
-      html += '<div class="arch-section-title">' + (repoKey === 'vllm-ascend' ? 'vllm-ascend' : 'vllm') + ' Workflows</div>';
-    }
-    for (var i = 0; i < items.length; i++) {
-      var w = items[i];
-      html += '<div class="arch-card">';
-      html += '<div class="arch-card-name" style="margin-bottom:6px">' + escapeHtml(w.topic || '') + '</div>';
-      if (w.steps) {
-        html += '<ol style="color:var(--text-secondary);padding-left:16px;line-height:1.8;font-size:0.78rem;margin:0">';
-        for (var si = 0; si < w.steps.length; si++) {
-          html += '<li>' + escapeHtml(w.steps[si]) + '</li>';
-        }
-        html += '</ol>';
-      }
-      html += '</div>';
-    }
-
-    // Also show vllm workflows if on vllm-ascend
-    if (repoKey === 'vllm-ascend' && workflows.vllm) {
-      html += '<div class="arch-section-title">vllm Workflows</div>';
-      var vllmItems = workflows.vllm || [];
-      for (var vi = 0; vi < vllmItems.length; vi++) {
-        var wv = vllmItems[vi];
-        html += '<div class="arch-card">';
-        html += '<div class="arch-card-name" style="margin-bottom:6px">' + escapeHtml(wv.topic || '') + '</div>';
-        if (wv.steps) {
-          html += '<ol style="color:var(--text-secondary);padding-left:16px;line-height:1.8;font-size:0.78rem;margin:0">';
-          for (var sj = 0; sj < wv.steps.length; sj++) {
-            html += '<li>' + escapeHtml(wv.steps[sj]) + '</li>';
-          }
-          html += '</ol>';
-        }
-        html += '</div>';
-      }
-    }
-
-    if (!html) html = '<div style="padding:20px;text-align:center;color:var(--text-muted)">No workflows found</div>';
-    return html;
-  }
-
-  function renderArchTesting() {
-    var kb = archKnowledge.knowledge_base || {};
-    var testing = kb.testing_guide || {};
-    var html = '';
-
-    var repoKey = currentRepo === 'vllm-project/vllm' ? 'vllm' : 'vllm-ascend';
-    var guide = testing[repoKey] || {};
-
-    if (guide.environment_setup) {
-      html += '<div class="arch-section-title">Environment Setup</div>';
-      html += '<div class="arch-card"><pre class="arch-card-code">' + escapeHtml(guide.environment_setup) + '</pre></div>';
-    }
-
-    if (guide.test_commands && guide.test_commands.length > 0) {
-      html += '<div class="arch-section-title">Test Commands</div>';
-      for (var i = 0; i < guide.test_commands.length; i++) {
-        html += '<div class="arch-card"><pre class="arch-card-code">' + escapeHtml(guide.test_commands[i]) + '</pre></div>';
-      }
-    }
-
-    if (guide.lint_commands && guide.lint_commands.length > 0) {
-      html += '<div class="arch-section-title">Lint Commands</div>';
-      for (var i = 0; i < guide.lint_commands.length; i++) {
-        html += '<div class="arch-card"><pre class="arch-card-code">' + escapeHtml(guide.lint_commands[i]) + '</pre></div>';
-      }
-    }
-
-    if (!html) html = '<div style="padding:20px;text-align:center;color:var(--text-muted)">No testing guide found</div>';
-    return html;
-  }
-
-  function renderArchMapping() {
-    var cpr = archKnowledge.cross_project_relationship || {};
-    var html = '';
-
-    // patch_impact_map
-    var impactMap = cpr.patch_impact_map || {};
-    var keys = Object.keys(impactMap);
-    if (keys.length > 0) {
-      html += '<div class="arch-section-title">Patch Impact Map (' + keys.length + ')</div>';
-      for (var i = 0; i < keys.length; i++) {
-        var vllmPath = keys[i];
-        var ascendPatch = impactMap[vllmPath];
-        html += '<div class="arch-card arch-card-clickable" data-arch-detail="mapping-' + i + '">';
-        html += '<div class="arch-card-path">' + escapeHtml(vllmPath) + '</div>';
-        html += '<div style="font-size:0.85rem"><span class="arch-mapping-arrow">→</span> <span class="arch-card-name" style="display:inline">' + escapeHtml(ascendPatch) + '</span></div>';
-        html += '</div>';
-      }
-    }
-
-    // impact_judgment_rules
-    var rules = cpr.impact_judgment_rules || {};
-    var ruleKeys = Object.keys(rules);
-    if (ruleKeys.length > 0) {
-      html += '<div class="arch-section-title">Impact Judgment Rules</div>';
-      for (var ri = 0; ri < ruleKeys.length; ri++) {
-        var rk = ruleKeys[ri];
-        var paths = rules[rk] || [];
-        html += '<div class="arch-card arch-card-clickable" data-arch-detail="rule-' + rk + '">';
-        html += '<div style="font-weight:600;color:var(--accent);font-size:0.82rem">' + rk + ' (' + paths.length + ')</div>';
-        html += '<div style="font-size:0.72rem;color:var(--text-muted);margin-top:2px">' + paths.slice(0, 3).join(', ');
-        if (paths.length > 3) html += ', ...';
-        html += '</div></div>';
-      }
-    }
-
-    if (!html) html = '<div style="padding:20px;text-align:center;color:var(--text-muted)">No cross-project mapping found</div>';
-    return html;
-  }
-
-  function getArchDetailHtml(detailId) {
-    if (!archKnowledge) return '<p>No data</p>';
-    var parts = detailId.split('-');
-    var type = parts[0];
-
-    switch (type) {
-      case 'module': {
-        var idx = parseInt(parts.slice(1).join('-'), 10);
-        var m = archKnowledge.modules[idx];
-        if (!m) return '<p>Not found</p>';
-        var h = '<div class="arch-section-title">' + escapeHtml(m.name) + '</div>';
-        if (m.path) h += '<div style="margin-bottom:8px"><span class="adapt-drawer-label">Path:</span> <code>' + escapeHtml(m.path) + '</code></div>';
-        if (m.description) h += '<p style="color:var(--text-secondary);line-height:1.6;margin-bottom:12px">' + escapeHtml(m.description) + '</p>';
-        if (m.key_classes && m.key_classes.length > 0) {
-          h += '<div class="arch-section-title" style="font-size:0.85rem">Key Classes</div><ul style="color:var(--text-secondary);padding-left:16px">';
-          m.key_classes.forEach(function (k) { h += '<li style="margin:4px 0">' + escapeHtml(k) + '</li>'; });
-          h += '</ul>';
-        }
-        return h;
-      }
-      case 'patch': {
-        // format: patch-{category}-{index}
-        var catKey = parts.slice(1, -1).join('-');
-        var idx = parseInt(parts[parts.length - 1], 10);
-        var kb = archKnowledge.knowledge_base || {};
-        var catalog = kb.patch_catalog || {};
-        var patches = catalog[catKey] || [];
-        var p = patches[idx];
-        if (!p) return '<p>Not found</p>';
-        var h = '<div class="arch-section-title">' + escapeHtml(p.file) + '</div>';
-        if (p.targets) h += '<div style="margin-bottom:8px"><span class="adapt-drawer-label">Targets:</span><ul style="color:var(--text-secondary);padding-left:16px;margin:4px 0">' + p.targets.map(function (t) { return '<li>' + escapeHtml(t) + '</li>'; }).join('') + '</ul></div>';
-        if (p.why) h += '<p style="color:var(--text-secondary);line-height:1.6;margin-bottom:8px"><strong>Why:</strong> ' + escapeHtml(p.why) + '</p>';
-        if (p.how) h += '<p style="color:var(--text-secondary);line-height:1.6;margin-bottom:8px"><strong>How:</strong> ' + escapeHtml(p.how) + '</p>';
-        if (p.related_pr) h += '<p style="color:var(--accent-blue);margin-bottom:4px">PR: ' + escapeHtml(p.related_pr) + '</p>';
-        if (p.future_plan) h += '<p style="color:var(--text-muted);font-size:0.82rem;font-style:italic">Plan: ' + escapeHtml(p.future_plan) + '</p>';
-        return h;
-      }
-      case 'workflow': {
-        // format: workflow-{repo}-{index}
-        var repoKey = parts[1];
-        var idx = parseInt(parts.slice(2).join('-'), 10);
-        var kb = archKnowledge.knowledge_base || {};
-        var workflows = kb.development_workflows || {};
-        var items = workflows[repoKey] || [];
-        var w = items[idx];
-        if (!w) return '<p>Not found</p>';
-        var h = '<div class="arch-section-title">' + escapeHtml(w.topic) + '</div>';
-        if (w.steps) {
-          h += '<ol style="color:var(--text-secondary);padding-left:16px;line-height:1.8">';
-          w.steps.forEach(function (s) { h += '<li>' + escapeHtml(s) + '</li>'; });
-          h += '</ol>';
-        }
-        return h;
-      }
-      case 'rule': {
-        var rk = parts.slice(1).join('-');
-        var cpr = archKnowledge.cross_project_relationship || {};
-        var rules = cpr.impact_judgment_rules || {};
-        var paths = rules[rk] || [];
-        var h = '<div class="arch-section-title">' + rk + ' (' + paths.length + ')</div>';
-        h += '<ul style="color:var(--text-secondary);padding-left:16px;line-height:1.8">';
-        paths.forEach(function (p) { h += '<li><code>' + escapeHtml(p) + '</code></li>'; });
-        h += '</ul>';
-        return h;
-      }
-      case 'mapping': {
-        var idx = parseInt(parts.slice(1).join('-'), 10);
-        var cpr = archKnowledge.cross_project_relationship || {};
-        var impactMap = cpr.patch_impact_map || {};
-        var keys = Object.keys(impactMap);
-        var vllmPath = keys[idx];
-        var ascendPatch = impactMap[vllmPath];
-        if (!vllmPath) return '<p>Not found</p>';
-        var h = '<div class="arch-section-title">Patch Mapping</div>';
-        h += '<div style="margin-bottom:8px"><span class="adapt-drawer-label">vllm:</span> <code>' + escapeHtml(vllmPath) + '</code></div>';
-        h += '<div style="margin-bottom:8px"><span class="adapt-drawer-label">ascend:</span> <code>' + escapeHtml(ascendPatch) + '</code></div>';
-        return h;
-      }
-      default:
-        return '<p>Unknown detail type</p>';
     }
   }
 
@@ -1141,6 +843,24 @@
           if (a.ascend_impact.suggested_test_areas && a.ascend_impact.suggested_test_areas.length > 0) {
             html += `<div class="impact-text" style="margin-top:4px"><strong>Areas:</strong> ${a.ascend_impact.suggested_test_areas.map(escapeHtml).join(', ')}</div>`;
           }
+        }
+        html += `</div>`;
+      }
+      if (a.deep_analysis) {
+        const da = a.deep_analysis;
+        html += `<div class="impact-card deep-analysis">`;
+        html += `<div class="impact-label deep-analysis">Deep Analysis</div>`;
+        if (da.affected_interfaces && da.affected_interfaces.length > 0) {
+          html += `<div class="impact-text"><strong>Affected Interfaces:</strong> ${da.affected_interfaces.map(escapeHtml).join(', ')}</div>`;
+        }
+        if (da.adaptation_effort) {
+          html += `<div class="impact-text" style="margin-top:4px"><strong>Effort:</strong> ${escapeHtml(da.adaptation_effort)}</div>`;
+        }
+        if (da.adaptation_guide) {
+          html += `<div class="impact-text" style="margin-top:4px"><strong>Guide:</strong> ${renderMarkdown(da.adaptation_guide)}</div>`;
+        }
+        if (da.risk) {
+          html += `<div class="impact-text" style="margin-top:4px"><strong>Risk:</strong> ${escapeHtml(da.risk)}</div>`;
         }
         html += `</div>`;
       }
@@ -1492,8 +1212,7 @@
         $('#searchClear').style.display = 'none';
         $$('.filter-chip').forEach((c) => c.classList.remove('active'));
         $$('.filter-chip')[0].classList.add('active');
-        // Reset arch knowledge on repo switch
-        archKnowledge = null;
+        // Reset arch impact index on repo switch
         archImpactIndex = null;
         await loadAvailableDates();
         await loadAdaptationStatus();
@@ -1560,124 +1279,9 @@
       render();
     });
 
-    // ── Architecture Knowledge Drawer toggle ──
-    $('#archBtn').addEventListener('click', function () {
-      if (archPanelOpen) {
-        closeArchDrawer();
-      } else {
-        openArchDrawer();
-      }
-    });
-
-    $('#archDrawerClose').addEventListener('click', closeArchDrawer);
-
-    // ── Arch detail drawer ──
-    $('#archDetailBack').addEventListener('click', closeArchDetail);
-    $('#archDetailClose').addEventListener('click', closeArchDetail);
-
-    // ── Architecture tab switching + card clicks ──
-    document.addEventListener('click', function (e) {
-      var archTab = e.target.closest('.arch-tab');
-      if (archTab) {
-        // Only handle tabs inside arch drawer
-        if (archTab.closest('#archDrawer')) {
-          $$('.arch-tab').forEach(function (t) { t.classList.remove('active'); });
-          archTab.classList.add('active');
-          renderArchTab(archTab.dataset.archTab);
-        }
-        return;
-      }
-
-      // ── Arch card click → show detail drawer ──
-      var archCard = e.target.closest('.arch-card-clickable');
-      if (archCard && archCard.dataset.archDetail) {
-        var detailId = archCard.dataset.archDetail;
-        var title = archCard.querySelector('.arch-card-name');
-        var detailHtml = getArchDetailHtml(detailId);
-        openArchDetail(title ? title.textContent : 'Detail', detailHtml);
-        return;
-      }
-
-      // ── Adaptation detail drawer ──
-      var adaptBadge = e.target.closest('.adapt-badge');
-      if (adaptBadge) {
-        var sha = adaptBadge.dataset.adaptSha;
-        if (adaptationStatus && adaptationStatus[sha]) {
-          showAdaptationDetail(adaptationStatus[sha]);
-        }
-        return;
-      }
-
-      // ── Close adaptation detail drawer ──
-      if (e.target.closest('.adapt-drawer-close') || e.target.closest('.adapt-drawer-overlay')) {
-        closeAdaptationDrawer();
-        return;
-      }
-    });
-
-    function closeAdaptationDrawer() {
-      var drawer = document.querySelector('.adapt-drawer');
-      var overlay = document.querySelector('.adapt-drawer-overlay');
-      if (drawer) {
-        drawer.classList.remove('open');
-        setTimeout(function () {
-          if (drawer) drawer.remove();
-          if (overlay) overlay.remove();
-        }, 250);
-      } else {
-        if (overlay) overlay.remove();
-      }
-    }
-
-    function showAdaptationDetail(adapt) {
-      // Remove existing drawer
-      var existing = document.querySelector('.adapt-drawer');
-      var existingOverlay = document.querySelector('.adapt-drawer-overlay');
-      if (existing) existing.remove();
-      if (existingOverlay) existingOverlay.remove();
-
-      var overlay = document.createElement('div');
-      overlay.className = 'adapt-drawer-overlay';
-      document.body.appendChild(overlay);
-
-      var labels = {
-        unknown: 'Unknown',
-        pending: 'Pending',
-        in_progress: 'In Progress',
-        adapted: 'Adapted',
-        skipped: 'Skipped'
-      };
-      var statusLabel = labels[adapt.status] || adapt.status;
-
-      var html = '<div class="adapt-drawer">';
-      html += '<div class="adapt-drawer-inner">';
-      html += '<div class="adapt-drawer-header">';
-      html += '<div class="adapt-drawer-title">Adaptation Details</div>';
-      html += '<button class="adapt-drawer-close">✕</button>';
-      html += '</div>';
-      html += '<div class="adapt-drawer-body">';
-      html += '<div class="adapt-drawer-row"><span class="adapt-drawer-label">SHA</span><span class="adapt-drawer-value"><code>' + escapeHtml(adapt.sha || '').substring(0, 12) + '</code></span></div>';
-      html += '<div class="adapt-drawer-row"><span class="adapt-drawer-label">Status</span><span class="adapt-drawer-value">' + statusLabel + '</span></div>';
-      if (adapt.message) html += '<div class="adapt-drawer-row"><span class="adapt-drawer-label">Message</span><span class="adapt-drawer-value">' + escapeHtml(adapt.message.substring(0, 120)) + '</span></div>';
-      if (adapt.ascend_impact_summary) html += '<div class="adapt-drawer-row"><span class="adapt-drawer-label">Impact</span><span class="adapt-drawer-value">' + escapeHtml(adapt.ascend_impact_summary) + '</span></div>';
-      if (adapt.adaptation_notes) html += '<div class="adapt-drawer-row"><span class="adapt-drawer-label">Notes</span><span class="adapt-drawer-value">' + escapeHtml(adapt.adaptation_notes) + '</span></div>';
-      if (adapt.adapted_at) html += '<div class="adapt-drawer-row"><span class="adapt-drawer-label">Adapted At</span><span class="adapt-drawer-value">' + escapeHtml(adapt.adapted_at) + '</span></div>';
-      if (adapt.adapted_by) html += '<div class="adapt-drawer-row"><span class="adapt-drawer-label">Adapted By</span><span class="adapt-drawer-value">' + escapeHtml(adapt.adapted_by) + '</span></div>';
-      html += '</div>'; // .adapt-drawer-body
-      html += '</div>'; // .adapt-drawer-inner
-      html += '</div>'; // .adapt-drawer
-
-      document.body.insertAdjacentHTML('beforeend', html);
-      // Trigger slide-in animation after DOM insertion
-      setTimeout(function () {
-        var drawer = document.querySelector('.adapt-drawer');
-        if (drawer) drawer.classList.add('open');
-      }, 20);
-    }
-
     document.addEventListener('click', (e) => {
       const header = e.target.closest('.commit-header');
-      if (header) {
+      if (header && !e.target.closest('.commit-sha')) {
         const card = header.closest('.commit-card');
         card.classList.toggle('expanded');
         var expanded = [];
@@ -1739,7 +1343,7 @@
     });
   }
 
-  if (document.readyState === 'loading') {
+if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', init);
   } else {
     init();

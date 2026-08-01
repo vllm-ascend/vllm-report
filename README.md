@@ -1,6 +1,6 @@
 # vllm-report
 
-Daily commit monitor and AI analysis for [vllm](https://github.com/vllm-project/vllm) and [vllm-ascend](https://github.com/vllm-project/vllm-ascend). Provides a knowledge base for AI agents (Claude Code, OpenCode) to support vllm-ascend code upgrades and main2main adaptation.
+Daily commit monitor and AI analysis for [vllm](https://github.com/vllm-project/vllm) and [vllm-ascend](https://github.com/vllm-project/vllm-ascend). Provides a knowledge base for AI agents to support vllm-ascend code upgrades and main2main adaptation.
 
 ## Features
 
@@ -11,34 +11,37 @@ Daily commit monitor and AI analysis for [vllm](https://github.com/vllm-project/
 - **Diff-Aware Architecture Impact** — Commits modifying key interface files get `architecture_impact` markers (affected_interfaces, recommend_refresh), detected automatically from file paths against cross-project relationship rules
 - **Architecture Context Cache** — Weekly auto-generated project architecture summaries via Claude Code agent, injected into AI analysis prompts for precise impact judgment
 - **Knowledge Base** — `knowledge_base` field in architecture.json includes patch catalog, development workflows, and testing guide
-- **Patch Catalog Extraction** — Deterministic regex-based parsing of vllm-ascend's `patch/__init__.py` via `_extract_patches.py`, producing structured JSON without LLM costs
+- **Patch Catalog Extraction** — Deterministic regex-based parsing of vllm-ascend's `patch/__init__.py`, producing structured JSON without LLM costs
 - **Search Index** — Keyword/tag/module index for fast cross-date search
-- **Adaptation Status Tracking** — Track which vllm upstream commits have been adapted to vllm-ascend, with CLI and MCP tool support
-- **MCP Server** — Stdio-based MCP server with 22 tools for AI agents to query the knowledge base (query tools, adaptation tracking, architecture knowledge). Supports progressive loading — agents can start with a lightweight overview and drill into specific modules as needed
+- **Adaptation Status Tracking** — Automatically tracks which vllm upstream commits need adaptation, with only two states: `pending` (needs work) and `adapted` (covered by baseline). Regenerated on every fetch+analyze cycle.
+- **MCP Server** — Stdio-based MCP server with 25 tools for AI agents to query the knowledge base. Supports progressive loading — agents can start with a lightweight overview and drill into specific modules as needed
 - **Email Report** — Daily markdown report sent via SMTP with categorized commit summaries
-- **Static Web Dashboard** — Dark-themed monitor page with commit list, diff viewer, AI analysis overlay, and tag-based filtering
-- **Data Lifecycle Management** — Stale data cleanup (`clean_stale_data.py`) removes commit data without corresponding analysis
+- **Static Web Dashboard** — Dark-themed monitor page with commit list, diff viewer, AI analysis overlay, and adaptation status filtering
+- **Data Lifecycle Management** — Stale data cleanup removes commit data without corresponding analysis
 
 ## Project Structure
 
 ```
 vllm-report/
-├── .github/workflows/
-│   ├── daily-commit.yml          # Daily fetch + AI analysis
-│   ├── weekly-context.yml        # Weekly architecture context generation
-│   ├── pages.yml                 # GitHub Pages deployment
-│   └── send-report.yml           # Email report workflow
+├── .github/
+│   ├── workflows/
+│   │   ├── daily-commit.yml          # Daily fetch + AI analysis
+│   │   ├── weekly-context.yml        # Weekly architecture context generation
+│   │   └── pages.yml                 # GitHub Pages deployment
+│   └── scripts/
+│       └── clean_stale_data.py       # Data cleanup (CI only)
 ├── data/
-│   ├── README.json               # Entry point for AI agents
-│   ├── vllm/                     # vllm project data
+│   ├── README.json                   # Entry point for AI agents
+│   ├── vllm/                         # vllm project data
 │   │   ├── meta.json
-│   │   ├── commits/              # Daily commit JSON files
-│   │   ├── analysis/             # Daily AI analysis results
+│   │   ├── commits/                  # Daily commit JSON files
+│   │   ├── analysis/                 # Daily AI analysis results
 │   │   ├── context/
-│   │   │   └── architecture.json
+│   │   │   ├── architecture.json
+│   │   │   └── arch_deltas.json
 │   │   ├── index.json
-│   │   ├── commits-index.json
-│   └── vllm-ascend/              # vllm-ascend project data
+│   │   └── commits-index.json
+│   └── vllm-ascend/                  # vllm-ascend project data
 │       ├── meta.json
 │       ├── commits/
 │       ├── analysis/
@@ -47,30 +50,35 @@ vllm-report/
 │       ├── index.json
 │       ├── commits-index.json
 │       └── adaptation-status.json
-├── scripts/
-│   ├── _source_repo.py           # Local repo discovery/pull/clone (internal)
-│   ├── _claude_client.py         # Claude Code CLI wrapper (internal)
-│   ├── _extract_patches.py       # Patch catalog extractor (deterministic)
-│   ├── fetch_commits.py          # Fetch commit data
-│   ├── analyze_commits.py        # Two-phase AI analysis
-│   ├── generate_context.py       # Architecture context via Claude Code agent
-│   ├── build_index.py            # Search index builder
-│   ├── track_adaptation.py       # Adaptation status CLI
-│   ├── clean_stale_data.py       # Data cleanup (commits without analysis)
-│   ├── send_report.py            # Email report
-│   └── serve.py                  # Dev server
-├── mcp_server.py                 # MCP Server (22 tools, stdio-based)
+├── src/
+│   ├── __init__.py
+│   ├── mcp_server_app.py             # MCP Server (stdio-based, 25 tools)
+│   ├── vllm_report_mcp/
+│   │   ├── __init__.py
+│   │   ├── _claude_client.py         # Claude Code CLI wrapper (internal)
+│   │   └── _extract_patches.py       # Patch catalog extractor (deterministic)
+│   ├── data/
+│   │   ├── __init__.py
+│   │   ├── _source_repo.py           # Local repo discovery/pull/clone (internal)
+│   │   ├── _track_arch_delta.py      # Architecture delta chain (internal)
+│   │   ├── fetch_commits.py          # Fetch commit data
+│   │   ├── analyze_commits.py        # Two-phase AI analysis
+│   │   ├── deep_analyze_commits.py   # Phase 2 deep analysis via Claude Code
+│   │   ├── generate_context.py       # Architecture context generation
+│   │   ├── build_index.py            # Search index builder
+│   │   └── track_adaptation.py       # Adaptation status CLI
+├── serve.py                          # Dev server for dashboard
 ├── site/
 │   ├── index.html
 │   ├── style.css
 │   └── app.js
-├── schemas/
-│   ├── commits-schema.json
-│   └── analysis-schema.json
+├── tests/
+│   ├── test_arch_delta.py
+│   └── test_core.py
 ├── docs/
-│   ├── data-spec.md              # Data format specification
-│   ├── usage-guide.md            # AI agent usage guide
-│   └── frontend-enhancement-plan.md # Optional frontend enhancements
+│   ├── data-spec.md                  # Data format specification
+│   ├── mcp-usage-guide.md            # AI agent usage guide
+│   └── sop.md                        # Standard operating procedures
 └── .gitignore
 ```
 
@@ -80,17 +88,17 @@ vllm-report/
 
 ```bash
 # Auto-detect or clone local repos
-python scripts/fetch_commits.py --repo vllm-project/vllm
-python scripts/fetch_commits.py --repo vllm-project/vllm-ascend
+python src/data/fetch_commits.py --repo vllm-project/vllm
+python src/data/fetch_commits.py --repo vllm-project/vllm-ascend
 
 # Specify local source code path
-python scripts/fetch_commits.py --repo vllm-project/vllm --local-repo ~/code/vllm
+python src/data/fetch_commits.py --repo vllm-project/vllm --local-repo ~/code/vllm
 
 # Use GitHub API only (no local repo)
-GITHUB_TOKEN=xxx python scripts/fetch_commits.py --repo vllm-project/vllm
+GITHUB_TOKEN=xxx python src/data/fetch_commits.py --repo vllm-project/vllm
 
 # Refresh a specific date (overwrite existing data)
-python scripts/fetch_commits.py --repo vllm-project/vllm --refresh-date 2026-07-30
+python src/data/fetch_commits.py --repo vllm-project/vllm --refresh-date 2026-07-30
 ```
 
 ### 2. Set Up API Keys
@@ -98,25 +106,22 @@ python scripts/fetch_commits.py --repo vllm-project/vllm --refresh-date 2026-07-
 ```bash
 # DeepSeek API for Phase 1 bulk analysis
 export LLM_API_KEY="sk-your-deepseek-key"
-
-# Anthropic API for Phase 2 deep analysis and architecture generation
-export ANTHROPIC_API_KEY="sk-your-anthropic-key"
 ```
 
 ### 3. Generate Architecture Context
 
 ```bash
 # Generate for vllm (uses Claude Code agent to read source code)
-python scripts/generate_context.py --repo vllm-project/vllm --force
+python src/data/generate_context.py --repo vllm-project/vllm --force
 
 # Generate for vllm-ascend
-python scripts/generate_context.py --repo vllm-project/vllm-ascend --force
+python src/data/generate_context.py --repo vllm-project/vllm-ascend --force
 
 # Cross-reference vllm vs vllm-ascend
-python scripts/generate_context.py --cross-reference --force
+python src/data/generate_context.py --cross-reference --force
 
 # Both repos at once with cross-reference
-python scripts/generate_context.py \
+python src/data/generate_context.py \
   --repo vllm-project/vllm \
   --repo vllm-project/vllm-ascend \
   --cross-reference --force
@@ -126,16 +131,16 @@ python scripts/generate_context.py \
 
 ```bash
 # Analyze all unanalyzed dates (catch-up mode, default)
-python scripts/analyze_commits.py --repo vllm-project/vllm
+python src/data/analyze_commits.py --repo vllm-project/vllm
 
 # Analyze a specific date
-python scripts/analyze_commits.py --repo vllm-project/vllm --date 2024-01-15 --force
+python src/data/analyze_commits.py --repo vllm-project/vllm --date 2024-01-15 --force
 
 # Analyze only the latest date
-python scripts/analyze_commits.py --repo vllm-project/vllm --latest
+python src/data/analyze_commits.py --repo vllm-project/vllm --latest
 
 # Explicit catch-up mode (same as default)
-python scripts/analyze_commits.py --repo vllm-project/vllm --catch-up
+python src/data/analyze_commits.py --repo vllm-project/vllm --catch-up
 ```
 
 The analysis runs in two phases:
@@ -145,38 +150,32 @@ The analysis runs in two phases:
 ### 5. Build Search Index
 
 ```bash
-python scripts/build_index.py --ascend-repo-path ~/code/vllm-ascend
+python src/data/build_index.py --ascend-repo-path ~/code/vllm-ascend
 ```
 
 ### 6. Track Adaptation Status
 
 ```bash
-# Initialize tracking (scans analysis for ascend_affected commits after baseline)
-python scripts/track_adaptation.py init \
+# Initialize tracking (scans analysis for ascend_affected commits, auto-classifies)
+python src/data/track_adaptation.py init \
   --ascend-repo-path ~/code/vllm-ascend
 
 # Force re-initialize with a specific start date
-python scripts/track_adaptation.py init \
+python src/data/track_adaptation.py init \
   --ascend-repo-path ~/code/vllm-ascend \
   --since 2026-07-15 --force
 
-# Update a commit's status
-python scripts/track_adaptation.py update --sha abc123 --status adapted
-
-# Mark a commit as pending (confirmed not yet adapted)
-python scripts/track_adaptation.py review --sha abc123 --status pending
-
-# Show progress
-python scripts/track_adaptation.py status
+# Show progress (only two states: pending / adapted)
+python src/data/track_adaptation.py status
 
 # List commits by status
-python scripts/track_adaptation.py list --status pending
+python src/data/track_adaptation.py list --status pending
 ```
 
 ### 7. Start MCP Server (for AI Agents)
 
 ```bash
-python mcp_server.py \
+python -m src.mcp_server_app \
   --data-dir /path/to/vllm-report/data \
   --ascend-repo-path /path/to/vllm-ascend
 ```
@@ -188,7 +187,7 @@ Claude Code config (`~/.claude/settings.local.json`):
     "vllm-report": {
       "command": "python",
       "args": [
-        "/path/to/vllm-report/mcp_server.py",
+        "-m", "src.mcp_server_app",
         "--data-dir", "/path/to/vllm-report/data",
         "--ascend-repo-path", "/path/to/vllm-ascend"
       ]
@@ -200,13 +199,13 @@ Claude Code config (`~/.claude/settings.local.json`):
 ### 8. View Dashboard
 
 ```bash
-python scripts/serve.py
+python serve.py
 # or open site/index.html directly
 ```
 
 ## AI Agent Integration
 
-See [docs/usage-guide.md](docs/usage-guide.md) for detailed usage scenarios:
+See [docs/mcp-usage-guide.md](docs/mcp-usage-guide.md) for detailed usage scenarios:
 
 - **Claude Code** (native MCP): Configure the MCP server, then ask questions like "What commits affect ascend today?"
 - **OpenCode / Codex CLI**: Read JSON files directly from `data/` directory
@@ -219,22 +218,18 @@ See [docs/usage-guide.md](docs/usage-guide.md) for detailed usage scenarios:
 | Secret | Description |
 |--------|-------------|
 | `DEEPSEEK_API_KEY` | API key for DeepSeek (Phase 1 bulk analysis) |
-| `ANTHROPIC_API_KEY` | API key for Claude Code (Phase 2 deep analysis + architecture generation) |
+| `CLAUDE_AUTH_TOKEN` | Auth token for Claude Code (Phase 2 deep analysis + architecture generation) |
+| `CLAUDE_BASE_URL` | API base URL for Claude Code |
+| `CLAUDE_MODEL` | Claude Code model name (e.g. `astron-code-latest`) |
+| `CLAUDE_SMALL_FAST_MODEL` | Claude Code small fast model name (e.g. `astron-code-latest`) |
 | `GITHUB_TOKEN` | Default token (auto-provided) |
 
 ### Optional Secrets (for Email Report)
 
-| Secret | Description |
-|--------|-------------|
-| `SMTP_USER` | SMTP login username |
-| `SMTP_PASS` | SMTP login password |
-| `NOTIFY_EMAIL` | Recipient email address(es) |
-
 ### Workflows
 
-- **`daily-commit.yml`** — Runs daily at 02:00 CST: fetch → Phase 1 DeepSeek analysis → Phase 2 Claude Code analysis → build index → clean stale data → send email report → deploy
+- **`daily-commit.yml`** — Runs daily at 02:00 CST: fetch → Phase 1 DeepSeek analysis → Phase 2 Claude Code analysis → build index → clean stale data → deploy
 - **`weekly-context.yml`** — Runs weekly on Monday 08:00 CST: checkout vllm/vllm-ascend source → generate architecture via Claude Code → cross-reference → rebuild index
-- **`send-report.yml`** — Standalone workflow for on-demand email report generation
 - **`pages.yml`** — Deploys GitHub Pages on push to `site/` or `data/`
 
 ## Data Format
@@ -300,50 +295,49 @@ The `knowledge_base` field contains three sub-fields:
 
 ### Progressive Loading via MCP
 
-The MCP server provides granular tools so AI agents can load only what they need:
-
-```
-Agent's first call:    get_architecture_overview("vllm-ascend")       → ~1KB overview
-Agent's second call:   get_module_info("vllm-ascend", "attention")    → ~1KB module detail
-Agent's third call:    get_interface_surface("vllm")                  → ~8KB interface surface
-If needed:             get_development_workflows("vllm-ascend")       → ~2KB workflows
-                       get_implementation_principles("vllm")          → ~5KB principles
-                       get_patch_catalog("platform")                  → patches only
-```
-
-Instead of loading the full 90KB `architecture.json` to find a single piece of information.
+See [docs/mcp-usage-guide.md](docs/mcp-usage-guide.md) for progressive loading patterns and usage scenarios for all 25 MCP tools.
 
 ## MCP Server Tools
 
-The MCP server (`mcp_server.py`) provides **22 tools** across three categories:
+The MCP server (`src/mcp_server_app.py`) provides **25 tools** across four categories:
 
-**Query Tools (13):**
-- `get_architecture_overview` — **[Progressive]** Return overview + modules list (minimal), use as first call
-- `get_module_info` — **[Progressive]** Return detailed info for a single module (fuzzy match supported)
-- `get_interface_surface` — **[Progressive]** Return interface surface (inheritable interfaces + not_used_by_ascend paths)
-- `get_key_abstractions` — **[Progressive]** Return key abstractions/classes with inheritance info
+**Architecture Analysis (10):**
+- `get_architecture_overview` — **[Progressive]** Return overview + modules list, use as first call
+- `get_module_info` — **[Progressive]** Return detailed info for a single module (fuzzy match)
+- `get_interface_surface` — **[Progressive]** Return interface surface (inheritable interfaces + not_used_by_ascend)
+- `get_key_abstractions` — **[Progressive]** Return key classes with inheritance info
 - `get_implementation_principles` — **[Progressive]** Return implementation principles
 - `get_hardware_abstraction` — **[Progressive]** Return hardware abstraction layer info
 - `get_development_workflows` — **[Progressive]** Return development workflow templates
 - `get_testing_guide` — **[Progressive]** Return testing guide
-- `get_architecture_context` — **[Full]** Return complete architecture.json (all of the above), use on-demand
-- `get_daily_analysis` — Return analysis data for a specific date
-- `search_analysis` — Cross-date search with keyword/tag/date filters
-- `get_module_history` — Get change history for a specific module
-- `get_commit_diff` — Get full diff for a commit (local data first, GitHub API fallback)
+- `get_architecture_context` — **[Full]** Return complete architecture.json
+- `get_architecture_at_commit` — Return architecture snapshot at a specific commit
+- `get_architecture_diff` — Diff architecture between two commits
+- `get_architecture_freshness` — Check if architecture.json is up-to-date
+- `get_commit_arch_delta` — Architecture delta for a single commit
 
-**Adaptation Tracking Tools:**
-- `get_ascend_impact_summary` — Summary of commits that affect vllm-ascend
+**Adaptation Management (5):**
 - `get_adaptation_baseline` — Return current vllm baseline verified by vllm-ascend
-- `get_pending_adaptations` — Get list of pending/unknown adaptation commits
-- `update_adaptation_status` — Update adaptation status for a commit
-- `advance_baseline` — Advance the vllm baseline (update vllm-main-verified.commit)
+- `advance_baseline` — Advance the vllm baseline (auto-marks covered commits as adapted)
+- `get_pending_adaptations` — Get list of pending adaptation commits
 - `get_adaptation_guide` — Get adaptation guide for a commit (markdown format)
+- `get_adaptation_roadmap` — Full adaptation roadmap from sha_from to sha_to
 
-**Architecture Knowledge Tools:**
+**Change Analysis (5):**
+- `get_ascend_impact_summary` — Summary of commits that affect vllm-ascend
+- `get_commit_diff` — Get full diff for a commit (local data first, GitHub API fallback)
+- `search_analysis` — Cross-date search with keyword/tag/date filters
+- `get_daily_analysis` — Return analysis data for a specific date
+- `get_module_history` — Get change history for a specific module
+
+**Engineering Support (5):**
 - `get_cross_project_mapping` — Return vllm ↔ vllm-ascend cross-project mapping
 - `get_patch_catalog` — Return vllm-ascend patch catalog
-- `get_architecture_freshness` — Check if architecture.json is up-to-date
+- `get_development_workflows` — Return development workflow templates
+- `get_testing_guide` — Return testing guide
+- `get_patch_catalog` — Return vllm-ascend patch catalog (filterable by category)
+
+See [docs/mcp-usage-guide.md](docs/mcp-usage-guide.md) for usage scenarios.
 
 ## License
 

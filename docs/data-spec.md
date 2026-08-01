@@ -18,7 +18,8 @@ data/
 │   │   ├── 2026-07-30.json
 │   │   └── ...
 │   ├── context/
-│   │   └── architecture.json        # 项目架构知识摘要（11 维度）
+│   │   └── architecture.json        # 项目架构知识摘要（用户主动刷新，锚定一个 commit）
+│   ├── arch_deltas.json             # 架构增量变化链（自基线以来的每个 commit 的架构影响）
 │   ├── index.json                   # 检索索引（标签/模块/关键词 → SHA 列表）
 │   ├── commits-index.json           # SHA → {date, message} 查找表（配合 index.json 使用）
 │   └── meta.json                    # 仓库元数据
@@ -27,6 +28,7 @@ data/
 │   ├── commits/
 │   ├── context/
 │   │   └── architecture.json
+│   ├── arch_deltas.json
 │   ├── index.json
 │   ├── commits-index.json
 │   ├── adaptation-status.json       # 适配状态跟踪（仅 vllm-ascend）
@@ -216,13 +218,13 @@ data/
 
 ### 6. `data/vllm-ascend/adaptation-status.json`
 
-**作用：** 记录 vllm-ascend 的 main2main 适配进度。
+**作用：** 记录 vllm-ascend 的 main2main 适配进度。由 `track_adaptation.py init` 自动生成，仅维护两种状态。
 
 **关键字段：**
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
-| `baseline` | object | 基线引用（不缓存 SHA，指向 vllm-ascend 源文件） |
+| `baseline` | object | 基线信息（含 SHA 和日期） |
 | `commits` | object[] | commit 适配状态列表 |
 | `stats` | object | 统计汇总 |
 
@@ -232,7 +234,10 @@ data/
 |------|------|------|
 | `source` | string | vllm-main-verified.commit 文件路径 |
 | `release_tag_source` | string | vllm-release-tag.commit 文件路径 |
+| `main_sha` | string | 当前基线 SHA |
+| `release_tag` | string | 当前 release tag |
 | `tracking_start_date` | string | 开始跟踪的日期 |
+| `baseline_date` | string | 基线 commit 对应的分析日期 |
 
 **commits 中的每个条目：**
 
@@ -241,26 +246,54 @@ data/
 | `sha` | string | vllm commit SHA |
 | `upstream_date` | string | vllm 上游 commit 日期 |
 | `upstream_sha` | string | vllm 上游 commit SHA |
-| `message` | string | commit 消息 |
-| `status` | string | 状态：unknown / pending / in_progress / adapted / skipped |
+| `message` | string | commit 消息（截断到 120 字符） |
+| `status` | string | 状态：`pending`（待适配）或 `adapted`（已适配） |
 | `tags` | string[] | 标签 |
 | `ascend_impact_summary` | string | 影响概述 |
 | `adaptation_notes` | string | 适配备注 |
 | `adapted_at` | string (nullable) | 适配完成时间 |
-| `adapted_by` | string (nullable) | 适配人 |
 
 **stats 字段：**
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | `total` | integer | 总计 |
-| `unknown` | integer | 待确认 |
 | `pending` | integer | 待适配 |
-| `in_progress` | integer | 适配中 |
 | `adapted` | integer | 已适配 |
-| `skipped` | integer | 已跳过 |
 
-**兼容性：** 稳定。新增字段不影响已有条目。
+**兼容性：** 2026-08 重构，状态从 5 种精简为 2 种（pending / adapted）。旧格式的 `unknown` / `in_progress` / `skipped` 不再使用。
+
+---
+
+### 7. `data/{repo}/arch_deltas.json`
+
+**作用：** 记录自架构基线以来每个 commit 对架构的增量影响。用于实现"架构知识时间旅行"——分析历史 commit 时，可以知道该 commit 发生时架构知识的样子。
+
+**架构知识版本化模型：**
+- `architecture.json` 是一个**基线快照**（用户主动刷新）
+- `arch_deltas.json` 记录基线之后的每个 commit 对架构的增量变化
+- 分析 prompt 中使用"基线 + 到该 commit 的增量"来还原该 commit 发生时的架构知识
+- 用户刷新 `architecture.json` 时，`arch_deltas.json` 会被清空
+
+**关键字段：**
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `baseline_sha` | string | 当前架构知识基线的 commit SHA |
+| `baseline_generated_at` | string (ISO 8601) | 基线生成时间 |
+| `deltas` | object | commit SHA → delta 信息的映射 |
+
+**每个 delta 的字段：**
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `affected_modules` | string[] | 受影响的模块路径（如 attention/backends） |
+| `affected_interfaces` | string[] | 受影响的接口名 |
+| `interface_changes` | string | 接口变更描述 |
+| `change_summary` | string | commit 标题（第一行） |
+| `ascend_impact` | boolean | 是否影响 vllm-ascend |
+
+**兼容性：** 实验性。2026-08 新增，用于支持架构知识时间旅行。
 
 ---
 

@@ -13,32 +13,35 @@
 - **知识库** — architecture.json 的 `knowledge_base` 字段包含 patch 目录、开发工作流、测试指南
 - **Patch 目录提取** — 通过 `_extract_patches.py` 对 vllm-ascend 的 `patch/__init__.py` 进行确定性正则解析，生成结构化 JSON，无需 LLM 调用
 - **检索索引** — 关键词/标签/模块索引，支持跨日期快速搜索
-- **适配状态跟踪** — 跟踪哪些 vllm 上游 commit 已适配到 vllm-ascend，提供 CLI 和 MCP 工具支持
-- **MCP Server** — 22 个工具的 stdio 模式 MCP Server，供 AI Agent 查询知识库（查询工具、适配跟踪、架构知识三类）。支持渐进式加载——Agent 先获取轻量概览，再按需深入具体模块
+- **适配状态跟踪** — 自动跟踪哪些 vllm 上游 commit 需要适配，仅维护两种状态：`pending`（待适配）和 `adapted`（已被基线覆盖）。每次 fetch+analyze 后自动重新生成。
+- **MCP Server** — 25 个工具的 stdio 模式 MCP Server，供 AI Agent 查询知识库。支持渐进式加载——Agent 先获取轻量概览，再按需深入具体模块
 - **邮件报告** — 每日通过 SMTP 发送 markdown 格式报告，含分类 commit 汇总
-- **静态 Web Dashboard** — 深色主题监控页面，包含 commit 列表、diff 查看器、AI 分析覆盖、标签筛选
-- **数据生命周期管理** — 过期数据清理（`clean_stale_data.py`）删除无对应分析的 commit 数据
+- **静态 Web Dashboard** — 深色主题监控页面，包含 commit 列表、diff 查看器、AI 分析覆盖、适配状态筛选
+- **数据生命周期管理** — 过期数据清理删除无对应分析的 commit 数据
 
 ## 项目结构
 
 ```
 vllm-report/
-├── .github/workflows/
-│   ├── daily-commit.yml          # 每日抓取 + AI 分析
-│   ├── weekly-context.yml        # 每周架构上下文生成
-│   ├── pages.yml                 # GitHub Pages 部署
-│   └── send-report.yml           # 邮件报告工作流
+├── .github/
+│   ├── workflows/
+│   │   ├── daily-commit.yml          # 每日抓取 + AI 分析
+│   │   ├── weekly-context.yml        # 每周架构上下文生成
+│   │   └── pages.yml                 # GitHub Pages 部署
+│   └── scripts/
+│       └── clean_stale_data.py       # 数据清理（CI 专用）
 ├── data/
-│   ├── README.json               # AI Agent 入口引导文件
-│   ├── vllm/                     # vllm 项目数据
+│   ├── README.json                   # AI Agent 入口引导文件
+│   ├── vllm/                         # vllm 项目数据
 │   │   ├── meta.json
-│   │   ├── commits/              # 每日 commit JSON 文件
-│   │   ├── analysis/             # 每日 AI 分析结果
+│   │   ├── commits/                  # 每日 commit JSON 文件
+│   │   ├── analysis/                 # 每日 AI 分析结果
 │   │   ├── context/
-│   │   │   └── architecture.json
+│   │   │   ├── architecture.json
+│   │   │   └── arch_deltas.json
 │   │   ├── index.json
 │   │   ├── commits-index.json
-│   └── vllm-ascend/              # vllm-ascend 项目数据
+│   └── vllm-ascend/                  # vllm-ascend 项目数据
 │       ├── meta.json
 │       ├── commits/
 │       ├── analysis/
@@ -47,30 +50,35 @@ vllm-report/
 │       ├── index.json
 │       ├── commits-index.json
 │       └── adaptation-status.json
-├── scripts/
-│   ├── _source_repo.py           # 仓库发现/拉取/克隆（内部模块）
-│   ├── _claude_client.py         # Claude Code CLI 封装（内部模块）
-│   ├── _extract_patches.py       # Patch 目录提取器（确定性解析）
-│   ├── fetch_commits.py          # 抓取 commit 数据
-│   ├── analyze_commits.py        # 双阶段 AI 分析
-│   ├── generate_context.py       # 通过 Claude Code Agent 生成架构上下文
-│   ├── build_index.py            # 检索索引构建器
-│   ├── track_adaptation.py       # 适配状态 CLI 工具
-│   ├── clean_stale_data.py       # 数据清理（清理无分析的 commit 数据）
-│   ├── send_report.py            # 邮件报告
-│   └── serve.py                  # 开发服务器
-├── mcp_server.py                 # MCP Server（22 个工具，stdio 模式）
+├── src/
+│   ├── __init__.py
+│   ├── mcp_server_app.py             # MCP Server（stdio 模式，25 个工具）
+│   ├── vllm_report_mcp/
+│   │   ├── __init__.py
+│   │   ├── _claude_client.py         # Claude Code CLI 封装（内部模块）
+│   │   └── _extract_patches.py       # Patch 目录提取器（确定性解析）
+│   ├── data/
+│   │   ├── __init__.py
+│   │   ├── _source_repo.py           # 仓库发现/拉取/克隆（内部模块）
+│   │   ├── _track_arch_delta.py      # 架构增量链（内部模块）
+│   │   ├── fetch_commits.py          # 抓取 commit 数据
+│   │   ├── analyze_commits.py        # 双阶段 AI 分析
+│   │   ├── deep_analyze_commits.py   # Phase 2 Claude Code 深度分析
+│   │   ├── generate_context.py       # 架构上下文生成
+│   │   ├── build_index.py            # 检索索引构建器
+│   │   └── track_adaptation.py       # 适配状态 CLI 工具
+├── serve.py                          # Dashboard 开发服务器
 ├── site/
 │   ├── index.html
 │   ├── style.css
 │   └── app.js
-├── schemas/
-│   ├── commits-schema.json
-│   └── analysis-schema.json
+├── tests/
+│   ├── test_arch_delta.py
+│   └── test_core.py
 ├── docs/
-│   ├── data-spec.md              # 数据格式规范
-│   ├── usage-guide.md            # AI Agent 使用指南
-│   └── frontend-enhancement-plan.md # 前端增强方案（可选）
+│   ├── data-spec.md                  # 数据格式规范
+│   ├── mcp-usage-guide.md            # AI Agent 使用指南
+│   └── sop.md                        # 标准操作流程
 └── .gitignore
 ```
 
@@ -80,17 +88,17 @@ vllm-report/
 
 ```bash
 # 自动检测或克隆本地仓库
-python scripts/fetch_commits.py --repo vllm-project/vllm
-python scripts/fetch_commits.py --repo vllm-project/vllm-ascend
+python src/data/fetch_commits.py --repo vllm-project/vllm
+python src/data/fetch_commits.py --repo vllm-project/vllm-ascend
 
 # 指定本地源码路径
-python scripts/fetch_commits.py --repo vllm-project/vllm --local-repo ~/code/vllm
+python src/data/fetch_commits.py --repo vllm-project/vllm --local-repo ~/code/vllm
 
 # 仅使用 GitHub API（无需本地仓库）
-GITHUB_TOKEN=xxx python scripts/fetch_commits.py --repo vllm-project/vllm
+GITHUB_TOKEN=xxx python src/data/fetch_commits.py --repo vllm-project/vllm
 
 # 刷新指定日期的数据（覆盖现有数据）
-python scripts/fetch_commits.py --repo vllm-project/vllm --refresh-date 2026-07-30
+python src/data/fetch_commits.py --repo vllm-project/vllm --refresh-date 2026-07-30
 ```
 
 ### 2. 设置 API Key
@@ -98,25 +106,22 @@ python scripts/fetch_commits.py --repo vllm-project/vllm --refresh-date 2026-07-
 ```bash
 # DeepSeek API 用于 Phase 1 批量分析
 export LLM_API_KEY="sk-your-deepseek-key"
-
-# Anthropic API 用于 Phase 2 深度分析和架构生成
-export ANTHROPIC_API_KEY="sk-your-anthropic-key"
 ```
 
 ### 3. 生成架构上下文
 
 ```bash
 # 为 vllm 生成（使用 Claude Code Agent 读取源码）
-python scripts/generate_context.py --repo vllm-project/vllm --force
+python src/data/generate_context.py --repo vllm-project/vllm --force
 
 # 为 vllm-ascend 生成
-python scripts/generate_context.py --repo vllm-project/vllm-ascend --force
+python src/data/generate_context.py --repo vllm-project/vllm-ascend --force
 
 # 交叉分析 vllm 和 vllm-ascend
-python scripts/generate_context.py --cross-reference --force
+python src/data/generate_context.py --cross-reference --force
 
 # 一次完成两个仓库和交叉分析
-python scripts/generate_context.py \
+python src/data/generate_context.py \
   --repo vllm-project/vllm \
   --repo vllm-project/vllm-ascend \
   --cross-reference --force
@@ -126,16 +131,16 @@ python scripts/generate_context.py \
 
 ```bash
 # 分析所有未分析日期（catch-up 模式，默认行为）
-python scripts/analyze_commits.py --repo vllm-project/vllm
+python src/data/analyze_commits.py --repo vllm-project/vllm
 
 # 分析指定日期
-python scripts/analyze_commits.py --repo vllm-project/vllm --date 2024-01-15 --force
+python src/data/analyze_commits.py --repo vllm-project/vllm --date 2024-01-15 --force
 
 # 仅分析最新日期
-python scripts/analyze_commits.py --repo vllm-project/vllm --latest
+python src/data/analyze_commits.py --repo vllm-project/vllm --latest
 
 # 显式 catch-up 模式（与默认行为相同）
-python scripts/analyze_commits.py --repo vllm-project/vllm --catch-up
+python src/data/analyze_commits.py --repo vllm-project/vllm --catch-up
 ```
 
 分析分两阶段：
@@ -145,38 +150,32 @@ python scripts/analyze_commits.py --repo vllm-project/vllm --catch-up
 ### 5. 构建检索索引
 
 ```bash
-python scripts/build_index.py --ascend-repo-path ~/code/vllm-ascend
+python src/data/build_index.py --ascend-repo-path ~/code/vllm-ascend
 ```
 
 ### 6. 跟踪适配状态
 
 ```bash
-# 初始化跟踪（扫描分析结果中基线之后的 ascend_affected commit）
-python scripts/track_adaptation.py init \
+# 初始化跟踪（扫描分析结果，自动按基线划分 adapted/pending）
+python src/data/track_adaptation.py init \
   --ascend-repo-path ~/code/vllm-ascend
 
 # 强制重新初始化，指定起始日期
-python scripts/track_adaptation.py init \
+python src/data/track_adaptation.py init \
   --ascend-repo-path ~/code/vllm-ascend \
   --since 2026-07-15 --force
 
-# 更新 commit 状态
-python scripts/track_adaptation.py update --sha abc123 --status adapted
-
-# 标记为待适配（确认尚未适配）
-python scripts/track_adaptation.py review --sha abc123 --status pending
-
-# 查看进度
-python scripts/track_adaptation.py status
+# 查看进度（仅两种状态：pending / adapted）
+python src/data/track_adaptation.py status
 
 # 按状态列出 commit
-python scripts/track_adaptation.py list --status pending
+python src/data/track_adaptation.py list --status pending
 ```
 
 ### 7. 启动 MCP Server（供 AI Agent 使用）
 
 ```bash
-python mcp_server.py \
+python -m src.mcp_server_app \
   --data-dir /path/to/vllm-report/data \
   --ascend-repo-path /path/to/vllm-ascend
 ```
@@ -188,7 +187,7 @@ Claude Code 配置（`~/.claude/settings.local.json`）：
     "vllm-report": {
       "command": "python",
       "args": [
-        "/path/to/vllm-report/mcp_server.py",
+        "-m", "src.mcp_server_app",
         "--data-dir", "/path/to/vllm-report/data",
         "--ascend-repo-path", "/path/to/vllm-ascend"
       ]
@@ -200,13 +199,13 @@ Claude Code 配置（`~/.claude/settings.local.json`）：
 ### 8. 查看 Dashboard
 
 ```bash
-python scripts/serve.py
+python serve.py
 # 或直接打开 site/index.html
 ```
 
 ## AI Agent 集成
 
-详见 [docs/usage-guide.md](docs/usage-guide.md) 的使用场景说明：
+详见 [docs/mcp-usage-guide.md](docs/mcp-usage-guide.md) 的使用场景说明：
 
 - **Claude Code**（原生 MCP）：配置 MCP Server 后，可以直接问"今天有哪些影响 ascend 的 commit？"
 - **OpenCode / Codex CLI**：直接从 `data/` 目录读取 JSON 文件
@@ -219,22 +218,19 @@ python scripts/serve.py
 | Secret | 说明 |
 |--------|------|
 | `DEEPSEEK_API_KEY` | DeepSeek API Key（Phase 1 批量分析） |
-| `ANTHROPIC_API_KEY` | Anthropic API Key（Phase 2 深度分析 + 架构生成） |
+| `CLAUDE_AUTH_TOKEN` | Claude Code 认证 Token（Phase 2 深度分析 + 架构生成） |
+| `CLAUDE_BASE_URL` | Claude Code API 地址 |
+| `CLAUDE_MODEL` | Claude Code 模型名称（如 `astron-code-latest`） |
+| `CLAUDE_SMALL_FAST_MODEL` | Claude Code 小模型名称（如 `astron-code-latest`） |
 | `GITHUB_TOKEN` | 默认 Token（自动提供） |
 
 ### 可选 Secrets（邮件报告）
-
-| Secret | 说明 |
-|--------|------|
-| `SMTP_USER` | SMTP 登录用户名 |
-| `SMTP_PASS` | SMTP 登录密码 |
 | `NOTIFY_EMAIL` | 收件人邮箱地址 |
 
 ### 工作流
 
-- **`daily-commit.yml`** — 每天 02:00 CST 运行：抓取 → Phase 1 DeepSeek 分析 → Phase 2 Claude Code 分析 → 构建索引 → 清理过期数据 → 发送邮件报告 → 部署
+- **`daily-commit.yml`** — 每天 02:00 CST 运行：抓取 → Phase 1 DeepSeek 分析 → Phase 2 Claude Code 分析 → 构建索引 → 清理过期数据 → 部署
 - **`weekly-context.yml`** — 每周一 08:00 CST 运行：检出 vllm/vllm-ascend 源码 → 通过 Claude Code 生成架构 → 交叉分析 → 重建索引
-- **`send-report.yml`** — 独立的按需邮件报告生成工作流
 - **`pages.yml`** — 推送 `site/` 或 `data/` 时部署 GitHub Pages
 
 ## 数据格式
@@ -313,35 +309,45 @@ Agent 三次调用：    get_interface_surface("vllm")                   → ~8K
 
 ## MCP Server 工具列表
 
-MCP Server（`mcp_server.py`）提供 **22 个工具**，分为三类：
+MCP Server（`src/mcp_server_app.py`）提供 **25 个工具**，分为四类：
 
-**查询工具（13 个）：**
-- `get_architecture_overview` — **[渐进式]** 返回架构概览（overview + modules 列表，不含详情），首次调用的入口
-- `get_module_info` — **[渐进式]** 返回单个模块的详细信息，支持模糊匹配
-- `get_interface_surface` — **[渐进式]** 返回接口面（可继承接口列表 + not_used_by_ascend 路径）
-- `get_key_abstractions` — **[渐进式]** 返回关键抽象/类列表（含继承关系和方法签名）
-- `get_implementation_principles` — **[渐进式]** 返回实现原理列表
+**架构分析（10 个）：**
+- `get_architecture_overview` — **[渐进式]** 返回架构概览，首次调用入口
+- `get_module_info` — **[渐进式]** 返回单个模块详情，支持模糊匹配
+- `get_interface_surface` — **[渐进式]** 返回接口面（可继承接口 + not_used_by_ascend 路径）
+- `get_key_abstractions` — **[渐进式]** 返回关键类列表（含继承关系和方法签名）
+- `get_implementation_principles` — **[渐进式]** 返回实现原理
 - `get_hardware_abstraction` — **[渐进式]** 返回硬件适配层信息
 - `get_development_workflows` — **[渐进式]** 返回开发工作流模板
 - `get_testing_guide` — **[渐进式]** 返回测试指南
-- `get_architecture_context` — **[全量]** 返回完整的 architecture.json（含以上所有内容），按需使用
-- `get_daily_analysis` — 返回指定日期的分析数据
-- `search_analysis` — 跨日期搜索，支持关键词/标签/日期范围过滤
-- `get_module_history` — 获取某模块的变更历史
-- `get_commit_diff` — 获取某个 commit 的完整 diff（优先本地数据，GitHub API 兜底）
+- `get_architecture_context` — **[全量]** 返回完整 architecture.json
+- `get_architecture_at_commit` — 指定 commit 时的架构快照
+- `get_architecture_diff` — 两 commit 间架构差异
+- `get_architecture_freshness` — 检查架构数据时效性
+- `get_commit_arch_delta` — 单个 commit 的架构增量影响
 
-**适配跟踪工具：**
-- `get_ascend_impact_summary` — 影响 ascend 的 commit 汇总
-- `get_adaptation_baseline` — 返回当前 vllm 基线（已通过 vllm-ascend 验证）
-- `get_pending_adaptations` — 获取待适配/待确认的 commit 列表
-- `update_adaptation_status` — 更新某个 commit 的适配状态
-- `advance_baseline` — 推进基线（更新 vllm-main-verified.commit）
+**适配管理（5 个）：**
+- `get_adaptation_baseline` — 返回当前 vllm 基线
+- `advance_baseline` — 推进基线（自动将新基线前的 commit 标记为 adapted）
+- `get_pending_adaptations` — 获取待适配 commit 列表
 - `get_adaptation_guide` — 获取某个 commit 的适配指南（markdown 格式）
+- `get_adaptation_roadmap` — 从 SHA_from 到 SHA_to 的完整适配路线
 
-**架构知识工具：**
-- `get_cross_project_mapping` — 返回 vllm ↔ vllm-ascend 跨项目映射
+**变更分析（5 个）：**
+- `get_ascend_impact_summary` — 日期范围内影响 ascend 的 commit 摘要
+- `get_commit_diff` — 获取某个 commit 的完整 diff
+- `search_analysis` — 跨日期搜索（关键词/标签/日期范围）
+- `get_daily_analysis` — 返回指定日期的分析数据
+- `get_module_history` — 获取某模块的变更历史
+
+**工程支持（5 个）：**
+- `get_cross_project_mapping` — vllm ↔ vllm-ascend 跨项目映射
 - `get_patch_catalog` — 返回 vllm-ascend patch 目录
-- `get_architecture_freshness` — 检查 architecture.json 的时效性
+- `get_development_workflows` — 开发工作流模板
+- `get_testing_guide` — 测试指南
+- `get_patch_catalog` — patch 目录（可分类筛选）
+
+详见 [docs/mcp-usage-guide.md](docs/mcp-usage-guide.md) 的使用场景说明。
 
 ## 许可证
 

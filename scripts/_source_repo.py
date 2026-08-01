@@ -13,6 +13,7 @@ KNOWN_REPOS = {
             os.path.expanduser("~/code/vllm"),
             os.path.expanduser("~/projects/vllm"),
             os.path.expanduser("~/vllm"),
+            os.path.join(os.getcwd(), "repos", "vllm"),
         ],
     },
     "vllm-project/vllm-ascend": {
@@ -22,6 +23,7 @@ KNOWN_REPOS = {
             os.path.expanduser("~/code/vllm-ascend"),
             os.path.expanduser("~/projects/vllm-ascend"),
             os.path.expanduser("~/vllm-ascend"),
+            os.path.join(os.getcwd(), "repos", "vllm-ascend"),
         ],
     },
 }

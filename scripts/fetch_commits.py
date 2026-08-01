@@ -10,7 +10,7 @@ import subprocess
 from datetime import datetime, timezone, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from source_repo import ensure_repo, repo_dir_name
+from _source_repo import ensure_repo, repo_dir_name
 
 import requests
 
@@ -223,20 +223,8 @@ def merge_commits(existing_commits, new_commits):
 
 
 def update_dates_index(data_dir, repo):
-    repo_dir = os.path.join(data_dir, repo_dir_name(repo))
-    commits_dir = os.path.join(repo_dir, "commits")
-    dates_path = os.path.join(repo_dir, "dates.json")
-
-    if not os.path.isdir(commits_dir):
-        return
-
-    dates = sorted(
-        f.replace(".json", "")
-        for f in os.listdir(commits_dir)
-        if f.endswith(".json") and f != "meta.json" and re.match(r"^\d{4}-\d{2}-\d{2}$", f.replace(".json", ""))
-    )
-
-    save_json_atomic(dates_path, {"dates": dates})
+    """(DEPRECATED) dates.json is no longer written — dates are derived from filesystem or index.json."""
+    pass
 
 
 def write_daily_commits(data_dir, repo, day, commits, branch="main", overwrite=False):

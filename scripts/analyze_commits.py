@@ -9,7 +9,8 @@ import urllib.error
 from datetime import datetime, timezone, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from source_repo import ensure_repo, repo_dir_name
+from _source_repo import ensure_repo, repo_dir_name
+from _claude_client import call_claude
 
 TZ_CN = timezone(timedelta(hours=8))
 
@@ -280,8 +281,11 @@ def build_context_section(context):
         ts = context["test_structure"]
         parts.append(f"测试结构：{ts.get('path', '')} - {ts.get('description', '')}")
 
-    gen_time = context.get("generated_at", "unknown")
-    parts.append(f"\n（上下文生成时间：{gen_time}，如需更详细信息请走读源码）")
+    # Add architecture version info
+    arch_sha = context.get("commit_sha", "unknown")
+    arch_gen_time = context.get("generated_at", "unknown")
+    parts.append(f"\n（架构上下文基于 commit: {arch_sha[:12]}，生成时间：{arch_gen_time}）")
+    parts.append(f"（如需更详细源码信息请走读源码）")
 
     return "\n".join(parts)
 
@@ -290,8 +294,8 @@ def build_context_section(context):
 # If ALL changed files in a commit match these patterns, it can be
 # auto-determined as ascend_affected=false, skipping the LLM call.
 #
-# The base set is hardcoded. It can be extended at runtime by loading
-# the not_used_by_ascend list from architecture.json (see triage_ascend).
+# The not_used_by_ascend list is loaded from architecture.json, which is
+# regenerated weekly by the LLM, so it stays up-to-date automatically.
 
 AUTO_FALSE_DIRS = (
     "tests/",
@@ -316,63 +320,36 @@ AUTO_FALSE_FILES = {
     ".pre-commit-config.yaml", ".codespellrc", ".flake8",
 }
 
-# Platform-specific files that are definitely NOT used by ascend.
-# These are hardcoded as a fallback; architecture.json's not_used_by_ascend
-# takes priority when available.
-AUTO_FALSE_PLATFORM_SPECIFIC = (
-    "vllm/platforms/cuda.py",
-    "vllm/platforms/rocm.py",
-    "vllm/platforms/xpu.py",
-    "vllm/platforms/tpu.py",
-    "vllm/platforms/cpu.py",
-    "vllm/platforms/zen_cpu.py",
-    "vllm/platforms/unspecified.py",
-    "vllm/v1/worker/gpu_worker.py",
-    "vllm/v1/worker/cpu_worker.py",
-    "vllm/v1/worker/xpu_worker.py",
-    "vllm/v1/attention/backends/flash_attn.py",
-    "vllm/v1/attention/backends/flashinfer.py",
-    "vllm/v1/attention/backends/rocm_attn.py",
-    "vllm/v1/attention/backends/rocm_aiter.py",
-    "vllm/v1/attention/backends/cpu_attn.py",
-    "vllm/v1/attention/backends/triton_attn.py",
-    "vllm/v1/attention/backends/flex_attention.py",
-    "vllm/v1/attention/backends/turboquant_attn.py",
-    "vllm/kernels/aiter_ops/",
-    "vllm/kernels/vllm_c/",
-    "vllm/kernels/xpu_ops/",
-    "vllm/distributed/device_communicators/cuda_communicator.py",
-    "vllm/distributed/device_communicators/cpu_communicator.py",
-    "vllm/distributed/device_communicators/xpu_communicator.py",
-    "vllm/distributed/device_communicators/ray_communicator.py",
-)
-
-# ── Runtime-extensible not_used_by_ascend set ────────────────────────
-# Populated by load_not_used_by_ascend() from architecture.json.
-_not_used_by_ascend_extra = set()
+# ── Dynamic not_used_by_ascend cache ────────────────────────────────
+# Loaded from architecture.json on first use.
+_not_used_by_ascend_cache = None
 
 
-def load_not_used_by_ascend(data_dir):
+def _load_not_used_by_ascend(data_dir):
     """Load the not_used_by_ascend list from vllm architecture.json.
 
-    This extends the hardcoded AUTO_FALSE patterns with architecture-aware
-    paths that the LLM identified as definitely not used by vllm-ascend.
+    This is generated weekly by the LLM and reflects the current codebase.
+    Returns a set of file/directory prefixes that are definitely not used
+    by vllm-ascend.
     """
-    global _not_used_by_ascend_extra
-    if _not_used_by_ascend_extra:
-        return
+    global _not_used_by_ascend_cache
+    if _not_used_by_ascend_cache is not None:
+        return _not_used_by_ascend_cache
+
     vllm_dir = os.path.join(data_dir, "vllm")
     context_path = os.path.join(vllm_dir, "context", "architecture.json")
     context = load_json(context_path)
     if context is None:
-        return
+        _not_used_by_ascend_cache = set()
+        return _not_used_by_ascend_cache
+
     iface = context.get("interface_surface", {})
     not_used = iface.get("not_used_by_ascend", [])
-    for path in not_used:
-        _not_used_by_ascend_extra.add(path)
+    _not_used_by_ascend_cache = set(not_used)
+    return _not_used_by_ascend_cache
 
 
-def _is_auto_false_path(filename):
+def _is_auto_false_path(filename, not_used_set):
     """Check if a single file path is definitely NOT ascend-relevant."""
     if filename.startswith(AUTO_FALSE_DIRS):
         return True
@@ -380,16 +357,13 @@ def _is_auto_false_path(filename):
         return True
     if filename in AUTO_FALSE_FILES:
         return True
-    for prefix in AUTO_FALSE_PLATFORM_SPECIFIC:
-        if filename == prefix or filename.startswith(prefix.rstrip("/") + "/"):
-            return True
-    for prefix in _not_used_by_ascend_extra:
+    for prefix in not_used_set:
         if filename == prefix or filename.startswith(prefix.rstrip("/") + "/"):
             return True
     return False
 
 
-def triage_ascend(commit):
+def triage_ascend(commit, not_used_set):
     """Check if a commit definitely does NOT affect vllm-ascend.
 
     Returns True if every changed file is in a non-ascend-relevant path,
@@ -399,7 +373,7 @@ def triage_ascend(commit):
     files = commit.get("files", [])
     if not files:
         return False
-    return all(_is_auto_false_path(f.get("filename", "")) for f in files)
+    return all(_is_auto_false_path(f.get("filename", ""), not_used_set) for f in files)
 
 
 def auto_analyze_commit(commit, repo):
@@ -746,16 +720,15 @@ def analyze_commits(repo, date, data_dir, confirm, force, local_repo=None):
 
     print(f"Analyzing {num_commits} commits for {repo} on {date}...")
 
-    # Load not_used_by_ascend from architecture.json for better triage
+    # Load not_used_by_ascend from architecture.json for triage
     is_vllm = "vllm-ascend" not in repo
-    if is_vllm:
-        load_not_used_by_ascend(data_dir)
+    not_used_set = _load_not_used_by_ascend(data_dir) if is_vllm else set()
 
     # Phase 1: triage — path-based pre-filter
     llm_shas = []
     auto_analysis = []
     for c in all_commits:
-        if is_vllm and triage_ascend(c):
+        if is_vllm and triage_ascend(c, not_used_set):
             auto_analysis.append(auto_analyze_commit(c, repo))
         else:
             llm_shas.append(c["sha"])
@@ -844,7 +817,7 @@ def analyze_commits(repo, date, data_dir, confirm, force, local_repo=None):
     # Validate the accumulated analysis
     if analysis and "commits" in analysis:
         # Only validate LLM-analyzed commits, not auto triaged ones
-        all_llm_shas = {c["sha"] for c in all_commits if not is_vllm or not triage_ascend(c)}
+        all_llm_shas = {c["sha"] for c in all_commits if not is_vllm or not triage_ascend(c, not_used_set)}
         errors = validate_analysis(analysis, commits_data, repo)
         if errors:
             print("Validation errors:")
@@ -898,6 +871,64 @@ def analyze_commits(repo, date, data_dir, confirm, force, local_repo=None):
     analysis["commits"] = merged_commits
     analysis["generated_at"] = datetime.now(TZ_CN).isoformat()
 
+    # Record which architecture version this analysis was based on
+    context = load_context(data_dir, repo)
+    if context:
+        analysis["architecture_based_on_sha"] = context.get("commit_sha", "unknown")
+        analysis["architecture_generated_at"] = context.get("generated_at", "unknown")
+
+    # Add diff-aware architecture impact detection
+    # Mark commits that modify key interface files
+    definitely_affected_paths = set()
+    if context and context.get("cross_project_relationship"):
+        cpr = context["cross_project_relationship"]
+        rules = cpr.get("impact_judgment_rules", {})
+        raw_paths = rules.get("definitely_affected_paths", [])
+        # The format is [path1, description1, path2, description2, ...]
+        # Take only the path elements (even indices)
+        for i, p in enumerate(raw_paths):
+            if i % 2 == 0:
+                # Clean up: remove any trailing 的 or Chinese punctuation
+                clean = p.strip().rstrip("、，,")
+                if clean:
+                    definitely_affected_paths.add(clean)
+
+    for commit in merged_commits:
+        commit_data = None
+        for c in all_commits:
+            if c["sha"] == commit["sha"]:
+                commit_data = c
+                break
+        if commit_data:
+            files = commit_data.get("files", [])
+            affected_interfaces = set()
+            for f in files:
+                fname = f.get("filename", "")
+                for pattern in definitely_affected_paths:
+                    if fname.startswith(pattern.rstrip("/")):
+                        affected_interfaces.add(pattern)
+            if affected_interfaces:
+                commit["architecture_impact"] = {
+                    "affects_architecture": True,
+                    "affected_interfaces": sorted(affected_interfaces),
+                    "recommend_refresh": True,
+                }
+
+    # Phase 2: Claude Code agent mode for ascend_affected re-analysis
+    # After Phase 1 analysis is complete, check which commits have ascend_affected=true
+    # and re-analyze them with Claude Code for deeper insight
+    if is_vllm and local_repo:
+        ascend_affected_commits = [
+            ac for ac in merged_commits
+            if ac.get("ascend_impact", {}).get("ascend_affected")
+        ]
+        if ascend_affected_commits:
+            print(f"  Phase 2: Deep analysis of {len(ascend_affected_commits)} ascend_affected commits via Claude Code...")
+            _deep_analyze_ascend_commits(
+                repo, date, merged_commits, ascend_affected_commits,
+                all_commits, data_dir, local_repo,
+            )
+
     if confirm:
         display_analysis(analysis)
         answer = input("Write this analysis to file? [Y/n] ").strip().lower()
@@ -908,6 +939,106 @@ def analyze_commits(repo, date, data_dir, confirm, force, local_repo=None):
     save_json_atomic(analysis_path, analysis)
     print(f"Analysis written to {analysis_path}")
     return True
+
+
+def _deep_analyze_ascend_commits(repo, date, merged_commits, ascend_affected_commits, all_commits, data_dir, local_repo):
+    """Re-analyze ascend_affected commits using Claude Code agent mode.
+
+    Provides deeper analysis than the bulk Phase 1 LLM call, using
+    Claude Code's ability to read the actual source files and cross-reference
+    architecture context.
+    """
+    # Build a focused prompt for the ascend_affected commits
+    commit_details = []
+    commit_shas = {ac["sha"] for ac in ascend_affected_commits}
+    for c in all_commits:
+        if c["sha"] in commit_shas:
+            files_changed = [f["filename"] for f in c.get("files", [])]
+            commit_details.append({
+                "sha": c["sha"][:12],
+                "message": (c.get("message", "") or "").split("\n")[0][:120],
+                "files_changed": files_changed,
+                "patch_summary": "\n".join(
+                    f"  {f['filename']}: +{f['additions']}/-{f['deletions']}"
+                    for f in c.get("files", [])
+                )[:2000],
+            })
+
+    # Resolve the vllm-report data directory for architecture context
+    project_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    data_dir_abs = os.path.abspath(data_dir) if not os.path.isabs(data_dir) else data_dir
+
+    prompt = f"""You are analyzing vllm commits that may affect vllm-ascend. Provide deep analysis.
+
+## Repository
+- vllm: {repo}
+- vllm-ascend: vllm-project/vllm-ascend
+- Date: {date}
+
+## Architecture Context
+Read the architecture.json files for both projects at:
+- {data_dir_abs}/vllm/context/architecture.json
+- {data_dir_abs}/vllm-ascend/context/architecture.json
+
+Focus on the interface_surface and cross_project_relationship fields to understand impact rules.
+
+The vllm source code is at: {local_repo}
+Read relevant source files to understand the actual code changes.
+
+## Commits to Deep Analyze
+These commits were identified as potentially affecting vllm-ascend. For each, provide:
+1. affected_interfaces: Which specific interfaces/classes in vllm-ascend are affected
+2. adaptation_effort: How much adaptation work is needed (low/medium/high)
+3. adaptation_guide: What needs to be adapted in vllm-ascend
+4. risk: Risk assessment of the adaptation
+
+{json.dumps(commit_details, ensure_ascii=False, indent=2)}
+"""
+
+    deep_analysis_schema = {
+        "type": "object",
+        "additionalProperties": {
+            "type": "object",
+            "properties": {
+                "affected_interfaces": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+                "adaptation_effort": {
+                    "type": "string",
+                    "enum": ["low", "medium", "high"],
+                },
+                "adaptation_guide": {
+                    "type": "string",
+                    "description": "What needs to be adapted in vllm-ascend",
+                },
+                "risk": {"type": "string"},
+            },
+            "required": ["affected_interfaces", "adaptation_effort", "adaptation_guide"],
+        },
+    }
+
+    result = call_claude(
+        prompt=prompt,
+        json_schema=deep_analysis_schema,
+        max_budget_usd=5.0,
+        add_dirs=[local_repo, data_dir_abs],
+    )
+
+    if result is None:
+        print("  Phase 2 deep analysis failed, keeping Phase 1 results")
+        return
+
+    # Merge deep analysis results back into the original analysis
+    count = 0
+    for ac in merged_commits:
+        sha = ac["sha"]
+        deep = result.get(sha, None)
+        if deep:
+            ac["deep_analysis"] = deep
+            count += 1
+
+    print(f"  Phase 2: Deep analysis completed for {count} commits")
 
 
 def get_unanalyzed_dates(data_dir, repo):

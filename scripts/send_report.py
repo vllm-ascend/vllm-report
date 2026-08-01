@@ -11,7 +11,7 @@ from email.mime.text import MIMEText
 from datetime import datetime, timezone, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from source_repo import repo_dir_name
+from _source_repo import repo_dir_name
 
 TZ_CN = timezone(timedelta(hours=8))
 DATA_DIR = "data"

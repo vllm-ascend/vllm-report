@@ -15,12 +15,11 @@ import argparse
 import json
 import os
 import sys
-import urllib.request
-import urllib.error
 from datetime import datetime, timezone, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from source_repo import ensure_repo, get_current_sha, repo_dir_name
+from _source_repo import ensure_repo, get_current_sha, repo_dir_name
+from _claude_client import call_claude
 
 TZ_CN = timezone(timedelta(hours=8))
 
@@ -41,69 +40,261 @@ REPO_SOURCE_DIRS = {
     "vllm-project/vllm-ascend": "vllm_ascend",
 }
 
-VLLM_KEY_FILES = [
-    # Platform & plugin
-    "vllm/platforms/__init__.py",
-    "vllm/platforms/interface.py",
-    "vllm/plugins/__init__.py",
-    # Engine core
-    "vllm/v1/engine/core.py",
-    "vllm/v1/engine/llm_engine.py",
-    "vllm/v1/engine/core_client.py",
-    # Executor & worker (GPUModelRunner is parent of NPUModelRunner)
-    "vllm/v1/executor/abstract.py",
-    "vllm/v1/worker/worker_base.py",
-    "vllm/v1/worker/gpu_model_runner.py",
-    # Attention
-    "vllm/v1/attention/backend.py",
-    "vllm/v1/attention/backends/registry.py",
-    # Scheduler & KV cache
-    "vllm/v1/core/scheduler.py",
-    "vllm/v1/kv_cache_interface.py",
-    # Config
-    "vllm/config/vllm.py",
-    # Model
-    "vllm/model_executor/models/registry.py",
-    "vllm/model_executor/models/interfaces_base.py",
-    # Compilation
-    "vllm/compilation/compiler_interface.py",
-    # Sampling
-    "vllm/v1/sample/sampler.py",
-    # Distributed
-    "vllm/distributed/device_communicators/base_device_communicator.py",
-    # Entrypoints (OpenAI/Anthropic API surface)
-    "vllm/entrypoints/openai/serving_chat.py",
-]
+def build_knowledge_base_template():
+    """Build the fixed template for knowledge_base fields.
 
-ASCEND_KEY_FILES = [
-    # Platform
-    "vllm_ascend/platform.py",
-    # Worker & model runner
-    "vllm_ascend/worker/worker.py",
-    "vllm_ascend/worker/model_runner_v1.py",
-    # Attention
-    "vllm_ascend/attention/attention_v1.py",
-    # Compilation
-    "vllm_ascend/compilation/acl_graph.py",
-    "vllm_ascend/compilation/compiler_interface.py",
-    # Distributed
-    "vllm_ascend/distributed/device_communicators/npu_communicator.py",
-    "vllm_ascend/distributed/parallel_state.py",
-    # Sampling
-    "vllm_ascend/sample/sampler.py",
-    # Config
-    "vllm_ascend/ascend_config.py",
-    # Patch
-    "vllm_ascend/patch/__init__.py",
-    # Quantization
-    "vllm_ascend/quantization/__init__.py",
-    # Ops (entry point for custom ops / triton kernels)
-    "vllm_ascend/ops/__init__.py",
-    # Models
-    "vllm_ascend/models/__init__.py",
-    # Device / memory
-    "vllm_ascend/device_allocator/camem.py",
-]
+    These are hardcoded values that do NOT need LLM generation:
+    - development_workflows: stable workflows that rarely change
+    - testing_guide: test commands and environment setup
+
+    Returns a JSON string for the prompt.
+    """
+    kb = {
+        "development_workflows": {
+            "vllm": [
+                {
+                    "topic": "添加新模型",
+                    "steps": [
+                        "在 vllm/model_executor/models/ 下创建模型文件",
+                        "在 vllm/model_executor/models/registry.py 中注册",
+                        "在 vllm/config/model.py 中添加架构默认值（如需要）",
+                        "添加测试：tests/models/",
+                    ],
+                },
+                {
+                    "topic": "添加配置项",
+                    "steps": [
+                        "在 vllm/config/ 对应配置类中添加字段（使用 @dataclass + config 元数据）",
+                        "在 vllm/engine/arg_utils.py 中添加 CLI 参数（映射到配置字段）",
+                        "添加测试",
+                    ],
+                },
+                {
+                    "topic": "添加平台后端",
+                    "steps": [
+                        "在 vllm/platforms/ 中创建新的 Platform 子类",
+                        "通过 vllm.platform_plugins entry point 注册",
+                        "实现平台特定的 attention、worker、通信等",
+                    ],
+                },
+            ],
+            "vllm-ascend": [
+                {
+                    "topic": "添加 Platform Patch",
+                    "steps": [
+                        "在 vllm_ascend/patch/platform/ 中创建 patch 文件",
+                        "实现 monkey-patch 逻辑（修改上游 vLLM 的类/函数）",
+                        "在 vllm_ascend/patch/__init__.py 中添加文档（what/why/how/related PR/future plan）",
+                        "Patch 会被 adapt_patch(is_global_patch=True) 自动发现和加载",
+                    ],
+                },
+                {
+                    "topic": "添加 Worker Patch",
+                    "steps": [
+                        "在 vllm_ascend/patch/worker/ 中创建 patch 文件",
+                        "实现 monkey-patch 逻辑",
+                        "在 vllm_ascend/patch/__init__.py 中添加文档（同上）",
+                        "Patch 会被 adapt_patch(is_global_patch=False) 自动发现和加载",
+                    ],
+                },
+                {
+                    "topic": "适配新模型到 NPU",
+                    "steps": [
+                        "评估是否需要 patch：attention 替换 → worker patch；修改 forward → worker patch；结构差异大 → 在 vllm_ascend/models/ 中创建 NPU 特有实现",
+                        "添加 worker patch（如 patch_<model_name>.py）",
+                        "在 vllm_ascend/patch/__init__.py 中记录",
+                        "添加测试：tests/e2e/models/",
+                    ],
+                },
+                {
+                    "topic": "添加环境变量",
+                    "steps": [
+                        "在 vllm_ascend/envs.py 的 env_variables 字典中添加",
+                        "命名遵循 VLLM_ASCEND_* 规范",
+                        "添加文档注释（默认值、有效范围、是否敏感）",
+                        "在代码中通过 from vllm_ascend import envs 引用，禁止硬编码环境变量名",
+                    ],
+                },
+                {
+                    "topic": "添加 Attention 后端",
+                    "steps": [
+                        "在 vllm_ascend/attention/ 中创建新的 attention 实现",
+                        "继承 vllm_ascend/attention/abstract.py 中的基类",
+                        "在 vllm_ascend/attention/__init__.py 中注册",
+                    ],
+                },
+            ],
+        },
+        "testing_guide": {
+            "vllm": {
+                "environment_setup": "cd ~/code/vllm && source .venv/bin/activate && uv pip install -r requirements/test/cuda.txt",
+                "test_commands": [
+                    ".venv/bin/python -m pytest tests/path/to/test_file.py -v",
+                    ".venv/bin/python -m pytest tests/models/ -v",
+                ],
+                "lint_commands": [
+                    "pre-commit run --all-files",
+                    "pre-commit run ruff-check --all-files",
+                ],
+            },
+            "vllm-ascend": {
+                "environment_setup": "cd ~/code/vllm-ascend && pip install -e .[dev]",
+                "test_commands": [
+                    "pytest -sv tests/ut/",
+                    "pytest -sv tests/e2e/pull_request/one_card/",
+                ],
+                "lint_commands": [
+                    "ruff check vllm_ascend/",
+                    "bash format.sh ci",
+                ],
+            },
+        },
+    }
+    return json.dumps(kb, ensure_ascii=False, indent=2)
+
+
+def _build_architecture_schema():
+    """Build JSON Schema for architecture.json output."""
+    return {
+        "type": "object",
+        "properties": {
+            "overview": {"type": "string"},
+            "modules": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "name": {"type": "string"},
+                        "description": {"type": "string"},
+                        "key_classes": {"type": "array", "items": {"type": "string"}},
+                    },
+                    "required": ["path", "name", "description"],
+                },
+            },
+            "key_abstractions": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "description": {"type": "string"},
+                        "location": {"type": "string"},
+                        "inherits_from": {"type": ["string", "null"]},
+                        "key_methods": {"type": "array", "items": {"type": "string"}},
+                        "ascend_implementations": {"type": "array", "items": {"type": "string"}},
+                        "relationships": {"type": "array", "items": {"type": "string"}},
+                    },
+                    "required": ["name", "description", "location"],
+                },
+            },
+            "implementation_principles": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "module": {"type": "string"},
+                        "problem": {"type": "string"},
+                        "workflow": {"type": "string"},
+                        "interactions": {"type": "string"},
+                        "platform_differences": {"type": "string"},
+                    },
+                    "required": ["module", "problem", "workflow", "interactions"],
+                },
+            },
+            "module_dependencies": {"type": "string"},
+            "hardware_abstraction": {
+                "type": "object",
+                "properties": {
+                    "description": {"type": "string"},
+                    "platform_independent": {"type": "array", "items": {"type": "string"}},
+                    "platform_specific": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["description"],
+            },
+            "interface_surface": {
+                "type": "object",
+                "properties": {
+                    "description": {"type": "string"},
+                    "inheritable_interfaces": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "interface": {"type": "string"},
+                                "location": {"type": "string"},
+                                "ascend_impl": {"type": "string"},
+                                "key_methods": {"type": "array", "items": {"type": "string"}},
+                                "impact_rule": {"type": "string"},
+                            },
+                            "required": ["interface", "location", "ascend_impl"],
+                        },
+                    },
+                    "not_used_by_ascend": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["description"],
+            },
+            "test_structure": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "description": {"type": "string"},
+                },
+            },
+            "knowledge_base": {
+                "type": "object",
+                "properties": {
+                    "patch_catalog": {
+                        "type": "object",
+                        "properties": {
+                            "platform_patches": {"type": "array"},
+                            "worker_patches": {"type": "array"},
+                            "v2_worker_patches": {"type": "array"},
+                        },
+                    },
+                    "development_workflows": {"type": "object"},
+                    "testing_guide": {"type": "object"},
+                },
+            },
+        },
+        "required": [
+            "overview", "modules", "key_abstractions",
+            "implementation_principles", "module_dependencies",
+            "hardware_abstraction", "interface_surface",
+        ],
+    }
+
+
+def _build_cross_ref_schema():
+    """Build JSON Schema for cross-reference output."""
+    return {
+        "type": "object",
+        "properties": {
+            "vllm_to_ascend_map": {
+                "type": "object",
+                "additionalProperties": {"type": ["string", "null"]},
+            },
+            "ascend_only_components": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
+            "impact_judgment_rules": {
+                "type": "object",
+                "properties": {
+                    "definitely_affected_paths": {"type": "array", "items": {"type": "string"}},
+                    "potentially_affected_paths": {"type": "array", "items": {"type": "string"}},
+                    "never_affected_paths": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["definitely_affected_paths", "potentially_affected_paths", "never_affected_paths"],
+            },
+            "patch_impact_map": {
+                "type": "object",
+                "additionalProperties": {"type": "string"},
+            },
+        },
+        "required": ["vllm_to_ascend_map", "ascend_only_components", "impact_judgment_rules", "patch_impact_map"],
+    }
+
 
 CONTEXT_PROMPT_TEMPLATE = """你是一个资深代码架构分析师。请根据以下项目源码结构目录树和关键接口文件内容，生成一份结构化的项目知识摘要。
 
@@ -117,8 +308,19 @@ CONTEXT_PROMPT_TEMPLATE = """你是一个资深代码架构分析师。请根据
 {tree}
 ```
 
-## 关键接口文件内容
-{key_files_content}
+## 关键接口文件
+源码位于 {local_repo}，请使用 Read 工具读取关键接口文件来理解项目架构。从目录树中重点关注：
+- 平台抽象层（platform/）
+- 引擎核心（engine/）
+- Worker/Model Runner（worker/）
+- Attention 后端（attention/）
+- Scheduler 和 KV Cache（core/sched/、kv_cache_interface.py）
+- Config（config/）
+- Model Executor（model_executor/）
+- Compilation（compilation/）
+- Sampling（sample/）
+- Distributed（distributed/）
+- Patch（patch/，仅 vllm-ascend）
 
 ## 分析要求
 请基于以上信息，分析以下内容：
@@ -134,76 +336,20 @@ CONTEXT_PROMPT_TEMPLATE = """你是一个资深代码架构分析师。请根据
    - 核心工作流程（用文字描述即可，不要写代码）
    - 与其他模块的交互方式
    - 不同硬件平台的差异处理方式
-   - 示例主题（根据仓库选择）：
-     * vllm 仓库：Platform 插件加载机制、AttentionBackend 选择与缓存机制、EngineCore 调度循环、KV Cache 管理、GPUModelRunner 前向传播流程、torch.compile 集成方式、OOT 平台注册机制
-     * vllm-ascend 仓库：NPUPlatform 注册与加载流程、NPUModelRunner 与 GPUModelRunner 的差异、ACL Graph 与 CUDA Graph 的差异、AscendAttentionBackend 的 NZ 格式处理、patch 机制（platform 级/worker 级）、EPLB 负载均衡原理
+{extra_context}
 5. **模块依赖关系**：模块间如何调用和依赖
 6. **硬件适配层**：与硬件相关的抽象层，哪些是平台无关的接口，哪些是平台特定的实现
 7. **接口面**（interface_surface）——非常重要：列出所有被外部平台插件（如 vllm-ascend）继承/复写的核心接口：
    - 对每个接口，说明：基类位置、ascend 实现类名、关键方法签名、影响规则（签名/行为变更的后果）
    - 同时列出 **不被 vllm-ascend 使用** 的模块/路径（如 flashinfer、cuda.py、rocm.py 等纯平台特定代码）
-{extra_context}
 
-## 输出格式
-输出 JSON 格式，不要输出其他内容，不要使用文件写入工具，直接在回复中输出 JSON：
+## 附加要求：生成 knowledge_base 字段
+请在 JSON 输出中增加 `knowledge_base` 字段，包含以下内容：
+
+1. **patch_catalog**: 从 patch/__init__.py 中提取的 patch 信息（如果你能看到该文件内容）。包含 targets（修改的目标类/函数）、why、how、related_pr、future_plan。
+2. **development_workflows**: 请参考以下固定模板，嵌入到 knowledge_base 中。这些模板是固定的，不需要修改。
 ```json
-{{
-  "repo": "{repo}",
-  "generated_at": "<当前时间 UTC+8>",
-  "commit_sha": "<commit SHA>",
-  "overview": "<项目概述>",
-  "modules": [
-    {{
-      "path": "<模块路径>",
-      "name": "<模块名>",
-      "description": "<职责描述（含实现原理，如适用）>",
-      "key_classes": ["<类名>"]
-    }}
-  ],
-  "key_abstractions": [
-    {{
-      "name": "<抽象名>",
-      "description": "<描述>",
-      "location": "<所在文件>",
-      "inherits_from": "<继承的基类，没有则填 null>",
-      "key_methods": ["<方法签名>: <作用简述>"],
-      "ascend_implementations": ["<ascend 实现类名，仅 vllm 仓库填写>"],
-      "relationships": ["<关联的抽象>"]
-    }}
-  ],
-  "implementation_principles": [
-    {{
-      "module": "<模块名>",
-      "problem": "<该模块解决的问题>",
-      "workflow": "<核心工作流程的文字描述，不用写代码>",
-      "interactions": "<与其他模块的交互方式>",
-      "platform_differences": "<不同硬件平台的差异处理方式（如适用）>"
-    }}
-  ],
-  "module_dependencies": "<模块间依赖关系的文字描述>",
-  "hardware_abstraction": {{
-    "description": "<硬件适配层的整体描述>",
-    "platform_independent": ["<平台无关接口>"],
-    "platform_specific": ["<平台特定实现>"]
-  }},
-  "interface_surface": {{
-    "description": "<哪些接口被外部平台插件继承/复写>",
-    "inheritable_interfaces": [
-      {{
-        "interface": "<vLLM 基类全限定名>",
-        "location": "<文件路径>",
-        "ascend_impl": "<vllm-ascend 中的实现类名>",
-        "key_methods": ["<方法签名>: <作用>"],
-        "impact_rule": "<修改该接口的签名或行为后对 vllm-ascend 的影响>"
-      }}
-    ],
-    "not_used_by_ascend": ["<vllm 中不被 vllm-ascend 使用的路径/模块>"]
-  }},
-  "test_structure": {{
-    "path": "<测试目录>",
-    "description": "<测试组织方式>"
-  }}
-}}
+{knowledge_base_template}
 ```"""
 
 VLLM_EXTRA_CONTEXT = """
@@ -344,121 +490,8 @@ def build_tree(local_repo, source_dir, max_depth=4):
     return "\n".join(lines)
 
 
-def read_key_files(local_repo, key_files):
-    parts = []
-    for rel_path in key_files:
-        abs_path = os.path.join(local_repo, rel_path)
-        if not os.path.exists(abs_path):
-            continue
-        try:
-            with open(abs_path, "r", encoding="utf-8") as f:
-                content = f.read()
-            lines = content.split("\n")
-            if len(lines) > 200:
-                content = "\n".join(lines[:200]) + "\n... (truncated)"
-            parts.append(f"### {rel_path}\n```python\n{content}\n```")
-        except (IOError, OSError):
-            continue
-
-    return "\n\n".join(parts)
-
-
-def extract_json_from_output(output, required_key="overview"):
-    import json as _json
-    if not output:
-        return None
-
-    text = output.strip()
-    if text.startswith("```"):
-        start = text.find("\n")
-        if start != -1:
-            text = text[start:].strip()
-        if text.endswith("```"):
-            text = text[:-3].strip()
-
-    stats_marker = "\n— "
-    stats_idx = text.rfind(stats_marker)
-    if stats_idx != -1:
-        text = text[:stats_idx].strip()
-
-    json_start = text.find("{")
-    if json_start == -1:
-        return None
-
-    i = json_start
-    while i != -1:
-        try:
-            parsed, end = _json.JSONDecoder().raw_decode(text, i)
-            if isinstance(parsed, dict) and any(k in parsed for k in (required_key, "modules", "commits")):
-                return parsed
-            i = text.find("{", i + 1)
-        except (_json.JSONDecodeError, ValueError):
-            i = text.find("{", i + 1)
-
-    return None
-
-
-DEFAULT_API_BASE = "https://api.deepseek.com/v1"
-
-
-def call_llm(prompt, max_tokens=32768):
-    prompt_bytes = len(prompt.encode("utf-8"))
-    print(f"  [call] prompt size: {prompt_bytes:,} bytes")
-
-    api_key = os.environ.get("LLM_API_KEY")
-    if not api_key:
-        print("Error: LLM_API_KEY environment variable not set")
-        return None
-
-    api_base = os.environ.get("LLM_API_BASE", DEFAULT_API_BASE).rstrip("/")
-    api_model = os.environ.get("LLM_MODEL", "deepseek-v4-flash")
-
-    endpoint = f"{api_base}/chat/completions"
-    body = json.dumps({
-        "model": api_model,
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.1,
-        "max_tokens": max_tokens,
-    }).encode("utf-8")
-
-    req = urllib.request.Request(
-        endpoint,
-        data=body,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}",
-        },
-    )
-
-    try:
-        with urllib.request.urlopen(req, timeout=600) as resp:
-            result = json.loads(resp.read())
-        content = result["choices"][0]["message"]["content"]
-        if not content or not content.strip():
-            print("LLM returned empty response")
-            return None
-        return content
-    except urllib.error.HTTPError as e:
-        print(f"API HTTP error: {e.code} {e.reason}")
-        try:
-            detail = e.read().decode("utf-8")
-            print(f"  Response: {detail[:300]}")
-        except Exception:
-            pass
-        return None
-    except urllib.error.URLError as e:
-        print(f"API connection error: {e.reason}")
-        return None
-    except json.JSONDecodeError as e:
-        print(f"API returned invalid JSON: {e}")
-        return None
-    except KeyError as e:
-        print(f"Unexpected API response format (missing {e})")
-        return None
-
-
 def generate_context(repo, data_dir, force, local_repo=None):
-    """Phase 1: Generate architecture.json for a single repo."""
+    """Phase 1: Generate architecture.json for a single repo using Claude Code agent."""
     repo_dir = os.path.join(data_dir, repo_dir_name(repo))
     context_path = os.path.join(repo_dir, "context", "architecture.json")
 
@@ -475,52 +508,40 @@ def generate_context(repo, data_dir, force, local_repo=None):
 
     source_dir = REPO_SOURCE_DIRS.get(repo, repo_dir_name(repo))
     is_vllm = "vllm-ascend" not in repo
-    key_files = VLLM_KEY_FILES if is_vllm else ASCEND_KEY_FILES
 
     print(f"Building directory tree for {repo} (source: {source_dir})...")
     tree = build_tree(local_repo, source_dir)
     print(f"  -> {len(tree.split(chr(10)))} entries")
 
-    print(f"Reading key interface files...")
-    key_files_content = read_key_files(local_repo, key_files)
-    print(f"  -> {len(key_files_content)} chars from {len(key_files)} files")
-
     extra = VLLM_EXTRA_CONTEXT if is_vllm else ASCEND_EXTRA_CONTEXT
     commit_sha = get_current_sha(local_repo) or "unknown"
+
+    knowledge_base_template = build_knowledge_base_template()
 
     prompt = CONTEXT_PROMPT_TEMPLATE.format(
         repo=repo,
         commit_sha=commit_sha,
+        local_repo=local_repo,
         tree=tree,
-        key_files_content=key_files_content,
         extra_context=extra,
+        knowledge_base_template=knowledge_base_template,
     )
 
-    print("Calling LLM to synthesize architecture summary...")
-    output = call_llm(prompt)
-    if output is None:
-        print("Failed to get response from LLM")
+    arch_schema = _build_architecture_schema()
+
+    print("Calling Claude Code (agent mode) to synthesize architecture summary...")
+    context = call_claude(
+        prompt=prompt,
+        json_schema=arch_schema,
+        max_budget_usd=8.0,
+        add_dirs=[local_repo],
+    )
+    if context is None:
+        print("Failed to get response from Claude Code")
         return False
 
-    context = extract_json_from_output(output)
-    if context is None:
-        print("Failed to parse JSON from LLM output")
-        print(f"Output length: {len(output)} chars")
-        print(f"First 100 chars: {output[:100]!r}")
-        print(f"Last 100 chars: {output[-100:]!r}")
-
-        fallback_path = os.path.join(repo_dir, "_llm_result.json")
-        if os.path.exists(fallback_path):
-            print(f"Trying fallback: reading {fallback_path}...")
-            try:
-                with open(fallback_path, "r", encoding="utf-8") as f:
-                    context = json.load(f)
-                os.unlink(fallback_path)
-            except (json.JSONDecodeError, OSError) as e:
-                print(f"Fallback also failed: {e}")
-                context = None
-
-    if context is None:
+    if not isinstance(context, dict):
+        print(f"Unexpected response type: {type(context)}")
         return False
 
     context["repo"] = repo
@@ -561,24 +582,43 @@ def generate_cross_reference(data_dir, force, vllm_local=None, ascend_local=None
 
     print("Phase 2: Generating cross-project relationship...")
 
-    vllm_json = json.dumps(vllm_ctx, ensure_ascii=False, indent=2)
-    ascend_json = json.dumps(ascend_ctx, ensure_ascii=False, indent=2)
+    # Only send the essential fields, not the full arch.json which is too large
+    def slim_ctx(ctx):
+        return {
+            "repo": ctx.get("repo"),
+            "overview": ctx.get("overview"),
+            "modules": ctx.get("modules", []),
+            "key_abstractions": [
+                {
+                    "name": a.get("name"),
+                    "location": a.get("location"),
+                    "inherits_from": a.get("inherits_from"),
+                    "key_methods": a.get("key_methods", []),
+                    "ascend_implementations": a.get("ascend_implementations", []),
+                }
+                for a in (ctx.get("key_abstractions") or [])
+            ],
+            "interface_surface": ctx.get("interface_surface"),
+        }
+
+    vllm_json = json.dumps(slim_ctx(vllm_ctx), ensure_ascii=False, indent=2)
+    ascend_json = json.dumps(slim_ctx(ascend_ctx), ensure_ascii=False, indent=2)
 
     prompt = CROSS_REFERENCE_PROMPT.format(
         vllm_context_json=vllm_json,
         ascend_context_json=ascend_json,
     )
 
-    output = call_llm(prompt, max_tokens=16384)
-    if output is None:
-        print("Failed to get cross-reference from LLM")
-        return False
+    cross_ref_schema = _build_cross_ref_schema()
 
-    cross_ref = extract_json_from_output(output, required_key="vllm_to_ascend_map")
+    print("Calling Claude Code (agent mode) for cross-reference...")
+    cross_ref = call_claude(
+        prompt=prompt,
+        json_schema=cross_ref_schema,
+        max_budget_usd=8.0,
+    )
     if cross_ref is None:
-        print("Failed to parse cross-reference JSON from LLM output")
-        print(f"Output length: {len(output)} chars")
-        print(f"First 200 chars: {output[:200]!r}")
+        print("Failed to get cross-reference from Claude Code")
         return False
 
     # Write cross_project_relationship into both architecture files

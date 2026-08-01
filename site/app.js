@@ -3,18 +3,26 @@
   const DATA_BASE_LOCAL = '../data';
   const DATA_BASE_PAGES = './data';
 
-  let DATA_BASE = DATA_BASE_PAGES;
+  let DATA_BASE = '/data';
 
   async function detectDataBase() {
-    const testUrl = `${DATA_BASE_PAGES}/vllm/dates.json`;
+    // Under dev server (python serve.py), root path /data/ works.
+    // Under GitHub Pages, /data/ also works (site is deployed to root).
+    // Under direct file open, /data/ won't exist, fallback to relative paths.
     try {
-      const resp = await fetch(testUrl, { method: 'HEAD' });
+      const resp = await fetch(`/data/vllm/index.json`, { method: 'HEAD' });
       if (resp.ok) {
-        DATA_BASE = DATA_BASE_PAGES;
+        DATA_BASE = '/data';
         return;
       }
     } catch {}
-    DATA_BASE = DATA_BASE_LOCAL;
+    try {
+      const resp = await fetch(`../data/vllm/index.json`, { method: 'HEAD' });
+      if (resp.ok) {
+        DATA_BASE = '../data';
+        return;
+      }
+    } catch {}
   }
 
   let currentRepo = REPOS[0];
@@ -52,9 +60,10 @@
   }
 
   async function loadAvailableDates() {
-    const index = await fetchJSON(`${DATA_BASE}/${repoDir(currentRepo)}/dates.json`);
-    if (index && index.dates && index.dates.length > 0) {
-      availableDates = index.dates.sort().reverse();
+    // Load dates from index.json (which has analysis_dates field)
+    const index = await fetchJSON(`${DATA_BASE}/${repoDir(currentRepo)}/index.json`);
+    if (index && index.analysis_dates && index.analysis_dates.length > 0) {
+      availableDates = index.analysis_dates.sort().reverse();
       return;
     }
 
@@ -89,9 +98,10 @@
   }
 
   async function loadAnalysisDates() {
-    var data = await fetchJSON(DATA_BASE + '/' + repoDir(currentRepo) + '/analysis-dates.json');
-    if (data && data.dates) {
-      analysisDates = data.dates;
+    // Load analysis dates from index.json
+    const index = await fetchJSON(DATA_BASE + '/' + repoDir(currentRepo) + '/index.json');
+    if (index && index.analysis_dates) {
+      analysisDates = index.analysis_dates;
     } else {
       analysisDates = [];
     }

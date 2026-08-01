@@ -1,7 +1,5 @@
 (function () {
   const REPOS = ['vllm-project/vllm', 'vllm-project/vllm-ascend'];
-  const DATA_BASE_LOCAL = '../data';
-  const DATA_BASE_PAGES = './data';
 
   let DATA_BASE = '/data';
 
@@ -36,6 +34,14 @@
   let crossDayResults = null; // { commits: [...], analysis: {...} } from cross-day search
   let sectionsExpanded = { ascend: true, code: false, chore: false, 'needs-test': true, other: false }; // per-section collapse state
 
+  // ── New data shared across enhancements ──
+  let adaptationStatus = null;      // sha -> {status, ...} from adaptation-status.json
+  let archImpactIndex = null;       // {sha: [interfaces...]} from index.json
+  let archKnowledge = null;         // architecture.json content
+  let archPanelOpen = false;
+  let currentArchTab = 'modules';
+  let cachedIndex = null;           // cached index.json content
+
   const $ = (sel) => document.querySelector(sel);
   const $$ = (sel) => document.querySelectorAll(sel);
 
@@ -62,8 +68,13 @@
   async function loadAvailableDates() {
     // Load dates from index.json (which has analysis_dates field)
     const index = await fetchJSON(`${DATA_BASE}/${repoDir(currentRepo)}/index.json`);
+    cachedIndex = index;
     if (index && index.analysis_dates && index.analysis_dates.length > 0) {
       availableDates = index.analysis_dates.sort().reverse();
+      // Also load architecture impact index
+      if (cachedIndex.architecture_impact_index) {
+        archImpactIndex = cachedIndex.architecture_impact_index;
+      }
       return;
     }
 
@@ -98,10 +109,12 @@
   }
 
   async function loadAnalysisDates() {
-    // Load analysis dates from index.json
-    const index = await fetchJSON(DATA_BASE + '/' + repoDir(currentRepo) + '/index.json');
-    if (index && index.analysis_dates) {
-      analysisDates = index.analysis_dates;
+    // Load analysis dates from cached index.json
+    if (cachedIndex && cachedIndex.analysis_dates) {
+      analysisDates = cachedIndex.analysis_dates;
+      if (cachedIndex.architecture_impact_index) {
+        archImpactIndex = cachedIndex.architecture_impact_index;
+      }
     } else {
       analysisDates = [];
     }
@@ -365,6 +378,16 @@
       if (activeFilter === 'all') return true;
       if (!a) return false;
 
+      // Adaptation status filters (vllm-ascend only)
+      if (activeFilter === 'adapt-pending' || activeFilter === 'adapt-adapted') {
+        if (!adaptationStatus) return false;
+        var adapt = adaptationStatus[c.sha];
+        if (!adapt) return false;
+        if (activeFilter === 'adapt-pending') return adapt.status === 'pending' || adapt.status === 'unknown';
+        if (activeFilter === 'adapt-adapted') return adapt.status === 'adapted' || adapt.status === 'skipped';
+        return false;
+      }
+
       switch (activeFilter) {
         case 'needs-test':
           return (a.test_impact && a.test_impact.needs_test_update) || (a.ascend_impact && a.ascend_impact.needs_test_update);
@@ -395,6 +418,10 @@
 
   function updateFilterChips(allCommits) {
     var filters = ['all', 'needs-test', 'affects-ascend', 'high-risk', 'feature', 'bugfix', 'refactor', 'performance'];
+    // Add adaptation status filters (only for vllm repo, where upstream commits are tracked)
+    if (currentRepo === 'vllm-project/vllm' && adaptationStatus) {
+      filters.push('adapt-pending', 'adapt-adapted');
+    }
     var saved = activeFilter;
     var counts = {};
     for (var i = 0; i < filters.length; i++) {
@@ -503,6 +530,533 @@
     return s;
   }
 
+  // ── Adaptation Status (P1) ────────────────────
+  async function loadAdaptationStatus() {
+    const data = await fetchJSON(`${DATA_BASE}/vllm-ascend/adaptation-status.json`);
+    if (!data || !data.commits) {
+      adaptationStatus = null;
+      return;
+    }
+    const statusMap = {};
+    data.commits.forEach(function (c) {
+      // Use upstream_sha if available, fallback to sha
+      var key = c.upstream_sha || c.sha;
+      statusMap[key] = c;
+    });
+    adaptationStatus = statusMap;
+  }
+
+  function getAdaptBadgeHtml(sha) {
+    if (!adaptationStatus) return '';
+    var adapt = adaptationStatus[sha];
+    if (!adapt) return '';
+    var status = adapt.status || 'unknown';
+    var labels = {
+      unknown: 'Unknown',
+      pending: 'Pending',
+      in_progress: 'In Progress',
+      adapted: 'Adapted',
+      skipped: 'Skipped'
+    };
+    var label = labels[status] || status;
+    return `<span class="adapt-badge ${status}" data-adapt-sha="${sha}">${label}</span>`;
+  }
+
+  // ── Architecture Impact Marker (P3) ───────────
+  function getArchImpactHtml(sha) {
+    if (!archImpactIndex) return '';
+    var impact = archImpactIndex[sha];
+    if (!impact) return '';
+    // impact can be a string[] of affected interfaces, or an object
+    if (Array.isArray(impact)) {
+      var interfaces = impact.join(', ');
+      return `<span class="arch-impact-marker" title="Affected interfaces: ${escapeHtml(interfaces)}">⚡ Arch Impact: ${escapeHtml(interfaces.substring(0, 60))}</span>`;
+    }
+    return '';
+  }
+
+  // ── Baseline Info (P3) ────────────────────────
+  async function loadBaseline() {
+    if (currentRepo !== 'vllm-project/vllm-ascend') {
+      $('#baselineBar').style.display = 'none';
+      return;
+    }
+    try {
+      // Read main baseline SHA
+      const mainResp = await fetch(
+        'https://api.github.com/repos/vllm-project/vllm-ascend/contents/.github/vllm-main-verified.commit'
+      );
+      // Read release tag
+      const releaseResp = await fetch(
+        'https://api.github.com/repos/vllm-project/vllm-ascend/contents/.github/vllm-release-tag.commit'
+      );
+      if (!mainResp.ok || !releaseResp.ok) {
+        // Fallback: read from adaptation-status.json stats
+        showBaselineFromStats();
+        return;
+      }
+      const mainData = await mainResp.json();
+      const releaseData = await releaseResp.json();
+      var mainSha = atob(mainData.content).trim();
+      var releaseTag = atob(releaseData.content).trim();
+
+      // Get stats from adaptation-status.json
+      var adaptData = await fetchJSON(`${DATA_BASE}/vllm-ascend/adaptation-status.json`);
+      var stats = adaptData && adaptData.stats ? adaptData.stats : {};
+
+      var html = '';
+      html += '<span class="baseline-text">';
+      html += 'Main: <code>' + mainSha.substring(0, 12) + '</code>';
+      if (releaseTag) html += ' &nbsp;|&nbsp; Release: <code>' + escapeHtml(releaseTag) + '</code>';
+      if (stats.total) {
+        html += ' &nbsp;|&nbsp; ';
+        html += '<span class="baseline-status pending">Pending: ' + (stats.pending || 0) + '</span> ';
+        html += '<span class="baseline-status adapted">Adapted: ' + (stats.adapted || 0) + '</span> ';
+        if (stats.unknown) html += 'Unknown: ' + stats.unknown + ' ';
+        if (stats.skipped) html += 'Skipped: ' + stats.skipped;
+      }
+      html += '</span>';
+
+      $('#baselineText').innerHTML = html;
+      $('#baselineBar').style.display = 'block';
+    } catch {
+      showBaselineFromStats();
+    }
+  }
+
+  async function showBaselineFromStats() {
+    try {
+      var adaptData = await fetchJSON(`${DATA_BASE}/vllm-ascend/adaptation-status.json`);
+      var stats = adaptData && adaptData.stats ? adaptData.stats : {};
+      if (!stats.total) {
+        $('#baselineBar').style.display = 'none';
+        return;
+      }
+      var html = '';
+      html += '<span class="baseline-text">Adaptation: ';
+      html += '<span class="baseline-status pending">Pending: ' + (stats.pending || 0) + '</span> ';
+      html += '<span class="baseline-status adapted">Adapted: ' + (stats.adapted || 0) + '</span> ';
+      if (stats.unknown) html += ' Unknown: ' + stats.unknown;
+      if (stats.in_progress) html += ' In Progress: ' + stats.in_progress;
+      html += '</span>';
+      $('#baselineText').innerHTML = html;
+      $('#baselineBar').style.display = 'block';
+    } catch {
+      $('#baselineBar').style.display = 'none';
+    }
+  }
+
+  // ── Architecture Knowledge Drawer (P4) ─────────
+  async function loadArchKnowledge() {
+    const data = await fetchJSON(`${DATA_BASE}/${repoDir(currentRepo)}/context/architecture.json`);
+    archKnowledge = data;
+    return data;
+  }
+
+  function openArchDrawer() {
+    archPanelOpen = true;
+    var drawer = $('#archDrawer');
+    var btn = $('#archBtn');
+    drawer.classList.add('open');
+    btn.classList.add('active');
+    renderArchTab(currentArchTab);
+  }
+
+  function closeArchDrawer() {
+    archPanelOpen = false;
+    var drawer = $('#archDrawer');
+    var btn = $('#archBtn');
+    drawer.classList.remove('open');
+    btn.classList.remove('active');
+  }
+
+  function openArchDetail(title, html) {
+    var detailDrawer = $('#archDetailDrawer');
+    detailDrawer.querySelector('.arch-drawer-title').textContent = title;
+    $('#archDetailBody').innerHTML = html;
+    detailDrawer.style.display = 'flex';
+    requestAnimationFrame(function () {
+      detailDrawer.classList.add('open');
+    });
+  }
+
+  function closeArchDetail() {
+    var detailDrawer = $('#archDetailDrawer');
+    detailDrawer.classList.remove('open');
+    setTimeout(function () {
+      detailDrawer.style.display = 'none';
+    }, 250);
+  }
+
+  function renderArchTab(tab) {
+    currentArchTab = tab;
+    if (!archKnowledge) {
+      $('#archDrawerBody').innerHTML = '<div style="padding:40px;text-align:center;color:var(--text-muted)">No architecture data available</div>';
+      loadArchKnowledge().then(function () {
+        renderArchTab(currentArchTab);
+      });
+      return;
+    }
+
+    var html = '';
+    switch (tab) {
+      case 'modules':
+        html = renderArchModules();
+        break;
+      case 'patches':
+        html = renderArchPatches();
+        break;
+      case 'workflows':
+        html = renderArchWorkflows();
+        break;
+      case 'testing':
+        html = renderArchTesting();
+        break;
+      case 'mapping':
+        html = renderArchMapping();
+        break;
+    }
+    $('#archDrawerBody').innerHTML = html;
+  }
+
+  function renderArchModules() {
+    var modules = archKnowledge.modules || [];
+    var html = '';
+    for (var i = 0; i < modules.length; i++) {
+      var m = modules[i];
+      html += '<div class="arch-card arch-card-clickable" data-arch-detail="module-' + i + '">';
+      html += '<div class="arch-card-name">' + escapeHtml(m.name || '') + '</div>';
+      if (m.path) html += '<div class="arch-card-path">' + escapeHtml(m.path) + '</div>';
+      if (m.description) html += '<div class="arch-card-desc">' + escapeHtml(m.description) + '</div>';
+      if (m.key_classes && m.key_classes.length > 0) {
+        html += '<div style="font-size:0.72rem;color:var(--text-muted);margin-top:4px">Classes: ' + m.key_classes.join(', ') + '</div>';
+      }
+      html += '</div>';
+    }
+    if (!html) html = '<div style="padding:20px;text-align:center;color:var(--text-muted)">No modules found</div>';
+    return html;
+  }
+
+  function renderArchPatches() {
+    var kb = archKnowledge.knowledge_base || {};
+    var catalog = kb.patch_catalog || {};
+    var html = '';
+
+    var categories = [
+      { key: 'platform_patches', label: 'Platform Patches' },
+      { key: 'worker_patches', label: 'Worker Patches' },
+      { key: 'v2_worker_patches', label: 'V2 Worker Patches' }
+    ];
+
+    for (var ci = 0; ci < categories.length; ci++) {
+      var cat = categories[ci];
+      var patches = catalog[cat.key] || [];
+      if (patches.length === 0) continue;
+      html += '<div class="arch-section-title">' + cat.label + ' (' + patches.length + ')</div>';
+      for (var pi = 0; pi < patches.length; pi++) {
+        var p = patches[pi];
+        html += '<div class="arch-card arch-card-clickable" data-arch-detail="patch-' + cat.key + '-' + pi + '">';
+        html += '<div class="arch-card-name">' + escapeHtml(p.file || '') + '</div>';
+        if (p.targets && p.targets.length > 0) {
+          html += '<div class="arch-card-path">Targets: ' + p.targets.slice(0, 2).join(', ') + (p.targets.length > 2 ? '...' : '') + '</div>';
+        }
+        html += '</div>';
+      }
+    }
+
+    if (!html) html = '<div style="padding:20px;text-align:center;color:var(--text-muted)">No patches found</div>';
+    return html;
+  }
+
+  function renderArchWorkflows() {
+    var kb = archKnowledge.knowledge_base || {};
+    var workflows = kb.development_workflows || {};
+    var html = '';
+
+    var repoKey = currentRepo === 'vllm-project/vllm' ? 'vllm' : 'vllm-ascend';
+    var items = workflows[repoKey] || [];
+    if (items.length > 0) {
+      html += '<div class="arch-section-title">' + (repoKey === 'vllm-ascend' ? 'vllm-ascend' : 'vllm') + ' Workflows</div>';
+    }
+    for (var i = 0; i < items.length; i++) {
+      var w = items[i];
+      html += '<div class="arch-card">';
+      html += '<div class="arch-card-name" style="margin-bottom:6px">' + escapeHtml(w.topic || '') + '</div>';
+      if (w.steps) {
+        html += '<ol style="color:var(--text-secondary);padding-left:16px;line-height:1.8;font-size:0.78rem;margin:0">';
+        for (var si = 0; si < w.steps.length; si++) {
+          html += '<li>' + escapeHtml(w.steps[si]) + '</li>';
+        }
+        html += '</ol>';
+      }
+      html += '</div>';
+    }
+
+    // Also show vllm workflows if on vllm-ascend
+    if (repoKey === 'vllm-ascend' && workflows.vllm) {
+      html += '<div class="arch-section-title">vllm Workflows</div>';
+      var vllmItems = workflows.vllm || [];
+      for (var vi = 0; vi < vllmItems.length; vi++) {
+        var wv = vllmItems[vi];
+        html += '<div class="arch-card">';
+        html += '<div class="arch-card-name" style="margin-bottom:6px">' + escapeHtml(wv.topic || '') + '</div>';
+        if (wv.steps) {
+          html += '<ol style="color:var(--text-secondary);padding-left:16px;line-height:1.8;font-size:0.78rem;margin:0">';
+          for (var sj = 0; sj < wv.steps.length; sj++) {
+            html += '<li>' + escapeHtml(wv.steps[sj]) + '</li>';
+          }
+          html += '</ol>';
+        }
+        html += '</div>';
+      }
+    }
+
+    if (!html) html = '<div style="padding:20px;text-align:center;color:var(--text-muted)">No workflows found</div>';
+    return html;
+  }
+
+  function renderArchTesting() {
+    var kb = archKnowledge.knowledge_base || {};
+    var testing = kb.testing_guide || {};
+    var html = '';
+
+    var repoKey = currentRepo === 'vllm-project/vllm' ? 'vllm' : 'vllm-ascend';
+    var guide = testing[repoKey] || {};
+
+    if (guide.environment_setup) {
+      html += '<div class="arch-section-title">Environment Setup</div>';
+      html += '<div class="arch-card"><pre class="arch-card-code">' + escapeHtml(guide.environment_setup) + '</pre></div>';
+    }
+
+    if (guide.test_commands && guide.test_commands.length > 0) {
+      html += '<div class="arch-section-title">Test Commands</div>';
+      for (var i = 0; i < guide.test_commands.length; i++) {
+        html += '<div class="arch-card"><pre class="arch-card-code">' + escapeHtml(guide.test_commands[i]) + '</pre></div>';
+      }
+    }
+
+    if (guide.lint_commands && guide.lint_commands.length > 0) {
+      html += '<div class="arch-section-title">Lint Commands</div>';
+      for (var i = 0; i < guide.lint_commands.length; i++) {
+        html += '<div class="arch-card"><pre class="arch-card-code">' + escapeHtml(guide.lint_commands[i]) + '</pre></div>';
+      }
+    }
+
+    if (!html) html = '<div style="padding:20px;text-align:center;color:var(--text-muted)">No testing guide found</div>';
+    return html;
+  }
+
+  function renderArchMapping() {
+    var cpr = archKnowledge.cross_project_relationship || {};
+    var html = '';
+
+    // patch_impact_map
+    var impactMap = cpr.patch_impact_map || {};
+    var keys = Object.keys(impactMap);
+    if (keys.length > 0) {
+      html += '<div class="arch-section-title">Patch Impact Map (' + keys.length + ')</div>';
+      for (var i = 0; i < keys.length; i++) {
+        var vllmPath = keys[i];
+        var ascendPatch = impactMap[vllmPath];
+        html += '<div class="arch-card arch-card-clickable" data-arch-detail="mapping-' + i + '">';
+        html += '<div class="arch-card-path">' + escapeHtml(vllmPath) + '</div>';
+        html += '<div style="font-size:0.85rem"><span class="arch-mapping-arrow">→</span> <span class="arch-card-name" style="display:inline">' + escapeHtml(ascendPatch) + '</span></div>';
+        html += '</div>';
+      }
+    }
+
+    // impact_judgment_rules
+    var rules = cpr.impact_judgment_rules || {};
+    var ruleKeys = Object.keys(rules);
+    if (ruleKeys.length > 0) {
+      html += '<div class="arch-section-title">Impact Judgment Rules</div>';
+      for (var ri = 0; ri < ruleKeys.length; ri++) {
+        var rk = ruleKeys[ri];
+        var paths = rules[rk] || [];
+        html += '<div class="arch-card arch-card-clickable" data-arch-detail="rule-' + rk + '">';
+        html += '<div style="font-weight:600;color:var(--accent);font-size:0.82rem">' + rk + ' (' + paths.length + ')</div>';
+        html += '<div style="font-size:0.72rem;color:var(--text-muted);margin-top:2px">' + paths.slice(0, 3).join(', ');
+        if (paths.length > 3) html += ', ...';
+        html += '</div></div>';
+      }
+    }
+
+    if (!html) html = '<div style="padding:20px;text-align:center;color:var(--text-muted)">No cross-project mapping found</div>';
+    return html;
+  }
+
+  function getArchDetailHtml(detailId) {
+    if (!archKnowledge) return '<p>No data</p>';
+    var parts = detailId.split('-');
+    var type = parts[0];
+
+    switch (type) {
+      case 'module': {
+        var idx = parseInt(parts.slice(1).join('-'), 10);
+        var m = archKnowledge.modules[idx];
+        if (!m) return '<p>Not found</p>';
+        var h = '<div class="arch-section-title">' + escapeHtml(m.name) + '</div>';
+        if (m.path) h += '<div style="margin-bottom:8px"><span class="adapt-drawer-label">Path:</span> <code>' + escapeHtml(m.path) + '</code></div>';
+        if (m.description) h += '<p style="color:var(--text-secondary);line-height:1.6;margin-bottom:12px">' + escapeHtml(m.description) + '</p>';
+        if (m.key_classes && m.key_classes.length > 0) {
+          h += '<div class="arch-section-title" style="font-size:0.85rem">Key Classes</div><ul style="color:var(--text-secondary);padding-left:16px">';
+          m.key_classes.forEach(function (k) { h += '<li style="margin:4px 0">' + escapeHtml(k) + '</li>'; });
+          h += '</ul>';
+        }
+        return h;
+      }
+      case 'patch': {
+        // format: patch-{category}-{index}
+        var catKey = parts.slice(1, -1).join('-');
+        var idx = parseInt(parts[parts.length - 1], 10);
+        var kb = archKnowledge.knowledge_base || {};
+        var catalog = kb.patch_catalog || {};
+        var patches = catalog[catKey] || [];
+        var p = patches[idx];
+        if (!p) return '<p>Not found</p>';
+        var h = '<div class="arch-section-title">' + escapeHtml(p.file) + '</div>';
+        if (p.targets) h += '<div style="margin-bottom:8px"><span class="adapt-drawer-label">Targets:</span><ul style="color:var(--text-secondary);padding-left:16px;margin:4px 0">' + p.targets.map(function (t) { return '<li>' + escapeHtml(t) + '</li>'; }).join('') + '</ul></div>';
+        if (p.why) h += '<p style="color:var(--text-secondary);line-height:1.6;margin-bottom:8px"><strong>Why:</strong> ' + escapeHtml(p.why) + '</p>';
+        if (p.how) h += '<p style="color:var(--text-secondary);line-height:1.6;margin-bottom:8px"><strong>How:</strong> ' + escapeHtml(p.how) + '</p>';
+        if (p.related_pr) h += '<p style="color:var(--accent-blue);margin-bottom:4px">PR: ' + escapeHtml(p.related_pr) + '</p>';
+        if (p.future_plan) h += '<p style="color:var(--text-muted);font-size:0.82rem;font-style:italic">Plan: ' + escapeHtml(p.future_plan) + '</p>';
+        return h;
+      }
+      case 'workflow': {
+        // format: workflow-{repo}-{index}
+        var repoKey = parts[1];
+        var idx = parseInt(parts.slice(2).join('-'), 10);
+        var kb = archKnowledge.knowledge_base || {};
+        var workflows = kb.development_workflows || {};
+        var items = workflows[repoKey] || [];
+        var w = items[idx];
+        if (!w) return '<p>Not found</p>';
+        var h = '<div class="arch-section-title">' + escapeHtml(w.topic) + '</div>';
+        if (w.steps) {
+          h += '<ol style="color:var(--text-secondary);padding-left:16px;line-height:1.8">';
+          w.steps.forEach(function (s) { h += '<li>' + escapeHtml(s) + '</li>'; });
+          h += '</ol>';
+        }
+        return h;
+      }
+      case 'rule': {
+        var rk = parts.slice(1).join('-');
+        var cpr = archKnowledge.cross_project_relationship || {};
+        var rules = cpr.impact_judgment_rules || {};
+        var paths = rules[rk] || [];
+        var h = '<div class="arch-section-title">' + rk + ' (' + paths.length + ')</div>';
+        h += '<ul style="color:var(--text-secondary);padding-left:16px;line-height:1.8">';
+        paths.forEach(function (p) { h += '<li><code>' + escapeHtml(p) + '</code></li>'; });
+        h += '</ul>';
+        return h;
+      }
+      case 'mapping': {
+        var idx = parseInt(parts.slice(1).join('-'), 10);
+        var cpr = archKnowledge.cross_project_relationship || {};
+        var impactMap = cpr.patch_impact_map || {};
+        var keys = Object.keys(impactMap);
+        var vllmPath = keys[idx];
+        var ascendPatch = impactMap[vllmPath];
+        if (!vllmPath) return '<p>Not found</p>';
+        var h = '<div class="arch-section-title">Patch Mapping</div>';
+        h += '<div style="margin-bottom:8px"><span class="adapt-drawer-label">vllm:</span> <code>' + escapeHtml(vllmPath) + '</code></div>';
+        h += '<div style="margin-bottom:8px"><span class="adapt-drawer-label">ascend:</span> <code>' + escapeHtml(ascendPatch) + '</code></div>';
+        return h;
+      }
+      default:
+        return '<p>Unknown detail type</p>';
+    }
+  }
+
+  // ── Search Acceleration (P2) ──────────────────
+  async function searchAcrossDates() {
+    if (!searchQuery) return;
+    showLoading(true);
+
+    // Try to use cached index.json for fast pre-filtering
+    var index = cachedIndex || await fetchJSON(`${DATA_BASE}/${repoDir(currentRepo)}/index.json`);
+    var matchedDates = null;
+
+    if (index && index.keyword_index) {
+      // Use keyword_index to find matching SHAs first
+      var kw = searchQuery.toLowerCase();
+      var kwIndex = index.keyword_index;
+      var matchingShas = new Set();
+
+      // Check if keyword directly matches any index entry
+      for (var key in kwIndex) {
+        if (key.indexOf(kw) !== -1 || kw.indexOf(key) !== -1) {
+          kwIndex[key].forEach(function (sha) { matchingShas.add(sha); });
+        }
+      }
+
+      // If no keyword match, try tags_index
+      if (matchingShas.size === 0 && index.tags_index) {
+        var tagsIndex = index.tags_index;
+        for (var tag in tagsIndex) {
+          if (tag.indexOf(kw) !== -1 || kw.indexOf(tag) !== -1) {
+            tagsIndex[tag].forEach(function (sha) { matchingShas.add(sha); });
+          }
+        }
+      }
+
+      // Resolve SHAs to dates using commits-index
+      if (matchingShas.size > 0) {
+        var commitsIndex = await fetchJSON(`${DATA_BASE}/${repoDir(currentRepo)}/commits-index.json`);
+        if (commitsIndex) {
+          var dateSet = new Set();
+          matchingShas.forEach(function (sha) {
+            var info = commitsIndex[sha];
+            if (info && info.date) dateSet.add(info.date);
+          });
+          matchedDates = Array.from(dateSet).sort().reverse();
+        }
+      }
+    }
+
+    // If index didn't help, fall back to scanning all dates
+    if (!matchedDates) {
+      matchedDates = availableDates.slice();
+    }
+
+    var allCommits = [];
+    var allAnalysis = {};
+
+    // Fetch in parallel batches of 10
+    var batchSize = 10;
+    for (var i = 0; i < matchedDates.length; i += batchSize) {
+      var batch = matchedDates.slice(i, i + batchSize);
+      var results = await Promise.all(batch.map(function (date) {
+        return Promise.all([
+          fetchJSON(dataUrl(currentRepo, 'commits', date)),
+          fetchJSON(dataUrl(currentRepo, 'analysis', date)),
+        ]);
+      }));
+      for (var j = 0; j < results.length; j++) {
+        var commitsData2 = results[j][0];
+        var analysisData2 = results[j][1];
+        if (commitsData2 && commitsData2.commits) {
+          for (var k = 0; k < commitsData2.commits.length; k++) {
+            commitsData2.commits[k]._date = batch[j];
+            allCommits.push(commitsData2.commits[k]);
+          }
+        }
+        if (analysisData2 && analysisData2.commits) {
+          for (var m = 0; m < analysisData2.commits.length; m++) {
+            allAnalysis[analysisData2.commits[m].sha] = analysisData2.commits[m];
+          }
+        }
+      }
+    }
+
+    var filtered = filterCommits(allCommits, allAnalysis);
+    crossDayResults = { commits: filtered, analysis: allAnalysis };
+    sectionsExpanded = { ascend: true, code: true, chore: true, 'needs-test': true, other: true }; // cross-day search expands all
+    showLoading(false);
+    render();
+  }
+
+  // ── Render ─────────────────────────────────────
   function renderCommitCard(commit) {
     const a = getAnalysisForSha(commit.sha);
     const hasAnalysis = !!a;
@@ -521,7 +1075,7 @@
 
     let html = `<div class="${cardClass}" data-sha="${commit.sha}">`;
     html += `<div class="commit-header">`;
-    html += `<span class="expand-arrow">\u25B6</span>`;
+    html += `<span class="expand-arrow">▶</span>`;
     html += `<a class="commit-sha" href="https://github.com/${currentRepo}/commit/${commit.sha}" target="_blank">${shaShort}</a>`;
     html += `<div class="commit-message">`;
     html += `<div class="commit-title">${highlightText(title, searchQuery)}</div>`;
@@ -534,6 +1088,18 @@
         html += `<span class="${tagClass(tag)}">${escapeHtml(tag)}</span>`;
       }
       html += `</div>`;
+    }
+
+    // ── Enhancement: Adaptation Status Badge (P1) ──
+    var adaptBadge = getAdaptBadgeHtml(commit.sha);
+    if (adaptBadge) {
+      html += `<div style="display:flex;align-items:center;gap:6px;flex-shrink:0;padding:0 16px 2px">${adaptBadge}</div>`;
+    }
+
+    // ── Enhancement: Architecture Impact Marker (P3) ──
+    var archImpact = getArchImpactHtml(commit.sha);
+    if (archImpact) {
+      html += `<div style="display:flex;align-items:center;gap:6px;flex-shrink:0;padding:0 16px 2px">${archImpact}</div>`;
     }
 
     html += `<div class="commit-meta">`;
@@ -552,7 +1118,7 @@
       }
       if (a.test_impact) {
         html += `<div class="impact-card test-impact">`;
-        html += `<div class="impact-label${a.test_impact.needs_test_update ? ' needs-test' : ''}">${a.test_impact.needs_test_update ? '\u26A0 Test Update Needed' : 'Test Impact'}</div>`;
+        html += `<div class="impact-label${a.test_impact.needs_test_update ? ' needs-test' : ''}">${a.test_impact.needs_test_update ? '[!] Test Update Needed' : 'Test Impact'}</div>`;
         html += `<div class="impact-text"><strong>Reason:</strong> ${renderMarkdown(a.test_impact.reason || '')}</div>`;
         if (a.test_impact.suggested_test_areas && a.test_impact.suggested_test_areas.length > 0) {
           html += `<div class="impact-text" style="margin-top:4px"><strong>Areas:</strong> ${a.test_impact.suggested_test_areas.map(escapeHtml).join(', ')}</div>`;
@@ -571,7 +1137,7 @@
           html += `<div class="impact-text" style="margin-top:4px"><strong>Testing:</strong> ${renderMarkdown(testImp)}</div>`;
         }
         if (a.ascend_impact.needs_test_update) {
-          html += `<div class="impact-text" style="margin-top:4px"><span class="stat-badge additions" style="font-size:0.75rem">\u26A0 Test Update Needed</span></div>`;
+          html += `<div class="impact-text" style="margin-top:4px"><span class="stat-badge additions" style="font-size:0.75rem">[!] Test Update Needed</span></div>`;
           if (a.ascend_impact.suggested_test_areas && a.ascend_impact.suggested_test_areas.length > 0) {
             html += `<div class="impact-text" style="margin-top:4px"><strong>Areas:</strong> ${a.ascend_impact.suggested_test_areas.map(escapeHtml).join(', ')}</div>`;
           }
@@ -583,7 +1149,7 @@
 
     if (commit.files && commit.files.length > 0) {
       html += `<div class="diff-section">`;
-      html += `<div class="diff-toggle" data-sha="${commit.sha}"><span class="arrow">\u25B6</span> ${commit.files.length} file(s) changed</div>`;
+      html += `<div class="diff-toggle" data-sha="${commit.sha}"><span class="arrow">▶</span> ${commit.files.length} file(s) changed</div>`;
       html += `<div class="diff-content" id="diff-${commit.sha}">`;
       for (const file of commit.files) {
         html += `<div class="file-diff">`;
@@ -911,48 +1477,7 @@
     return renderCommitCard(commit);
   }
 
-  async function searchAcrossDates() {
-    if (!searchQuery) return;
-    showLoading(true);
-
-    var allCommits = [];
-    var allAnalysis = {};
-    var dates = availableDates.slice();
-
-    // Fetch in parallel batches of 10
-    var batchSize = 10;
-    for (var i = 0; i < dates.length; i += batchSize) {
-      var batch = dates.slice(i, i + batchSize);
-      var results = await Promise.all(batch.map(function (date) {
-        return Promise.all([
-          fetchJSON(dataUrl(currentRepo, 'commits', date)),
-          fetchJSON(dataUrl(currentRepo, 'analysis', date)),
-        ]);
-      }));
-      for (var j = 0; j < results.length; j++) {
-        var commitsData = results[j][0];
-        var analysisData = results[j][1];
-        if (commitsData && commitsData.commits) {
-          for (var k = 0; k < commitsData.commits.length; k++) {
-            commitsData.commits[k]._date = batch[j];
-            allCommits.push(commitsData.commits[k]);
-          }
-        }
-        if (analysisData && analysisData.commits) {
-          for (var m = 0; m < analysisData.commits.length; m++) {
-            allAnalysis[analysisData.commits[m].sha] = analysisData.commits[m];
-          }
-        }
-      }
-    }
-
-    var filtered = filterCommits(allCommits, allAnalysis);
-    crossDayResults = { commits: filtered, analysis: allAnalysis };
-    sectionsExpanded = { ascend: true, code: true, chore: true, 'needs-test': true, other: true }; // cross-day search expands all
-    showLoading(false);
-    render();
-  }
-
+  // ── Init ────────────────────────────────────────
   function init() {
     $$('.repo-tab').forEach((tab) => {
       tab.addEventListener('click', async () => {
@@ -967,7 +1492,12 @@
         $('#searchClear').style.display = 'none';
         $$('.filter-chip').forEach((c) => c.classList.remove('active'));
         $$('.filter-chip')[0].classList.add('active');
+        // Reset arch knowledge on repo switch
+        archKnowledge = null;
+        archImpactIndex = null;
         await loadAvailableDates();
+        await loadAdaptationStatus();
+        await loadBaseline();
         currentDateIndex = 0;
         currentMonth = null;
         if (availableDates.length > 0) {
@@ -1030,6 +1560,121 @@
       render();
     });
 
+    // ── Architecture Knowledge Drawer toggle ──
+    $('#archBtn').addEventListener('click', function () {
+      if (archPanelOpen) {
+        closeArchDrawer();
+      } else {
+        openArchDrawer();
+      }
+    });
+
+    $('#archDrawerClose').addEventListener('click', closeArchDrawer);
+
+    // ── Arch detail drawer ──
+    $('#archDetailBack').addEventListener('click', closeArchDetail);
+    $('#archDetailClose').addEventListener('click', closeArchDetail);
+
+    // ── Architecture tab switching + card clicks ──
+    document.addEventListener('click', function (e) {
+      var archTab = e.target.closest('.arch-tab');
+      if (archTab) {
+        // Only handle tabs inside arch drawer
+        if (archTab.closest('#archDrawer')) {
+          $$('.arch-tab').forEach(function (t) { t.classList.remove('active'); });
+          archTab.classList.add('active');
+          renderArchTab(archTab.dataset.archTab);
+        }
+        return;
+      }
+
+      // ── Arch card click → show detail drawer ──
+      var archCard = e.target.closest('.arch-card-clickable');
+      if (archCard && archCard.dataset.archDetail) {
+        var detailId = archCard.dataset.archDetail;
+        var title = archCard.querySelector('.arch-card-name');
+        var detailHtml = getArchDetailHtml(detailId);
+        openArchDetail(title ? title.textContent : 'Detail', detailHtml);
+        return;
+      }
+
+      // ── Adaptation detail drawer ──
+      var adaptBadge = e.target.closest('.adapt-badge');
+      if (adaptBadge) {
+        var sha = adaptBadge.dataset.adaptSha;
+        if (adaptationStatus && adaptationStatus[sha]) {
+          showAdaptationDetail(adaptationStatus[sha]);
+        }
+        return;
+      }
+
+      // ── Close adaptation detail drawer ──
+      if (e.target.closest('.adapt-drawer-close') || e.target.closest('.adapt-drawer-overlay')) {
+        closeAdaptationDrawer();
+        return;
+      }
+    });
+
+    function closeAdaptationDrawer() {
+      var drawer = document.querySelector('.adapt-drawer');
+      var overlay = document.querySelector('.adapt-drawer-overlay');
+      if (drawer) {
+        drawer.classList.remove('open');
+        setTimeout(function () {
+          if (drawer) drawer.remove();
+          if (overlay) overlay.remove();
+        }, 250);
+      } else {
+        if (overlay) overlay.remove();
+      }
+    }
+
+    function showAdaptationDetail(adapt) {
+      // Remove existing drawer
+      var existing = document.querySelector('.adapt-drawer');
+      var existingOverlay = document.querySelector('.adapt-drawer-overlay');
+      if (existing) existing.remove();
+      if (existingOverlay) existingOverlay.remove();
+
+      var overlay = document.createElement('div');
+      overlay.className = 'adapt-drawer-overlay';
+      document.body.appendChild(overlay);
+
+      var labels = {
+        unknown: 'Unknown',
+        pending: 'Pending',
+        in_progress: 'In Progress',
+        adapted: 'Adapted',
+        skipped: 'Skipped'
+      };
+      var statusLabel = labels[adapt.status] || adapt.status;
+
+      var html = '<div class="adapt-drawer">';
+      html += '<div class="adapt-drawer-inner">';
+      html += '<div class="adapt-drawer-header">';
+      html += '<div class="adapt-drawer-title">Adaptation Details</div>';
+      html += '<button class="adapt-drawer-close">✕</button>';
+      html += '</div>';
+      html += '<div class="adapt-drawer-body">';
+      html += '<div class="adapt-drawer-row"><span class="adapt-drawer-label">SHA</span><span class="adapt-drawer-value"><code>' + escapeHtml(adapt.sha || '').substring(0, 12) + '</code></span></div>';
+      html += '<div class="adapt-drawer-row"><span class="adapt-drawer-label">Status</span><span class="adapt-drawer-value">' + statusLabel + '</span></div>';
+      if (adapt.message) html += '<div class="adapt-drawer-row"><span class="adapt-drawer-label">Message</span><span class="adapt-drawer-value">' + escapeHtml(adapt.message.substring(0, 120)) + '</span></div>';
+      if (adapt.ascend_impact_summary) html += '<div class="adapt-drawer-row"><span class="adapt-drawer-label">Impact</span><span class="adapt-drawer-value">' + escapeHtml(adapt.ascend_impact_summary) + '</span></div>';
+      if (adapt.adaptation_notes) html += '<div class="adapt-drawer-row"><span class="adapt-drawer-label">Notes</span><span class="adapt-drawer-value">' + escapeHtml(adapt.adaptation_notes) + '</span></div>';
+      if (adapt.adapted_at) html += '<div class="adapt-drawer-row"><span class="adapt-drawer-label">Adapted At</span><span class="adapt-drawer-value">' + escapeHtml(adapt.adapted_at) + '</span></div>';
+      if (adapt.adapted_by) html += '<div class="adapt-drawer-row"><span class="adapt-drawer-label">Adapted By</span><span class="adapt-drawer-value">' + escapeHtml(adapt.adapted_by) + '</span></div>';
+      html += '</div>'; // .adapt-drawer-body
+      html += '</div>'; // .adapt-drawer-inner
+      html += '</div>'; // .adapt-drawer
+
+      document.body.insertAdjacentHTML('beforeend', html);
+      // Trigger slide-in animation after DOM insertion
+      setTimeout(function () {
+        var drawer = document.querySelector('.adapt-drawer');
+        if (drawer) drawer.classList.add('open');
+      }, 20);
+    }
+
     document.addEventListener('click', (e) => {
       const header = e.target.closest('.commit-header');
       if (header) {
@@ -1078,7 +1723,9 @@
 
     $$('.filter-chip')[0].classList.add('active');
     detectDataBase().then(() => {
-      loadAvailableDates().then(() => {
+      loadAvailableDates().then(async () => {
+        await loadAdaptationStatus();
+        await loadBaseline();
         loadAnalysisDates().then(function () {
           currentDateIndex = 0;
           if (availableDates.length > 0) {

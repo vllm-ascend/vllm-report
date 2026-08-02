@@ -7,10 +7,11 @@ structured JSON output support.
 """
 import json
 import os
+import shutil
 import subprocess
 import sys
 
-CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "/usr/local/bin/claude")
+CLAUDE_BIN = os.environ.get("CLAUDE_BIN") or shutil.which("claude") or "/usr/local/bin/claude"
 CLAUDE_TIMEOUT = 600  # 10 minutes default
 
 

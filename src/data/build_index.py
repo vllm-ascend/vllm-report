@@ -85,22 +85,66 @@ def get_analysis_dates(data_dir, repo_dir_name_val):
 
 
 def tokenize(text):
-    """Simple word tokenizer for English commit messages.
-
-    Splits on whitespace and punctuation, converts to lowercase.
-    Returns a set of unique tokens.
-    """
     if not text:
         return set()
-    # Split on non-alphanumeric characters (keep underscores and hyphens)
-    tokens = re.findall(r"[a-zA-Z][a-zA-Z0-9_-]*", text.lower())
-    # Filter out very short tokens and common noise words
+    text_lower = text.lower()
+    lines = text_lower.split("\n")
+    filtered_lines = []
+    trailer_prefixes = (
+        "signed-off-by", "co-authored-by", "reviewed-by", "acked-by",
+        "reported-by", "tested-by", "suggested-by",
+    )
+    for line in lines:
+        stripped = line.strip()
+        if any(stripped.startswith(p) for p in trailer_prefixes):
+            continue
+        filtered_lines.append(stripped)
+    clean_text = " ".join(filtered_lines)
+    tokens = re.findall(r"[a-zA-Z][a-zA-Z0-9_-]*", clean_text)
+    sha_pattern = re.compile(r"^[0-9a-f]{7,40}$")
+    tokens = [t for t in tokens if not sha_pattern.match(t)]
     stop_words = {
         "the", "a", "an", "and", "or", "of", "to", "in", "for", "on",
         "is", "it", "as", "at", "by", "with", "from", "be", "not", "are",
         "was", "were", "has", "have", "had", "do", "does", "did", "but",
         "if", "no", "so", "up", "out", "all", "just", "about", "can",
         "this", "that", "use", "fix", "add", "set", "get", "make", "refactor",
+        "how", "why", "which", "where", "when", "what", "who", "whom",
+        "after", "before", "during", "since", "until", "while",
+        "within", "without", "through", "because", "therefore",
+        "however", "although", "though", "instead",
+        "using", "based", "following", "including", "regarding",
+        "also", "too", "very", "just", "only", "more", "less", "most",
+        "here", "there", "where", "hence", "thus", "then",
+        "same", "other", "another", "different", "both", "each", "every",
+        "well", "already", "still", "yet", "even", "ever", "never",
+        "much", "many", "few", "some", "any", "all", "both",
+        "such", "than", "their", "them", "its", "our", "your", "her", "his",
+        "may", "might", "can", "could", "will", "would", "shall", "should",
+        "added", "removed", "changed", "updated", "fixed", "introduced",
+        "adds", "removes", "changes", "updates", "fixes", "introduces",
+        "adding", "removing", "changing", "updating", "fixing", "introducing",
+        "implementation", "implementations", "implement", "implements", "implemented",
+        "support", "supports", "supported", "supporting",
+        "enable", "enabled", "enables", "enabling",
+        "allow", "allows", "allowed", "allowing",
+        "handle", "handles", "handled", "handling",
+        "prevent", "prevents", "prevented", "preventing",
+        "ensure", "ensures", "ensured", "ensuring",
+        "require", "requires", "required", "requiring",
+        "provide", "provides", "provided", "providing",
+        "improve", "improves", "improved", "improving",
+        "optimize", "optimizes", "optimized", "optimizing",
+        "introduce", "introduces", "introduced", "introducing",
+        "caused", "cause", "causes", "causing",
+        "commit", "commits", "committed", "committing",
+        "issue", "issues", "problem", "problems", "result", "results",
+        "reason", "reasons", "solution", "solutions", "method", "methods",
+        "approach", "approaches", "purpose", "detail", "details",
+        "simple", "basic", "major", "minor", "multiple", "single",
+        "common", "standard", "typical", "specific", "various",
+        "overall", "current", "existing", "previous", "subsequent",
+        "available", "necessary", "possible", "potential",
     }
     return {t for t in tokens if len(t) > 2 and t not in stop_words}
 

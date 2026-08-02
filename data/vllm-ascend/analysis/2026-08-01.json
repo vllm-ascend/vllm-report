@@ -1,0 +1,188 @@
+{
+  "date": "2026-08-01",
+  "repo": "vllm-project/vllm-ascend",
+  "generated_at": "2026-08-02T10:10:23.380650+08:00",
+  "daily_summary": "当日变更聚焦四类工作：(1) Ascend MoE 职责边界重构——新增 AscendRoutedExperts 承载 routed expert 权重/量化方法选择/EPLB 初始化等逻辑，与上游 RoutedExperts 的职责边界对齐；(2) Model Runner V2 流水线并行支持——通过最小适配（GroupCoordinatorPatch 保留 torch_distributed_backend、非末 PP rank 执行后提前返回 None、post_update 容忍缺失张量与负 idx_mapping）复用上游 PPHandler，并移除 Ascend 自研的 triton post_update kernel；(3) 权重更新生命周期对齐 vLLM 上游——NPUWorker 将 start/update/finish 全部委托给 HCCL/NPU IPC 传输引擎，引擎自持 model 引用完成权重加载与 layerwise reload；(4) DSA 上下文并行（dsa_cp）集成 DSpark 非因果注意力，为 draft token 构造含完整 draft block 的 SWA 稀疏索引。此外还包含大量周级 CI 性能/精度配置新增（Kimi K2.6/K2.7 W4A8、Qwen3.6-35B-A3B、DeepSeek-V4 Pro/Flash 系列）、平台级 HCCL 超时配置 bugfix、DCP 支持范围文档更新及 CI 分支选项扩展。",
+  "test_impact_summary": "当日测试看护呈现‘功能重构同步迁移单测 + 周级 E2E 配置大幅扩容’的双轨特征：MoE 重构与权重生命周期重构均伴随单测同步迁移/重写（test_fused_moe、test_worker_v1、test_npu_ipc_engine），并新增 AscendRoutedExperts、MRV2 PP 中间 rank 的针对性用例，同时删除了随上游收敛而过时的 post_update triton E2E 测试；这些改动说明重构类风险已由测试同步锁住。周级 E2E 配置大量新增（Kimi/Qwen3.6/DeepSeek-V4 系列），需要 CI 基础设施保障多节点资源、模型与数据集在 model_dataset_list.json 中可见，以及 baseline 随版本漂移的持续维护。DSA-CP+DSpark 属于注意力正确性高风险路径，依赖四卡接受率 E2E 持续看护。配置/文档/CI 类变更测试压力较低，但建议为平台超时下限保护补充一条配置单测作为可选加固。",
+  "commits": [
+    {
+      "sha": "5d6ddd906dc13b2e83242cb5433856e0fb875434",
+      "comment": "该 PR 将 Ascend 侧 routed experts 逻辑从 AscendMoERunner 中拆出，新增 vllm_ascend/ops/fused_moe/routed_experts.py 中的 AscendRoutedExperts 作为 Ascend 专有的 routed expert 容器，对齐上游 vLLM RoutedExperts 的职责边界。AscendUnquantizedFusedMoEMethod、apply()、no_shared_forward_impl()、EPLB 初始化（init_eplb）、quant_type 属性、update_expert_map/get_log2phy_map/clear_moe_load 等一并迁移到新类；AscendMoERunner 仅保留 shared expert 协调与整体 forward 编排。FusedMoE patch 改为向 vLLM 工厂透传 routed_experts_cls/routed_experts_args；310P 新增 AscendRoutedExperts310 以选择专用非量化方法；量化 fallback 导入路径同步更新。注意 no_shared_forward_impl 改为纯关键字参数，且 zero_expert 累加从旧实现的 final_hidden_states += 改为 final_hidden_states.routed_out +=（更明确地作用于 FusedExpertsResult）。潜在风险：逻辑迁移后需保证 EPLB 容量校验、量化方法选择、MoE 通信设置等行为与原先完全一致，并依赖上游 RoutedExperts 构造函数签名兼容。",
+      "tags": [
+        "refactor",
+        "medium-risk",
+        "ops/fused-moe",
+        "quantization",
+        "eplb"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "大量逻辑从 fused_moe.py 迁移到新模块 routed_experts.py，原有单测断言的目标函数与 patch 模块路径全部变化，必须同步更新；同时新增了 AscendRoutedExperts 的量化方法选择、tid2eid 传递、no_shared_forward_impl 全流程等针对性单测，310P 测试也改为验证 routed expert 归属性。",
+        "suggested_test_areas": [
+          "tests/ut/ops/test_fused_moe.py",
+          "tests/ut/_310p/fused_moe/test_shared_fused_moe_310.py",
+          "tests/ut/ops/a3_2/test_select_experts.py",
+          "tests/ut/conftest.py"
+        ]
+      },
+      "message": "[Refactor][Ops] Move Ascend routed experts logic out of MoE runner (#13268)\n\n### What this PR does / why we need it?\n\nCome from https://github.com/vllm-project/vllm-ascend/issues/13220.\n\nThis PR refactors Ascend fused MoE to align the ownership boundary with\nupstream vLLM's routed experts split.\n\n- Adds `AscendRoutedExperts` as the Ascend-owned routed expert\ncontainer.\n- Moves no-shared routed expert forward execution and\n`AscendUnquantizedFusedMoEMethod` out of `AscendMoERunner`.\n- Updates the FusedMoE patch to instantiate the Ascend routed experts\nclass and pass Ascend-specific routed expert args there.\n- Adds a 310P routed experts specialization for 310P unquantized method\nselection.\n- Updates quantization fallback imports and unit tests for the new\nmodule boundary.\n\nThis keeps `AscendMoERunner` focused on runner/shared-expert\norchestration while routed expert weights, quant method selection, and\nrouted expert execution live with `AscendRoutedExperts`.\n\n### Does this PR introduce _any_ user-facing change?\n\nNo. This is an internal fused MoE refactor.\n\n### How was this patch tested?\n\n- `python -m py_compile vllm_ascend/ops/fused_moe/fused_moe.py\nvllm_ascend/ops/fused_moe/routed_experts.py\nvllm_ascend/_310p/fused_moe/fused_moe.py\nvllm_ascend/patch/platform/patch_fused_moe.py\nvllm_ascend/quantization/compressed_tensors_config.py\nvllm_ascend/quantization/modelslim_config.py\ntests/ut/ops/test_fused_moe.py\ntests/ut/_310p/fused_moe/test_shared_fused_moe_310.py`\n- `git diff --check origin/main..HEAD`\n\nAttempted:\n\n- `pytest -q tests/ut/ops/test_fused_moe.py\ntests/ut/_310p/fused_moe/test_shared_fused_moe_310.py`\n\nThe local pytest run is blocked before test collection by the\nsource-tree environment missing `vllm_ascend._build_info`:\n\n```text\nImportError: cannot import name '_build_info' from 'vllm_ascend'\n```\n\n- vLLM version: v0.26.0\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/d02df748bf9efd99022f1a062597dc3cb3808485\n\n---------\n\nSigned-off-by: weijinqian0 <1184188277@qq.com>\nCo-authored-by: gemini-code-assist[bot] <176961590+gemini-code-assist[bot]@users.noreply.github.com>"
+    },
+    {
+      "sha": "3281a5fc44ec344ba304c9161a3959d8649471f4",
+      "comment": "在 Model Runner V2 上支持上游流水线并行（PP），改动保持最小且不引入 Ascend 专用 PPHandler：GroupCoordinatorPatch 保存 torch_distributed_backend 使上游 make_sibling_device_group() 可正常工作；NPUWorker.execute_model 在 use_v2_model_runner 时对非末 PP rank 在发送 intermediate tensors 后直接返回 None，避免进入 MRV1 的 kv_connector_output 路径；post_update 适配非末 rank 的 sampled-token 重放（output_bin_counts/query_start_loc 可缺失、idx_mapping 含负条目时跳过请求状态更新）。同时删除了 Ascend 自研 triton post_update kernel 及其 E2E 测试，改为依赖上游 GPUModelRunner 的 post_update 实现。潜在风险：删除自定义 post_update 后需确认推测解码场景下采样后处理行为与上游一致；中间 rank 返回 None 会影响依赖 ModelRunnerOutput 的调用方，需确保 MRV2 调用链已对齐上游 GPUWorker 语义。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "model-runner",
+        "pipeline-parallelism",
+        "distributed",
+        "spec-decode"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "新增 tests/ut/worker/a2/test_worker_v2.py 覆盖 MRV2 中间 PP rank 的 tensor 收发与返回 None 行为；test_patch_distributed.py 增加 backend 保留断言；test_worker_v1.py 需在相关用例中显式设置 use_v2_model_runner=False 以隔离 MRV1 路径；同时删除了过时的 post_update triton E2E 测试。",
+        "suggested_test_areas": [
+          "tests/ut/worker/a2/test_worker_v2.py",
+          "tests/ut/patch/worker/patch_common/test_patch_distributed.py",
+          "tests/ut/worker/a2/test_worker_v1.py"
+        ]
+      },
+      "message": "[Feature][MRV2] Support pipeline parallelism on Ascend (#12997)\n\n### What this PR does / why we need it?\n\nThis PR adds the minimal Ascend-side adaptations required to support the\nupstream pipeline parallelism implementation in Model Runner V2.\n\nThe implementation reuses the upstream `PPHandler` and PP execution\nflow. The main adaptations are:\n\n- Preserve `torch_distributed_backend` in `GroupCoordinatorPatch`,\nallowing the upstream `make_sibling_device_group()` implementation to\nwork correctly.\n- Let non-last PP ranks return `None` after sending intermediate\ntensors, instead of entering the Model Runner V1 KV connector output\npath.\n- Adapt `post_update` to handle sampled-token replay on non-last PP\nranks:\n  - Allow `output_bin_counts` to be absent.\n  - Allow `query_start_loc` to be absent.\n- Skip request-state updates when `idx_mapping` contains a negative\nentry.\n- Add or update unit tests for the distributed group backend and\nnon-last-rank worker behavior.\n\nThe changes are intentionally kept minimal, and no Ascend-specific\n`PPHandler` implementation is introduced.\n\n### Does this PR introduce _any_ user-facing change?\n\nYes.\n\nModel Runner V2 on Ascend can now run with pipeline parallelism by\nsetting `--pipeline-parallel-size` to a value greater than 1.\n\nNo new API or configuration option is introduced.\n\n### How was this patch tested?\n\n- Manually verified Model Runner V2 serving with pipeline parallel size\n2.\n- Manually verified that the PP2 performance test can run successfully.\n- Added or updated unit tests covering:\n  - Preservation of the distributed backend in `GroupCoordinatorPatch`.\n  - Non-last PP rank handling of plain `IntermediateTensors`.\n\nAccuracy validation currently encounters an unrelated sampling\npost-processing issue, which is outside the scope of this PR.\n\n- vLLM version: v0.26.0\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/d02df748bf9efd99022f1a062597dc3cb3808485\n\n---------\n\nSigned-off-by: LostFox11 <wangziyue17@huawei.com>\nCo-authored-by: LostFox11 <wangziyue17@huawei.com>"
+    },
+    {
+      "sha": "9eabafb0c8e151783110ad03aeeb08a85d17239a",
+      "comment": "将 vLLM 上游权重同步生命周期重构（vllm-project/vllm#44353）移植到 Ascend：权重加载决策从 worker 下沉到各 weight transfer engine。NPUWorker 的 start_weight_update/update_weights/finish_weight_update 现在直接委托给 weight_transfer_engine；HCCL 与 NPU IPC 引擎通过 engine 自持的 self.model.load_weights 加载权重；NPU IPC 引擎原先 start/finish 为 no-op，现在负责 initialize/finalize_layerwise_reload；npu_generate_uuid 改为接受显式逻辑设备号并使用 engine.device.index；update 抛错时重置 _weight_update_active 以便重试。用户可见变更：start_weight_update 不再接受 is_checkpoint_format 参数，checkpoint/kernel 格式处理完全归属引擎。潜在风险：引擎依赖 model/model_config 属性被正确注入，RL 客户端需按新生命周期（start -> update -> finish）调用并自行暂停/恢复生成。",
+      "tags": [
+        "refactor",
+        "medium-risk",
+        "worker",
+        "weight-transfer",
+        "distributed"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "TestNPUWorkerWeightUpdate 整体从 worker 内部实现重写为引擎委托断言，并删除 checkpoint/kernel 格式分支测试；NPU IPC 引擎新增 layerwise reload 初始化/终结化与 engine 设备句柄匹配测试；HCCL/NPU IPC E2E 用例移除旧生命周期探测与兼容分支，改为直接调用 start/finish 端点。",
+        "suggested_test_areas": [
+          "tests/ut/worker/a2/test_worker_v1.py",
+          "tests/ut/distributed/weight_transfer/test_npu_ipc_engine.py",
+          "tests/e2e/pull_request/one_card/test_npu_ipc_weight_transfer.py",
+          "tests/e2e/pull_request/two_card/test_hccl_weight_transfer.py"
+        ]
+      },
+      "message": "[Refactor] Align weight transfer lifecycle with vLLM (#12876)\n\n### What this PR does / why we need it?\n\nPorts the vLLM weight sync lifecycle refactor from\n[vllm-project/vllm#44353](https://github.com/vllm-project/vllm/pull/44353)\nto the Ascend HCCL and NPU IPC backends.\n\nThe upstream refactor moves weight-loading decisions out of the worker\nand into each weight transfer engine. This PR applies the same ownership\nmodel on Ascend:\n\n- delegates `start_weight_update`, `update_weights`, and\n`finish_weight_update` from `NPUWorker` to the configured transfer\nengine;\n- updates HCCL and NPU IPC engines to load weights through their\nengine-owned model;\n- adds checkpoint-format layerwise reload setup and finalization to NPU\nIPC;\n- uses the engine-owned device for NPU IPC handle matching and tensor\nrebuilding;\n- resets the worker lifecycle state when an update raises, allowing a\nsubsequent update attempt; and\n- removes legacy lifecycle request fallbacks from the HCCL/NPU IPC\nexamples and E2E tests.\n\n### Does this PR introduce _any_ user-facing change?\n\nYes. Weight updates now use the explicit lifecycle:\n\n`start_weight_update -> update_weights -> finish_weight_update`\n\n`start_weight_update` no longer accepts `is_checkpoint_format`;\ncheckpoint-format handling belongs to each transfer engine. RL clients\nshould pause generation before starting an update and resume it after\nfinishing.\n\n### How was this patch tested?\n\n- `ruff format --check` and `ruff check` on all nine changed Python\nfiles with Ruff 0.14.0.\n- `python -m compileall` on all nine changed Python files.\n- `python -m pytest -s -v tests/ut/worker/a2/test_worker_v1.py -k\nTestNPUWorkerWeightUpdate`\n- `python -m pytest -s -v\ntests/ut/distributed/weight_transfer/test_npu_ipc_engine.py`\n- `python -m pytest -s -v\ntests/e2e/pull_request/one_card/test_npu_ipc_weight_transfer.py`\n- `python -m pytest -s -v\ntests/e2e/pull_request/two_card/test_hccl_weight_transfer.py`\n\nThe unit tests and both NPU IPC/HCCL E2E tests passed on an Ascend\nself-hosted runner with vLLM 0.25.1.\n\n- vLLM version: v0.26.0\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/d02df748bf9efd99022f1a062597dc3cb3808485\n\n---------\n\nSigned-off-by: Ulrica111 <ulrica111@users.noreply.github.com>\nCo-authored-by: Ulrica111 <ulrica111@users.noreply.github.com>"
+    },
+    {
+      "sha": "07aab43cd7bfa94b3b1a47965e877acda0746587",
+      "comment": "纯 CI/测试配置变更：为 Kimi-K2.6-W4A8 / Kimi-K2.7-W4A8 增加周级多节点 PD（3.5k/64k/128k/254k 上下文、TPOT50/20）与单节点 A3 性能/精度用例，并为 Qwen3.6-35B-A3B 增加 W8A8/W4A8 用例。更新 weekly_config.yaml、model_dataset_list.json 及大量 YAML 配置，涉及 DFlash 推测解码、Mooncake PD KV 传输、recompute scheduler、FUSED_MC2/FlashComm1 等 Ascend 特性组合。不涉及产品代码。注意事项：性能 baseline 为硬编码值，模型/数据集需可从 ModelScope/HF 获取，且跑批资源需满足多节点 32 卡规模要求。",
+      "tags": [
+        "ci",
+        "test",
+        "low-risk",
+        "weekly-benchmarks"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "新增的周级配置需要 CI 基础设施具备对应多节点资源，且新模型与数据集已注册到 model_dataset_list.json；每个用例的 baseline 与 threshold 需随硬件/版本漂移持续维护，否则会出现误报。",
+        "suggested_test_areas": [
+          "tests/e2e/weekly/multi_node/external_dp/config/Kimi-K2.6-W4A8-*.yaml",
+          "tests/e2e/weekly/multi_node/external_dp/config/Kimi-K2.7-W4A8-*.yaml",
+          "tests/e2e/weekly/single_node/configs/Kimi-K2.6-w4a8-A3.yaml",
+          "tests/e2e/weekly/single_node/configs/Kimi-K2.7-w4a8-A3.yaml",
+          "tests/e2e/weekly/single_node/configs/Qwen3.6-35B-A3B-*.yaml"
+        ]
+      },
+      "message": "[CI] Add weely performance and accuracy test cases for Kimi-K2.6-W4A8 and Kimi-K2.7-W4A8 (#13285)\n\n### What this PR does / why we need it?\nThis PR adds weekly performance and accuracy test cases for\nKimi-K2.6-W4A8 and Kimi-K2.7-W4A8 models, as well as Qwen3.6-35B-A3B\nmodels, to ensure continuous validation of performance and accuracy.\n\n### Does this PR introduce _any_ user-facing change?\nNO\n\n### How was this patch tested?\nby the running the test\n\n- vLLM version: v0.26.0\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/d02df748bf9efd99022f1a062597dc3cb3808485\n\n---------\n\nSigned-off-by: weixin <murongfengerxch@163.com>"
+    },
+    {
+      "sha": "850b363ac26011f6794e0337f3cfea9c71b5f677",
+      "comment": "更新 DeepSeek-V4 系列周级多节点 PD 测试配置：将原 DeepSeek-V4-flash-w8a8-PD.yaml 重命名并拆分为 no-prefix 与 prefix 两个独立用例，新增 DeepSeek-V4-Pro-w4a8 的 1M 上下文、无 prefix、prefix-cache 三套配置。参数上统一 VLLM_RPC_TIMEOUT/HCCL 超时与 OMP 线程数、block-size 从 128 调整为 32、MTP speculative tokens 调整（decode 侧 1→3）、更新性能 baseline，并补充 warmup 用例。纯测试配置变更，不涉及产品代码。",
+      "tags": [
+        "test",
+        "ci",
+        "low-risk",
+        "weekly-benchmarks"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "配置重命名要求 .github/workflows/configs/weekly_config.yaml 中的引用同步更新；新增 Pro 配置需验证模型/数据集（含 1M 长上下文数据集）可用性以及新版 baseline 的合理性，否则周级任务会因路径漂移或阈值失配而失败。",
+        "suggested_test_areas": [
+          "tests/e2e/weekly/multi_node/external_dp/config/DeepSeek-V4-flash-w8a8-PD-no-prefix.yaml",
+          "tests/e2e/weekly/multi_node/external_dp/config/DeepSeek-V4-flash-w8a8-PD-prefix.yaml",
+          "tests/e2e/weekly/multi_node/external_dp/config/DeepSeek-V4-Pro-w4a8-*.yaml",
+          ".github/workflows/configs/weekly_config.yaml"
+        ]
+      },
+      "message": "[Test][Misc] Update DeepSeek-V4-Flash-w8a8-PD-no-prefix test configuration (#13229)\n\n### What this PR does / why we need it?\nThis pull request updates the configuration for the\n`DeepSeek-V4-Flash-w8a8-PD-no-prefix` multi-node end-to-end test.\n\n### Does this PR introduce _any_ user-facing change?\nNo, this PR only updates internal test configurations and benchmarks.\n\n### How was this patch tested?\nTested via the updated weekly multi-node E2E test suite.\n\n\n- vLLM version: v0.26.0\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/d02df748bf9efd99022f1a062597dc3cb3808485\n\n---------\n\nSigned-off-by: chen-commits <1636718796@qq.com>\nSigned-off-by: chen <1636718796@qq.com>"
+    },
+    {
+      "sha": "fa3b1bd7e0e604c17fce2c44ce873725bfd176d8",
+      "comment": "为 DeepSeek-V4 的 DSA 上下文并行（dsa_cp）集成 DSpark 特征：当 query block causal=False 时，每个 CP rank 对有效 query 使用完整 KV 长度而不再按 causal 规则截断；为每个 draft token 构造“历史 SWA 窗口 + 完整 draft block”的 ori_sparse_indices；SWA 窗口扩展到 window_size + draft_block_size 并传入注意力算子，实现 draft block 内非因果注意力。实现涉及 AscendDSACPMetadataBuilder 的 decode 元数据构建（新增 seq_lens_cpu 兼容获取、is_noncausal 分支、global_dspark_indices 构建/填充/切片）与 AscendDSACPImpl 的 extra_attn_kwargs 传递及 ori_win_left/right 回退。风险：非因果路径与稀疏索引构造的正确性直接影响生成精度；仅 DSpark+dsa_cp 组合启用，需 E2E 接受率指标持续看护。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "attention",
+        "context-parallel",
+        "spec-decode"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "四卡 E2E test_dspark_deepseekv4.py 增加 dsa-cp-dspark 参数化用例（num_speculative_tokens=7、enable_flashcomm1/enable_dsa_cp=true），新增接受率 golden 值需要持续看护；建议在单元测试层补充 DSA-CP 元数据构建对 is_noncausal/dspark_swa_indices 分支的覆盖。",
+        "suggested_test_areas": [
+          "tests/e2e/pull_request/four_card/spec_decode/test_dspark_deepseekv4.py",
+          "vllm_ascend/attention/context_parallel/dsa_cp.py 对应的元数据构建单测"
+        ]
+      },
+      "message": "[Feature]dsv4 dsa_cp support dspark (#13249)\n\n### What this PR does / why we need it?\ndsv4 dsa_cp supports the integration of the dspark feature.  \n1. Identify DSpark query blocks with causal=False, allowing each CP rank\nto use the full KV length for valid queries, no longer truncating\naccording to causal rules.\n2. Construct \"historical SWA window + complete draft block\"\nori_sparse_indices for each draft token.\n3. Expand the SWA window to window_size + draft_block_size and pass the\nsparse indices into the attention operator to achieve non-causal\nattention within the draft block.\n\n### Does this PR introduce _any_ user-facing change?\nNo\n\n### How was this patch tested?\n\n- vLLM version: v0.26.0\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/d02df748bf9efd99022f1a062597dc3cb3808485\n\n---------\n\nSigned-off-by: weiguihua2 <weiguihua2@huawei.com>"
+    },
+    {
+      "sha": "8a440c4740651c2e8e7e250badfdeb2f922b984a",
+      "comment": "Bugfix：NPUPlatform.check_and_update_config 中新增 VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS 的下限保护——当配置值小于 1836s（HCCL 算子超时间隔）时强制设为 3000s，避免 DP 引擎的 execute_model RPC 超时短于集合通信超时，导致通信挂起且无日志。改动小、风险低，仅影响多进程执行模型超时配置，不改变其他平台配置逻辑。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "platform",
+        "config"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "纯配置下限保护，无 API/行为契约变化，现有测试不受影响；可在 platform 配置相关单测中补充一个断言 env 被抬升的用例作为可选加固，但非必需。",
+        "suggested_test_areas": [
+          "tests/ut 中 NPUPlatform.check_and_update_config 相关配置测试"
+        ]
+      },
+      "message": "[Bugfix]Modify the VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS timeout duration. (#13233)\n\n### What this PR does / why we need it?\nThe timeout interval of the HCCL operator is 1836s. Timeout in seconds\nfor execute_model RPC calls in multiprocessing must be greater than\n1836s. The timeout interval of the HCCL operator is 1836s. Timeout in\nseconds for execute_model RPC calls in multiprocessing must be greater\nthan 1836s. The timeout interval of the DP engine is shorter than that\nof the collective communication (1836s). As a result, the communication\ntimes out and is suspended without logs.\n\n### Does this PR introduce _any_ user-facing change?\nNA\n\n### How was this patch tested?\n\n\n- vLLM version: v0.26.0\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/d02df748bf9efd99022f1a062597dc3cb3808485\n\n---------\n\nSigned-off-by: lty <linhebiwen@gmail.com>"
+    },
+    {
+      "sha": "895d037f18c4105abcdc082b47642fe6f9fdd6b2",
+      "comment": "文档更新：细化 DCP 支持场景范围，明确 Ascend 950 上 SFA 不支持与 DCP 叠加，MLA/GQA 为实验性支持；新增特性组合矩阵表，逐项说明 Chunked Prefill、Prefix Caching、Graph 模式、P/D 分离、MLAPO、推测解码在不同设备与注意力后端下与 DCP 的叠加能力。无代码变更，属于用户可见的文档澄清。",
+      "tags": [
+        "docs",
+        "low-risk",
+        "attention",
+        "context-parallel"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "文档-only 变更，不涉及测试逻辑或测试配置。",
+        "suggested_test_areas": []
+      },
+      "message": "[DOC]Modify the scope of scenarios supported by DCP (#13302)\n\n### What this PR does / why we need it?\nModify the scope of scenarios supported by DCP.\nIn scenario 950, SFA does not support the overlay of DCP, while MLA and\nGQA are experimentally supported.\n\n### Does this PR introduce _any_ user-facing change?\nyes\n\n### How was this patch tested?\n\n- vLLM version: v0.26.0\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/d02df748bf9efd99022f1a062597dc3cb3808485\n\nSigned-off-by: weiguihua2 <weiguihua2@huawei.com>"
+    },
+    {
+      "sha": "ed6b9afbfcedafcdda39583106afde865c3b31e4",
+      "comment": "CI 变更：nightly_image_build 与 schedule_image_build_and_push 两个 workflow 的 branch 下拉选项新增 releases/v0.25.1rc 与 releases/v0.26.0rc，便于对发布候选分支触发镜像构建。无产品代码影响。",
+      "tags": [
+        "ci",
+        "low-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "仅 workflow 下拉选项扩展，不影响构建逻辑与测试行为。",
+        "suggested_test_areas": []
+      },
+      "message": "[CI] Add options for releases/v0.25.1rc and releases/0.26.0rc (#13312)\n\n### What this PR does / why we need it?\nAdd options for releases/v0.25.1rc and releases/0.26.0rc\n\n\nSigned-off-by: hfadzxy <starmoon_zhang@163.com>"
+    }
+  ],
+  "architecture_based_on_sha": "e04f251a5895969d1c1f4ac9a3807177a0c4769c",
+  "architecture_generated_at": "2026-08-01T20:25:03.693997+08:00"
+}

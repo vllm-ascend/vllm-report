@@ -158,6 +158,10 @@ def cmd_init(args):
         for ac in analysis.get("commits", []):
             ascend_impact = ac.get("ascend_impact", {})
             if ascend_impact.get("ascend_affected"):
+                # 检查 deep_analysis 是否确认了是 false positive
+                da = ac.get("deep_analysis", {})
+                if da.get("ascend_affected_confirmed") is False:
+                    continue
                 all_commits.append({
                     "sha": ac["sha"],
                     "upstream_date": date,

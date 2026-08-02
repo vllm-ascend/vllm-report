@@ -28,7 +28,7 @@ from datetime import datetime, timezone, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from data._source_repo import repo_dir_name
-from data._track_arch_delta import get_deltas_up_to
+from data._track_arch_delta import get_deltas_up_to, add_delta, load_deltas, deltas_path, save_json_atomic as save_deltas
 from data._source_cache import SourceContextCache
 from data._claude_client import call_claude
 
@@ -193,15 +193,20 @@ Patch summary:
 {patch_summary}
 
 ## Analysis Requirements
-1. affected_interfaces: Which specific interfaces/classes in vllm-ascend are affected
-2. adaptation_effort: How much adaptation work is needed (low/medium/high)
-3. adaptation_guide: What needs to be adapted in vllm-ascend (be specific about files and methods)
-4. risk: Risk assessment of the adaptation
+1. ascend_affected_confirmed: Is this commit a TRUE positive? Set to false if it doesn't actually require any adaptation in vllm-ascend (Phase 1 false positive).
+2. affected_interfaces: Which specific interfaces/classes in vllm-ascend are affected (empty array if ascend_affected_confirmed is false)
+3. adaptation_effort: How much adaptation work is needed (low/medium/high). Set to "low" if ascend_affected_confirmed is false.
+4. adaptation_guide: What needs to be adapted in vllm-ascend (be specific about files and methods). Empty string if ascend_affected_confirmed is false.
+5. risk: Risk assessment of the adaptation. Empty string if ascend_affected_confirmed is false.
 """
 
             deep_analysis_schema = {
                 "type": "object",
                 "properties": {
+                    "ascend_affected_confirmed": {
+                        "type": "boolean",
+                        "description": "Whether this commit truly requires adaptation in vllm-ascend. Set to false if Phase 1 was a false positive.",
+                    },
                     "affected_interfaces": {
                         "type": "array",
                         "items": {"type": "string"},
@@ -216,7 +221,7 @@ Patch summary:
                     },
                     "risk": {"type": "string"},
                 },
-                "required": ["affected_interfaces", "adaptation_effort", "adaptation_guide"],
+                "required": ["ascend_affected_confirmed", "affected_interfaces", "adaptation_effort", "adaptation_guide"],
             }
 
             result = call_claude(
@@ -229,6 +234,10 @@ Patch summary:
             if result:
                 item["deep_analysis"] = result
                 print(f"    Deep analysis completed for {sha_short}")
+
+                if result.get("ascend_affected_confirmed") is False:
+                    item.setdefault("ascend_impact", {})["ascend_affected"] = False
+                    print(f"    Phase 1 false positive: ascend_affected overridden to false")
             else:
                 print(f"    Deep analysis failed for {sha_short}")
 
@@ -239,9 +248,19 @@ Patch summary:
                         for fc in full["commits"]:
                             if fc["sha"] == sha:
                                 fc["deep_analysis"] = item["deep_analysis"]
+                                if result and result.get("ascend_affected_confirmed") is False:
+                                    fc.setdefault("ascend_impact", {})["ascend_affected"] = False
                                 break
                         save_json_atomic(analysis_path, full)
                         print(f"    Progress saved to {analysis_path}")
+
+                    if result and result.get("ascend_affected_confirmed") is False:
+                        repo_short = repo_dir_name(repo)
+                        deltas_data = load_deltas(data_dir, repo_short)
+                        if deltas_data and sha in deltas_data.get("deltas", {}):
+                            deltas_data["deltas"][sha]["ascend_impact"] = False
+                            save_deltas(deltas_path(data_dir, repo_short), deltas_data)
+                            print(f"    arch_deltas updated: {sha[:12]} ascend_impact set to false")
                 except Exception as e:
                     print(f"    Warning: failed to save progress: {e}")
 

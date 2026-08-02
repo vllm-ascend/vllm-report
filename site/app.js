@@ -47,7 +47,7 @@
   let searchQuery = '';
   let analysisDates = [];
   let crossDayResults = null; // { commits: [...], analysis: {...} } from cross-day search
-  let sectionsExpanded = { ascend: true, code: false, chore: false, 'needs-test': true, other: false }; // per-section collapse state
+  let sectionsExpanded = { ascend: true, code: false, chore: false, 'needs-test': true, other: false, 'false-positive': true }; // per-section collapse state
 
   // ── New data shared across enhancements ──
   let adaptationStatus = null;      // sha -> {status, ...} from adaptation-status.json
@@ -353,6 +353,8 @@
       return 'chore';
     }
     // vllm repo
+    // 有 deep_analysis 但被确认为 false positive 的单独归类
+    if (a && a.deep_analysis && a.deep_analysis.ascend_affected_confirmed === false) return 'false-positive';
     if (a && a.ascend_impact && a.ascend_impact.ascend_affected === true) return 'ascend';
     // Check if auto-triaged (comment starts with "（自动判定）")
     if (a && a.comment && a.comment.indexOf('（自动判定）') === 0) return 'chore';
@@ -367,6 +369,7 @@
       if (a && a.test_impact && a.test_impact.needs_test_update) return 'needs-test';
       return 'chore';
     }
+    if (a && a.deep_analysis && a.deep_analysis.ascend_affected_confirmed === false) return 'false-positive';
     if (a && a.ascend_impact && a.ascend_impact.ascend_affected === true) return 'ascend';
     if (a && a.comment && a.comment.indexOf('（自动判定）') === 0) return 'chore';
     if (a && a.ascend_impact && a.ascend_impact.ascend_affected === false) return 'code';
@@ -753,7 +756,7 @@
 
     var filtered = filterCommits(allCommits, allAnalysis);
     crossDayResults = { commits: filtered, analysis: allAnalysis };
-    sectionsExpanded = { ascend: true, code: true, chore: true, 'needs-test': true, other: true }; // cross-day search expands all
+    sectionsExpanded = { ascend: true, code: true, chore: true, 'needs-test': true, other: true, 'false-positive': true }; // cross-day search expands all
     showLoading(false);
     render();
   }
@@ -848,21 +851,28 @@
       }
       if (a.deep_analysis) {
         const da = a.deep_analysis;
-        html += `<div class="impact-card deep-analysis">`;
-        html += `<div class="impact-label deep-analysis">Deep Analysis</div>`;
-        if (da.affected_interfaces && da.affected_interfaces.length > 0) {
-          html += `<div class="impact-text"><strong>Affected Interfaces:</strong> ${da.affected_interfaces.map(escapeHtml).join(', ')}</div>`;
+        if (da.ascend_affected_confirmed === false) {
+          html += `<div class="impact-card"><div class="impact-label" style="color:#e67e22">Phase 2: No Adaptation Needed</div><div class="impact-text">AI 深度分析确认此 commit 无需适配 vllm-ascend</div></div>`;
+        } else {
+          html += `<div class="impact-card deep-analysis">`;
+          html += `<div class="impact-label deep-analysis">Deep Analysis</div>`;
+          if (da.ascend_affected_confirmed === true) {
+            html += `<div class="impact-text" style="margin-top:4px"><strong>Confirmed:</strong> 需要适配</div>`;
+          }
+          if (da.affected_interfaces && da.affected_interfaces.length > 0) {
+            html += `<div class="impact-text"><strong>Affected Interfaces:</strong> ${da.affected_interfaces.map(escapeHtml).join(', ')}</div>`;
+          }
+          if (da.adaptation_effort) {
+            html += `<div class="impact-text" style="margin-top:4px"><strong>Effort:</strong> ${escapeHtml(da.adaptation_effort)}</div>`;
+          }
+          if (da.adaptation_guide) {
+            html += `<div class="impact-text" style="margin-top:4px"><strong>Guide:</strong> ${renderMarkdown(da.adaptation_guide)}</div>`;
+          }
+          if (da.risk) {
+            html += `<div class="impact-text" style="margin-top:4px"><strong>Risk:</strong> ${escapeHtml(da.risk)}</div>`;
+          }
+          html += `</div>`;
         }
-        if (da.adaptation_effort) {
-          html += `<div class="impact-text" style="margin-top:4px"><strong>Effort:</strong> ${escapeHtml(da.adaptation_effort)}</div>`;
-        }
-        if (da.adaptation_guide) {
-          html += `<div class="impact-text" style="margin-top:4px"><strong>Guide:</strong> ${renderMarkdown(da.adaptation_guide)}</div>`;
-        }
-        if (da.risk) {
-          html += `<div class="impact-text" style="margin-top:4px"><strong>Risk:</strong> ${escapeHtml(da.risk)}</div>`;
-        }
-        html += `</div>`;
       }
       html += `</div>`;
     }
@@ -1111,6 +1121,7 @@
     var isVllm = currentRepo === 'vllm-project/vllm';
     var primaryKey = isVllm ? 'ascend' : 'needs-test';
     var primaryCommits = groups[primaryKey] || [];
+    var fpCommits = groups['false-positive'] || [];
     var codeCommits = isVllm ? (groups['code'] || []) : [];
     var choreCommits = groups['chore'] || [];
     var otherCount = codeCommits.length + choreCommits.length;
@@ -1130,6 +1141,21 @@
       html += '<div class="section-body" style="' + (primaryExpanded ? '' : 'display:none') + '">';
       for (var j = 0; j < primaryCommits.length; j++) {
         html += renderCommitCardForCommit(primaryCommits[j], analysisMap);
+      }
+      html += '</div></div>';
+    }
+
+    // False Positive section (deep_analyzed but no adaptation needed)
+    if (fpCommits.length > 0) {
+      var fpExpanded = sectionsExpanded['false-positive'];
+      html += '<div class="commit-section">';
+      html += '<div class="section-header section-false-positive" data-section="false-positive">';
+      html += '<span class="section-arrow">' + (fpExpanded ? '▼' : '▶') + '</span> ';
+      html += 'False Positive (Deep Analyzed, No Adaptation) (' + fpCommits.length + ')';
+      html += '</div>';
+      html += '<div class="section-body" style="' + (fpExpanded ? '' : 'display:none') + '">';
+      for (var n = 0; n < fpCommits.length; n++) {
+        html += renderCommitCardForCommit(fpCommits[n], analysisMap);
       }
       html += '</div></div>';
     }
@@ -1207,7 +1233,7 @@
         activeFilter = 'all';
         searchQuery = '';
         crossDayResults = null;
-        sectionsExpanded = { ascend: true, code: false, chore: false, 'needs-test': true, other: false };
+        sectionsExpanded = { ascend: true, code: false, chore: false, 'needs-test': true, other: false, 'false-positive': true };
         $('#searchInput').value = '';
         $('#searchClear').style.display = 'none';
         $$('.filter-chip').forEach((c) => c.classList.remove('active'));

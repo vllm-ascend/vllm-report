@@ -29,7 +29,8 @@ from datetime import datetime, timezone, timedelta
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from data._source_repo import repo_dir_name
 from data._track_arch_delta import get_deltas_up_to
-from vllm_report_mcp._claude_client import call_claude
+from data._source_cache import SourceContextCache
+from data._claude_client import call_claude
 
 TZ_CN = timezone(timedelta(hours=8))
 
@@ -87,6 +88,8 @@ def deep_analyze_commits(repo, date, data_dir, local_repo):
 
     repo_short = repo_dir_name(repo)
     data_dir_abs = os.path.abspath(data_dir) if not os.path.isabs(data_dir) else data_dir
+    repo_dir_abs = os.path.join(data_dir_abs, repo_short)
+    cache = SourceContextCache(repo_dir_abs, repo_dir=local_repo)
 
     for item in to_analyze:
         sha = item["sha"]
@@ -124,6 +127,13 @@ def deep_analyze_commits(repo, date, data_dir, local_repo):
                 continue
 
             files_changed = [f["filename"] for f in commit_info.get("files", [])]
+            # 构建源码缓存摘要
+            full_paths = [
+                os.path.join(local_repo, f)
+                for f in files_changed
+                if os.path.exists(os.path.join(local_repo, f))
+            ]
+            source_cache_text = cache.get_batch_summary(full_paths)
             patch_summary = "\n".join(
                 f"  {f['filename']}: +{f['additions']}/-{f['deletions']}"
                 for f in commit_info.get("files", [])
@@ -174,6 +184,7 @@ IMPORTANT: The source code is at the commit just BEFORE this commit ({parent_sha
 This is the correct state for analyzing what this commit changes.
 Read relevant source files to understand the code and interfaces that this commit modifies.
 {delta_context}
+{source_cache_text}
 
 ## Commit to Analyze
 Files changed: {', '.join(files_changed)}

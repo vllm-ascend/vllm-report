@@ -53,12 +53,10 @@ vllm-report/
 ├── src/
 │   ├── __init__.py
 │   ├── mcp_server_app.py             # MCP Server (stdio-based, 25 tools)
-│   ├── vllm_report_mcp/
-│   │   ├── __init__.py
-│   │   ├── _claude_client.py         # Claude Code CLI wrapper (internal)
-│   │   └── _extract_patches.py       # Patch catalog extractor (deterministic)
 │   ├── data/
 │   │   ├── __init__.py
+│   │   ├── _claude_client.py         # Claude Code CLI wrapper
+│   │   ├── _extract_patches.py       # Patch catalog extractor (deterministic)
 │   │   ├── _source_repo.py           # Local repo discovery/pull/clone (internal)
 │   │   ├── _track_arch_delta.py      # Architecture delta chain (internal)
 │   │   ├── fetch_commits.py          # Fetch commit data

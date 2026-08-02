@@ -695,6 +695,24 @@ def validate_analysis(analysis, commits_data, repo):
     return errors
 
 
+def merge_commits(all_commits, auto_analysis, llm_commits):
+    merged_shas = {}
+    for ac in auto_analysis:
+        merged_shas[ac["sha"]] = ac
+    for ac in llm_commits:
+        merged_shas[ac["sha"]] = ac
+    result = []
+    for c in all_commits:
+        ac = merged_shas.get(c["sha"])
+        if ac:
+            if not ac.get("message"):
+                ac["message"] = c.get("message", "")
+            result.append(ac)
+        else:
+            result.append({"sha": c["sha"], "comment": "（分析缺失）", "tags": ["chore"]})
+    return result
+
+
 def display_analysis(analysis):
     is_vllm = "vllm-ascend" not in analysis.get("repo", "")
     print("\n" + "=" * 60)
@@ -745,9 +763,13 @@ def analyze_commits(repo, date, data_dir, confirm, force, local_repo=None):
     repo_dir = get_repo_dir(data_dir, repo)
     analysis_path = os.path.join(repo_dir, "analysis", f"{date}.json")
 
+    existing_analysis = None
     if os.path.exists(analysis_path) and not force:
-        if confirm:
-            existing = load_json(analysis_path)
+        existing = load_json(analysis_path)
+        if existing and existing.get("partial"):
+            print(f"Found partial analysis for {date}, resuming from previous run...")
+            existing_analysis = existing
+        elif confirm:
             if existing:
                 print(f"Analysis already exists for {date}:")
                 display_analysis(existing)
@@ -778,6 +800,15 @@ def analyze_commits(repo, date, data_dir, confirm, force, local_repo=None):
         print(f"  ├ {len(auto_analysis)} commits auto-determined (no ascend impact)")
     if llm_shas:
         print(f"  └ {len(llm_shas)} commits sent to LLM for analysis")
+
+    if existing_analysis:
+        existing_shas = {ac["sha"] for ac in existing_analysis.get("commits", [])}
+        llm_shas = [s for s in llm_shas if s not in existing_shas]
+        auto_analysis = [ac for ac in auto_analysis if ac["sha"] not in existing_shas]
+        if existing_analysis.get("commits"):
+            print(f"  ├ Resumed: {len(existing_analysis['commits'])} commits already analyzed")
+        if llm_shas:
+            print(f"  └ Remaining: {len(llm_shas)} commits to analyze")
 
     # Phase 2: call LLM only for non-triaged commits
     llm_analysis = None  # Will hold the accumulated LLM results
@@ -859,6 +890,19 @@ def analyze_commits(repo, date, data_dir, confirm, force, local_repo=None):
 
         if not missing_shas and not remaining_after_batch:
             print(f"  ✓ All {len(llm_set)} commits analyzed")
+            # 保存中间结果（断点续推）
+            partial_commits = merge_commits(all_commits, auto_analysis, llm_analysis.get("commits", []))
+            partial = {
+                "date": date,
+                "repo": repo,
+                "partial": True,
+                "daily_summary": "（分析进行中，尚未完成）",
+                "generated_at": datetime.now(TZ_CN).isoformat(),
+                "commits": partial_commits,
+            }
+            save_json_atomic(analysis_path, partial)
+            total_done = len(partial_commits) - len(auto_analysis)
+            print(f"  └ Saved partial progress ({total_done} LLM + {len(auto_analysis)} auto = {len(partial_commits)}/{num_commits} commits)")
             break
         elif not missing_shas and remaining_after_batch:
             llm_shas = remaining_after_batch
@@ -1019,6 +1063,7 @@ def analyze_commits(repo, date, data_dir, confirm, force, local_repo=None):
             print("Skipped.")
             return True
 
+    analysis.pop("partial", None)
     save_json_atomic(analysis_path, analysis)
     print(f"Analysis written to {analysis_path}")
     print(f"Tip: run 'deep_analyze_commits --repo {repo} --date {date} --local-repo ...' for Phase 2 deep analysis")

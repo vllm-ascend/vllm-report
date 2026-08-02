@@ -42,7 +42,7 @@ from datetime import datetime, timezone, timedelta
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from data._source_repo import ensure_repo, get_current_sha, repo_dir_name, _find_upstream_remote, KNOWN_REPOS
 from data._track_arch_delta import reset_deltas
-from vllm_report_mcp._claude_client import call_claude
+from data._claude_client import call_claude
 
 TZ_CN = timezone(timedelta(hours=8))
 

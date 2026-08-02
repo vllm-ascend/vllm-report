@@ -53,12 +53,10 @@ vllm-report/
 ├── src/
 │   ├── __init__.py
 │   ├── mcp_server_app.py             # MCP Server（stdio 模式，25 个工具）
-│   ├── vllm_report_mcp/
-│   │   ├── __init__.py
-│   │   ├── _claude_client.py         # Claude Code CLI 封装（内部模块）
-│   │   └── _extract_patches.py       # Patch 目录提取器（确定性解析）
 │   ├── data/
 │   │   ├── __init__.py
+│   │   ├── _claude_client.py         # Claude Code CLI 封装
+│   │   ├── _extract_patches.py       # Patch 目录提取器（确定性解析）
 │   │   ├── _source_repo.py           # 仓库发现/拉取/克隆（内部模块）
 │   │   ├── _track_arch_delta.py      # 架构增量链（内部模块）
 │   │   ├── fetch_commits.py          # 抓取 commit 数据

@@ -852,7 +852,13 @@
       if (a.deep_analysis) {
         const da = a.deep_analysis;
         if (da.ascend_affected_confirmed === false) {
-          html += `<div class="impact-card"><div class="impact-label" style="color:#e67e22">Phase 2: No Adaptation Needed</div><div class="impact-text">AI 深度分析确认此 commit 无需适配 vllm-ascend</div></div>`;
+          html += `<div class="impact-card deep-analysis">`;
+          html += `<div class="impact-label" style="color:#e67e22">Phase 2: No Adaptation Needed</div>`;
+          html += `<div class="impact-text">AI 深度分析确认此 commit 无需适配 vllm-ascend</div>`;
+          if (da.adaptation_guide) {
+            html += `<div class="impact-text" style="margin-top:4px"><strong>分析详情:</strong> ${renderMarkdown(da.adaptation_guide)}</div>`;
+          }
+          html += `</div>`;
         } else {
           html += `<div class="impact-card deep-analysis">`;
           html += `<div class="impact-label deep-analysis">Deep Analysis</div>`;

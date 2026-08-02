@@ -180,17 +180,23 @@ python -m src.mcp_server_app \
   --ascend-repo-path /path/to/vllm-ascend
 ```
 
-Claude Code 配置（`~/.claude/settings.local.json`）：
-```json
+在 AI 工具中配置：
+
+**Claude Code**（命令行）：
+```bash
+claude mcp add vllm-report -- python -m src.mcp_server_app \
+    --data-dir /path/to/vllm-report/data \
+    --ascend-repo-path /path/to/vllm-ascend
+```
+
+**OpenCode**（`opencode.json` 或 `opencode.jsonc`）：
+```jsonc
 {
-  "mcpServers": {
+  "mcp": {
     "vllm-report": {
-      "command": "python",
-      "args": [
-        "-m", "src.mcp_server_app",
-        "--data-dir", "/path/to/vllm-report/data",
-        "--ascend-repo-path", "/path/to/vllm-ascend"
-      ]
+      "type": "local",
+      "command": ["python", "-m", "src.mcp_server_app", "--data-dir", "/path/to/vllm-report/data", "--ascend-repo-path", "/path/to/vllm-ascend"],
+      "enabled": true
     }
   }
 }
@@ -207,9 +213,9 @@ python serve.py
 
 详见 [docs/mcp-usage-guide.md](docs/mcp-usage-guide.md) 的使用场景说明：
 
-- **Claude Code**（原生 MCP）：配置 MCP Server 后，可以直接问"今天有哪些影响 ascend 的 commit？"
-- **OpenCode / Codex CLI**：直接从 `data/` 目录读取 JSON 文件
-- **自定义 Agent**：通过 `socat` 将 MCP Server 包装为 HTTP 访问
+- **Claude Code**（原生 MCP）：`claude mcp add vllm-report -- python -m src.mcp_server_app ...`
+- **OpenCode**（原生 MCP）：在 `opencode.json` 或 `opencode.jsonc` 中配置 `mcp`
+- **其他工具**：通过 `socat` 包装为 HTTP 访问，或直接从 `data/` 目录读取 JSON 文件
 
 ## GitHub Actions 配置
 

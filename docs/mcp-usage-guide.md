@@ -8,17 +8,59 @@
 ## 前置条件
 
 1. vllm-report 项目数据已正常生成（index.json、arch.json、analysis JSON 等）
-2. MCP Server 已配置（Claude Code 场景）或可直接读取 JSON 文件（其他工具场景）
+2. MCP Server 已配置（Claude Code / OpenCode 场景）或可直接读取 JSON 文件（其他工具场景）
+
+---
+
+## 第三方工具对接方式
+
+### 方式一：Claude Code（原生 MCP）
+
+使用 `claude mcp add` 命令添加（Claude Code 不支持通过配置文件加载 MCP）：
+
+```bash
+claude mcp add vllm-report -- python -m src.mcp_server_app \
+    --data-dir /path/to/vllm-report/data \
+    --ascend-repo-path /path/to/vllm-ascend
+```
+
+`--ascend-repo-path` 用于读取 vllm-ascend 项目中的基线文件（`.github/vllm-main-verified.commit` 和 `.github/vllm-release-tag.commit`），使 MCP Server 能回答"当前已验证到哪个 commit"的问题。
+
+配置后，在 vllm-ascend 项目目录下打开 Claude Code，自动拥有所有知识库能力。可用 `claude mcp list` 验证连接状态。
+
+### 方式二：OpenCode（原生 MCP）
+
+OpenCode 完全支持 MCP 协议，在项目 `opencode.json` 或 `opencode.jsonc` 中配置：
+
+```jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "vllm-report": {
+      "type": "local",
+      "command": ["python", "-m", "src.mcp_server_app", "--data-dir", "/path/to/vllm-report/data", "--ascend-repo-path", "/path/to/vllm-ascend"],
+      "enabled": true
+    }
+  }
+}
+```
+
+或在 `~/.config/opencode/opencode.json` 中全局配置。配置后重启 opencode 生效。
+
+### 方式三：HTTP 包装（任意工具）
+
+用 socat 将 MCP Server 包装为 TCP 服务：
+
+```bash
+socat TCP-LISTEN:9999,reuseaddr,fork \
+  EXEC:"python -m src.mcp_server_app --data-dir /path/to/vllm-report/data --ascend-repo-path /path/to/vllm-ascend"
+```
 
 ---
 
 ## 场景一：日常巡检
 
 > 每天查看 vllm 上游有哪些 commit 会影响 vllm-ascend
-
-### Claude Code（MCP 方式）
-
-在 vllm-ascend 项目目录下，直接问：
 
 ```
 今天 vllm 有哪些影响 ascend 的 commit？
@@ -37,24 +79,12 @@ Agent 内部：
 1. [high-risk] refactor AttentionBackend.forward() 签名
    → 影响：AscendAttentionBackend 需要适配新的 forward 参数
    → 对应 patch：attention_v1.py
-   → 建议：修改 vllm_ascend/attention/attention_v1.py 中的 forward 方法签名
 
 2. [medium-risk] Scheduler 新增 max_num_seqs 校验
    → 影响：patch_balance_schedule.py 可能需要更新
-   → 建议：检查 patch_balance_schedule.py 中的调度逻辑
 
 3. [low-risk] 更新 CI 配置
    → 不影响 ascend，跳过
-```
-
-### OpenCode / Codex CLI（文件读取方式）
-
-```python
-# 伪代码：工具内部逻辑
-analysis = read_json("data/vllm/analysis/2026-07-31.json")
-affected = [c for c in analysis.commits 
-            if c.ascend_impact.ascend_affected]
-print(f"找到 {len(affected)} 个影响 ascend 的 commit")
 ```
 
 ---
@@ -63,15 +93,13 @@ print(f"找到 {len(affected)} 个影响 ascend 的 commit")
 
 > 准备将 vllm main 的最新代码同步到 vllm-ascend，查看还有哪些没适配
 
-### Claude Code（MCP 方式）
-
 ```
 上次同步是 7月15日，我要做一次 main2main 同步，帮我看看还有哪些没适配的？
 ```
 
 Agent 内部：
-1. 调用 `get_adaptation_baseline()` 获取当前已验证的基线（来自 vllm-ascend 的 `.github/vllm-main-verified.commit`）。返回的基线信息包含 `main_verified_sha`（commit SHA），Agent 根据此 SHA 在 analysis 文件中找到对应日期作为基线日期
-2. 调用 `get_ascend_impact_summary("vllm", baseline_date, today)` 获取基线之后影响 ascend 的 commit。`baseline_date` 从基线信息的 `generated_at` 或对应 analysis 文件的日期中提取
+1. 调用 `get_adaptation_baseline()` 获取当前已验证的基线
+2. 调用 `get_ascend_impact_summary("vllm", baseline_date, today)` 获取基线之后影响 ascend 的 commit
 3. 调用 `get_pending_adaptations()` 查看当前适配进度
 4. 对比得出"需要适配但还没做"的列表
 
@@ -79,18 +107,17 @@ Agent 内部：
 
 ```
 当前基线信息：
-  main 已验证 SHA: d02df748b — [Bugfix] Accept RFC 2397 parameters in base64 data URLs
-  release 基线: v0.26.0
+  main 已验证 SHA: d02df748b
   基线之后: 127 个 commit，其中 12 个影响 ascend
 
-上次同步时间：2026-07-15
+最近同步时间：2026-07-15
 当前最新分析：2026-07-31
 间隔：16 天
 
 这段时间有 12 个 commit 影响 ascend：
-  - 5 个已适配 ✅
-  - 1 个跳过（仅文档变更）⏭️
-  - 6 个待适配 ⏳
+  - 5 个已适配
+  - 1 个跳过（仅文档变更）
+  - 6 个待适配
 
 待适配列表（按风险排序）：
 1. [high-risk] refactor AttentionBackend.forward() - 7月30日
@@ -99,7 +126,6 @@ Agent 内部：
      a. 查看 commit diff
      b. 修改 vllm_ascend/attention/attention_v1.py
      c. 运行相关测试
-     d. 标记为 adapted
 
 2. [medium-risk] Scheduler max_num_seqs 校验 - 7月28日
    ...
@@ -107,31 +133,11 @@ Agent 内部：
 是否开始适配第 1 个？
 ```
 
-### CLI 方式（直接使用 track_adaptation.py）
-
-```bash
-# 查看当前适配进度
-python src/data/track_adaptation.py status
-
-# 输出示例：
-# 总计: 12  |  已适配: 5  |  待确认: 1  |  待适配: 6  |  已跳过: 1
-
-# 列出待适配的 commit
-python src/data/track_adaptation.py list --status pending
-
-# 输出示例：
-# abc123 - refactor AttentionBackend.forward() [high-risk] - 7月30日
-# def456 - Scheduler max_num_seqs 校验 [medium-risk] - 7月28日
-# ...
-```
-
 ---
 
 ## 场景三：适配单个 commit
 
 > 针对某个具体的 commit，了解改动详情并进行适配
-
-### Claude Code（MCP 方式）
 
 ```
 帮我适配这个 commit：abc123，它改了 AttentionBackend 的 forward 方法
@@ -163,7 +169,7 @@ commit abc123 - refactor AttentionBackend.forward()
 2. 将 forward 方法添加 `cache_config` 参数
 3. 调整返回值处理逻辑
 4. 运行测试：pytest -sv tests/ut/attention/
-5. 适配状态由下一次 `track_adaptation.py init` 自动更新（基线推进后自动变为 adapted）
+5. 适配状态由下一次 `track_adaptation.py init` 自动更新
 ```
 
 ---
@@ -171,8 +177,6 @@ commit abc123 - refactor AttentionBackend.forward()
 ## 场景四：架构变更评估
 
 > 评估某个核心接口变更的影响范围
-
-### Claude Code（MCP 方式）
 
 ```
 这个 commit 改了 vllm/platforms/interface.py，影响有多大？
@@ -208,8 +212,6 @@ Agent 内部：
 
 > 开发中需要了解某个模块近期的变更趋势
 
-### Claude Code（MCP 方式）
-
 ```
 最近 attention 模块有什么变更？
 ```
@@ -225,12 +227,10 @@ Agent 内部：
 过去 14 天 attention 模块有 5 个变更：
 
 1. 7月30日 - refactor AttentionBackend.forward() [high-risk]
-   ⚡ 影响 ascend：是
-   → patch：attention_v1.py 需要适配
+   ⚡ 影响 ascend：是 → patch：attention_v1.py 需要适配
 
 2. 7月28日 - fix MLA attention bias [bugfix]
-   ⚡ 影响 ascend：是
-   → patch：mla_v1.py 需要同步修复
+   ⚡ 影响 ascend：是 → patch：mla_v1.py 需要同步修复
 
 3. 7月25日 - add FlashInfer fallback [feature]
    ⚡ 影响 ascend：否（FlashInfer 是 CUDA 特有）
@@ -247,8 +247,6 @@ Agent 内部：
 ## 场景六：查询架构知识
 
 > 快速了解 ascend 某个模块的架构设计
-
-### Claude Code（MCP 方式）
 
 ```
 ascend 的 attention 后端有哪些？和 vllm 的 AttentionBackend 是什么关系？
@@ -292,8 +290,6 @@ Ascend Attention 后端：
 
 > 适配完成后，需要运行测试验证
 
-### Claude Code（MCP 方式）
-
 ```
 怎么运行 ascend 的 attention 相关测试？
 ```
@@ -315,77 +311,6 @@ Ascend attention 测试：
 
 没有 NPU 硬件时，部分 attention 单测可在 CPU 上运行：
   VLLM_ASCEND_USE_CPU_ATTENTION=1 pytest -sv tests/ut/attention/
-
-环境准备：
-  cd ~/code/vllm-ascend
-  pip install -e .[dev]
-```
-
----
-
-## 第三方工具对接方式
-
-### 方式一：Claude Code（原生 MCP）
-
-在 `~/.claude/settings.local.json` 中配置：
-
-```json
-{
-  "mcpServers": {
-    "vllm-report": {
-      "command": "python",
-      "args": [
-        "-m", "src.mcp_server_app",
-        "--data-dir", "/path/to/vllm-report/data",
-        "--ascend-repo-path", "/path/to/vllm-ascend"
-      ]
-    }
-  }
-}
-```
-
-`--ascend-repo-path` 用于读取 vllm-ascend 项目中的基线文件（`.github/vllm-main-verified.commit` 和 `.github/vllm-release-tag.commit`），使 MCP Server 能回答"当前已验证到哪个 commit"的问题。
-
-配置后，在 vllm-ascend 项目目录下打开 Claude Code，自动拥有所有知识库能力。
-
-### 方式二：OpenCode / Codex CLI
-
-这些工具目前不支持 MCP 协议，但可以直接读取 JSON 文件：
-
-```
-# 架构知识
-data/vllm/context/architecture.json
-data/vllm-ascend/context/architecture.json
-
-# 检索索引（快速定位）
-data/vllm/index.json
-data/vllm-ascend/index.json
-
-# 每日分析
-data/vllm/analysis/YYYY-MM-DD.json
-data/vllm-ascend/analysis/YYYY-MM-DD.json
-
-# 适配状态
-data/vllm-ascend/adaptation-status.json
-
-# 项目入口引导
-data/README.json
-```
-
-使用方式：在提示词中引用这些文件路径，Agent 会自动读取。如果需要基线信息，额外读取 vllm-ascend 项目中的：
-```
-/path/to/vllm-ascend/.github/vllm-main-verified.commit
-/path/to/vllm-ascend/.github/vllm-release-tag.commit
-```
-
-### 方式三：自定义 Agent
-
-如果需要 HTTP 访问，可以包装 MCP Server：
-
-```bash
-# 用 socat 包装 stdio 为 TCP
-socat TCP-LISTEN:9999,reuseaddr,fork \
-  EXEC:"python -m src.mcp_server_app --data-dir /path/to/vllm-report/data --ascend-repo-path /path/to/vllm-ascend"
 ```
 
 ---
@@ -425,22 +350,22 @@ socat TCP-LISTEN:9999,reuseaddr,fork \
 
 ## MCP 工具速查表
 
-> 以下为 vllm-report MCP Server 提供的全部 25 个工具，按类别组织。
+> 以下为 vllm-report MCP Server 提供的全部工具，按类别组织。
 
 ### 架构分析（10 个）
 
 | 工具 | 渐进式 | 说明 |
 |------|--------|------|
-| `get_architecture_overview` | ✅ [Progressive] | 概览 + 模块列表（轻量级，首选） |
+| `get_architecture_overview` | ✅ | 概览 + 模块列表（轻量级，首选） |
 | `get_architecture_context` | ❌ | 完整架构数据（量大，可能截断，按需使用） |
 | `get_architecture_at_commit` | ❌ | 指定 commit 时的架构快照 |
 | `get_architecture_diff` | ❌ | 两 commit 间架构差异 |
 | `get_architecture_freshness` | ❌ | 架构数据是否过时 |
-| `get_module_info` | ✅ [Progressive] | 单个模块详情（支持模糊匹配） |
+| `get_module_info` | ✅ | 单个模块详情（支持模糊匹配） |
 | `get_module_history` | ❌ | 模块近期变更历史（可指定天数） |
-| `get_key_abstractions` | ✅ [Progressive] | 关键抽象类 + 继承关系 + ascend 实现 |
-| `get_hardware_abstraction` | ✅ [Progressive] | 平台无关 vs 平台特定代码划分 |
-| `get_implementation_principles` | ✅ [Progressive] | 核心工作流详解（EngineCore、Scheduler、Attention 等） |
+| `get_key_abstractions` | ✅ | 关键抽象类 + 继承关系 + ascend 实现 |
+| `get_hardware_abstraction` | ✅ | 平台无关 vs 平台特定代码划分 |
+| `get_implementation_principles` | ✅ | 核心工作流详解 |
 
 ### 适配管理（5 个）
 
@@ -466,39 +391,35 @@ socat TCP-LISTEN:9999,reuseaddr,fork \
 
 | 工具 | 渐进式 | 说明 |
 |------|--------|------|
-| `get_interface_surface` | ✅ [Progressive] | vllm 可继承接口 + ascend 实现映射 + 影响规则 |
-| `get_cross_project_mapping` | ❌ | vllm ↔ vllm-ascend 跨项目映射（含必然/可能/绝不影响的路径规则） |
-| `get_development_workflows` | ✅ [Progressive] | 开发工作流模板 |
-| `get_testing_guide` | ✅ [Progressive] | 测试命令和环境配置 |
-| `get_patch_catalog` | ❌ | vllm-ascend 所有 patch 的完整目录（含 why/how/related PR/future plan） |
+| `get_interface_surface` | ✅ | vllm 可继承接口 + ascend 实现映射 + 影响规则 |
+| `get_cross_project_mapping` | ❌ | vllm ↔ vllm-ascend 跨项目映射 |
+| `get_development_workflows` | ✅ | 开发工作流模板 |
+| `get_testing_guide` | ✅ | 测试命令和环境配置 |
+| `get_patch_catalog` | ❌ | vllm-ascend 所有 patch 的完整目录 |
 
 ### 渐进式加载模式
 
 ```
-┌──────────────────────────────────────────────────────────────────┐
-│  第一步：get_architecture_overview(repo)                         │
-│  → 返回模块列表 + 概述，快速了解项目结构                         │
-├──────────────────────────────────────────────────────────────────┤
-│  第二步：按需深入                                              │
-│  ├─ get_module_info(repo, module_name)          → 单个模块详情    │
-│  ├─ get_key_abstractions(repo)                  → 类级继承关系     │
-│  ├─ get_interface_surface(repo)                 → 接口表面        │
-│  └─ get_implementation_principles(repo)         → 工作流细节      │
-├──────────────────────────────────────────────────────────────────┤
-│  第三步：特定场景                                              │
-│  ├─ 适配 commit → get_adaptation_guide(sha)     → 适配指南        │
-│  ├─ 查 patch    → get_patch_catalog()           → patch 目录      │
-│  ├─ 跑测试      → get_testing_guide(repo)       → 测试命令        │
-│  └─ 开发新功能  → get_development_workflows(repo)→ 工作流模板     │
-└──────────────────────────────────────────────────────────────────┘
+第一步：get_architecture_overview(repo)
+  → 返回模块列表 + 概述，快速了解项目结构
+
+第二步：按需深入
+  ├─ get_module_info(repo, module_name)   → 单个模块详情
+  ├─ get_key_abstractions(repo)           → 类级继承关系
+  ├─ get_interface_surface(repo)          → 接口表面
+  └─ get_implementation_principles(repo)  → 工作流细节
+
+第三步：特定场景
+  ├─ 适配 commit → get_adaptation_guide(sha)    → 适配指南
+  ├─ 查 patch    → get_patch_catalog()          → patch 目录
+  ├─ 跑测试      → get_testing_guide(repo)      → 测试命令
+  └─ 开发新功能  → get_development_workflows(repo) → 工作流模板
 ```
 
 ### 数据量说明
 
-实际调用发现，部分接口返回数据量较大：
-- `get_architecture_context` — 完整架构数据（含 implementation_principles、interface_surface、key_abstractions、knowledge_base 等），输出会被截断（超过 ~25KB）
-- `get_architecture_at_commit` — 同上，包含完整快照
-- 优先使用渐进式接口（标注 `[Progressive]`）避免信息过载
+- `get_architecture_context` 和 `get_architecture_at_commit` 返回完整架构数据，可能被截断（超过 ~25KB）
+- 优先使用渐进式接口（标注 ✅）避免信息过载
 
 ### 空结果说明
 
@@ -515,9 +436,9 @@ socat TCP-LISTEN:9999,reuseaddr,fork \
 | 工具 | 角色 | 说明 |
 |------|------|------|
 | **Web Dashboard**（site/） | 人工浏览 | 不变，继续使用 |
-| **MCP Server**（src/mcp_server_app.py） | Agent 查询入口 | 22 个 tools，知识库核心接口。支持渐进式加载——先调 `get_architecture_overview` 获取轻量概览，再按需深入具体维度 |
+| **MCP Server**（src/mcp_server_app.py） | Agent 查询入口 | 22 个 tools，知识库核心接口 |
 | **track_adaptation.py** | 适配进度管理 | CLI 工具，init/update/status/list |
 | **build_index.py** | 检索索引 | 每日更新，加速跨日期搜索 |
-| **index.json + commits-index.json** | 两层检索索引 | index.json 存 SHA 列表映射，commits-index.json 存 SHA→基本信息。MCP Server 和前端搜索加速 |
-| **architecture.json** | 架构知识库（11 维度） | 含 overview、modules、key_abstractions、implementation_principles、interface_surface、cross_project_relationship、knowledge_base（patch_catalog + 开发工作流 + 测试指南） |
+| **index.json + commits-index.json** | 两层检索索引 | index.json 存 SHA 列表映射，commits-index.json 存 SHA→基本信息 |
+| **architecture.json** | 架构知识库（11 维度） | 含 overview、modules、key_abstractions、implementation_principles、interface_surface、cross_project_relationship、knowledge_base |
 | **vllm-knowledge** | 手写知识库 | **已废弃**，内容已合并到 architecture.json |

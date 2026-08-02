@@ -180,17 +180,23 @@ python -m src.mcp_server_app \
   --ascend-repo-path /path/to/vllm-ascend
 ```
 
-Claude Code config (`~/.claude/settings.local.json`):
-```json
+Configure in your AI tool:
+
+**Claude Code** (CLI):
+```bash
+claude mcp add vllm-report -- python -m src.mcp_server_app \
+    --data-dir /path/to/vllm-report/data \
+    --ascend-repo-path /path/to/vllm-ascend
+```
+
+**OpenCode** (in `opencode.json` or `opencode.jsonc`):
+```jsonc
 {
-  "mcpServers": {
+  "mcp": {
     "vllm-report": {
-      "command": "python",
-      "args": [
-        "-m", "src.mcp_server_app",
-        "--data-dir", "/path/to/vllm-report/data",
-        "--ascend-repo-path", "/path/to/vllm-ascend"
-      ]
+      "type": "local",
+      "command": ["python", "-m", "src.mcp_server_app", "--data-dir", "/path/to/vllm-report/data", "--ascend-repo-path", "/path/to/vllm-ascend"],
+      "enabled": true
     }
   }
 }
@@ -207,9 +213,9 @@ python serve.py
 
 See [docs/mcp-usage-guide.md](docs/mcp-usage-guide.md) for detailed usage scenarios:
 
-- **Claude Code** (native MCP): Configure the MCP server, then ask questions like "What commits affect ascend today?"
-- **OpenCode / Codex CLI**: Read JSON files directly from `data/` directory
-- **Custom Agent**: Wrap MCP Server with `socat` for HTTP access
+- **Claude Code** (native MCP): `claude mcp add vllm-report -- python -m src.mcp_server_app ...`
+- **OpenCode** (native MCP): Configure `mcp` in `opencode.json` or `opencode.jsonc`
+- **Other tools**: Wrap MCP Server with `socat` for HTTP access, or read JSON files directly from `data/`
 
 ## GitHub Actions Setup
 

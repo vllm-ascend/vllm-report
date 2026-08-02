@@ -802,59 +802,59 @@ async def tool_update_adaptation_status(sha: str, status: str, notes: Optional[s
     adaptation["stats"] = stats
 
     async def tool_advance_baseline(new_sha: str, message: Optional[str] = None) -> str:
-    """推进基线，更新 vllm-ascend 的 vllm-main-verified.commit"""
-    if not ascend_repo_path:
-        return json.dumps({"error": "ascend-repo-path not configured. Cannot advance baseline."}, ensure_ascii=False)
+        """推进基线，更新 vllm-ascend 的 vllm-main-verified.commit"""
+        if not ascend_repo_path:
+            return json.dumps({"error": "ascend-repo-path not configured. Cannot advance baseline."}, ensure_ascii=False)
 
-    baseline_file = os.path.join(ascend_repo_path, ".github", "vllm-main-verified.commit")
-    if not os.path.exists(baseline_file):
-        return json.dumps({"error": f"Baseline file not found: {baseline_file}"}, ensure_ascii=False)
+        baseline_file = os.path.join(ascend_repo_path, ".github", "vllm-main-verified.commit")
+        if not os.path.exists(baseline_file):
+            return json.dumps({"error": f"Baseline file not found: {baseline_file}"}, ensure_ascii=False)
 
-    try:
-        # Read current
-        with open(baseline_file, "r") as f:
-            current = f.read().strip()
+        try:
+            # Read current
+            with open(baseline_file, "r") as f:
+                current = f.read().strip()
 
-        # Write new SHA
-        with open(baseline_file, "w") as f:
-            f.write(new_sha.strip() + "\n")
+            # Write new SHA
+            with open(baseline_file, "w") as f:
+                f.write(new_sha.strip() + "\n")
 
-        # Auto-mark newly-covered commits as adapted in adaptation-status.json
-        adaptation_path = get_adaptation_status_path(data_dir)
-        adaptation = load_json(adaptation_path)
-        updated_count = 0
-        if adaptation:
-            new_baseline_date = find_sha_date(data_dir, "vllm", new_sha)
-            for commit in adaptation.get("commits", []):
-                if commit.get("status") == "pending" and new_baseline_date:
-                    if commit.get("upstream_date", "") <= new_baseline_date:
-                        commit["status"] = "adapted"
-                        commit["adapted_at"] = datetime.now(TZ_CN).isoformat()
-                        updated_count += 1
-            if updated_count > 0:
-                stats = {"total": 0, "pending": 0, "adapted": 0}
+            # Auto-mark newly-covered commits as adapted in adaptation-status.json
+            adaptation_path = get_adaptation_status_path(data_dir)
+            adaptation = load_json(adaptation_path)
+            updated_count = 0
+            if adaptation:
+                new_baseline_date = find_sha_date(data_dir, "vllm", new_sha)
                 for commit in adaptation.get("commits", []):
-                    stats["total"] += 1
-                    s = commit.get("status", "pending")
-                    if s in stats:
-                        stats[s] += 1
-                adaptation["stats"] = stats
-                adaptation["baseline"]["main_sha"] = new_sha
-                adaptation["baseline"]["baseline_date"] = new_baseline_date or ""
-                save_json_atomic(adaptation_path, adaptation)
+                    if commit.get("status") == "pending" and new_baseline_date:
+                        if commit.get("upstream_date", "") <= new_baseline_date:
+                            commit["status"] = "adapted"
+                            commit["adapted_at"] = datetime.now(TZ_CN).isoformat()
+                            updated_count += 1
+                if updated_count > 0:
+                    stats = {"total": 0, "pending": 0, "adapted": 0}
+                    for commit in adaptation.get("commits", []):
+                        stats["total"] += 1
+                        s = commit.get("status", "pending")
+                        if s in stats:
+                            stats[s] += 1
+                    adaptation["stats"] = stats
+                    adaptation["baseline"]["main_sha"] = new_sha
+                    adaptation["baseline"]["baseline_date"] = new_baseline_date or ""
+                    save_json_atomic(adaptation_path, adaptation)
 
-        msg = message or f"Advance baseline from {current[:12]} to {new_sha[:12]}"
-        return json.dumps({
-            "success": True,
-            "previous_sha": current,
-            "new_sha": new_sha,
-            "file_updated": baseline_file,
-            "commits_auto_adapted": updated_count,
-            "message": msg,
-            "note": "File updated locally. Please commit and push to vllm-ascend repository."
-        }, ensure_ascii=False, indent=2)
-    except IOError as e:
-        return json.dumps({"error": f"Failed to update baseline: {str(e)}"}, ensure_ascii=False)
+            msg = message or f"Advance baseline from {current[:12]} to {new_sha[:12]}"
+            return json.dumps({
+                "success": True,
+                "previous_sha": current,
+                "new_sha": new_sha,
+                "file_updated": baseline_file,
+                "commits_auto_adapted": updated_count,
+                "message": msg,
+                "note": "File updated locally. Please commit and push to vllm-ascend repository."
+            }, ensure_ascii=False, indent=2)
+        except IOError as e:
+            return json.dumps({"error": f"Failed to update baseline: {str(e)}"}, ensure_ascii=False)
 
 
 # ── Architecture Delta Tools ──────────────────────────────────────

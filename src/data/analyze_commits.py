@@ -20,9 +20,12 @@ Phase 1: 调用 DeepSeek 批量分析 commit，标记 ascend_affected。
 """
 import argparse
 import json
+import math
 import os
 import sys
 import tempfile
+import threading
+import time
 import urllib.request
 import urllib.error
 from datetime import datetime, timezone, timedelta
@@ -547,15 +550,6 @@ DEFAULT_API_BASE = "https://api.deepseek.com"
 
 
 def call_llm(prompt):
-    """Call the LLM API directly via environment variables.
-
-    Required env var:
-      LLM_API_KEY  — API key (e.g. DeepSeek sk-xxx)
-
-    Optional env vars:
-      LLM_API_BASE  — API base URL (default: {DEFAULT_API_BASE})
-      LLM_MODEL     — model name sent to API (default: "deepseek-chat")
-    """
     prompt_bytes = len(prompt.encode("utf-8"))
     print(f"  [call] prompt size: {prompt_bytes:,} bytes")
 
@@ -584,16 +578,32 @@ def call_llm(prompt):
         },
     )
 
+    heartbeat_stop = threading.Event()
+
+    def heartbeat():
+        start = time.time()
+        while not heartbeat_stop.is_set():
+            elapsed = int(time.time() - start)
+            print(f"\r  ⏳ LLM 等待中... ({elapsed}s)", end="", flush=True)
+            heartbeat_stop.wait(10)
+
+    hb_thread = threading.Thread(target=heartbeat, daemon=True)
+    hb_thread.start()
+
     try:
         with urllib.request.urlopen(req, timeout=600) as resp:
             result = json.loads(resp.read())
         content = result["choices"][0]["message"]["content"]
         if not content or not content.strip():
-            print("LLM returned empty response")
+            heartbeat_stop.set()
+            print(f"\r  ⏳ LLM 返回空内容{' ' * 40}")
             return None
+        heartbeat_stop.set()
+        print(f"\r  ⏳ LLM 响应完成{' ' * 40}")
         return content
     except urllib.error.HTTPError as e:
-        print(f"API HTTP error: {e.code} {e.reason}")
+        heartbeat_stop.set()
+        print(f"\r  ⏳ LLM 请求失败: HTTP {e.code}{' ' * 40}")
         try:
             detail = e.read().decode("utf-8")
             print(f"  Response: {detail[:300]}")
@@ -601,13 +611,16 @@ def call_llm(prompt):
             pass
         return None
     except urllib.error.URLError as e:
-        print(f"API connection error: {e.reason}")
+        heartbeat_stop.set()
+        print(f"\r  ⏳ LLM 请求失败: {e.reason}{' ' * 40}")
         return None
     except json.JSONDecodeError as e:
-        print(f"API returned invalid JSON: {e}")
+        heartbeat_stop.set()
+        print(f"\r  ⏳ LLM 返回无效 JSON{' ' * 40}")
         return None
     except KeyError as e:
-        print(f"Unexpected API response format (missing {e})")
+        heartbeat_stop.set()
+        print(f"\r  ⏳ LLM 响应格式异常 (missing {e}){' ' * 40}")
         return None
 
 
@@ -799,7 +812,8 @@ def analyze_commits(repo, date, data_dir, confirm, force, local_repo=None):
     if auto_analysis:
         print(f"  ├ {len(auto_analysis)} commits auto-determined (no ascend impact)")
     if llm_shas:
-        print(f"  └ {len(llm_shas)} commits sent to LLM for analysis")
+        total_batches = math.ceil(len(llm_shas) / MAX_COMMITS_PER_BATCH)
+        print(f"  └ {len(llm_shas)} commits sent to LLM for analysis ({total_batches} batches)")
 
     if existing_analysis:
         existing_shas = {ac["sha"] for ac in existing_analysis.get("commits", [])}
@@ -808,20 +822,23 @@ def analyze_commits(repo, date, data_dir, confirm, force, local_repo=None):
         if existing_analysis.get("commits"):
             print(f"  ├ Resumed: {len(existing_analysis['commits'])} commits already analyzed")
         if llm_shas:
-            print(f"  └ Remaining: {len(llm_shas)} commits to analyze")
+            remaining_batches = math.ceil(len(llm_shas) / MAX_COMMITS_PER_BATCH)
+            print(f"  └ Remaining: {len(llm_shas)} commits to analyze ({remaining_batches} batches)")
 
     # Phase 2: call LLM only for non-triaged commits
-    llm_analysis = None  # Will hold the accumulated LLM results
+    llm_analysis = None
     max_retries = 3
     retry_count = 0
     missing_shas = set()
 
     MAX_COMMITS_PER_BATCH = 15
     remaining_after_batch = []
+    batch_idx = 0
+    total_batches = max(1, math.ceil(len(llm_shas) / MAX_COMMITS_PER_BATCH)) if llm_shas else 1
 
     while llm_shas and retry_count < max_retries:
+        batch_idx += 1
         llm_set = set(llm_shas)
-        # Batch: split into smaller chunks if too many commits
         if len(llm_shas) > MAX_COMMITS_PER_BATCH:
             batch = llm_shas[:MAX_COMMITS_PER_BATCH]
             remaining_after_batch = llm_shas[MAX_COMMITS_PER_BATCH:]
@@ -834,11 +851,10 @@ def analyze_commits(repo, date, data_dir, confirm, force, local_repo=None):
             print("ERROR: empty prompt after subset filter")
             return False
 
-        print(f"Calling LLM (attempt {retry_count + 1}, {len(llm_set)} commits)...")
+        print(f"  [{batch_idx}/{total_batches}] 正在调用 LLM (第{retry_count + 1}次尝试, {len(llm_set)}个commit)...")
         output = call_llm(prompt)
         if output is None:
-            print("Failed to get response from LLM")
-            # Merge current batch back into remaining for retry
+            print(f"  [{batch_idx}/{total_batches}] ✗ LLM 返回空，正在重试...")
             remaining = list(llm_set) + remaining_after_batch
             if remaining:
                 llm_shas = remaining
@@ -849,7 +865,7 @@ def analyze_commits(repo, date, data_dir, confirm, force, local_repo=None):
 
         analysis = extract_json_from_output(output)
         if analysis is None:
-            print("Failed to parse JSON from LLM output")
+            print(f"  [{batch_idx}/{total_batches}] ✗ 解析 LLM 输出失败")
             print(f"Output length: {len(output)} chars")
             print(f"First 100 chars: {output[:100]!r}")
             print(f"Last 100 chars: {output[-100:]!r}")
@@ -875,7 +891,6 @@ def analyze_commits(repo, date, data_dir, confirm, force, local_repo=None):
         if analysis is None:
             return False
 
-        # Accumulate LLM results across retries
         if llm_analysis is None:
             llm_analysis = analysis
         else:
@@ -884,14 +899,13 @@ def analyze_commits(repo, date, data_dir, confirm, force, local_repo=None):
                 if ac["sha"] not in existing_shas:
                     llm_analysis["commits"].append(ac)
 
-        # Check for missing shas
         analyzed_shas = {ac["sha"] for ac in llm_analysis.get("commits", [])}
         missing_shas = llm_set - analyzed_shas
 
+        partial_commits = merge_commits(all_commits, auto_analysis, llm_analysis.get("commits", []))
+        total_done = len(partial_commits) - len(auto_analysis)
+
         if not missing_shas and not remaining_after_batch:
-            print(f"  ✓ All {len(llm_set)} commits analyzed")
-            # 保存中间结果（断点续推）
-            partial_commits = merge_commits(all_commits, auto_analysis, llm_analysis.get("commits", []))
             partial = {
                 "date": date,
                 "repo": repo,
@@ -901,16 +915,27 @@ def analyze_commits(repo, date, data_dir, confirm, force, local_repo=None):
                 "commits": partial_commits,
             }
             save_json_atomic(analysis_path, partial)
-            total_done = len(partial_commits) - len(auto_analysis)
-            print(f"  └ Saved partial progress ({total_done} LLM + {len(auto_analysis)} auto = {len(partial_commits)}/{num_commits} commits)")
+            print(f"  [{batch_idx}/{total_batches}] ✓ 完成 (已分析 {total_done}/{num_commits} 个commit)")
+            print(f"    └ Saved partial progress ({total_done} LLM + {len(auto_analysis)} auto = {len(partial_commits)}/{num_commits} commits)")
             break
         elif not missing_shas and remaining_after_batch:
+            partial = {
+                "date": date,
+                "repo": repo,
+                "partial": True,
+                "daily_summary": "（分析进行中，尚未完成）",
+                "generated_at": datetime.now(TZ_CN).isoformat(),
+                "commits": partial_commits,
+            }
+            save_json_atomic(analysis_path, partial)
+            print(f"  [{batch_idx}/{total_batches}] ✓ 完成 (已分析 {total_done}/{num_commits} 个commit)")
+            print(f"    └ Saved partial progress (batch done, {total_done}/{num_commits} commits)")
             llm_shas = remaining_after_batch
             remaining_after_batch = []
             retry_count = 0
             continue
 
-        print(f"  ⚠ {len(missing_shas)} commits missing from LLM response, retrying...")
+        print(f"  [{batch_idx}/{total_batches}] ⚠ {len(missing_shas)}个commit 缺失，正在重试...")
         for sha in sorted(missing_shas):
             print(f"    - {sha[:8]}")
 

@@ -24,6 +24,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -62,6 +63,7 @@ def save_json_atomic(filepath, data):
 
 
 def deep_analyze_commits(repo, date, data_dir, local_repo):
+    total_start = time.time()
     repo_dir = get_repo_dir(data_dir, repo)
     analysis_path = os.path.join(repo_dir, "analysis", f"{date}.json")
 
@@ -91,10 +93,12 @@ def deep_analyze_commits(repo, date, data_dir, local_repo):
     repo_dir_abs = os.path.join(data_dir_abs, repo_short)
     cache = SourceContextCache(repo_dir_abs, repo_dir=local_repo)
 
-    for item in to_analyze:
+    total = len(to_analyze)
+    for i, item in enumerate(to_analyze, 1):
         sha = item["sha"]
         sha_short = sha[:12]
-        print(f"  Deep analyzing {sha_short}...")
+        round_start = time.time()
+        print(f"\n  [{i}/{total}] Deep analyzing {sha_short}...")
 
         original_head = None
         try:
@@ -140,7 +144,7 @@ def deep_analyze_commits(repo, date, data_dir, local_repo):
             )[:2000]
 
             baseline_sha, deltas = get_deltas_up_to(data_dir, repo_short, sha)
-            deltas = [(s, d) for s, d in deltas if s != sha]
+            deltas = [(s, d) for s, d in deltas if s != sha and d.get('change_summary', '').strip()]
 
             delta_context = ""
             if deltas:
@@ -227,19 +231,20 @@ Patch summary:
             result = call_claude(
                 prompt=prompt,
                 json_schema=deep_analysis_schema,
-                max_budget_usd=None,
                 add_dirs=[local_repo, data_dir_abs],
             )
 
             if result:
                 item["deep_analysis"] = result
-                print(f"    Deep analysis completed for {sha_short}")
+                round_elapsed = int(time.time() - round_start)
+                print(f"  [{i}/{total}] ✓ {sha_short} 分析完成 ({round_elapsed}s)")
 
                 if result.get("ascend_affected_confirmed") is False:
                     item.setdefault("ascend_impact", {})["ascend_affected"] = False
-                    print(f"    Phase 1 false positive: ascend_affected overridden to false")
+                    print(f"  [{i}/{total}] Phase 1 false positive: ascend_affected overridden to false")
             else:
-                print(f"    Deep analysis failed for {sha_short}")
+                round_elapsed = int(time.time() - round_start)
+                print(f"  [{i}/{total}] ✗ {sha_short} 分析失败 ({round_elapsed}s)")
 
             if "deep_analysis" in item:
                 try:
@@ -252,7 +257,7 @@ Patch summary:
                                     fc.setdefault("ascend_impact", {})["ascend_affected"] = False
                                 break
                         save_json_atomic(analysis_path, full)
-                        print(f"    Progress saved to {analysis_path}")
+                        print(f"  [{i}/{total}] Progress saved to {analysis_path}")
 
                     if result and result.get("ascend_affected_confirmed") is False:
                         repo_short = repo_dir_name(repo)
@@ -260,9 +265,9 @@ Patch summary:
                         if deltas_data and sha in deltas_data.get("deltas", {}):
                             deltas_data["deltas"][sha]["ascend_impact"] = False
                             save_deltas(deltas_path(data_dir, repo_short), deltas_data)
-                            print(f"    arch_deltas updated: {sha[:12]} ascend_impact set to false")
+                            print(f"  [{i}/{total}] arch_deltas updated: {sha[:12]} ascend_impact set to false")
                 except Exception as e:
-                    print(f"    Warning: failed to save progress: {e}")
+                    print(f"  [{i}/{total}] Warning: failed to save progress: {e}")
 
         finally:
             if original_head:
@@ -272,7 +277,8 @@ Patch summary:
                     cwd=local_repo, capture_output=True, text=True, timeout=60,
                 )
 
-    print(f"Deep analysis completed for {len(to_analyze)} commits")
+    total_elapsed = int(time.time() - total_start)
+    print(f"Deep analysis completed for {len(to_analyze)} commits (总耗时 {total_elapsed}s)")
     return True
 
 

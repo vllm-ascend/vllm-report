@@ -212,8 +212,8 @@ def main():
     output_path = os.path.abspath(os.path.join(args.data_dir, repo_dir_name(args.repo), "commits", f"{args.date}.json"))
     if os.path.exists(output_path):
         if not args.force:
-            print(f"Error: {output_path} already exists, use --force to overwrite")
-            sys.exit(1)
+            print(f"{output_path} already exists, skipping (use --force to overwrite)")
+            return
         print(f"Warning: overwriting {output_path}")
 
     after = f"{args.date}T00:00:00+08:00"

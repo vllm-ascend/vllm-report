@@ -796,6 +796,8 @@ def analyze_commits(repo, date, data_dir, confirm, force, local_repo=None):
 
     print(f"Analyzing {num_commits} commits for {repo} on {date}...")
 
+    MAX_COMMITS_PER_BATCH = 15
+
     # Load not_used_by_ascend from architecture.json for triage
     is_vllm = "vllm-ascend" not in repo
     not_used_set = _load_not_used_by_ascend(data_dir) if is_vllm else set()
@@ -831,7 +833,6 @@ def analyze_commits(repo, date, data_dir, confirm, force, local_repo=None):
     retry_count = 0
     missing_shas = set()
 
-    MAX_COMMITS_PER_BATCH = 15
     remaining_after_batch = []
     batch_idx = 0
     total_batches = max(1, math.ceil(len(llm_shas) / MAX_COMMITS_PER_BATCH)) if llm_shas else 1

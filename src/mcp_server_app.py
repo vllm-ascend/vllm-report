@@ -1436,15 +1436,16 @@ from mcp.types import (
 from mcp.types import PaginatedRequestParams
 
 
-async def handle_list_tools(ctx, params) -> ListToolsResult:
+@server.list_tools()
+async def handle_list_tools() -> ListToolsResult:
     """Handler for tools/list. ctx is ServerRequestContext, params is PaginatedRequestParams."""
     return ListToolsResult(tools=TOOLS)
 
 
-async def handle_call_tool(ctx, params: CallToolRequestParams) -> CallToolResult:
-    """Handler for tools/call. ctx is ServerRequestContext, params is CallToolRequestParams."""
-    name = params.name
-    args = params.arguments or {}
+@server.call_tool()
+async def handle_call_tool(name: str, arguments: dict) -> CallToolResult:
+    """Handler for tools/call. Registered via @server.call_tool() decorator."""
+    args = arguments or {}
 
     try:
         if name == "get_architecture_context":
@@ -1534,9 +1535,8 @@ def main():
         print(f"Error: data directory not found: {data_dir}", file=sys.stderr)
         sys.exit(1)
 
-    # Set up MCP server
-    server.add_request_handler("tools/list", PaginatedRequestParams, handle_list_tools)
-    server.add_request_handler("tools/call", CallToolRequestParams, handle_call_tool)
+    # Tools are registered via @server.list_tools() and @server.call_tool()
+    # decorators on handle_list_tools / handle_call_tool above.
 
     # Run with stdio transport
 

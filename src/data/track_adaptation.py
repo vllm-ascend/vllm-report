@@ -71,22 +71,47 @@ def read_baseline(ascend_repo_path, filename):
         return f.read().strip()
 
 
-def find_baseline_date(data_dir, sha):
-    """Find the analysis date for a given SHA by scanning analysis files."""
+def find_baseline_date(data_dir, sha, vllm_repo_path=None):
+    """Find the analysis date for a given SHA by scanning analysis files, then commits data, then git log."""
     analysis_dir = os.path.join(data_dir, "vllm", "analysis")
-    if not os.path.isdir(analysis_dir):
-        return None
+    if os.path.isdir(analysis_dir):
+        for fname in sorted(os.listdir(analysis_dir), reverse=True):
+            if not fname.endswith(".json"):
+                continue
+            date = fname.replace(".json", "")
+            analysis = load_json(os.path.join(analysis_dir, fname))
+            if not analysis:
+                continue
+            for commit in analysis.get("commits", []):
+                if commit.get("sha", "")[:12] == sha[:12]:
+                    return date
 
-    for fname in sorted(os.listdir(analysis_dir), reverse=True):
-        if not fname.endswith(".json"):
-            continue
-        date = fname.replace(".json", "")
-        analysis = load_json(os.path.join(analysis_dir, fname))
-        if not analysis:
-            continue
-        for commit in analysis.get("commits", []):
-            if commit.get("sha", "")[:12] == sha[:12]:
-                return date
+    commits_dir = os.path.join(data_dir, "vllm", "commits")
+    if os.path.isdir(commits_dir):
+        for fname in sorted(os.listdir(commits_dir), reverse=True):
+            if not fname.endswith(".json"):
+                continue
+            date = fname.replace(".json", "")
+            data = load_json(os.path.join(commits_dir, fname))
+            if not data:
+                continue
+            for commit in data.get("commits", []):
+                if commit.get("sha", "")[:12] == sha[:12]:
+                    return date
+
+    if vllm_repo_path:
+        import subprocess
+        try:
+            result = subprocess.run(
+                ["git", "log", "-1", "--format=%aI", sha],
+                capture_output=True, text=True, timeout=10,
+                cwd=vllm_repo_path,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return result.stdout.strip()[:10]
+        except Exception:
+            pass
+
     return None
 
 
@@ -122,7 +147,7 @@ def cmd_init(args):
     print(f"Release tag: {release_tag or 'N/A'}")
 
     # Find baseline date
-    baseline_date = find_baseline_date(data_dir, main_sha)
+    baseline_date = find_baseline_date(data_dir, main_sha, args.local_repo)
     if not baseline_date:
         print(f"Warning: Could not find baseline date for {main_sha[:12]}")
         print("Using --since argument or all available data")
@@ -315,6 +340,7 @@ def main():
     init_parser = subparsers.add_parser("init", parents=[global_opts], help="Initialize adaptation tracking")
     init_parser.add_argument("--since", default=None, help="Start tracking from this date (YYYY-MM-DD)")
     init_parser.add_argument("--force", action="store_true", help="Overwrite existing file")
+    init_parser.add_argument("--local-repo", default=None, help="Path to local vllm repository for git log fallback")
 
     # status
     status_parser = subparsers.add_parser("status", parents=[global_opts], help="Show adaptation status summary")

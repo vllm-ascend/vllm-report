@@ -22,6 +22,7 @@ import argparse
 import json
 import math
 import os
+import re
 import sys
 import tempfile
 import threading
@@ -624,20 +625,38 @@ def call_llm(prompt):
         return None
 
 
-def extract_json_from_output(output):
+def extract_json_from_output(output, log_prefix=""):
     if not output:
         return None
 
     text = output.strip()
-    # Strip markdown code fences
-    if text.startswith("```"):
-        start = text.find("\n")
-        if start != -1:
-            text = text[start:].strip()
-        if text.endswith("```"):
-            text = text[:-3].strip()
+    last_error = None
 
-    # Strip trailing stats line (from the last "\n- " onwards)
+    # Try direct json.loads first (LLM often returns plain JSON without markdown fences)
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict) and "commits" in parsed:
+            return parsed
+    except json.JSONDecodeError as e:
+        last_error = e
+
+    # Try to extract JSON from markdown code blocks
+    # Pattern: ```json ... ``` or ``` ... ```
+    code_block_match = re.search(
+        r'```(?:json)?\s*\n?(\{.*?\})\s*\n?```',
+        text,
+        re.DOTALL,
+    )
+    if code_block_match:
+        candidate = code_block_match.group(1).strip()
+        try:
+            parsed = json.loads(candidate)
+            if isinstance(parsed, dict) and "commits" in parsed:
+                return parsed
+        except json.JSONDecodeError as e:
+            last_error = e
+
+    # Strip trailing stats line (from the last "\n— " onwards)
     stats_marker = "\n— "
     stats_idx = text.rfind(stats_marker)
     if stats_idx != -1:
@@ -653,14 +672,16 @@ def extract_json_from_output(output):
     while i != -1:
         try:
             parsed, end = json.JSONDecoder().raw_decode(text, i)
-            # Only accept if it looks like our expected structure
             if isinstance(parsed, dict) and "commits" in parsed:
                 return parsed
-            # Otherwise keep trying - might be embedded in text
             i = text.find("{", i + 1)
-        except (json.JSONDecodeError, ValueError):
+        except (json.JSONDecodeError, ValueError) as e:
+            if isinstance(e, json.JSONDecodeError):
+                last_error = e
             i = text.find("{", i + 1)
 
+    if last_error:
+        print(f"  {log_prefix}JSON parse error: {last_error}")
     return None
 
 

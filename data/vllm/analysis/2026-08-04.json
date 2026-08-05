@@ -1,0 +1,886 @@
+{
+  "date": "2026-08-04",
+  "repo": "vllm-project/vllm",
+  "generated_at": "2026-08-05T09:28:13.523088+08:00",
+  "daily_summary": "当日变更方向多元：核心侧新增 V2 Model Runner 的 E/P/D（Encoder/Prefill/Decode）分离部署支持（encoder-only worker 模式 + ECConnector），为推测解码新增 DSpark top-k Markov 投影与更严格的 block-size 校验；前端将 DeepSeek V4 0731 版 reasoning effort 提示词/映射全面更新，并默认开启 thinking；Mamba/hybrid 模型默认启用 prefix caching（mamba_cache_mode 默认改为 align）；Transformers modeling backend 补齐 MLA 支持（新增 MLAFuser 及 use_mla 判定语义调整）。同时包含多项 bugfix/优化：sparse MLA masked MHA workspace 守卫、多模态 embedding 展平、KV cache 容量日志时机修正、kimi_k3 推理结束检查从 O(context) 降为 O(delta)、fused_moe 延迟导入避免每次启动加载 nixl_ep，以及 DeepGEMM 构建、XPU collect_env、ROCm AITER MOE routing 等平台特定修复。",
+  "ascend_impact_summary": "当日对 vllm-ascend 有实质影响的变更集中在三处：(1) GPUModelRunner 新增 E/P/D 分离部署的 encoder-only 模式与 ECConnector（基类变更，NPUModelRunnerV1/V2 派生类需关注空 KV cache spec 返回与 ec_transfer 导入链）；(2) DSpark 推测解码新增 dspark_draft_topk 配置及 num_speculative_tokens >= dspark_block_size 的强制校验，直接作用于 vllm-ascend 的 DSpark proposer 与 Qwen3DSpark 模型实现；(3) Transformers modeling backend 新增 MLA 支持并改变 ModelConfig.use_mla 判定语义（transformers 后端按 kv_lora_rank 判定），NPU 上以 model_impl='transformers' 运行 MLA 模型时需确认 AscendMLA 后端兼容 latent forward 路径。其余变更为文档、测试、纯平台特定（CUDA/ROCm/XPU）或平台无关的 bugfix，对 vllm-ascend 无影响。",
+  "commits": [
+    {
+      "sha": "4f819f801b7702e39d9588cc9f2ecd28560b31f5",
+      "comment": "该 commit 为 V2 Model Runner 引入 E/P/D（Encoder/Prefill/Decode）分离部署支持。通过 VllmConfig 新增 is_ec_producer_only / is_encoder_only 属性标记 encoder-only worker，在 GPUModelRunner 中为 encoder-only 模式跳过 KV cache 分配（get_kv_cache_spec 返回 {}）、CUDA graph 捕获（capture_model 返回 0）、kernel warmup（warmup.py 提前返回）及常规 prefill/decode 执行路径（execute_model 返回 make_empty_encoder_model_runner_output）。新增 ECConnector/ActiveECConnector 管理 encoder cache 的加载/保存，依赖 vllm.distributed.ec_transfer。BlockTables 对 num_kv_cache_groups==0 场景增加短路保护。实现方式是在基类中插入多个 early-exit 分支，默认路径行为不变；风险点在于派生类若覆写 execute_model/_dummy_run/profile_run/capture_model 等方法需同步感知 encoder-only 语义，以及新引入的 ec_transfer 导入链在所有平台需保持可导入。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "model-runner",
+        "disaggregation",
+        "kv-cache"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "GPUModelRunner 是 vllm-ascend NPUModelRunnerV1/V2 的基类。本 commit 在 GPUModelRunner.__init__ 中新增 self.is_encoder_only 与 self.ec_connector 属性，并在 get_kv_cache_spec/_dummy_run/profile_run/capture_model/execute_model 中新增 encoder-only 提前返回路径；同时 vllm/v1/worker/gpu/ec_connector.py 新增对 vllm.distributed.ec_transfer 的导入链。默认 is_encoder_only=False 且 has_ec_transfer() 为 False 时 NPU 行为不变；若 vllm-ascend 需要支持 E/P/D 分离部署，NPUModelRunnerV1/V2 必须适配空 KV cache spec（{}）与 make_empty_encoder_model_runner_output 输出路径，并保证 vllm.distributed.ec_transfer 在 NPU 环境可导入。",
+        "testing": "现有 NPU 测试不受影响（默认路径未变），但需要验证 NPU 环境下新增的 vllm/v1/worker/gpu/ec_connector 导入链与 GPUModelRunner.__init__ 新属性不会破坏 NPUModelRunner 的初始化。",
+        "needs_test_update": true,
+        "suggested_test_areas": [
+          "vllm_ascend worker/model_runner 初始化 smoke test",
+          "encoder-only（is_encoder_only=True）模式下 NPUModelRunner 的 warmup/capture/execute 路径测试"
+        ]
+      },
+      "message": "[Model Runner v2] E/P/D disaggregation support (#38390)\n\nSigned-off-by: yewentao256 <zhyanwentao@126.com>\nSigned-off-by: Wentao Ye <44945378+yewentao256@users.noreply.github.com>",
+      "deep_analysis": {
+        "adaptation_effort": "low",
+        "adaptation_guide": "No adaptation needed. NPUModelRunner inherits from GPUModelRunner and the new encoder-only logic is fully inherited via super() calls in all overridden methods. AscendBlockTables inherits from BlockTables and the new early-return guards for zero KV cache groups work automatically for the non-overridden methods. The ec_connector module is internal to vllm's GPU worker and not referenced by vllm-ascend.",
+        "affected_interfaces": [],
+        "ascend_affected_confirmed": false,
+        "risk": ""
+      }
+    },
+    {
+      "sha": "77434861904a9f01ea4818fe9f0c7b2a5c05686e",
+      "comment": "DeepSeek V4 0731 版对话模板的 reasoning effort 提示词与映射更新：默认开启 thinking 并注入 high 级提示词（原 Absolute maximum 文案降级为 high 级）；新增 Beyond maximum 的 max 级提示词；xhigh 从映射到 max 改为映射到 high；low/minimal/medium 映射到 low 且不注入提示词；未显式指定 thinking 时默认启用 thinking。Rust 渲染器与 Python tokenizer（vllm/tokenizers/deepseek_v4.py 与 deepseek_v4_encoding.py）同步修改，测试全面更新。纯前端/模板行为变更，不影响推理引擎与模型执行。",
+      "tags": [
+        "feature",
+        "low-risk",
+        "tokenizer",
+        "frontend",
+        "reasoning"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Frontend] DeepSeek V4 0731 reasoning effort prompts & mappings (#50580)"
+    },
+    {
+      "sha": "f9c74b4b9c25c202cb84e0e9908b82a503a8c7c4",
+      "comment": "Mamba 相关模型默认启用 prefix caching，并将默认 mamba_cache_mode 从 'all' 改为 'align'（仅在 scheduler step 最后一个 token 且位置为 block_size 整数倍时缓存，需要 chunked prefill）。移除了 hybrid 模型默认关闭 prefix caching 的限制（arg_utils 中不再排除 is_hybrid），并移除 'all' 为默认行为的说明与实验性 warning。测试统一为 hybrid/全 CUDA graph 等用例加上 enable_chunked_prefill=True。变更降低 Mamba cache 显存占用，但 align 模式强制要求 chunked prefill，可能影响用户现有配置。",
+      "tags": [
+        "feature",
+        "low-risk",
+        "config",
+        "mamba",
+        "kv-cache"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响（Mamba/hybrid 模型相关，Ascend 不使用 mamba1/mamba2 attention 后端）",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Mamba] enable prefix cache by default (#50991)\n\nSigned-off-by: zjy0516 <riverclouds.zhu@qq.com>\nCo-authored-by: mergify[bot] <37929162+mergify[bot]@users.noreply.github.com>"
+    },
+    {
+      "sha": "7b50d2c0bcee44ad89ee7ec75377560ed37915e3",
+      "comment": "将 DeepEP/Mori/Nixl EP 的 prepare_finalize 实现从模块级导入改为函数内延迟导入，避免每次 vllm serve 启动时导入 nixl_ep 等重依赖（之前在 current_platform.is_cuda_alike() 下无条件导入）。行为无变化，纯导入优化；对使用这些 EP 后端的用户启动速度有改善，也减少非 CUDA 环境的无谓模块加载。",
+      "tags": [
+        "refactor",
+        "performance",
+        "low-risk",
+        "fused-moe"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响（仅延迟导入 DeepEP/Mori/Nixl，Ascend 使用自有 MoE 算子路径）",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Misc] Avoid importing `nixl_ep` on every `vllm serve` config (#50879)\n\nSigned-off-by: NickLucche <nicolo.lucchesi@mistral.ai>"
+    },
+    {
+      "sha": "122b3d46b674f8b005a7c9902e27cf3b37b109ec",
+      "message": "[Bugfix][CPU] Fix macOS build: std::sqrt is not constexpr under libc++ (#50915)\n\nSigned-off-by: harjoth <harjoth.khara@gmail.com>",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "bugfix",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "199644d410dbfd94255d6b0cde08479858032266",
+      "comment": "修复 sparse MLA masked MHA 的 workspace 容量不足/越界问题：将 GLOBAL_TOPK_MASK_MAX_BYTES 从 64MiB 提升到 128MiB，抽出 _topk_mask_shape 与 _masked_mha_workspace_fits 作为统一容量计算入口，在 MLAAttention 判定 use_masked_mha 时增加 masked_mha_workspace_fits 守卫（impl 上新增静态方法），并在稠密 mask 构建处增加 words_needed 显式越界检查。测试覆盖 32K prefill 边界、batch/context 乘数等场景。属于 GPU（Triton/FlashAttn 稀疏 MLA）路径的 bugfix，对不启用 sparse MLA 的平台无行为影响。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "attention",
+        "mla"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响（sparse MLA masked MHA 为 GPU/Triton 专属路径，Ascend MLA 后端不启用 masked MHA；新增的 self.impl.masked_mha_workspace_fits 调用仅在 use_masked_mha 前置条件满足时才会触发，Ascend 配置下不会进入）",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Bugfix][Attention] Guard sparse MLA masked MHA workspace (#50906)\n\nSigned-off-by: yimdev <5779256+yimdev@users.noreply.github.com>\nSigned-off-by: Matthew Bonanni <mbonanni@redhat.com>\nCo-authored-by: OpenAI Codex <codex@openai.com>\nCo-authored-by: Matthew Bonanni <mbonanni@redhat.com>"
+    },
+    {
+      "sha": "7c40d61eaf6bdd80bb493cf94032efbbe0ed0ee4",
+      "comment": "修复 Transformers modeling backend 中多模态 embedding 展平只处理 3D 的问题，将 `embeddings.ndim == 3` 改为 `embeddings.ndim > 2` 并统一用 reshape(-1, hidden_dim) 展平到 2D，防止 4D 及以上 embedding（如视频/音频特征）导致 shape 不匹配。纯 bugfix，平台无关。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "multimodal",
+        "transformers-backend"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Bugfix] Flatten >2D multimodal embeddings, not just 3D (#50250)\n\nSigned-off-by: Michal Ganczarenko <michal.ganczarenko@intel.com>"
+    },
+    {
+      "sha": "5f2ee2fa8c59d9f9cddd07c79806e6418b0d841a",
+      "comment": "将 KV cache 容量计算与日志从 get_kv_cache_configs 移到 EngineCore 中 block-size 解析完成之后统一调用新增的 update_kv_cache_capacity 辅助函数，确保日志展示的是最终解析后的容量，并统一将 kv_cache_size_tokens / kv_cache_max_concurrency 写回 CacheConfig。同时日志补充 Maximum concurrency 信息。重构+日志时机修复，无行为语义变化。",
+      "tags": [
+        "refactor",
+        "bugfix",
+        "low-risk",
+        "kv-cache",
+        "core"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响（EngineCore 行为对 Ascend 仅涉及日志时机与容量回写位置的等价重构）",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Bugfix][Core] Log KV cache capacity after block-size resolution (#50462)\n\nSigned-off-by: Tanmay Dixit <22117787+tandixit95@users.noreply.github.com>\nSigned-off-by: Michael Goin <mgoin64@gmail.com>\nSigned-off-by: Matthew Bonanni <mbonanni@redhat.com>\nCo-authored-by: Tanmay Dixit <22117787+tandixit95@users.noreply.github.com>\nCo-authored-by: Michael Goin <mgoin64@gmail.com>\nCo-authored-by: Matthew Bonanni <mbonanni@redhat.com>\nCo-authored-by: Claude Opus 5 (1M context) <noreply@anthropic.com>"
+    },
+    {
+      "sha": "5789897aa40fbab6bdfcffaa9e83da64939286fb",
+      "comment": "为 Qwen3 DSpark 推测解码新增 dspark_draft_topk 配置：仅对 base logits 的 top-k 候选应用 Markov 投影并置其余为 -inf，降低全词表 bias 计算开销。SpeculativeConfig 新增字段及校验：method=='dspark' 时 num_speculative_tokens 必须 >= dspark_block_size（从 HF config 读取），否则直接报错；dspark_draft_topk 仅允许 Qwen3DSparkModel 且取值范围受限。DSparkSpeculator 新增 _sample_sequential_topk 路径，抽取 _sample_logits 复用 gumbel 采样；Qwen3DSparkModel 新增 apply_markov_bias_gathered。新校验对现有 DSpark 用户是行为变更（更严格的启动参数要求）。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "spec-decode",
+        "dspark"
+      ],
+      "ascend_impact": {
+        "ascend_affected": true,
+        "functionality": "SpeculativeConfig 新增 dspark_draft_topk 字段，且 method=='dspark' 时新增强制校验 num_speculative_tokens >= dspark_block_size，该校验对所有平台生效。vllm-ascend 的 DSpark proposer（vllm_ascend/spec_decode/ 中的 DSpark）若使用小于 block size 的 num_speculative_tokens 将直接启动报错。vLLM 原生 DSparkSpeculator 新增 _sample_sequential_topk / apply_markov_bias_gathered（top-k 马尔可夫投影）实现；vllm-ascend 使用自有 Qwen3DSpark 模型实现（vllm_ascend/models/）时，需要同步实现该 top-k 投影逻辑，否则 dspark_draft_topk 配置在 NPU 上不会生效。",
+        "testing": "需要新增 NPU 上 DSpark top-k（dspark_draft_topk）的采样正确性与 block-size 校验测试。",
+        "needs_test_update": true,
+        "suggested_test_areas": [
+          "vllm_ascend/spec_decode/ DSpark proposer 测试",
+          "Qwen3DSpark 模型 dspark_draft_topk 行为测试",
+          "SpeculativeConfig block-size 校验在 NPU 配置下的回归测试"
+        ]
+      },
+      "message": "[Spec Decode] Add top-k DSpark Markov projection (#49969)\n\nSigned-off-by: Andrii Skliar <askliar@nvidia.com>\nCo-authored-by: Andrii Skliar <askliar@nvidia.com>",
+      "deep_analysis": {
+        "adaptation_effort": "low",
+        "adaptation_guide": "## 适配分析\n\n### 变更内容\n此 commit 为 Qwen3 DSpark 添加了 **top-k Markov 投影**优化。核心思路：在每个 sequential 采样步骤，不再计算完整的 `O(vocab_size)` 维度的 Markov bias，而是只计算 top-k 基 logit 候选上的 bias，然后将修正值 scatter 回一个 `-inf` 填充的缓冲区。这显著减少了 per-step 计算量。\n\n### 变更文件\n1. **`vllm/config/speculative.py`** — 添加 `dspark_draft_topk` 配置字段和验证逻辑\n2. **`vllm/model_executor/models/qwen3_dspark.py`** — 添加 `DSparkMarkovHead.apply_bias_gathered()` 和 `Qwen3DSparkForCausalLM.apply_markov_bias_gathered()`\n3. **`vllm/v1/worker/gpu/spec_decode/dspark/speculator.py`** — 添加 `_sample_logits()`、`_sample_sequential_topk()`，重构 `_sample_sequential()` 为通用 + top-k 分支\n\n### 影响分析\nvllm-ascend 已有完整的 DSpark 支持（`AscendDSparkProposer`、`AscendQwen3DSparkForCausalLM`），但：\n\n- **vllm-ascend 不使用 v1 `DSparkSpeculator`** — ascend 使用自己的 `AscendDSparkProposer`（继承 `AscendDflashProposer → AscendEagleProposer → AscendLLMBaseProposer`），其采样路径在 `llm_base_proposer.py:1128-1146`，执行的是完整的 `O(vocab_size)` 的 `markov_embed + markov_bias`。\n- **`AscendQwen3DSparkForCausalLM` 继承上游 `Qwen3DSparkForCausalLM`** — 所以 `apply_markov_bias_gathered()` 方法会被自动继承，无需修改 ascend 的模型类。\n- **配置字段 `dspark_draft_topk`** 和验证逻辑（包括 `dspark_block_size` 检查）继承自上游 `SpeculativeConfig`，无需额外适配。\n- **Ascend 的 `DSparkMarkovHead`（`deepseek_v4_dspark.py`）** 是一个独立于上游 `qwen3_dspark.py` 中 `DSparkMarkovHead` 的类，不包含 `apply_bias_gathered()`。但此优化仅对 `Qwen3DSparkModel` 启用，不影响 DeepSeek-V4 DSpark。\n\n### 需要的适配\n当前 ascend 的 DSpark 采样路径（`llm_base_proposer.py:1128-1146`）没有实现 top-k Markov 优化。如果想利用此优化：\n\n**文件**: `vllm_ascend/spec_decode/llm_base_proposer.py`\n- 在第 1142-1146 行的 `for idx in range(self.num_speculative_tokens)` 循环中，检测 `dspark_draft_topk` 配置\n- 如果启用，使用 `model.apply_markov_bias_gathered()` 替代 `model.markov_embed() + model.markov_bias()` 组合\n- 需要预先计算 base_logits 的 topk 索引（一次，在循环外），然后在循环内 scatter 修正值\n\n### 优先级\n**低** — 此优化是性能优化而非功能修复。现有 ascend DSpark 功能不受影响，在 `dspark_draft_topk` 未设置（默认 `None`）时行为完全不变。仅在显式设置 `--dspark-draft-topk <N>` 且使用 Qwen3 DSpark 模型时需要适配。",
+        "affected_interfaces": [
+          "vllm_ascend/spec_decode/llm_base_proposer.py (DSpark sequential sampling path, lines 1128-1146)",
+          "vllm_ascend/models/qwen3_dspark.py (AscendQwen3DSparkForCausalLM - inherits upstream methods, no change needed)"
+        ],
+        "ascend_affected_confirmed": true,
+        "risk": "低。现有 ascend DSpark 功能不受影响，因为优化路径默认不启用（`dspark_draft_topk` 默认值为 `None`）。如果用户显式设置了 `--dspark-draft-topk`，ascend 会忽略该参数继续使用完整的 `O(vocab_size)` Markov bias 计算，产生正确但较慢的结果（不是错误，只是未获得优化加速）。需要确保 `AscendQwen3DSparkForCausalLM` 正确继承了 `apply_markov_bias_gathered()` 方法。"
+      }
+    },
+    {
+      "sha": "1eb3694521a67446ae23ce1e6dd04093e944a08e",
+      "comment": "纯文档修复：修正 docs/design/moe_kernel_features.md 中 naive 后端 MoERunner 的链接路径，以及 mxfp6 base.py docstring 中属性描述的缩进，消除文档构建告警。无功能影响。",
+      "tags": [
+        "docs",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Docs] Fix two docs build warnings (#51014)\n\nSigned-off-by: Harry Mellor <19981378+hmellor@users.noreply.github.com>\nCo-authored-by: Claude Opus 5 (1M context) <noreply@anthropic.com>"
+    },
+    {
+      "sha": "59b2fdfc4e237794c2b26f0781054ced73f5b8df",
+      "comment": "为 Transformers modeling backend 增加 MLA 支持：新增 MLAFuser 通过 FX 图结构匹配（不依赖 HF 属性名）识别 MLA 注意力子模块，将 q_a_proj/kv_a_proj_with_mqa 融合为 MergedColumnParallelLinear 并改写 forward，使压缩潜变量（kv_c_normed, k_pe）直接进入 vLLM MLAAttention 的 latent 接口。ModelConfig.use_mla 判定更新：transformers backend 下基于 hf_text_config.kv_lora_rank 判定，而非仅 DeepSeek 架构白名单；MLAFuser 匹配失败时 _get_attn_cls 设置 VLLM_MLA_DISABLE=1 降级为 full attention。Fusers 缓存键从模块类改为（类+shape）。改动量大（+699 行），涉及 config 语义、FX fuser 框架、attention 实例构建流程与 keep_in_fp32 权重处理，风险中等偏高。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "attention",
+        "mla",
+        "transformers-backend",
+        "config"
+      ],
+      "ascend_impact": {
+        "ascend_affected": true,
+        "functionality": "ModelConfig.use_mla 判定语义变更：transformers backend 下独立于 DeepSeek 架构白名单，改为按 kv_lora_rank 属性判定，且 VLLM_MLA_DISABLE 环境变量仍可全局强制关闭。vllm-ascend 的 NPUPlatform.check_and_update_config / AscendConfig 依赖 model_config.use_mla 选择 AscendMLA 后端，在 NPU 上以 model_impl='transformers' 运行 DeepSeek-V2 等 MLA 模型时，use_mla 会返回 True 并触发 MLA 后端。新增 MLAFuser 改写的注意力子模块通过 vllm_mla_attention_forward 调用 MLAAttention.forward(query, kv_c_normed, k_pe, output_shape=...) latent 路径，要求 AscendMLAImpl 完整兼容该输入形态。MLAFuser 匹配失败时 _get_attn_cls 会写入 VLLM_MLA_DISABLE=1 环境变量，影响进程内后续所有 use_mla 判定。",
+        "testing": "需要新增 NPU 上 transformers backend 运行 MLA 模型（如 DeepSeek-V2-Lite）的端到端测试，验证 latent forward 与 AscendMLAImpl 的兼容性、use_mla 自动判定以及 MLAFuser 匹配失败时的降级路径。",
+        "needs_test_update": true,
+        "suggested_test_areas": [
+          "vllm_ascend attention 后端在 transformers backend MLA 模型上的测试",
+          "DeepSeek-V2 model_impl='transformers' NPU 端到端正确性测试",
+          "use_mla 判定与 VLLM_MLA_DISABLE 降级行为测试"
+        ]
+      },
+      "message": "Support MLA properly in the Transformers modeling backend (#48250)\n\nSigned-off-by: Harry Mellor <19981378+hmellor@users.noreply.github.com>",
+      "deep_analysis": {
+        "ascend_affected_confirmed": true,
+        "affected_interfaces": [
+          "ModelConfig.use_mla (vllm/config/model.py)",
+          "MLAFuser (vllm/model_executor/models/transformers/fusers/mla.py)",
+          "Base._get_attn_cls (vllm/model_executor/models/transformers/base.py)",
+          "Base.create_attention_instances (vllm/model_executor/models/transformers/base.py)",
+          "vllm_attention_forward / vllm_mla_attention_forward (vllm/model_executor/models/transformers/__init__.py)",
+          "Fusers (vllm/model_executor/models/transformers/fuser.py)"
+        ],
+        "adaptation_effort": "medium",
+        "adaptation_guide": "## 适配指南\n\n### 变更概述\n\n本 commit 在 Transformers 建模后端（非 DeepSeek V4 原生 MLA 实现）中添加了对 MLA（Multi-head Latent Attention）的原生支持。核心变更：\n\n1. **`ModelConfig.use_mla` 语义变更**（`vllm/config/model.py`）\n   - 旧：`use_mla = is_deepseek_mla and not VLLM_MLA_DISABLE`\n   - 新：`use_mla` 优先检查 `using_transformers_backend()`，如果是则检查 `hf_text_config` 是否有 `kv_lora_rank` 属性；否则回退到 `is_deepseek_mla`\n   - **影响**：任何使用 Transformers 建模后端且配置中有 `kv_lora_rank` 的模型现在都会使 `use_mla=True`，而不仅仅是 DeepSeek MLA 模型。vllm-ascend 大量使用 `model_config.use_mla` 和 `model_config.is_deepseek_mla` 来控制行为。\n\n2. **新增 `MLAFuser`**（`vllm/model_executor/models/transformers/fusers/mla.py`）\n   - 新的 fuser 用于检测和融合 Transformers 模型中的 MLA 注意力模式\n   - 将 `q_a_proj` 和 `kv_a_proj` 融合为 `MergedColumnParallelLinear`，并绕过 KV expansion 方法\n\n3. **新增 `vllm_mla_attention_forward`**（`vllm/model_executor/models/transformers/__init__.py`）\n   - 注册为 `ALL_ATTENTION_FUNCTIONS[\"vllm_mla\"]`，用于区别标准注意力转发\n   - 接收 `query`、`kv_c_normed`、`k_pe` 而非 `query`、`key`、`value`\n\n### vllm-ascend 需要适配的领域\n\n**vllm-ascend 目前不直接使用 Transformers 建模后端**（其模型通过 `ModelRegistry` 注册为自定义实现，如 `AscendDeepseekV4ForCausalLM`）。因此，当 vllm-ascend 运行 DeepSeek V4 等 MLA 模型时，`using_transformers_backend()` 返回 `False`，`use_mla` 仍然回退到 `is_deepseek_mla`，行为不变。\n\n**但是，以下情况需要适配：**\n\n#### 1. `use_mla` 语义变化的风险（高优先级）\n即使 vllm-ascend 不使用 Transformers 后端，`use_mla` 的语义变化仍然影响所有通过 `model_config.use_mla` 做决策的代码路径。vllm-ascend 中有大量位置使用 `use_mla`：\n- **注意力后端选择**（`vllm_ascend/platform.py:798,822`）：`use_mla` 用作注意力后端查找的键\n- **RoPE 维度计算**（`vllm_ascend/utils.py:1442`）：`use_mla` 决定是否使用 `qk_rope_head_dim`\n- **GQA 后端判断**（`vllm_ascend/utils.py:1317`）：`is_deepseek_mla or use_mla` 判断\n- **Mamba 配置补丁**（`vllm_ascend/patch/platform/patch_mamba_config.py:81`）：`use_mla` 控制 KV cache page size 计算\n- **模型运行器**（`vllm_ascend/worker/model_runner_v1.py:372`）：`use_mla` 传递给各种构建函数\n\n**风险**：如果未来 vllm-ascend 开始支持通过 Transformers 建模后端运行 MLA 模型（如某些非 DeepSeek 的 MLA 模型），则 `use_mla=True` 会触发 DeepSeek V4 特定的注意力路径，而这些路径可能不兼容。但短期内不影响，因为 vllm-ascend 的模型注册表覆盖了 DeepSeek V4。\n\n#### 2. `is_deepseek_mla` 不再被 `use_mla` 使用（中优先级）\n旧代码中 `use_mla` 直接等价于 `is_deepseek_mla`（当 `VLLM_MLA_DISABLE` 未设置时）。vllm-ascend 中的许多代码逻辑上依赖于这种等价关系：\n- `vllm_ascend/ascend_config.py:198,242` 使用 `is_deepseek_mla` 判断 KV 传输配置\n- `vllm_ascend/distributed/kv_transfer/` 多处使用 `is_deepseek_mla`\n- `vllm_ascend/spec_decode/llm_base_proposer.py:490` 使用 `is_deepseek_mla` 判断 MTP\n\n**风险**：在 vllm-ascend 的上下文中，`is_deepseek_mla` 和 `use_mla` 仍然等价（因为 `using_transformers_backend()` 返回 False），所以这些代码路径不受影响。但任何新代码都不应依赖于 `use_mla == is_deepseek_mla` 这个假设。\n\n#### 3. `MLAFuser` 和 `Fusers` 缓存键变更（低优先级）\n`vllm/model_executor/models/transformers/fuser.py` 中 `Fusers` 的缓存键从 `type(m)` 改为 `key(m)`（包含类型和子模块名称）。这仅影响 Transformers 建模后端，vllm-ascend 不直接使用此路径。\n\n### 建议的适配操作\n\n1. **无需立即修改**：vllm-ascend 的模型注册表覆盖了 DeepSeek V4 等 MLA 模型，使得 `using_transformers_backend()` 返回 False，`use_mla` 行为不变。\n\n2. **监控风险**：如果未来 vllm-ascend 计划支持通过 Transformers 后端运行 MLA 模型，则需要在 `use_mla=True` 时正确区分 DeepSeek MLA 和其他 MLA 模型。\n\n3. **代码审查建议**：检查以下位置确保它们正确处理 `use_mla` 和 `is_deepseek_mla` 可能不再等价的情况：\n   - `vllm_ascend/ascend_config.py:242`：`is_deepseek_mla` 用于 `enable_kv_nz` 检查\n   - `vllm_ascend/distributed/kv_transfer/` 中的 `is_deepseek_mla` 使用\n   - `vllm_ascend/spec_decode/` 中的 `is_deepseek_mla` 使用",
+        "risk": "**低风险**。vllm-ascend 通过自定义模型注册表（`AscendDeepseekV4ForCausalLM` 等）运行 DeepSeek V4 等 MLA 模型，因此 `using_transformers_backend()` 返回 False，`use_mla` 语义和 `is_deepseek_mla` 的等价性在目前代码路径中保持不变。风险主要来自未来：如果 vllm-ascend 开始支持通过 Transformers 建模后端运行 MLA 模型，则 `use_mla=True` 会触发 DeepSeek V4 特定的注意力路径，可能导致不兼容。此外，`MLAFuser` 和 `vllm_mla_attention_forward` 等新增模块是 Transformers 后端内部实现，vllm-ascend 不直接使用。"
+      }
+    },
+    {
+      "sha": "24c939c47df59d0d3e9af2fe63046e21e65b5924",
+      "comment": "修复 XPU 环境下 collect_env 收集 oneccl 版本信息时包名映射错误：将 oneccl 加入 pip show 直查列表（与 vllm_xpu_kernels 相同处理），并从 apt 包名映射中移除 oneccl。仅影响环境信息收集，XPU 专属修复。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "xpu",
+        "collect-env"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[XPU] fix collecting oneccl version info (#47104)\n\nSigned-off-by: Yan Ma <yan.ma@intel.com>"
+    },
+    {
+      "sha": "6a9fdf0dc75844de3fff993c32e6f2a35f6fbf0d",
+      "comment": "修复多模态 checkpoint 的 seq-cls 模型 num_labels 解析：新增 _resolve_num_labels 辅助函数，优先使用顶层 config 的 num_labels（多模态复合 config 的标签空间声明在顶层），仅当顶层未声明（等于 PretrainedConfig 默认值）时才回退到 text_config.num_labels，避免 score head 维度错误。纯平台无关 bugfix，附单元测试覆盖四种组合。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "adapters",
+        "multimodal"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Bugfix] Resolve seq-cls `num_labels` from the top-level config for multimodal checkpoints (#50950)\n\nSigned-off-by: Lazurite <43494437+Rapisurazurite@users.noreply.github.com>"
+    },
+    {
+      "sha": "a1657a0235a77ce85f8d348c83ff4adb29918b71",
+      "comment": "更新 DeepGEMM 上游 commit 引用（f5a7642 → e21c821），修复 CUDA 12.9 FP8 头文件可见性问题。cmake 与 tools/install_deepgemm.sh 同步更新。纯构建依赖变更，仅影响 CUDA 构建路径。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "build",
+        "cuda"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Bugfix][Build] Fix DeepGEMM CUDA 12.9 FP8 header visibility (#51003)\n\nSigned-off-by: khluu <khluu000@gmail.com>"
+    },
+    {
+      "sha": "e98a8774cba6f518a8de4433801cc32323a46071",
+      "message": "[Rust Frontend][gRPC] Add multimodal image inference (#50368)\n\nCo-authored-by: Bugen Zhao <i@bugenzhao.com>\nSigned-off-by: Connor Carpenter <connorc@nvidia.com>\nSigned-off-by: Bugen Zhao <i@bugenzhao.com>",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "feature",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "0b1c151cbcacd12e207f2a91e4ca9f5b6961ec8a",
+      "message": "[Rust Frontend] Align tool rendering for Kimi K3 (#50540)\n\nCo-authored-by: mergify[bot] <37929162+mergify[bot]@users.noreply.github.com>\nSigned-off-by: Bugen Zhao <i@bugenzhao.com>",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "chore"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "72cd5424da80a4a9caa3f42fd65bc0b94e61cbf0",
+      "message": "[Rust][Benchmark] Preserve UTF-8 across benchmark stream chunks (#50868)\n\nSigned-off-by: reidliu41 <reid201711@gmail.com>",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "chore"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "cb8104839c141609d99f1254459ef3a4f1bd4263",
+      "message": "[XPU][CI]Adjust Samplers test ENV for Intel GPU (#50199)\n\nSigned-off-by: zengxian <xiangdong.zeng@intel.com>\nCo-authored-by: Kunshang Ji <kunshang.ji@intel.com>",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "chore"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "adbf08d977fb3fa26c4f19826745a02abd6dd7ca",
+      "comment": "Kimi K3 推理解析器新增 is_reasoning_end_streaming 流式判定：每次 decode step 只扫描当前 delta token 加 len(marker)-1 个上下文 token，将推理结束检查从 O(context) 降为 O(delta)，避免长 agentic 上下文下调度器检查拖慢 GPU。实现上新增 _match_at（避免切片分配）与 _newest_marker（单次反向扫描比较 open/close marker 新旧），并用随机序列对照测试验证流式判定与全量扫描在推理未结束场景下的一致性。平台无关，纯前端解析逻辑。",
+      "tags": [
+        "bugfix",
+        "performance",
+        "low-risk",
+        "reasoning"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Bugfix][Reasoning] kimi_k3: O(delta) reasoning-end check on the decode path (#50886)\n\nSigned-off-by: abmfy <abmfy@icloud.com>\nCo-authored-by: Claude Opus 5 (1M context) <noreply@anthropic.com>"
+    },
+    {
+      "sha": "385d4c084ef0c52fe0f7baf7dd2dc4bf86fbe548",
+      "comment": "ROCm AITER 热修复：AITER triton MOE routing 在 cudagraph padding 行包含垃圾值（±inf/nan）时可能触发 memory access fault。新增 _get_padding_mask 从 forward_context 读取 padding 标记（兼容 V1 slot_mapping < 0 与 V2 is_padding 两种方式），patch_gating_output 将 padding 行 gating_output 掩码为 0，避免 routing 以错误 expert id 访问内存。仅影响 ROCm AITER MXFP4 MoE 路径（w4a8/w4a16），并附详细的 GPT-OSS 回归测试（构造 inf/nan padding 行并毒化内存验证输出有限）。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "rocm",
+        "fused-moe",
+        "quantization"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响（纯 ROCm/AITER 专属修复，Ascend 不使用 vllm._aiter_ops 路径）",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[ROCm][AITER] Hotfix for `memory access fault` errors in AITER triton MOE routing (#50859)\n\nSigned-off-by: Felix Marty <Felix.Marty@amd.com>\nCo-authored-by: Andreas Karatzas <akaratza@amd.com>"
+    },
+    {
+      "sha": "74295e3bd47b64964fe6a51825079e75c84cc172",
+      "message": "[CI][Bugfix] Fix flaky `test_store_orders_after_compute_write` (#50926)\n\nSigned-off-by: Nick Hill <nickhill123@gmail.com>\nCo-authored-by: Claude <noreply@anthropic.com>",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "bugfix",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "413e70d52c3f2645b3c4bdf95458488f7d517217",
+      "comment": "为 NVIDIA H20 设备新增 E=256、N=512 的 MoE kernel 调优配置（vllm/model_executor/layers/fused_moe/configs/ 下的 JSON 文件）。该目录按 (E, N, device_name) 组织，运行时根据设备名加载对应配置。变更仅为新增数据文件，不涉及任何代码逻辑，风险极低。",
+      "tags": [
+        "performance",
+        "low-risk",
+        "moe",
+        "config"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "Perf/h20 moe config e256 n512 (#48825)\n\nSigned-off-by: zzt <zengzetang.zzt@antgroup.com>"
+    },
+    {
+      "sha": "8adc840c4553b8f70cda82e5e59a7f9977f64a11",
+      "message": "[ROCm][Test] Use BF16 for Jina v5 nano MTEB test (#50917)\n\nSigned-off-by: Andreas Karatzas <Andreas.Karatzas@amd.com>",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "chore"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "11f88260a240e6e8ee33410f9c65f00043c3e6f7",
+      "comment": "将 FlashKDA（Kimi-K3 的 CUDA 扩展）迁移到 PyTorch stable ABI：更新 FlashKDA 子模块版本、添加 TORCH_TARGET_VERSION 与 USE_CUDA 编译宏、将 csrc 注册代码从 TORCH_LIBRARY 改为 STABLE_TORCH_LIBRARY + STABLE_TORCH_LIBRARY_IMPL，并将 workspace 参数标记为可写 Tensor(c!)。同时从 CI 的 unstable allowlist 中移除 _flashkda_C.abi3.so。这是 CUDA 扩展的构建/ABI 维护工作，仅影响 Kimi-K3/NVIDIA 路径。",
+      "tags": [
+        "refactor",
+        "build",
+        "ci",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Kimi-K3] Migrate FlashKDA to PyTorch stable ABI (#50818)\n\nSigned-off-by: Thien Tran <gau.nernst@yahoo.com.sg>\nCo-authored-by: Shengqi Chen <harry-chen@outlook.com>"
+    },
+    {
+      "sha": "41ba11b8413cefc8b8f0c917d01594cbb26fdfa7",
+      "comment": "Kimi-K3 AttnRes 调度的健壮性 bugfix：1) C++ kernel 增加对 prefix/delta/output 张量行连续（packed rows）的检查，不满足时抛出明确错误；2) Python 侧在调用原生 kernel 前增加 hasattr(torch.ops._C, \"kimi_k3_attn_res\") 检查，避免在 SM100 但 CUDA < 13 导致算子未编译时误入 native 路径。属于 NVIDIA SM100 特定模型的修复。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "kernel",
+        "model"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Bugfix][Kimi-K3] Enforce packed rows and op availability in AttnRes dispatch (#50567)\n\nSigned-off-by: namgyu-youn <namgyu.dev@gmail.com>\nCo-authored-by: Claude Opus 5 <noreply@anthropic.com>"
+    },
+    {
+      "sha": "f42761204fb508bc205418c77b80bd50d0d11774",
+      "comment": "MoRI-IO KV Connector 的大规模改造，目标是在 2P2D（两 pod、DP=EP=16、TP=1）拓扑下支持 llm-d 路由 + 跨节点 Wide-EP + MoRI-IO 写入模式的 prefill/decode 分离。要点：DP rank 语义从本地 rank 改为全局 rank（fold_local_rank/pod_index 辅助函数），端口/主机按 pod-local rank 折叠；路由去中心化，不再从 request_id 自行推导 rank，而是遵守路由方下发的 remote_dp_rank/remote_dp_rank_override，prefill 端在 request_finished 回传实际执行的全局 DP rank；ReqMeta 增加 multi_pod_hosts/remote_dp_size_local 支持多 pod 握手与通知；unmap_request_id 支持 transfer_id 回退（应对 input_processor 修改 request_id）；update_connector_output 重写为 ACK 先到缓存 + 超时 reap + 精确 surfaced 集合；release 消息新增 consumer_tp_size；新增 VLLM_MORIIO_TRANSFER_TIMEOUT_S 兜底 RDMA 传输超时。风险较高：涉及网络消息契约、跨进程生命周期和并发状态机，消息格式变更与旧版本不兼容。",
+      "tags": [
+        "feature",
+        "high-risk",
+        "distributed",
+        "kv-transfer"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "llmd+vllm+mori-ep(inter node wide-ep)+mori-io(write) for 2p2d with dp=ep=16 tp=1 (#45043)\n\nSigned-off-by: Shiksha Patel <shikpate@amd.com>\nCo-authored-by: Douglas Lehr <91553416+dllehr-amd@users.noreply.github.com>\nCo-authored-by: mergify[bot] <37929162+mergify[bot]@users.noreply.github.com>"
+    },
+    {
+      "sha": "c8109375733e6b788e73c7cc1ed2004234834392",
+      "comment": "将 CuTe DSL 的 skinny GEMM 从 Kimi-K3 扩展到 GLM-5.2：_skinny_gemm.py 内核支持静态 K 特化（static_k），对 static_k 路径增加双 tile B 预取（_PREFETCH_TILES=2）并重写累加循环，动态 K 路径保持原样；dsv3_fused_a_gemm.cu 的 MmaComputer 支持 m_iter_cnt=2（tile_m=32），并新增 (6144, 2624) 与 (2048, 2048) 实例化；新增 glm52_low_latency_gemm.py 定义 GLM-5.2 QKV-A/Q-B/eh_proj 的投影计划，通过 GLM52LowLatencyLinearMethod 选择性地替换 LinearBase 的 quant_method，MTP 的 eh_proj 通过 build_glm52_plan 挂接。测试覆盖正确性、CUDA graph 捕获与非 packed 单行回退。CuTe DSL 为 CUDA 特有，属于 SM103/NVIDIA 专属优化。",
+      "tags": [
+        "feature",
+        "performance",
+        "medium-risk",
+        "kernel",
+        "model"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Kernel] Extend CuTe DSL skinny GEMM to GLM-5.2 (#49791)\n\nSigned-off-by: Peiyuan Zhou <peiyuanzhou1994@gmail.com>\nCo-authored-by: OpenAI Codex <codex@openai.com>\nCo-authored-by: Jee Jee Li <pandaleefree@gmail.com>"
+    },
+    {
+      "sha": "6a9109d865d8abbfe70777ea52520425f1be6d3f",
+      "comment": "修复 Qwen3-Omni（及 Qwen2.5-Omni）在 use_audio_in_video=True 且视频无音轨时的崩溃：Qwen2_5OmniThinkerMultiModalProcessor._call_hf_processor 与 Qwen3OmniMoeThinkerMultiModalProcessor 在 mm_data 无 audio 但有 videos 时抛出明确的 ValueError；Qwen2_5OmniThinkerMultiModalProcessor 中 use_audio_in_video 的计数断言改为更细致的 audio 数 < video 数检查；同时考虑了多模态 processor 缓存命中时 mm_data 为空的情形。属于多模态输入处理的健壮性 bugfix，平台无关。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "multimodal",
+        "model"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Bugfix] Fix Qwen3-Omni crash on video with no audio track when use_audio_in_video=True (#48420)\n\nSigned-off-by: RyanJHamby <ryanhamby22@gmail.com>\nSigned-off-by: Isotr0py <Isotr0py@outlook.com>\nCo-authored-by: Isotr0py <Isotr0py@outlook.com>"
+    },
+    {
+      "sha": "c2881ce60302b5455867d2c29cdfae5fbeddecac",
+      "comment": "修复 MRv2 Mamba align/prefix-cache 路径中 num_accepted 的跨 block 竞争：postprocess_mamba_fused_kernel 在 V2 模式此前会原地写 num_accepted_tokens_gpu，读改写与并发 program 存在竞争。现在 V2 路径也改为通过 num_accepted_tokens_out 参数写出（传入 num_accepted_tokens_gpu 作为输出），并在 kernel 启动前对决策 buffer 做整体快照（num_accepted_tokens_snapshot.copy_），避免 kernel 读取到被并发更新的数据。属于 GPU Triton kernel 的并发正确性修复。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "hybrid",
+        "spec-decode",
+        "kernel"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Bugfix][Hybrid] Fix cross-block race on num_accepted in MRv2 align prefix cache (#50432)\n\nSigned-off-by: Francesco Fusco <ffu@zurich.ibm.com>"
+    },
+    {
+      "sha": "0b37d8389f4b8378adab0d3dfa1beffbb152e303",
+      "comment": "修复 ModelOpt（NVFP4/FP8）量化方法的输出 dtype：将 self.out_dtype 从 torch.get_default_dtype()（默认 fp32）改为 get_current_vllm_config().model_config.dtype（即模型权重 dtype，如 bf16）。涉及 ModelOptFp8LinearMethod、ModelOptFp8PcPtLinearMethod、ModelOptFp8PbWoLinearMethod 三个类。此前当模型 dtype 不是 fp32 时，线性层输出 dtype 与模型 dtype 不一致可能导致下游错误；修复后保持一致。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "quantization"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "fix: NVFP4 quantization out_dtype should match model dtype, not torch default (#48861)\n\nSigned-off-by: Chris Fontes <2224082+fattchris@users.noreply.github.com>\nCo-authored-by: Chris Fontes <chris@fontes.io>\nCo-authored-by: Chris Fontes <chris@fontes.dev>\nCo-authored-by: mergify[bot] <37929162+mergify[bot]@users.noreply.github.com>"
+    },
+    {
+      "sha": "f57123aa2dbc1badb1865b18c724b308f90dceda",
+      "comment": "将 session_id 从 HTTP/API 层贯通到 engine 请求链路：OpenAI Chat/Completions/Responses 协议新增 session_id 字段，X-Session-ID 头与 vllm_xargs.session_id 作为回退来源；Rust 侧 proto、ChatRequest/TextRequest/GenerateRequest/EngineCoreRequest 均新增 session_id 字段；Python 侧 EngineCoreRequest、Request、AsyncLLM.generate、InputProcessor、LLMEngine 全程透传；并行采样（n>1）和 beam search 子请求保留 session_id。属于纯增量、向后兼容的字段贯通，无既有行为变更。",
+      "tags": [
+        "feature",
+        "low-risk",
+        "frontend",
+        "request-model"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "vllm/v1/engine/__init__.py（EngineCoreRequest）、vllm/v1/request.py（Request）、vllm/engine/protocol.py（EngineClient.generate 抽象方法）以及 AsyncLLM.generate 等请求链路接口新增可选参数 session_id（默认 None），向后兼容。vllm-ascend 的 NPUWorker、自定义调度器（BalanceScheduler 等）与请求处理代码使用 vLLM 的 Request/EngineCoreRequest 构造路径会自动带上该字段，无需强制改动；但若 vllm-ascend 中存在自定义 EngineClient 实现，则必须同步 generate 签名新增该参数。",
+        "testing": "无影响。vllm-ascend 现有测试不涉及该字段，且新增字段有默认值，不会破坏现有构造调用。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "feat(frontend): session id plumbing into requests (#48048)\n\nSigned-off-by: Karen Chung <karenc@nvidia.com>",
+      "deep_analysis": {
+        "adaptation_effort": "low",
+        "adaptation_guide": "",
+        "affected_interfaces": [],
+        "ascend_affected_confirmed": false,
+        "risk": ""
+      }
+    },
+    {
+      "sha": "e578de311c2416e66c6a8b9819586bb91de10f9d",
+      "comment": "修复 ModelRunnerV2 MambaHybridModelState.postprocess_state 在 idx_mapping 为 int32 且 num_sampled 为标量时的错误：原实现使用 tensor.index_fill_(0, idx_mapping, value)，而 index_fill_ 要求 index 为 int64，int32 映射会失败。改为新增 Triton kernel _fill_num_accepted_kernel 做按行填充，与既有的 _scatter_num_accepted_kernel 对称；同时处理 num_reqs=0 提前返回，并通过 kernel 统一跳过 -1 哨兵行。新增对应单元测试。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "model-runner",
+        "hybrid"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[ModelRunnerV2] Fix scalar Mamba state update with int32 mappings (#50327)\n\nSigned-off-by: Varun Shenoy <varun.vinayak.shenoy@oracle.com>\nSigned-off-by: Nick Hill <nickhill123@gmail.com>\nCo-authored-by: Nick Hill <nickhill123@gmail.com>"
+    },
+    {
+      "sha": "f43e1d26e3e6b40398be27b218cf2f2786432028",
+      "comment": "为 ROCm GFX120x（RDNA4）启用 AITER 与 FP8 推理：新增 is_aiter_found_and_supported_on_rdna4/is_rdna_aiter_enabled/is_rdna_linear_enabled/is_rdna_gdn_triton_kernels_available 等 gfx12 专有开关，绕过依赖 CK 构建的 gfx9 @if_aiter_supported 检查；RocmPlatform.supports_fp8 扩展为 on_cdna() or on_rdna4()；RowWiseTorchFP8 与 fused MoE 的 FP8 支持考虑 RDNA4；AiterFp8BlockScaledMMKernel 在 rdna4 下检查 Triton w8a8 形状调优表，未调优形状回退到通用 backend；编译 fusion pass 在 rdna4 下改用 native quant op 与 Triton replacement；后端优先级将 ROCM_AITER_UNIFIED_ATTN 前置。纯 ROCm 平台适配。",
+      "tags": [
+        "feature",
+        "performance",
+        "medium-risk",
+        "rocm"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[ROCm] Enable AITER and FP8 inference on GFX120x (#43615)\n\nSigned-off-by: skysnow2001 <skysnow9285@gmail.com>\nCo-authored-by: Douglas Lehr <91553416+dllehr-amd@users.noreply.github.com>"
+    },
+    {
+      "sha": "4a3447d200e5aa428d68d1a00aa00f1a19a1a729",
+      "comment": "修复 MRv2 推测解码的多模态 draft 能力检测：原先在 SpecDecodeBaseProposer.load_model 中通过 try/except 调用 embed_input_ids 来探测 draft 模型是否支持外部多模态 embedding；现在新增 SupportsMultiModalEmbeddings Protocol（supports_multimodal_embeddings 类属性标记）进行静态检测，EagleLlama4/EagleMistral/EagleMistralLarge3/InklingMTP/Exaone4-5 等显式声明。DraftModelSpeculator.load_model 在模型加载完成后基于 target 与 draft 双方能力计算 supports_mm_inputs；AutoRegressiveSpeculator 与 MultiModuleMTPSpeculator 的 inputs_embeds/cached_draft_input_embeds 分配从 __init__ 移到 load_model。能力检测时机从构造期推后到 load_model 之后，任何在 __init__ 中依赖 supports_mm_inputs 的代码需要同步调整。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "spec-decode",
+        "model-runner"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "vllm/v1/spec_decode/ 的能力检测机制变更影响 vllm-ascend 的 spec_decode proposer（Eagle/Medusa/DFlash 等）：(1) 多模态 draft 能力从运行时 try/except 探测改为静态标记 supports_multimodal_embeddings（SupportsMultiModalEmbeddings Protocol），vllm-ascend 的 draft 模型若支持多模态输入但未声明该标记，会被静默降级为 text-only；(2) DraftModelSpeculator.__init__ 中 supports_mm_inputs 恒为 False，直到 load_model 之后才根据 target/draft 双方能力计算，vllm-ascend 自定义 proposer 若在 __init__ 中读取该字段或自行分配 inputs_embeds，需要把相关逻辑移到 load_model。",
+        "testing": "需要更新 vllm-ascend spec_decode 相关测试，覆盖新的能力检测时机（load_model 后）与静态标记要求。",
+        "needs_test_update": true,
+        "suggested_test_areas": [
+          "vllm_ascend/spec_decode 多模态 draft 能力检测测试（Eagle/Medusa/DFlash 等 proposer）",
+          "vllm_ascend 依赖 supports_mm_inputs 时机的 worker 侧测试"
+        ]
+      },
+      "message": "[Bugfix][Model Runner V2] Restore multimodal draft capability detection (#50417)\n\nSigned-off-by: Raphael Rialland <raphael.rialland@mistral.ai>",
+      "deep_analysis": {
+        "adaptation_effort": "low",
+        "adaptation_guide": "This commit restores multimodal draft capability detection in speculative decoding. The key changes are:\n\n1. **New `SupportsMultiModalEmbeddings` protocol** extracted from `SupportsMultiModal` in `vllm/model_executor/models/interfaces.py` — vllm-ascend doesn't use this protocol and doesn't need to.\n\n2. **`supports_multimodal_embeddings()` helper** — not used by vllm-ascend anywhere.\n\n3. **`SpecDecodeBaseProposer.load_model` changes** — vllm-ascend overrides this method in `AscendSpecDecodeBaseProposer`, so the new check is shadowed. No adaptation needed.\n\n4. **`DraftModelSpeculator.load_model` changes** — vllm-ascend's v2 speculators (AscendAutoRegressiveSpeculator, AscendEagleSpeculator, AscendMTPSpeculator, etc.) inherit from this class and do NOT override `load_model`, so they automatically benefit from the improved detection. The new `supports_multimodal_embeddings(self.model)` check is called on vllm-ascend's draft models (which don't implement `SupportsMultiModalEmbeddings`), correctly resulting in `supports_mm_inputs=False`.\n\n5. **Upstream draft model classes** (EagleLlama4ForCausalLM, EagleMistralForCausalLM, etc.) are marked with `SupportsMultiModalEmbeddings` — none of these are used by vllm-ascend (which uses its own model classes like `Eagle3VwnLlamaForCausalLM` and `DeepSeekV4MTP`).\n\nNo adaptation required. This commit is backward compatible and improves correctness for multimodal speculative decoding without any breaking interface changes.",
+        "affected_interfaces": [],
+        "ascend_affected_confirmed": false,
+        "risk": ""
+      }
+    },
+    {
+      "sha": "42ab184ea74ee6cf2966529c77bb51fd825a5d0c",
+      "comment": "在 Model Runner V2（MRv2）中启用 routed-experts capture（--enable-return-routed-experts）：VllmConfig 移除对 MRv2 的 routed-experts capture 不支持限制；RoutedExpertsCapturer 构造签名新增必填 kv_cache_config，并通过 get_routed_experts_attn_gid 统一查找 full-attention KV cache group（找不到时抛出 ValueError）；移除 clear_buffer，改为每层覆盖写入；新增模块级 bind_routed_experts_capturer(model, capturer) 负责遍历模型绑定 MoE router 的 capture_fn（同时支持 BaseRouter 与 FusedMoEExpertsMonolithic，monolithic 无 replay 能力时抛错）。V1 runner 的 ExecuteModelState 新增必填字段 routed_experts；V2 runner（gpu_model_runner.py）删除本地 _bind_routed_experts_capturer/_get_attention_kv_cache_gid/routed_experts_attn_gid，改用共享函数。AsyncOutput 与 ray_utils 增加 routed_experts 的异步 D2H 与 Ray 零拷贝解除支持。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "model-runner",
+        "moe"
+      ],
+      "ascend_impact": {
+        "ascend_affected": true,
+        "functionality": "直接影响 vllm/v1/worker/gpu/model_runner.py（GPUModelRunner，NPUModelRunnerV1 的父类）与 vllm/v1/worker/gpu_model_runner.py（MRv2 runner，NPUModelRunnerV2 的父类）：(1) ExecuteModelState 新增必填字段 routed_experts（无默认值），vllm-ascend 派生 runner 若自行构造该 NamedTuple 必须传入，否则构造失败；(2) RoutedExpertsCapturer.__init__ 新增必填参数 kv_cache_config，vllm-ascend 若有自定义 capturer 需要同步；(3) MRv2 runner 删除了 _bind_routed_experts_capturer/_get_attention_kv_cache_gid 方法与 routed_experts_attn_gid 属性，若 vllm-ascend 引用了这些内部成员会断裂；(4) MRv2 现在允许启用 routed-experts capture，但 Ascend 的 MoE 实现若不满足绑定条件（monolithic kernel 无 routing-replay 支持），在 init_routed_experts_capturer 阶段会抛出 ValueError。",
+        "testing": "vllm-ascend 的 NPUModelRunnerV1/V2 测试需要验证 ExecuteModelState 构造、routed_experts_capturer 初始化路径以及启用该功能时 MoE 绑定行为。",
+        "needs_test_update": true,
+        "suggested_test_areas": [
+          "vllm_ascend/worker/model_runner_v1.py 相关测试（ExecuteModelState 新字段）",
+          "vllm_ascend/worker/v2/model_runner.py 相关测试（init_routed_experts_capturer 路径）"
+        ]
+      },
+      "message": "[MRV2] Enable routed-experts capture (#50721)\n\nSigned-off-by: aoshen02 <aoshen@inferact.ai>\nSigned-off-by: Nick Hill <nickhill123@gmail.com>\nCo-authored-by: Nick Hill <nickhill123@gmail.com>",
+      "deep_analysis": {
+        "adaptation_effort": "high",
+        "adaptation_guide": "## NPUModelRunnerV1 (vllm_ascend/worker/model_runner_v1.py) — REQUIRED FIXES\n\n### 1. `clear_buffer()` removed — AttributeError at runtime\n`RoutedExpertsCapturer.clear_buffer()` is removed in this commit. The device buffer is now overwritten per-step instead of zeroed.\n\n**Location:** `vllm_ascend/worker/model_runner_v1.py:1703-1705`\n```python\nif self.vllm_config.model_config.enable_return_routed_experts:\n    if self.routed_experts_initialized:\n        self.routed_experts_capturer.clear_buffer()  # REMOVED\n```\n**Fix:** Remove this block entirely. The new semantics are that each routed layer overwrites its own token rows in the device buffer, so explicit clearing is unnecessary.\n\n### 2. `_bind_routed_experts_capturer` override bypassed\nThe parent `GPUModelRunner.init_routed_experts_capturer()` now calls `bind_routed_experts_capturer(self.model, self.routed_experts_capturer)` (a standalone function) instead of `self._bind_routed_experts_capturer(capturer)`. The Ascend override at `model_runner_v1.py:3601-3608` that iterates over `self.compilation_config.static_forward_context` to set `_ascend_routed_experts_capturer` on `AscendMoERunner` modules will be skipped.\n\n**Location:** `vllm_ascend/worker/model_runner_v1.py:3601-3608`\n```python\ndef _bind_routed_experts_capturer(self, capturer=None) -> None:\n    from vllm_ascend.ops.fused_moe.fused_moe import AscendMoERunner\n    for module in self.compilation_config.static_forward_context.values():\n        if isinstance(module, AscendMoERunner):\n            module._ascend_routed_experts_capturer = capturer\n            module.routed_experts._ascend_routed_experts_capturer = capturer\n```\n**Fix:** Override `init_routed_experts_capturer()` in NPUModelRunnerV1 to:\n1. Call the parent's logic OR replicate it\n2. After the standalone `bind_routed_experts_capturer` call, also iterate `static_forward_context` to set `_ascend_routed_experts_capturer` on `AscendMoERunner` instances\n\n## NPUModelRunnerV2 (vllm_ascend/worker/v2/model_runner.py) — NO FIX NEEDED\n\nThe NPUModelRunnerV2 inherits from the new MRV2 `GPUModelRunner` which is the primary target of this commit. Since:\n- NPUModelRunnerV2 doesn't override `sample_tokens` (inherits the parent's logic)\n- NPUModelRunnerV2's `execute_model` calls `super()` which now includes routed-experts capture\n- The `ExecuteModelState._replace()` in NPUModelRunnerV2 only touches `hidden_states` and `aux_hidden_states`, leaving the new `routed_experts` field intact\n- NPUModelRunnerV2 doesn't reference `clear_buffer()`, `_get_attention_kv_cache_gid()`, `routed_experts_attn_gid`, or `_bind_routed_experts_capturer`\n\nNo changes are needed for the V2 model runner path.\n\n## Patch system (vllm_ascend/patch/worker/patch_routed_experts_capture.py) — NO FIX NEEDED\n\nThe monkey-patch replaces `RoutedExpertsCapturer.capture` with an Ascend-specific version that handles additional DP layouts (padded all-gather, all2all/mc2 SP paths). The `capture` method signature is unchanged. The new `bind_routed_experts_capturer` function creates closures that call `capturer.capture(layer_id, topk_ids)`, so the patched version is used correctly.",
+        "affected_interfaces": [
+          "GPUModelRunner (vllm/v1/worker/gpu/model_runner.py) — ExecuteModelState.routed_experts field added",
+          "RoutedExpertsCapturer (vllm/model_executor/layers/fused_moe/routed_experts_capturer.py) — __init__ signature changed (added kv_cache_config param), clear_buffer() removed, get_routed_experts() added, bind_routed_experts_capturer() extracted as standalone function"
+        ],
+        "ascend_affected_confirmed": true,
+        "risk": "HIGH for NPUModelRunnerV1 path:\n1. `AttributeError: 'RoutedExpertsCapturer' object has no attribute 'clear_buffer'` will crash any Ascend NPU model that has `enable_return_routed_experts=True` and uses the V1 model runner path.\n2. The `_bind_routed_experts_capturer` override bypass means `AscendMoERunner` modules won't get their `_ascend_routed_experts_capturer` attribute set, which could silently break routing-replay-dependent features (e.g., MoE routing replay in Qwen3-MoE) on the V1 path.\nNPUModelRunnerV2 path is unaffected as it inherits all the new logic correctly."
+      }
+    },
+    {
+      "sha": "e279f7158322d81f7b10ec9733fd7f9420d2fdc6",
+      "message": "[ROCm][Test] Fix AITER MXFP4 oracle contract (#50728)\n\nSigned-off-by: Andreas Karatzas <akaratza@amd.com>",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "bugfix",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "c4e9f09de74aa1bf885af8cafd949c3c4dca67db",
+      "message": "[Bugfix][Frontend] Reject empty gRPC stop strings (#50746)\n\nSigned-off-by: zq <zhouquan1511@163.com>\nCo-authored-by: zq <zhouquan1511@163.com>",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "bugfix",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "755513d9a24fb639a8985172e645c7fe5a263154",
+      "comment": "重构 Mamba 混合模型 postprocess 输入 staging：将 stage_mamba_state_idx_to_gpu 与 stage_postprocess_metadata_to_gpu 两个函数合并为单一的 stage_postprocess_inputs_to_gpu，在同一个循环内填充 mamba_state_idx、num_scheduled_tokens、num_computed_tokens、num_draft_tokens 四个 pinned buffer，然后统一发起四次 H→D 非阻塞拷贝；同时新增对 mamba_state_idx 缺失条目的断言。行为保持不变，但消除了两次独立的请求列表遍历，并减少了函数边界。新增测试验证填充位置、尾部空洞保持哨兵、缺失 state_idx 时断言触发。",
+      "tags": [
+        "refactor",
+        "low-risk",
+        "hybrid",
+        "model-runner"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Hybrid] Stage the postprocess inputs with a single loop over the request list (#48120)\n\nSigned-off-by: Francesco Fusco <ffu@zurich.ibm.com>\nCo-authored-by: Claude <noreply@anthropic.com>"
+    },
+    {
+      "sha": "1c0d20791556861f4c1804b43b03d9cc03ffa6b8",
+      "comment": "Gemma3Model.forward 的 intermediate_tensors 参数增加默认值 None。在 pipeline parallel 场景下，PP rank 0 的首次 forward 不会收到 intermediate_tensors，此前该参数为必填，调用方需要显式传 None；改为可选后与其他模型（如 Gemma2）的签名保持一致。仅影响 Gemma3 模型实现，向后兼容。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "model",
+        "pipeline-parallel"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Bugfix] Default Gemma3 Model intermediate_tensors to None (#50777)\n\nSigned-off-by: Taneem Ibrahim <taneem.ibrahim@gmail.com>\nCo-authored-by: Wentao Ye <44945378+yewentao256@users.noreply.github.com>"
+    },
+    {
+      "sha": "7f2e78ba4df2f7091c247155fc5aeecaa73a486d",
+      "comment": "修复 encode_audio_url/encode_image_url/encode_video_url 在目标格式未注册到 Python mimetypes.types_map 时生成非法 media type（裸 'image'/'audio'/'video'，缺少 subtype）的问题。回退值改为 f'{category}/{format.lower()}'，符合 data URL 对 type/subtype 格式的要求。新增测试使用 .tga（不在 types_map 中但 Pillow 可编码）验证回退路径。已注册格式（png/jpeg/mp3 等）行为完全不变；这是平台无关的多模态工具函数修复，风险低。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "multimodal"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Bugfix] Emit a valid media type from encode_{audio,image,video}_url (#49056)\n\nSigned-off-by: Vineeth Sai <vineethsai4444@gmail.com>"
+    },
+    {
+      "sha": "8f50685c48d6bc88d199d9560ab67615e1b2c2a4",
+      "comment": "ROCm/AITER 专用清理与重构：将 AITER_SITUV2_A8W4 环境变量重命名为 VLLM_ROCM_USE_AITER_MOE_SITUV2_A8W4，统一到 vLLM 的 VLLM_ROCM_* 命名空间，并移除对 AITER 内部环境变量的直接读取依赖（环境变量重命名是破坏性变更，用户需改用新变量）。新增 rocm_aiter_ops.is_fused_moe_situv2_a8w4_enabled()，强制要求 aiter fused moe 总开关同时开启。重构 mxfp4.py 的 K3 SiTU 路径：将 _setup_kernel_k3_situ 拆为 _convert_k3_situ_weight_to_kernel_format（仅返回转换后的张量），使 K3 不再提前 return，而是与公共权重赋值/内核构造流程统一。mxfp4 oracle 新增 AITER_MXFP4_BF16 + SiTU 的 128 对齐分支（K3 原生 moe_intermediate=3072 在 TP8 下为 384，对齐 128 为 no-op，避免通用 256 round-up 放大权重导致 OOM）。启用 a8w4 时额外设置 AITER_BF16_FP8_MOE_BOUND=0，防止 AITER 在低 token 数下回退到 bf16 激活。风险中：环境变量重命名影响用户配置；K3 权重转换流程的结构性调整需要 ROCm 回归验证。",
+      "tags": [
+        "refactor",
+        "medium-risk",
+        "fused-moe",
+        "quantization",
+        "rocm"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[ROCm][Kimi-K3] aiter moe environment variable cleanup (#50582)\n\nSigned-off-by: Hongxia Yang <hongxia.yang@amd.com>"
+    },
+    {
+      "sha": "952694e3843e478dd99cffd132c756d582fe8a94",
+      "comment": "NIXL（NVIDIA KV transfer）握手阶段的 speculative 配置兼容性校验增强。compute_nixl_compatibility_hash 新增 speculative_config 因子（method、draft model、revision、code_revision、parallel_drafting、解析后的 kv_cache_dtype、eagle auxiliary layer ids），使 P/D 实例在 speculation 配置不兼容时于握手阶段即失败，而非运行时才暴露。NIXL_CONNECTOR_VERSION 5→6。设计上刻意排除 draft attention_backend（其传输相关效果在运行时按 region 校验 KV block 布局）和 num_speculative_tokens（prefill/decode 允许不同 draft 深度），避免误报。新增参数化单测覆盖各因子的匹配/不匹配场景。风险中：兼容 hash 收紧会使原本能运行的异构配置在握手时被拒绝（这是预期行为）；kv_cache_dtype 解析依赖两端 cache_config 一致性。仅影响 NIXL 路径，与 vllm-ascend 使用的 Mooncake KV 传输无关。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "kv-transfer",
+        "spec-decode",
+        "nixl"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Bugfix] Validate NIXL speculative config compatibility (#49230)\n\nSigned-off-by: Tzu-Ling <tzulingk@nvidia.com>\nCo-authored-by: GPT-5.6 Sol <noreply@openai.com>\nCo-authored-by: Cursor Grok 4.5 <noreply@cursor.com>\nCo-authored-by: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
+    },
+    {
+      "sha": "65cf1276a25b5e7dbbed7d3febdd54a815ced8c8",
+      "comment": "Triton prefill attention kernel 滑动窗口路径的循环边界剪枝。对于 SLIDING_WINDOW_Q，根据当前 query block 最早 token 的窗口起点计算 start_n_limit（按 BLOCK_N 对齐），跳过完全在窗口之外的 key block；对于 SLIDING_WINDOW_K，用 last_needed = 当前 block 最晚 query 位置 + SLIDING_WINDOW_K 封顶 end_n。窗口外的 key 本来就会被完整 mask，跳过加载不改变语义，但可避免 windowed prefill 退化为 O(seq_len^2) 开销。数学上对 block 内所有 query 位置均安全；需注意同时设置 Q/K 双窗口时两个边界同时生效以及与 block_mask 的交互。风险低-中：属于循环边界修改，窗口边界计算若有偏差会影响正确性，但逻辑推导正确。仅影响 triton attention 后端路径。",
+      "tags": [
+        "performance",
+        "low-risk",
+        "attention",
+        "triton",
+        "sliding-window"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Kernel] Skip fully masked key blocks in windowed Triton prefill (#50776)\n\nSigned-off-by: almogtavor <almogtavor@gmail.com>"
+    },
+    {
+      "sha": "76d995df2c80fd1f81901723fa05c992714693b2",
+      "comment": "纯 CI/build 变更：将 scripts/benchmark_helion_kernels.py 复制进 ROCm Docker 镜像（开发镜像与 wheel release 镜像），并在 Buildkite test-amd.yaml 的 source_file_dependencies 中添加该脚本，使 Helion kernel 基准脚本在测试产物中可用，且脚本变更时自动触发相关 CI。无运行时逻辑变更。",
+      "tags": [
+        "ci",
+        "low-risk",
+        "build",
+        "rocm"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[CI][ROCm] Export Helion benchmark script in test artifacts (#50726)\n\nSigned-off-by: Andreas Karatzas <akaratza@amd.com>"
+    },
+    {
+      "sha": "f0de1a604cad003379e5bb4dfc3cc5d2a1f25fa8",
+      "comment": "修复 DCP 下 UniformTypeKVCacheSpecs.max_num_blocks_per_req 未按 DCP 分片的问题。UniformTypeKVCacheSpecs 聚合多个同类型 layer 的 KV cache spec：runner 用聚合 spec 确定 block table 宽度，而 metadata builder 由逐层 spec 构建。此前聚合类使用基类 cdiv(max_len, block_size) 计算宽度，会丢失 MLA/DCP 的分片逻辑（如 DCP=2 时宽度应为 32 而非 64），导致 block table 宽度与 builder 预期不一致。新实现委托给被包裹的逐层 spec 的 max_num_blocks_per_req，并断言组内所有 layer 宽度一致（mamba 状态复制不分片，宽度为 resident state block 数 3）。新增测试覆盖 MLA（DCP 1/2）与 mamba 场景。风险低：新增断言可能暴露既有 group 配置不一致问题，但属于合理收紧。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "kv-cache",
+        "dcp"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "修改 vllm/v1/kv_cache_interface.py 的 UniformTypeKVCacheSpecs，新增 max_num_blocks_per_req 覆写，委托给被包裹的逐层 spec 并断言组内宽度一致。vllm-ascend 的自定义 KV cache spec（AscendMLAAttentionSpec、AscendSFAIndexerCacheSpec、AscendSlidingWindowMLASpec）继承自 vLLM 的 KVCacheSpec 家族，在 DCP/上下文并行场景使用 UniformTypeKVCacheSpecs 聚合时，block table 宽度现在会正确反映逐层 spec 的 DCP 分片结果，与 metadata builder 保持一致。该变更不要求 vllm-ascend 修改任何代码，但需注意：若同一 group 内 Ascend 自定义 spec 返回不同的 max_num_blocks_per_req，新增断言会触发。",
+        "testing": "上游新增 test_uniform_type_spec_block_table_width_matches_layer_spec 覆盖 MLA（DCP 1/2）与 mamba 两种类型，行为与平台无关；vllm-ascend 现有测试无需改动。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Bugfix] Shard UniformTypeKVCacheSpecs block table width under DCP (#50823)\n\nSigned-off-by: Mikhail Kostryukov <mike@triptrack.net>\nSigned-off-by: Matthew Bonanni <mbonanni@redhat.com>\nCo-authored-by: Claude <noreply@anthropic.com>\nCo-authored-by: Matthew Bonanni <mbonanni@redhat.com>",
+      "deep_analysis": {
+        "adaptation_effort": "low",
+        "adaptation_guide": "No adaptation needed in vllm-ascend. The commit fixes UniformTypeKVCacheSpecs.max_num_blocks_per_req() to delegate to inner specs for correct DCP sharding. Ascend uses a manual formula (cdiv(max_model_len, block_size * dcp_world_size)) that already handles DCP sharding correctly for all spec types, including UniformTypeKVCacheSpecs. Ascend's approach in model_runner_310p.py:953, model_runner_v1.py:4372, and block_table.py:112-114 independently computes block table width without calling spec.max_num_blocks_per_req(), so the bug doesn't affect ascend.",
+        "affected_interfaces": [],
+        "ascend_affected_confirmed": false,
+        "risk": ""
+      }
+    }
+  ],
+  "architecture_based_on_sha": "7154856f3dcb1d3fdd5a136f7d2c5987f22244f5",
+  "architecture_generated_at": "2026-08-01T20:25:03.691327+08:00"
+}

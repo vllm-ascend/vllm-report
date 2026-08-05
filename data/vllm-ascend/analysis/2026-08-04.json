@@ -1,0 +1,330 @@
+{
+  "date": "2026-08-04",
+  "repo": "vllm-project/vllm-ascend",
+  "generated_at": "2026-08-05T10:29:58.333972+08:00",
+  "daily_summary": "当日 15 个 commit 以文档与 CI/测试维护为主。代码变更集中在 4 处：(1) compressor 算子 C++ 模板裁剪（arch32 从 192 个模板减至 4 个、arch35 减至 8 个），按 A3/A5 硬件规格固定 X_LAYOUT=X_DTYPE=ROTARY_MODE=CACHE_MODE=ROPE_DTYPE 维度以降低编译时间和二进制体积；(2) 新增 Ascend 本地优化的 compute_slot_mapping Triton kernel（int64→int32 转换、非连续 block table 窗口化加载、CP_WORLD_SIZE=1 特化路径），替换 vLLM 上游通用实现，per-step 性能提升约 49-57 倍；(3) W4A8-MXFP4 量化适配 ModelRunnerV2，moe_comm_method 从 get_forward_context() 改为从 _EXTRA_CTX 读取；(4) PD load balance proxy 示例修复冷缓存（None→0）和非流式响应场景的 cached_tokens 覆盖逻辑。另有移除已无用的 is_cumem_allocator_available patch。文档侧修复链接错误、添加模型教程锚点、标准化 TorchNPU/Ascend 950 术语、补充 DFlash/DSpark 推测解码与 reduce_sample 限制说明。CI 侧更新 CANN 默认版本至 2026.08.03、新增 build_type 支持、优化测试选择器并延长覆盖率任务超时。无 Platform/Worker/AttentionBackend 等核心接口变更。",
+  "test_impact_summary": "当日测试看护呈现'代码改动伴随测试补强'的趋势：compute_slot_mapping_kernel 新增了 4 个 Triton 单元测试（3 组 CP 参数化场景 + 1 个大序列场景），并替换了 v1 block table 路径的上游通用 kernel，需重点回归 vLLM v1 下 KV cache slot mapping、CP 交错布局及 CUDA graph padding 行为；W4A8-MXFP4 新增 2 个测试类覆盖 Linear/MoE 方法，但需补充 ModelRunnerV2 集成验证以确认 _EXTRA_CTX.moe_comm_method 在 additional_kwargs 中的初始化时序；compressor 模板裁剪属于 C++ 编译期变更，现有测试无法覆盖模板实例化缺失风险，建议在 A3（C4A/C4Li/C128A）和 A5 真实硬件上回归 attention compressor 各 profile；PD proxy bugfix 未附带测试，建议为 extract_cached_tokens/update_cached_tokens_in_chunk 增加冷/热缓存与非流式响应的单测；CI 侧 test_selector 将 PR 测试发现范围限定到 tests/e2e/pull_request 和 tests/ut，且无产品变更时提前退出，能显著减少 PR 无效 CI 消耗，但需验证其正则与函数级推荐算法变更；upstream workflow 升级 v0.26.0 新增约 30 个上游测试并删除过时项，需关注新引入的 v1/ec_connector、inkling 等测试在 Ascend 上的可运行性；A3 周级配置大修（修复 CLI 参数格式、更新模型名、调整 DP/TP、新增 Qwen3.6-27B 与 Qwen3-235B-A5 配置）直接影响周级 E2E 稳定性，需持续观察 baseline 阈值调整后的通过率。",
+  "commits": [
+    {
+      "sha": "b80d4e621a303d1a4077db5e4d80586d2446fb8f",
+      "comment": "纯文档变更：修复 Docker 安装指南和 msmodelslim 量化方法两个失效外链，并为 30+ 个模型教程文件中的 '5 Online Service Deployment' 标题统一添加 `{: #5-online-service-deployment }` 显式锚点，使跨文档引用（如第 5 章部署说明）能稳定跳转。同时修正 Qwen3-235B 和 Qwen3-Dense 文档表格中 '#NPUs' → 'NPUs' 的格式问题。不涉及任何代码逻辑。",
+      "tags": [
+        "docs",
+        "low-risk",
+        "documentation"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "纯文档变更（修复链接、添加锚点、表格格式微调），不影响任何产品代码或测试行为，无需新增或更新测试。",
+        "suggested_test_areas": []
+      },
+      "message": "[Doc] Fix link errors and add section anchors (#13485)\n\n### What this PR does / why we need it?\n\nThis PR fixes broken links in the documentation (such as the Docker\ninstallation guide link and the `msmodelslim` quantization method link)\nand adds explicit anchors (`{: #5-online-service-deployment }`) to the\n\"5 Online Service Deployment\" headers across various model tutorial\nfiles to ensure correct cross-referencing.\n\n### Does this PR introduce _any_ user-facing change?\n\nNo, this is a documentation-only update.\n\n### How was this patch tested?\n\nVerified that the links and anchors are correct.\n\n\n- vLLM version: v0.26.0\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/0351e9aa1fdf1a51329d1906881528dfe61fc88e\n\nSigned-off-by: herizhen <1270637059@qq.com>"
+    },
+    {
+      "sha": "9c624b98bf3882368a281488d79eea5f7a98e4c0",
+      "comment": "A3 周级 E2E 测试配置大修。主要变化：(1) 清理 weekly_config.yaml 中隐藏的不可见 unicode 字符（文件路径后残留），避免 YAML 解析或路径匹配问题；(2) 为多节点 external_dp 配置统一添加 VLLM_USE_MODELSCOPE=true，解决模型下载源问题；(3) 修正 DeepSeek V3.1T/V3.2T MTP3 PD 配置的 DP/TP 布局（V3.1T 从 dp8/tp4 改为 dp32/tp1，V3.2T 反向调整），实现两套配置的拓扑对齐；(4) 修复大量 CLI 参数格式错误，如 `--quantization ascend` 单字符串拆分为两个独立参数、`-async-scheduling` 补全为 `--async-scheduling`、`--compilation-config ` 尾部空格导致的 argv 解析异常、JSON 字符串中的多余引号等——这些此前很可能导致测试用例静默失败；(5) 新增 Qwen3-235B-W8A8-A5 和 Qwen3.6-27B-W8A8-A3 两个测试配置文件；(6) 更新模型名（如 DeepSeek-R1 权重路径改为 Eco-Tech 仓库新路径）并提高性能/准确率 baseline 阈值。整体属于测试基础设施维护，风险集中在配置正确性上。",
+      "tags": [
+        "test",
+        "ci",
+        "low-risk",
+        "e2e"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "该 commit 本身就是测试配置的增删改：新增 Qwen3_235b_w8a8_A5.yaml 和 qwen_3_6_27b_w8a8_A3.yaml，修改多节点 external_dp 与单节点 A3 配置。所有改动直接影响周级 E2E 测试的调度和断言基线。",
+        "suggested_test_areas": [
+          ".github/workflows/configs/weekly_config.yaml",
+          "tests/e2e/weekly/multi_node/external_dp/config/DeepSeek_V3.1T_MTP3_PD.yaml",
+          "tests/e2e/weekly/multi_node/external_dp/config/DeepSeek_V3.2T_MTP3_PD.yaml",
+          "tests/e2e/weekly/single_node/configs/Qwen3_235b_w8a8_A5.yaml",
+          "tests/e2e/weekly/single_node/configs/qwen_3_6_27b_w8a8_A3.yaml",
+          "tests/e2e/weekly/single_node/configs/Qwen3_32b_W8A8_wl_A3.yaml",
+          "tests/e2e/weekly/single_node/configs/Qwq_32b_A3.yaml"
+        ]
+      },
+      "message": "[TEST]Revise the A3 case (#13495)\n\n### What this PR does / why we need it?\n[TEST]Revise the A3 case\n### Does this PR introduce _any_ user-facing change?\nno\n### How was this patch tested?\n\n- vLLM version: v0.26.0\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/0351e9aa1fdf1a51329d1906881528dfe61fc88e\n\nSigned-off-by: zxinyue <1264904584@qq.com>"
+    },
+    {
+      "sha": "d5c70129e7e561df437eedf982b4ce4e05d7d578",
+      "comment": "CI 基础设施增强：(1) 将 nightly/weekly 镜像构建的默认 CANN 版本从 2026.07.29 升级到 2026.08.03，同步更新所有 workflow 的默认值、注释和 fromJSON fallback；(2) 为 schedule_nightly_test_* 和 schedule_weekly_test_* 系列 workflow 新增 build_type（release/daily）输入项，daily 构建使用独立的 QUAY_DAILY_USERNAME/PASSWORD 和 HW_USERNAME_DAILY/HW_TOKEN_DAILY 凭据，并在 build_args 中按 build_type 动态传入 CANN_QUAY_URL/CANN_VERSION。这使得 nightly 测试可以选择 daily 快照镜像或 release 正式镜像，支持更灵活的回归验证。纯 CI 变更，不影响产品代码。",
+      "tags": [
+        "ci",
+        "chore",
+        "low-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "仅修改镜像构建默认版本和 workflow 输入参数，不影响测试用例逻辑；但 nightly 测试若使用新 CANN 版本需关注镜像环境兼容性。",
+        "suggested_test_areas": []
+      },
+      "message": "[CI] modify default cann_version and add build_type support in nightly (#13480)\n\n### What this PR does / why we need it?\nThis PR updates the default image version number of cann_version, and\nenhances the E2E test framework by adding support for build_type\nselection, allowing users to specify different configurations (e.g.,\ndaily/release) when running nightly tests.\n\n### Does this PR introduce _any_ user-facing change?\nNo This is for internal nightly testing only\n\n### How was this patch tested?\nThis patch was tested by running the image building stage of the\nexisting nightly tests with both build_type configurations (daily and\nrelease).\n\n- vLLM version: v0.26.0\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/0351e9aa1fdf1a51329d1906881528dfe61fc88e\n\n---------\n\nSigned-off-by: duping <duping31@h-partners.com>"
+    },
+    {
+      "sha": "12a5d7aa1ebfdd77f5e901b7ddc00d65459665ae",
+      "comment": "PR 测试选择器优化：(1) 将测试文件发现范围从 tests/ 任意子目录收敛为 tests/e2e/pull_request/ 和 tests/ut/ 两个目录，避免 PR 误选 nightly/weekly 重型测试；(2) 函数级推荐算法改进——coverage 记录从 (test_case, covered_changed_lines) 扩展为 (test_case, covered_in_func, covered_changed_lines)，用 covered_in_func 判断函数覆盖存在性，显示行数优先使用变更行交集，若无交集则回退到函数覆盖行数，并新增 Function match 日志；(3) 在检测到无产品代码变更时提前退出并生成空 recommended_pytest_paths.txt，减少不必要的 CI 开销；(4) 增加 line/function 匹配统计日志。选择器正则改为 `tests/e2e/pull_request(?:/.+)?/test_\\w+\\.py|tests/ut(?:/.+)?/test_\\w+\\.py`，与仓库目录结构对齐。",
+      "tags": [
+        "ci",
+        "refactor",
+        "low-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "变更的是测试选择脚本本身而非测试用例，但选择范围收敛和提前退出逻辑需在 PR CI 上验证，确保 pull_request 测试仍能被正确推荐。建议在测试选择器上补充针对新正则与函数匹配算法的轻量级校验（该脚本暂无独立测试）。",
+        "suggested_test_areas": [
+          ".github/workflows/scripts/test_selector.py",
+          ".github/workflows/_selected_tests.yaml 的调用链路验证"
+        ]
+      },
+      "message": "[CI]Improve logging, optimize function-level recommendation algorithm, and add early exit for no product code changes (#13472)\n\n### What this PR does / why we need it?\n1、Add additional logging for better traceability\n2、Optimize the function granularity recommendation algorithm\n3、Exit early when no product code changes are detected\n4、This PR restricts the test case discovery scope to the following\ndirectories:\ntests/e2e/pull_request/\ntests/ut/\n\n### Does this PR introduce _any_ user-facing change?\nNo. This PR does not introduce any user-facing changes\n\n### How was this patch tested?\nWhen no product code changes are detected, the process exits early and\ngenerates an empty file named recommended_pytest_paths.txt. \n\n\n- vLLM version: v0.26.0\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/0351e9aa1fdf1a51329d1906881528dfe61fc88e\n\n---------\n\nSigned-off-by: shenhui-cli <shenhui85@126.com>"
+    },
+    {
+      "sha": "12df7bef2440c1b393322adf7191012c6137b5a2",
+      "comment": "推测解码特性文档补全：在方法表中新增 dspark 条目（半自回归块草稿 + 顺序 Markov logit-bias head），新增 DFlash 小节（离线 + 在线示例），并补齐 EAGLE 的在线示例、MTP 的离线示例、Suffix Decoding 的在线示例、ExtractHiddenStates 的在线示例，使每个方法都同时具备离线/在线用法。所有新示例均通过 EngineArgs.create_engine_config 验证可解析。另将 extract_hidden_states 示例中的 tmpdirname 重命名为 tmpdir（纯命名优化）。文档内容与 vllm_ascend/spec_decode/ 下的 dflash、dspark proposer 实现对应。",
+      "tags": [
+        "docs",
+        "low-risk",
+        "speculative-decoding"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "纯文档变更，示例中的 speculative_config 参数均经 EngineArgs 解析验证。无需测试更新，但若未来 DFlash/DSpark 配置项变化，需要同步维护该文档示例。",
+        "suggested_test_areas": []
+      },
+      "message": "[Doc] Add dspark/dflash sections and complete offline/online examples (#13388)\n\n### What this PR does / why we need it?\n\nAdd dspark to the Overview method table, add a DFlash section (offline +\nonline), and fill in the missing offline or online example for EAGLE /\nMTP / Suffix Decoding / Extracting Hidden States so every method section\nhas both. Verified each new config parses via\nEngineArgs.create_engine_config (suffix and extract_hidden_states fully\npass; eagle/mtp field shapes accepted).\n\n### Does this PR introduce _any_ user-facing change?\n\nN/A\n\n### How was this patch tested?\n\n- vLLM version: v0.26.0\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/0351e9aa1fdf1a51329d1906881528dfe61fc88e\n\n---------\n\nSigned-off-by: drslark <slarksblood@qq.com>\nCo-authored-by: GLM-5.2 <glm@z.ai>"
+    },
+    {
+      "sha": "60d68bd0df0a4a9fed205188e404735a76c0bbcd",
+      "comment": "为 enable_reduce_sample 配置项补充两条重要限制说明：(1) 不支持 PD 分离场景；(2) 请求 sampling logprobs 时必须禁用，否则 logprobs 会在分区的 logits 上静默计算，产生错误的 logprob 值和 top-k 排名。这是对 Ascend 特有的 reduce sample 优化（TP 场景下只通信 top-k 候选而非全词表 logits）的边界条件补充，对用户正确使用该优化有直接指导意义。纯文档变更。",
+      "tags": [
+        "docs",
+        "low-risk",
+        "configuration"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "纯文档变更，没有新增或修改配置逻辑。但该限制暗示 reduce_sample + logprobs 组合缺少测试保护，建议后续在 tests/ut 中补充该组合的断言用例（属于增强而非本 commit 必需）。",
+        "suggested_test_areas": []
+      },
+      "message": "[Doc][Misc] Add limitation for reduce sample (#13468)\n\n### What this PR does / why we need it?\n\nThis PR updates the documentation for the `enable_reduce_sample`\nconfiguration option in vLLM Ascend. It adds explicit limitations for\nthis optimization, specifically noting that:\n1. PD (Prefill-Decode) disaggregation scenarios are not supported.\n2. It must be disabled when sampling logprobs are requested, as logprobs\nwould otherwise be silently computed over partitioned logits instead of\nthe full vocabulary, leading to incorrect logprob values and top-k\nrankings.\n\n### Does this PR introduce _any_ user-facing change?\n\nNo, this is a documentation-only update.\n\n### How was this patch tested?\n\n- vLLM version: v0.26.0\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/0351e9aa1fdf1a51329d1906881528dfe61fc88e\n\nSigned-off-by: zouzy <zouzongyu@huawei.com>"
+    },
+    {
+      "sha": "38ebf452d56433f8a2149d44dcbbd53269a825b1",
+      "comment": "compressor 算子（注意力压缩器，用于 KV cache 压缩场景）的 C++ 模板实例化裁剪。原 ASCENDC_TPL_ARGS_SEL 保留所有字段的自由组合（2×2×2×2×2×3×2=192 个模板），但 A3 输入规格已固定 X_LAYOUT=TH、X_DTYPE=BF16、ROTARY_MODE=INTERLEAVE、CACHE_MODE=CONTINUOUS、ROPE_DTYPE=FP32，因此 arch32 裁剪为 COFF∈{1,2}×TEMPLATE_ID∈{EMPTY_X,PERF} 共 4 个模板，覆盖 C4A(r=4,D=512,coff=2)、C4Li(r=4,D=128,coff=2)（与 C4A 共享 key）、C128A(r=128,D=512,coff=1) 三个 profile；arch35（A5）保留 NORMAL+EMPTY_X 共 8 个模板。TEMPLATE_ID=EMPTY_X 保留使 T=0 的 empty-tensor 路径仍能匹配已编译产物。风险点：若运行时的 tiling key 组合不在保留集合中（例如未来新增 profile 或 ROPE_DTYPE 变化），kernel 实例化将缺失；当前通过固定规格规避该风险。",
+      "tags": [
+        "bugfix",
+        "performance",
+        "medium-risk",
+        "ops",
+        "attention"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "C++ 模板集合从 192 裁剪到 4/8，现有测试无法验证模板实例化缺失风险。需要在 A3（C4A/C4Li/C128A 三种 profile）和 A5 硬件上回归 compressor 算子的编译与运行，确认 tiling key 与保留模板一一对应。建议补充 tiling key → 模板映射的静态校验测试。",
+        "suggested_test_areas": [
+          "csrc/attention/compressor/op_kernel/arch32/compressor_template_tiling_key.h",
+          "csrc/attention/compressor/op_kernel/arch35/compressor_template_tiling_key.h",
+          "compressor 算子在 A3/A5 硬件上的 E2E 回归",
+          "tiling key 与模板组合的映射一致性检查"
+        ]
+      },
+      "message": "[BugFix][Ops]The function template for reducing compress is designed to reduce compilation time. (#13416)\n\n## Summary\n\n- Trim arch32 `compressor`'s `ASCENDC_TPL_ARGS_SEL` to the template\ncombinations actually used by A3, reducing the number of function\ntemplate instantiations.\n- Template combinations are reduced from 192 to 4: `COFF ∈ {1, 2}` ×\n`TEMPLATE_ID ∈ {EMPTY_X, PERF}`.\n- Other dimensions are fixed per the A3 spec: `X_LAYOUT=TH`,\n`X_DTYPE=BF16`, `ROTARY_MODE=INTERLEAVE`, `CACHE_MODE=CONTINUOUS`,\n`ROPE_DTYPE=FP32`.\n- Covers all A3 profiles:\n  - C4A: `r=4, D=512, coff=2`\n  - C4Li: `r=4, D=128, coff=2` (shares the same template key as C4A)\n  - C128A: `r=128, D=512, coff=1`\n- Keep `TEMPLATE_ID=EMPTY_X` so that the empty-tensor path (`T=0`) still\nmatches a compiled artifact.\n\n## Motivation\n\nThe current `ASCENDC_TPL_ARGS_SEL` keeps the full Cartesian product of\nall field values, which instantiates 192 templates, even though the A3\ninput spec already fixes layout, dtype, rotary/cache mode, and rope\ndtype. The redundant template instantiations significantly increase\ncompile time and binary size; among them, `TEMPLATE_ID=NORMAL` is never\nproduced by the arch32 tiling flow.\n\n## Verification\n\n- Locally verified that the tiling key values map one-to-one to the\nthree A3 profiles.\n- Local pre-commit checks passed except `actionlint` and\n`gitleaks-offline-scan`, which were skipped due to local environment\nissues.\n- CI is expected to validate arch32 kernel compilation and template\ninstantiation.\n\n\n- vLLM version: v0.26.0\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/d02df748bf9efd99022f1a062597dc3cb3808485\n\n---------\n\nSigned-off-by: ZT-AIA <1028681969@qq.com>"
+    },
+    {
+      "sha": "a0d3009eed93247205ca7a68ff4dc42feb72b9c5",
+      "comment": "upstream 测试工作流升级到 vLLM v0.26.0：从 e2e-upstream_singlecard 列表移除 8 个已过时/不再适用的上游测试（test_offline_mode、test_use_trtllm_attention、test_kv_cache_layout、test_model_load_with_params、test_registry、test_mla_prefill_selector 等，其中 2 个移入 e2e-upstream_online_1），新增约 30 个 v0.26.0 引入的上游测试，覆盖 v1/attention（test_backend_per_kind）、v1/core（test_swa_inflight_window_free、test_partial_prefix_cache_hits）、v1/ec_connector、v1/spec_decode（test_dflash_causality）、v1/worker（test_gpu_batch_ordering、test_cp_utils）、v1/sample、structured_output、quantization、inkling 模型测试、renderers、plugins 等新领域。同时在测试环境安装 vllm_add_dummy_endpoint_plugin 插件以支持 endpoint plugin 测试。该更新使 Ascend 上游兼容性看护范围与 v0.26.0 对齐。",
+      "tags": [
+        "test",
+        "ci",
+        "low-risk",
+        "upstream"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "直接改变了 upstream 测试的选择列表：删除 8 个测试、新增约 30 个测试、安装新插件。新增测试在 Ascend 平台上的可运行性需逐一验证，尤其是 ec_connector 和 inkling 等新模块在 NPU 上可能有平台依赖。",
+        "suggested_test_areas": [
+          ".github/workflows/scripts/upstream_config.yaml",
+          "新增的 v1/ec_connector、v1/spec_decode、models/inkling 等上游测试的 Ascend 适配验证",
+          "tests/plugins/vllm_add_dummy_endpoint_plugin 插件的安装与运行"
+        ]
+      },
+      "message": "[Test]Update upstream test workflow to v0.26.0 (#13176)\n\n### What this PR does / why we need it?\nThis PR updates the upstream test workflow to v0.26.0\n### Does this PR introduce _any_ user-facing change?\nNo\n### How was this patch tested?\nby running the test\n- vLLM version: v0.26.0\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/0351e9aa1fdf1a51329d1906881528dfe61fc88e\n\n---------\n\nSigned-off-by: jiangyunfan1 <jiangyunfan1@h-partners.com>"
+    },
+    {
+      "sha": "0af2fa3a018b40e9d55caa2eb04dca52f3574353",
+      "comment": "修复 PD 分离负载均衡代理中 cached_tokens 报告的两个缺陷：Root Cause 1——extract_cached_tokens 将'字段缺失'（冷缓存）与'非 int 值'都映射为 None，导致下游 update_cached_tokens_in_chunk 跳过覆盖，修复为返回 0（合法 int），使冷缓存场景能正常写入 cached_tokens=0；Root Cause 2——非流式响应 choices 非空，原有 `if not choices` 分支条件不满足导致覆盖逻辑永不触发，修复为 `if not choices or not stream_flag` 让非流式响应进入覆盖分支，同时内部 `if not choices` 仅对流式最后一个 chunk 执行 yield+continue，非流式响应在覆盖后继续走正常拼接路径。变更虽小但涉及流式/非流式两条路径的语义区分，提交附有 curl 实测验证数据（冷缓存 0 与热缓存 512/640 均正确）。该文件是示例代码，不影响核心产品。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "disaggregated-prefill",
+        "example"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "代理逻辑的行为修复（冷缓存 None→0、非流式覆盖分支）没有附带自动化测试。示例代码虽非产品路径，但该代理是 PD 场景用户直接使用的脚本，建议为 extract_cached_tokens/update_cached_tokens_in_chunk/流式与非流式响应处理补充单元测试，覆盖冷缓存、热缓存、choices 空与非空四种组合。",
+        "suggested_test_areas": [
+          "examples/disaggregated_prefill_v1/load_balance_proxy_server_example.py",
+          "新增 proxy cached_tokens 逻辑的单元测试（冷/热缓存、流式/非流式）"
+        ]
+      },
+      "message": "[BugFix] Report prefiller cached tokens in PD proxy，added first curl and non-streaming scenarios (#13040)\n\n### What this PR does / why we need it?\nImprovements built on top of #11630. Summary of improvements:\n  1. First curl request now returns cached_tokens = 0 (cold cache case)\n  2. Covers non-streaming scenarios\n\nThe existing proxy fix approach (extracting the real prefix-cache hit\ncount from the Prefiller's response and overriding the Decoder's\nincorrect value at the proxy layer) is correct in\n  direction, but fails in two scenarios:\n\n1. Cold cache (P has no prefix-cache hit): P-side num_cached_tokens=0\ngets filtered into prompt_tokens_details: None by vLLM's truthiness\ncheck if ... and final_res.num_cached_tokens:. The\n  proxy extracts None and skips the override entirely.\n2. Non-streaming requests: The proxy's override logic is only attached\nto the if not choices branch (the last streaming chunk). Non-streaming\nresponses have non-empty choices, so the override\n   never triggers.\n\n  **Root Causes**\n\n  Root Cause 1: extract_cached_tokens treats None as failure\n\n`  return cached_tokens if isinstance(cached_tokens, int) else None`\n\nWhen P has a cold cache, the response carries no cached_tokens field →\nreturns None → downstream update_cached_tokens_in_chunk sees None and\nreturn False → no override. 0 and \"field missing\"\n  are conflated.\n\n  Root Cause 2: Override logic only targets the last streaming chunk\n\n```\n  if not choices:                    # non-streaming has non-empty choices → never enters\n      if update_cached_tokens_in_chunk(...):\n          ...\n      yield chunk\n      continue\n```\n\nA non-streaming response is a single complete JSON with both choices and\nusage in the same chunk. Since choices is non-empty, the override is\nskipped.\n\n  **Changes**\n\n  Change 1: else None → else 0 (extract_cached_tokens, line 174)\n\n```\n   def extract_cached_tokens(response_json: dict) -> int | None:\n       usage = response_json.get(\"usage\") or {}\n       prompt_tokens_details = usage.get(\"prompt_tokens_details\") or {}\n       cached_tokens = prompt_tokens_details.get(\"cached_tokens\")\n  -    return cached_tokens if isinstance(cached_tokens, int) else None\n  +    return cached_tokens if isinstance(cached_tokens, int) else 0\n```\n\nFalls back to 0 (a valid int) for cold cache, so the downstream\nupdate_cached_tokens_in_chunk can write normally.\n\n  Change 2: Add or not stream_flag to the override condition (line 1063)\n\n ```\n  choices = chunk_json.get(\"choices\", [])\n  -if not choices:\n  +if not choices or not stream_flag:\nif update_cached_tokens_in_chunk(chunk_json,\nreported_prefiller_cached_tokens):\n           chunk = encode_response_chunk(chunk_json, is_sse)\n  +    if not choices:\n  +        yield chunk\n  +        continue\n  -    yield chunk\n  -    continue\n\n```\n  - Outer condition adds or not stream_flag: lets non-streaming responses enter the override branch.\n  - Inner condition adds if not choices: only the last streaming chunk does yield + continue; non-streaming responses fall through to the normal token-concatenation path after the override is\n  applied.\n\n  Streaming behavior is fully preserved — only the non-streaming path gains the override.\n### Does this PR introduce _any_ user-facing change?\nNo.\n\n### How was this patch tested?\n                                         \n**Stream:**\n\n bash-5.2$ curl http://100.111.123.123:8088/v1/chat/completions -H \"Content-Type: application/json\" -d @edge_test_261.json\ndata: {\"id\":\"chatcmpl-bcb8240e-90db-4688-8352-66e81cdf3198\",\"object\":\"chat.completion.chunk\",\"created\":1785378357,\"model\":\"glm-52\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"logprobs\":null,\"finish_reason\":null}],\"prompt_token_ids\":null,\"prompt_text\":null}\n\n......\n\ndata: {\"id\": \"chatcmpl-bcb8240e-90db-4688-8352-66e81cdf3198\", \"object\": \"chat.completion.chunk\", \"created\": 1785378357, \"model\": \"glm-52\", \"choices\": [], \"usage\": {\"prompt_tokens\": 723, \"total_tokens\": 733, \"completion_tokens\": 10, \"prompt_tokens_details\": {\"cached_tokens\": 0}}, \"system_fingerprint\": \"vllm-0.23.0-dp32-ep-18f00f9a\"}\n\ndata: [DONE]\n\nbash-5.2$ curl http://100.111.123.123:8088/v1/chat/completions -H \"Content-Type: application/json\" -d @edge_test_261.json\ndata: {\"id\":\"chatcmpl-2ec914ee-a3bd-4ec6-82e6-3f57ad0bce23\",\"object\":\"chat.completion.chunk\",\"created\":1785378364,\"model\":\"glm-52\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"logprobs\":null,\"finish_reason\":null}],\"prompt_token_ids\":null,\"prompt_text\":null}\n\n......\n\ndata: {\"id\": \"chatcmpl-2ec914ee-a3bd-4ec6-82e6-3f57ad0bce23\", \"object\": \"chat.completion.chunk\", \"created\": 1785378364, \"model\": \"glm-52\", \"choices\": [], \"usage\": {\"prompt_tokens\": 723, \"total_tokens\": 733, \"completion_tokens\": 10, \"prompt_tokens_details\": {\"cached_tokens\": 640}}, \"system_fingerprint\": \"vllm-0.23.0-dp32-ep-18f00f9a\"}                                                                      \n\n**Non-Stream:**\n\nbash-5.2$ curl http://100.111.123.123:8088/v1/chat/completions -H \"Content-Type: application/json\" -d @edge_test_260.json\n{\"id\": \"chatcmpl-9d4ea50e-2e98-4d66-a7d4-fb8beb05c86d\", \"object\": \"chat.completion\", \"created\": 1785377804, \"model\": \"glm-52\", \"choices\": [{\"index\": 0, \"message\": {\"role\": \"assistant\", \"content\": null, \"refusal\": null, \"annotations\": null, \"audio\": null, \"function_call\": null, \"reasoning\": \"1. 分析用户输入：\\n*   内容：\"}, \"logprobs\": null, \"finish_reason\": \"length\", \"stop_reason\": null, \"token_ids\": null, \"routed_experts\": null}], \"service_tier\": null, \"system_fingerprint\": \"vllm-0.23.0-dp32-ep-18f00f9a\", \"usage\": {\"prompt_tokens\": 633, \"total_tokens\": 643, \"completion_tokens\": 10, \"prompt_tokens_details\": {\"cached_tokens\": 0}, \"completion_tokens_details\": null}, \"prompt_logprobs\": null, \"prompt_token_ids\": null, \"prompt_text\": null, \"kv_transfer_params\": null}\n\nbash-5.2$ curl http://100.111.123.123:8088/v1/chat/completions -H \"Content-Type: application/json\" -d @edge_test_260.json\n{\"id\": \"chatcmpl-4b71f02c-eb39-4474-bc5e-ef8442a41aed\", \"object\": \"chat.completion\", \"created\": 1785377812, \"model\": \"glm-52\", \"choices\": [{\"index\": 0, \"message\": {\"role\": \"assistant\", \"content\": null, \"refusal\": null, \"annotations\": null, \"audio\": null, \"function_call\": null, \"reasoning\": \"1. **分析输入：**\\n    * **\"}, \"logprobs\": null, \"finish_reason\": \"length\", \"stop_reason\": null, \"token_ids\": null, \"routed_experts\": null}], \"service_tier\": null, \"system_fingerprint\": \"vllm-0.23.0-dp32-ep-18f00f9a\", \"usage\": {\"prompt_tokens\": 633, \"total_tokens\": 643, \"completion_tokens\": 10, \"prompt_tokens_details\": {\"cached_tokens\": 512}, \"completion_tokens_details\": null}, \"prompt_logprobs\": null, \"prompt_token_ids\": null, \"prompt_text\": null, \"kv_transfer_params\": null}\n\nAs u can see above, first curl cached_tokens=0, second=prefill cached tokens\n\n\n- vLLM version: v0.26.0\n- vLLM main: https://github.com/vllm-project/vllm/commit/d02df748bf9efd99022f1a062597dc3cb3808485\n\nSigned-off-by: hcm <huangchengmin@huawei.com>"
+    },
+    {
+      "sha": "e18da0c4c90425dac73dcc7b56ee7e4a4dc2aa24",
+      "comment": "移除已无用的 is_cumem_allocator_available monkey-patch（patch_camem_allocator.py 及其在 patch/platform/__init__.py 和 patch/__init__.py 文档中的引用）。该 patch 原本用于让 vLLM ModelConfig 在 enable_sleep_mode=True 时绕过 CUDA/ROCm 专属的 CuMem allocator 可用性检查，使 Ascend 的 CaMemAllocator 能通过校验；移除意味着上游 vLLM v0.26.0 已不再执行该检查（或有等效的平台能力钩子）。同时更新 CODEOWNERS：注释掉 benchmarks/examples/tests、vllm_ascend 的 core/patch/quantization/spec_decode/worker/xlite 等多个路径的所有者，移除不活跃维护者。commit 描述中也指出核心路径失去 code owner 的风险，后续需分配给活跃维护者。",
+      "tags": [
+        "refactor",
+        "chore",
+        "low-risk",
+        "patch"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "移除 sleep mode 相关的 patch 后，需回归验证 enable_sleep_mode=True 场景下 ModelConfig 校验和 CaMemAllocator 初始化流程是否仍正常（尤其在 v0.26.0 上游）。现有 sleep/wakeup 相关测试应能覆盖，但需确认其运行环境与上游版本匹配。",
+        "suggested_test_areas": [
+          "vllm_ascend/device_allocator/camem.py 相关 sleep/wakeup 测试",
+          "enable_sleep_mode 配置路径的集成验证",
+          "vllm_ascend/worker/worker.py 中 sleep(level)/wake_up(tags) 流程"
+        ]
+      },
+      "message": "[Misc] Drop useless patch `is_cumem_allocator_available` (#13401)\n\n### What this PR does / why we need it?\nThis PR removes the `patch_camem_allocator` patch and its references\nsince it is no longer needed. It also updates the `.github/CODEOWNERS`\nfile by commenting out several paths and removing inactive maintainers.\nHowever, commenting out critical paths like `/vllm_ascend/patch`,\n`/vllm_ascend/worker`, `/vllm_ascend/core`, and\n`/vllm_ascend/spec_decode` leaves core components without code owners,\nwhich should be addressed by assigning them to active maintainers.\n\n### Does this PR introduce _any_ user-facing change?\nNo.\n\n### How was this patch tested?\nNot applicable (code owners and patch removal).\n- vLLM version: v0.26.0\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/d02df748bf9efd99022f1a062597dc3cb3808485\n\nSigned-off-by: wangxiyuan <wangxiyuan1007@gmail.com>"
+    },
+    {
+      "sha": "61221e9add8c717b304005bd9d48d6215d035be7",
+      "comment": "CI 自动翻译工作流生成的中文文档更新：同步 GLM5 和 Kimi-K2-Thinking 两个模型教程的最新英文改动。Kimi-K2-Thinking.po 变化较大——删除了与新版英文源不一致的旧翻译条目（如 HCCL_BUFFSIZE/参数说明列表、Table 2 旧版建议），新增约 190 条与最新英文章节对应的翻译（参数分类表、调优指南、FAQ 链接、Long Context/Low Latency/High Throughput 场景建议表格等），使中文文档与英文文档保持同步。GLM5.po 追加了第 5 章锚点引用和 max-model-len/max-num-seqs 设置注意项的翻译。纯翻译变更。",
+      "tags": [
+        "docs",
+        "low-risk",
+        "translation"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "纯中文翻译同步，不涉及任何代码或可测试行为。",
+        "suggested_test_areas": []
+      },
+      "message": "[Doc] Translated Doc files 2026-08-04 (#13450)\n\n## Auto-Translation Summary\n\nTranslated **2** file(s):\n\n-\n<code>/home/runner/_work/vllm-ascend/vllm-ascend/docs/source/locale/zh_CN/LC_MESSAGES/tutorials/models/GLM5.po</code>\n-\n<code>/home/runner/_work/vllm-ascend/vllm-ascend/docs/source/locale/zh_CN/LC_MESSAGES/tutorials/models/Kimi-K2-Thinking.po</code>\n\n---\n\n[Workflow\nrun](https://github.com/vllm-project/vllm-ascend/actions/runs/30874801328)\n- vLLM version: v0.26.0\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/0351e9aa1fdf1a51329d1906881528dfe61fc88e\n\nSigned-off-by: wangxiyuan <wangxiyuan@users.noreply.github.com>\nCo-authored-by: wangxiyuan <wangxiyuan@users.noreply.github.com>"
+    },
+    {
+      "sha": "7760996577a04ebdf000968ac9d0327bc008003b",
+      "comment": "全局文档术语标准化：将 torch-npu 统一改为 TorchNPU（README、README.zh、installation.md、quick_start.md、faqs.md、versioning_policy.md、release_notes.md、testing.md、report_template.md、agent skill 等 13 个文件），并将 'A5 硬件'/'A5 系列' 统一改为 'Ascend 950 Products'（release notes、kv_pool.md、EPLB 文档、agent skill）。这是产品官方命名对齐的纯文档清理。",
+      "tags": [
+        "docs",
+        "low-risk",
+        "terminology"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "纯术语替换，不影响任何代码路径或测试行为。",
+        "suggested_test_areas": []
+      },
+      "message": "[Doc][Misc] Standardize TorchNPU capitalization and update Ascend 950 product terminology (#13453)\n\n### What this PR does / why we need it?\nThis pull request standardizes the capitalization of `torch-npu` to\n`TorchNPU` across multiple documentation files, FAQs, installation\nguides, and release notes. It also updates references from \"A5 hardware\"\nor \"A5 series\" to \"Ascend 950 Products\" to align with official product\nterminology. No review comments were provided for this pull request.\n\n### Does this PR introduce _any_ user-facing change?\nNo, this PR only contains documentation-only updates.\n\n### How was this patch tested?\nNo functional testing is required as these are documentation-only\nchanges.\n\n\n- vLLM version: v0.26.0\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/0351e9aa1fdf1a51329d1906881528dfe61fc88e\n\nSigned-off-by: x60087760 <xiechangxiu3@h-partners.com>\nCo-authored-by: x60087760 <xiechangxiu3@h-partners.com>"
+    },
+    {
+      "sha": "6278a143ec430f057f4aaa3978ab73eec46dcbbc",
+      "comment": "CI 超时策略优化：(1) _selected_tests.yaml 的可复用 workflow 新增 timeout-minutes 输入参数（默认 120），使调用方可以按需调整选中测试任务的超时时间；(2) 覆盖率定时任务 schedule_test_coverage.yaml 将 timeout-minutes 设为 180（3 小时），因为精确测试覆盖率数据在 2 小时内可能无法生成完毕；(3) 定时触发时间从整点 9:00 改为 8:55，避免调度系统整点延迟触发问题。纯 CI 配置变更，不影响测试用例本身。",
+      "tags": [
+        "ci",
+        "chore",
+        "low-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "仅调整 CI 超时和调度时间，不影响测试用例内容；但覆盖率任务超时延长至 3 小时需要在 CI 资源上验证可行性。",
+        "suggested_test_areas": []
+      },
+      "message": "[CI]For precise test coverage data, the e2e execution time is limited to 3 hours (#13420)\n\n### What this PR does / why we need it?\nIf the coverage data of the precise test cannot be generated within 2\nhours, the E2E execution duration needs to be changed to 3 hours. The\nE2E PR restriction remains 2 hours.\nThe scheduled task triggers with a delay at the exact time, so it has\nbeen changed to a non-whole hour; it has been adjusted from 9:00 AM to\n8:55 AM.\n### Does this PR introduce _any_ user-facing change?\nno\n### How was this patch tested?\nFull coverage data can be collected.\n\n- vLLM version: v0.26.0\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/0351e9aa1fdf1a51329d1906881528dfe61fc88e\n\n---------\n\nSigned-off-by: shiqiangA <shiqiang15@huawei.com>"
+    },
+    {
+      "sha": "f9c2ecbd039db040e95656dde647a224b8427ef1",
+      "comment": "新增 Ascend 本地化的 compute_slot_mapping Triton kernel（vllm_ascend/ops/triton/compute_slot_mapping.py），替换 v1 block table 路径对上游 vllm/v1/worker/block_table.py 中 _compute_slot_mapping_kernel 的复用。三个核心优化：(1) 将 positions 从 int64 cast 到 int32，减少 Ascend NPU 上的标量计算量；(2) 修复非连续 block table 加载——通过 windowed load（BLOCK_TABLE_WINDOW_SIZE 窗口）配合 tl.gather 一次性加载到寄存器，避免逐元素 gather 导致的非连续访存；(3) TOTAL_CP_WORLD_SIZE=1 特化路径，消除 CP 分支的虚拟块/交错计算。最后一个 program 专职将 [num_tokens, max_num_tokens) 填充为 PAD_ID，兼容 CUDA graph 固定 shape。性能数据：小 batch（4 tokens/2 reqs）从 173.1μs 降到 3.02μs（5732%），大 batch（8192 tokens/256 reqs）从 1038.83μs 降到 21.2μs（4900%）。配套新增 4 个单元测试（3 组 CP 参数化 + 1 个大序列测试）和中文算子文档。对 v1 路径的 per-step 延迟有直接收益。",
+      "tags": [
+        "performance",
+        "medium-risk",
+        "ops",
+        "kv-cache",
+        "model-runner",
+        "triton"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "该 commit 已新增 test_compute_slot_mapping_v1.py（3 组 CP 参数化场景 + 1 个大序列场景），覆盖了单 CP、交错 CP、混合块和 padding 逻辑。但新 kernel 替换了上游通用实现在 v1 block table 路径中的使用，需要回归验证 vLLM v1 下既有 block table、KV cache 分配、CP（DCP/PCP）场景及 CUDA graph 捕获时的 slot mapping 正确性。",
+        "suggested_test_areas": [
+          "tests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_compute_slot_mapping_v1.py（新增）",
+          "vllm_ascend/worker/block_table.py 的 CP 与非 CP 路径回归",
+          "v1 attention 后端与 slot mapping 集成的 E2E 测试",
+          "CUDA graph/ACL graph 捕获场景下的 padding 行为验证"
+        ]
+      },
+      "message": "[Performance][Kernel]optimize compute_slot_mapping_kernel (#13048)\n\n### What this PR does / why we need it?\n\nThis PR optimizes the Ascend slot mapping Triton kernel in the v1 block\ntable path.\n\nThe previous path reused the generic upstream vLLM\n_compute_slot_mapping_kernel:\nhttps://github.com/vllm-project/vllm/blob/main/vllm/v1/worker/block_table.py,\nwhich can generate excessive scalar computation on Ascend NPUs due to\nint64 arithmetic, modulo operations, and non-contiguous block table\nloads.\n\nThis PR adds a local Ascend-optimized _compute_slot_mapping_kernel with\nthe following improvements:\n\n- cast pos from int64 to int32 to avoid scalar computation\n- fix non-contigious load for block table\n- special code path for case TOTAL_CP_WORLD_SIZE=1 which eliminates a\nlot of scalar computation\n\nperformance：\n| cases |  shape | time before opt | time after opt | gains |\n| --- | --- | --- | --- | --- |\n| 1 | num_tokens=4,num_reqs=2,CP=1,max_num_batched_tokens=8192 | 173.1 |\n3.02 | 5732% |\n| 2 |\nnum_tokens=32\\*256,num_reqs=256,CP=1,max_num_batched_tokens=32\\*256 |\n1038.83 | 21.2 | 4900% |\n\n### Does this PR introduce _any_ user-facing change?\nNo. This is an internal performance optimization for Ascend slot\nmapping.\n\n### How was this patch tested?\nnew tests added with CI passed\n\n- vLLM version: v0.26.0\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/0351e9aa1fdf1a51329d1906881528dfe61fc88e\n\nSigned-off-by: ckey_Dou <ckey.chengbin@huawei.com>\nCo-authored-by: ckey_Dou <ckey.chengbin@huawei.com>"
+    },
+    {
+      "sha": "b481d79c7de49ab285e61cec689172931c124429",
+      "comment": "W4A8-MXFP4 量化适配 ModelRunnerV2：将 AscendW4A8MXFPDynamicFusedMoEMethod.apply 中 moe_comm_method 的获取方式从 vLLM 的 get_forward_context().moe_comm_method 改为 vllm_ascend 的 _EXTRA_CTX.moe_comm_method。原因是 ModelRunnerV2 初始化时把 moe_comm_method 存储在 additional_kwargs 字典中，_EXTRA_CTX 通过 ctx.additional_kwargs.get(name) 访问该值，而 vLLM 的 get_forward_context() 在 MRV2 下不再提供该字段。配套新增 tests/ut/quantization/methods/test_w4a8_mxfp4.py 单元测试，覆盖 Linear 方法的 get_weight/get_pergroup_param/process_weights_after_loading（转置验证）/apply（prequantized 与 bf16 输入），以及 MoE 方法的 get_weight/get_dynamic_quant_param/process_weights（NZ 转置）/apply（fused_experts 调用验证）。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "quantization",
+        "model-runner"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "新增了 2 个测试类共 12 个用例覆盖 w4a8_mxfp4 的 Linear/MoE 方法，但需进一步验证 ModelRunnerV2 集成场景——确保 _EXTRA_CTX.moe_comm_method 在 MRV2 initialize 时已通过 additional_kwargs 正确注入，建议补充 MRV2 下 W4A8-MXFP4 模型的端到端或集成测试。",
+        "suggested_test_areas": [
+          "tests/ut/quantization/methods/test_w4a8_mxfp4.py（新增）",
+          "vllm_ascend/quantization/methods/w4a8_mxfp4.py",
+          "ModelRunnerV2 下 W4A8-MXFP4 量化模型的集成测试（moe_comm_method 注入链路）"
+        ]
+      },
+      "message": "[Feature][MRV2] w4a8_mxfp4 adapted for modelrunnerv2 (#13192)\n\n### What this PR does / why we need it?\nw4a8_mxfp4 adapted for modelrunnerv2.When `modelrunnerv2` is\ninitialized, `moe_comm_method` is stored in the `additional_kwargs`\ndictionary, and `_EXTRA_CTX` accesses it via\n`ctx.additional_kwargs.get(name)`.\n\n### Does this PR introduce _any_ user-facing change?\nno\n\n### How was this patch tested?\n\n\n- vLLM version: v0.26.0\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/d02df748bf9efd99022f1a062597dc3cb3808485\n\n---------\n\nSigned-off-by: pichangping <1337510399@qq.com>"
+    },
+    {
+      "sha": "498e511c2d76261a3d984ef1b6286c922b608989",
+      "comment": "该 commit 从 .github/workflows/_analyze_failure.yaml 中删除了 archive-failure-report-to-obs job（约 226 行），原因是 OBS 上传任务会卡住 CI。变更只影响 GitHub Actions 工作流，不触及任何 Python 运行时、Worker、ModelRunner 或测试代码。删除后 failure report 不再归档到华为 OBS，可能导致历史失败报告追溯能力下降，但这是为缓解 CI 稳定性问题而有意的取舍。风险极低。",
+      "tags": [
+        "ci",
+        "chore",
+        "low-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "纯 GitHub Actions workflow 删除，不改变 vllm-ascend 任何运行逻辑，也不影响单元测试或 E2E 测试，无需更新测试用例。",
+        "suggested_test_areas": []
+      },
+      "message": "[CI][BugFix]failure analysis workflow obs upload delete (#13436)\n\n### What this PR does / why we need it?\nDelete the OBS update job due to jamming CI problems\n\nSigned-off-by: Xuyzhen <958522639@qq.com>"
+    },
+    {
+      "sha": "c8f9064617af1c58beb1875dc7f39968db69a35c",
+      "comment": "该 commit 为 Model Runner V2 增加 FlashComm1（FC1）支持。实现上新增 vllm_ascend/worker/v2/sp_utils.py，提供 _flashcomm_enabled 判断（enable_sp 且 MoE 模型或 token 数超过阈值）以及 hidden_states/aux_hidden_states 的 all-gather 和去 padding 工具；NPUModelRunner.execute_model 通过 flashcomm_dispatch_wrapper 临时 monkey-patch 上游 vllm_model_runner.dispatch_cg_and_sync_dp，在 eager/graph 执行形状选择前将 num_tokens 向上取整到 TP size 的倍数，以满足 FlashComm1 reduce-scatter 的序列维对齐要求；执行完 super().execute_model 后在最后一个 PP rank 上对 SP hidden states 做 all-gather 并截掉 FlashComm1 padding。同时修改 ops/register_custom_ops.py 的 _maybe_pad_and_reduce_impl，改用 _EXTRA_CTX 读取 flash_comm_v1_enabled 和 is_draft_model，使 MRV1/MRV2 都能正确感知 additional_kwargs 中的 Ascend 上下文。风险点包括：monkey-patch 的是上游模块级函数，依赖 dispatch_cg_and_sync_dp 当前签名，上游接口变化会破坏该包装；execute_model_state 的 _replace 依赖上游 ExecuteModelState 内部字段；_EXTRA_CTX 在 MRV2 additional context 未正确填充时可能导致属性访问异常。整体功能验证较充分但属于对上游内部 API 的较强耦合。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "model-runner",
+        "distributed"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "该 PR 已自带 tests/ut/worker/test_model_runner_v2_flashcomm.py（padding、all-gather 去 padding、dense/MoE 阈值）和两卡 E2E 用例（DeepSeek-V2-Lite W8A8 + TP=2 + EP + FC1），覆盖了主要新增分支，无需额外新增测试。后续上游 GPUModelRunner 内部接口变化时需要同步调整 mock 目标与断言。",
+        "suggested_test_areas": [
+          "tests/ut/worker/test_model_runner_v2_flashcomm.py",
+          "tests/e2e/pull_request/two_card/test_flashcomm_distributed.py"
+        ]
+      },
+      "message": "[MRV2][Feature] Add FlashComm1 support to Model Runner V2 (#12992)\n\n### What this PR does / why we need it?\n\nThis PR adds FlashComm1 support to Model Runner V2 on Ascend.\n\nModel Runner V2 uses the new vLLM forward context, where Ascend-specific\nfields are stored in `additional_kwargs`. This PR uses `_EXTRA_CTX` to\ncorrectly access `flash_comm_v1_enabled` and other Ascend-specific\nfields across both Model Runner V1 and V2, ensuring that FlashComm1 uses\nreduce-scatter instead of falling back to all-reduce.\n\nIt also:\n\n- Pads the token count to a multiple of the tensor-parallel size before\neager/graph execution shape selection, as required by FlashComm1\nreduce-scatter.\n- Enables FlashComm1 for MoE models and for dense models above the\nexisting token threshold.\n- All-gathers sequence-parallel hidden states and auxiliary hidden\nstates on the last pipeline-parallel rank.\n- Removes FlashComm1 padding from gathered outputs before downstream\npost-processing.\n\n### Does this PR introduce *any* user-facing change?\n\nYes.\n\nUsers can now enable FlashComm1 when using Model Runner V2 on Ascend\nwith `VLLM_USE_V2_MODEL_RUNNER=1` and\n`additional_config={\"enable_flashcomm1\": true}`.\n\n### How was this patch tested?\n\n- Added unit tests covering:\n  - Token padding before execution shape selection.\n  - Hidden-state all-gather and removal of FlashComm1 padding.\n- FlashComm1 enablement for MoE models and the dense-model token\nthreshold.\n- Added a two-card E2E test for `vllm-ascend/DeepSeek-V2-Lite-W8A8` with\nModel Runner V2, TP=2, expert parallelism, and FlashComm1 enabled.\n- Manually verified Model Runner V2 with FlashComm1 for successful\ngeneration and output accuracy.\n\n\n- vLLM version: v0.26.0\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/d02df748bf9efd99022f1a062597dc3cb3808485\n\n---------\n\nSigned-off-by: jiaqi-lee <15316070896@163.com>"
+    },
+    {
+      "sha": "3271865c89886af31c14b1db83db98e164439cc8",
+      "comment": "该 commit 仅修改 docs/source/user_guide/support_matrix/supported_models.md 中 A2/A3 Pooling Models 支持矩阵表格，修复表头分隔线列数不匹配以及 Supported Hardware、W8A8、Doc 列对齐问题，使 Markdown 表格能正确渲染。这是纯文档变更，不影响任何运行逻辑、API 或测试行为。",
+      "tags": [
+        "docs",
+        "low-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "文档-only 变更，不涉及源码或测试逻辑，无需更新测试用例。",
+        "suggested_test_areas": []
+      },
+      "message": "[Doc] Fix table formatting (#13431)\n\n### What this PR does / why we need it?\nThis PR fixes the column alignment and separator line in the A2/A3\nPooling Models support matrix table to ensure proper rendering.\n\n### Does this PR introduce _any_ user-facing change?\nNo, this is a documentation-only update.\n\n### How was this patch tested?\nDocumentation-only change, verified visually.\n\n\n- vLLM version: v0.26.0\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/0351e9aa1fdf1a51329d1906881528dfe61fc88e\n\nSigned-off-by: herizhen <1270637059@qq.com>"
+    }
+  ],
+  "architecture_based_on_sha": "e04f251a5895969d1c1f4ac9a3807177a0c4769c",
+  "architecture_generated_at": "2026-08-01T20:25:03.693997+08:00"
+}

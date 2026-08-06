@@ -14,7 +14,7 @@ Daily commit monitor and AI analysis for [vllm](https://github.com/vllm-project/
 - **Patch Catalog Extraction** — Deterministic regex-based parsing of vllm-ascend's `patch/__init__.py`, producing structured JSON without LLM costs
 - **Search Index** — Keyword/tag/module index for fast cross-date search
 - **Adaptation Status Tracking** — Automatically tracks which vllm upstream commits need adaptation, with only two states: `pending` (needs work) and `adapted` (covered by baseline). Regenerated on every fetch+analyze cycle.
-- **MCP Server** — Stdio-based MCP server with 25 tools for AI agents to query the knowledge base. Supports progressive loading — agents can start with a lightweight overview and drill into specific modules as needed
+- **MCP Server** — Stdio-based MCP server with 27 tools for AI agents to query the knowledge base. Supports progressive loading — agents can start with a lightweight overview and drill into specific modules as needed
 - **Email Report** — Daily markdown report sent via SMTP with categorized commit summaries
 - **Static Web Dashboard** — Dark-themed monitor page with commit list, diff viewer, AI analysis overlay, and adaptation status filtering
 - **Data Lifecycle Management** — Stale data cleanup removes commit data without corresponding analysis
@@ -52,7 +52,7 @@ vllm-report/
 │       └── adaptation-status.json
 ├── src/
 │   ├── __init__.py
-│   ├── mcp_server_app.py             # MCP Server (stdio-based, 25 tools)
+│   ├── mcp_server_app.py             # MCP Server (stdio-based, 27 tools)
 │   ├── data/
 │   │   ├── __init__.py
 │   │   ├── _claude_client.py         # Claude Code CLI wrapper
@@ -303,7 +303,7 @@ See [docs/mcp-usage-guide.md](docs/mcp-usage-guide.md) for progressive loading p
 
 ## MCP Server Tools
 
-The MCP server (`src/mcp_server_app.py`) provides **25 tools** across four categories:
+The MCP server (`src/mcp_server_app.py`) provides **27 tools** across four categories plus an **experience/knowledge** category:
 
 **Architecture Analysis (10):**
 - `get_architecture_overview` — **[Progressive]** Return overview + modules list, use as first call
@@ -340,6 +340,10 @@ The MCP server (`src/mcp_server_app.py`) provides **25 tools** across four categ
 - `get_development_workflows` — Return development workflow templates
 - `get_testing_guide` — Return testing guide
 - `get_patch_catalog` — Return vllm-ascend patch catalog (filterable by category)
+
+**Experience / Lessons (2):** — practical adaptation knowledge auto-recorded from main2main runs (recurring E2E fix failures, new patterns)
+- `get_adaptation_lessons` — Retrieve recorded lessons by keywords/tags (symptom, root_cause, fix_guidance). **Call this before re-diagnosing an E2E failure** — a matching lesson fixes it in one pass.
+- `submit_lesson` — Record a lesson (used by main2main_flow automatically when a step needed E2E fix rounds; also callable by agents to persist new findings)
 
 See [docs/mcp-usage-guide.md](docs/mcp-usage-guide.md) for usage scenarios.
 

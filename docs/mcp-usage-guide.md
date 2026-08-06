@@ -148,6 +148,7 @@ Agent 内部：
 2. 从 arch.json 的 `knowledge_base.patch_catalog` 中找到对应的 patch
 3. 从 `knowledge_base.development_workflows` 中找到适配步骤
 4. 从 `cross_project_relationship.patch_impact_map` 确认影响范围
+5. 调用 `get_adaptation_lessons(keywords=[改动主题 / 相关错误])` 查询是否已有类似经验 —— 命中则直接参考 fix_guidance，避免踩已踩过的坑
 
 **输出示例：**
 
@@ -171,6 +172,25 @@ commit abc123 - refactor AttentionBackend.forward()
 4. 运行测试：pytest -sv tests/ut/attention/
 5. 适配状态由下一次 `track_adaptation.py init` 自动更新
 ```
+
+
+---
+
+## 场景三.5：E2E 修复失败（适配后测试不过）
+
+> 适配后 E2E 测试失败，**重新诊断前必须先查已沉淀的经验**
+
+```
+E2E 报错：AssertionError: Failed to apply prompt replacement for mm_items['image'][0]
+```
+
+Agent 内部（**顺序强制**）：
+1. **先**调用 `get_adaptation_lessons(keywords=["Failed to apply prompt replacement"])`
+   —— 命中则直接按返回的 `fix_guidance` 执行，不再从头诊断
+2. 未命中时再读 traceback 分析（注意 multi-path：cache / no-data 路径的修复与正常路径不同）
+3. 修好后若发现是"第一次修不对"的新陷阱，调用 `submit_lesson` 沉淀
+   （main2main_flow 也会在 step 需要 E2E 修复轮次时自动沉淀）
+
 
 ---
 
@@ -396,6 +416,15 @@ Ascend attention 测试：
 | `get_development_workflows` | ✅ | 开发工作流模板 |
 | `get_testing_guide` | ✅ | 测试命令和环境配置 |
 | `get_patch_catalog` | ❌ | vllm-ascend 所有 patch 的完整目录 |
+
+### 经验沉淀（2 个）
+
+> 实战适配经验（E2E 反复失败后修好的陷阱、新发现的模式），由 main2main_flow 在 step 需要 E2E 修复轮次时自动沉淀，也可由 agent 主动提交。
+
+| 工具 | 说明 |
+|------|------|
+| `get_adaptation_lessons` | 按 keywords/tags 检索已记录的经验（symptom / root_cause / fix_guidance）。**E2E 失败重新诊断前必须先调用**——命中则直接按经验修复，一次到位 |
+| `submit_lesson` | 提交一条经验（title/root_cause/fix_guidance 必填），追加到当日 lessons/<date>.json |
 
 ### 渐进式加载模式
 

@@ -767,6 +767,129 @@ async def tool_get_pending_adaptations() -> str:
     }, ensure_ascii=False, indent=2)
 
 
+def get_lessons_dir(data_dir: str) -> str:
+    """Directory holding adaptation-lesson files, one JSON per date."""
+    return os.path.join(data_dir, "vllm-ascend", "lessons")
+
+
+def load_all_lessons(data_dir: str) -> list[dict]:
+    """Load every lesson from lessons/<date>.json (newest date first)."""
+    lessons_dir = get_lessons_dir(data_dir)
+    if not os.path.isdir(lessons_dir):
+        return []
+    lessons: list[dict] = []
+    for fname in sorted(os.listdir(lessons_dir), reverse=True):
+        if not fname.endswith(".json"):
+            continue
+        fpath = os.path.join(lessons_dir, fname)
+        data = load_json(fpath)
+        if data and isinstance(data.get("lessons"), list):
+            lessons.extend(data["lessons"])
+    return lessons
+
+
+async def tool_get_adaptation_lessons(
+    keywords: Optional[list[str]] = None,
+    tags: Optional[list[str]] = None,
+    limit: int = 3,
+) -> str:
+    """获取适配经验（实战沉淀的知识）。按 keywords（子串匹配，忽略大小写）
+    和/或 tags 过滤；不传则返回最近的全部。命中会累计 hits 计数。"""
+    lessons = load_all_lessons(data_dir)
+    if not lessons:
+        return json.dumps({"match": False, "lessons": [], "hit_ids": []},
+                          ensure_ascii=False, indent=2)
+
+    kw = [k.lower() for k in (keywords or []) if k]
+    tags = [t.lower() for t in (tags or []) if t]
+
+    scored: list[tuple[int, dict]] = []
+    for lesson in lessons:
+        score = 0
+        haystack = json.dumps(lesson, ensure_ascii=False).lower()
+        if kw:
+            for k in kw:
+                if k in haystack:
+                    score += 2
+            if score == 0:
+                continue
+        if tags:
+            lesson_tags = [t.lower() for t in lesson.get("tags", [])]
+            tag_hits = sum(1 for t in tags if t in lesson_tags)
+            if tag_hits == 0:
+                continue
+            score += tag_hits
+        # Prefer lessons not yet validated (low hits) so fresh lessons surface.
+        score -= min(lesson.get("hits", 0), 5)
+        scored.append((score, lesson))
+
+    if not scored:
+        return json.dumps({"match": False, "lessons": [], "hit_ids": []},
+                          ensure_ascii=False, indent=2)
+
+    scored.sort(key=lambda x: -x[0])
+    top = scored[:max(1, limit)]
+    for _, lesson in top:
+        lesson["hits"] = lesson.get("hits", 0) + 1
+
+    return json.dumps({
+        "match": True,
+        "lessons": [
+            {k: v for k, v in l.items() if k != "hits"}
+            for _, l in top
+        ],
+        "hit_ids": [l["id"] for _, l in top],
+    }, ensure_ascii=False, indent=2)
+
+
+async def tool_submit_lesson(
+    title: str,
+    symptom: str,
+    root_cause: str,
+    fix_guidance: list[str],
+    tags: list[str],
+    keywords: Optional[list[str]] = None,
+    example: Optional[str] = None,
+) -> str:
+    """提交一条适配经验到 lessons/<date>.json。按当天文件追加，避免并发冲突。"""
+    if not title or not root_cause or not fix_guidance:
+        return json.dumps({"error": "title, root_cause and fix_guidance are required"},
+                          ensure_ascii=False)
+
+    today = datetime.now(TZ_CN).strftime("%Y-%m-%d")
+    lessons_dir = get_lessons_dir(data_dir)
+    os.makedirs(lessons_dir, exist_ok=True)
+    fpath = os.path.join(lessons_dir, f"{today}.json")
+
+    data = load_json(fpath) or {"date": today, "lessons": []}
+    existing = data.setdefault("lessons", [])
+
+    # id: L<YYYYMMDD>-NNN (increment within the day's file)
+    seq = len(existing) + 1
+    lesson = {
+        "id": f"L{today.replace('-', '')}-{seq:03d}",
+        "title": title,
+        "keywords": keywords or [],
+        "symptom": symptom,
+        "root_cause": root_cause,
+        "fix_guidance": fix_guidance,
+        "tags": tags,
+        "example": example,
+        "created_at": datetime.now(TZ_CN).isoformat(),
+        "hits": 0,
+    }
+    if example:
+        lesson["example"] = example
+    existing.append(lesson)
+    save_json_atomic(fpath, data)
+
+    return json.dumps({
+        "status": "submitted",
+        "id": lesson["id"],
+        "file": os.path.relpath(fpath, data_dir),
+    }, ensure_ascii=False, indent=2)
+
+
 async def tool_update_adaptation_status(sha: str, status: str, notes: Optional[str] = None) -> str:
     """更新某个 commit 的适配状态（仅支持 pending → adapted）"""
     valid_statuses = ["pending", "adapted"]
@@ -1423,6 +1546,70 @@ TOOLS = [
             "required": ["repo", "sha"],
         },
     ),
+    Tool(
+        name="get_adaptation_lessons",
+        description="获取适配经验（实战沉淀的知识）。按 keywords（子串匹配）和/或 tags 过滤；返回最相关的几条含 symptom/root_cause/fix_guidance。适配或修复前先查这里，命中则直接按经验执行。",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "keywords": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "检索关键词（错误消息、主题词等，子串匹配忽略大小写）",
+                },
+                "tags": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "分类标签过滤（multimodal / cache-path / attention / worker / e2e-fix 等）",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "返回条数（默认 3）",
+                },
+            },
+        },
+    ),
+    Tool(
+        name="submit_lesson",
+        description="提交一条适配经验到 lessons 库（实战沉淀：E2E 反复失败后修好的陷阱、新发现的适配模式）。title/root_cause/fix_guidance 必填。",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "title": {
+                    "type": "string",
+                    "description": "经验的一句话标题",
+                },
+                "symptom": {
+                    "type": "string",
+                    "description": "现象（什么情况下触发）",
+                },
+                "root_cause": {
+                    "type": "string",
+                    "description": "根因",
+                },
+                "fix_guidance": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "修复步骤（可执行的操作列表）",
+                },
+                "tags": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "分类标签（multimodal / cache-path / attention / worker / e2e-fix 等）",
+                },
+                "keywords": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "检索关键词（错误消息关键字，供 get_adaptation_lessons 匹配）",
+                },
+                "example": {
+                    "type": "string",
+                    "description": "具体案例（可选）",
+                },
+            },
+            "required": ["title", "symptom", "root_cause", "fix_guidance", "tags"],
+        },
+    ),
 ]
 
 
@@ -1504,6 +1691,14 @@ async def handle_call_tool(ctx, params: CallToolRequestParams) -> CallToolResult
             result = await tool_get_adaptation_roadmap(args["repo"], args["sha_from"], args["sha_to"])
         elif name == "get_commit_arch_delta":
             result = await tool_get_commit_arch_delta(args["repo"], args["sha"])
+        elif name == "get_adaptation_lessons":
+            result = await tool_get_adaptation_lessons(
+                args.get("keywords"), args.get("tags"), args.get("limit", 3))
+        elif name == "submit_lesson":
+            result = await tool_submit_lesson(
+                args["title"], args.get("symptom", ""), args["root_cause"],
+                args["fix_guidance"], args["tags"], args.get("keywords"),
+                args.get("example"))
         else:
             result = json.dumps({"error": f"Unknown tool: {name}"})
     except Exception as e:

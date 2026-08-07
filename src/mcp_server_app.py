@@ -35,6 +35,7 @@ opencode config (~/.config/opencode/opencode.jsonc):
 import argparse
 import json
 import os
+import subprocess
 import sys
 from datetime import datetime, timezone, timedelta
 from typing import Any, Optional
@@ -842,6 +843,60 @@ async def tool_get_adaptation_lessons(
     }, ensure_ascii=False, indent=2)
 
 
+def _persist_lesson_to_remote() -> str:
+    """Commit + push the lessons change to the remote (best-effort).
+
+    The MCP server usually runs from a short-lived clone (e.g. the main2main
+    flow re-creates its vllm-report clone every run), so a lesson that is
+    only saved locally would be lost.  Commit with an explicit identity (the
+    fresh clone has none — a bare ``git commit`` fails with "Author identity
+    unknown") and push with a token-embedded URL when ``GH_TOKEN`` /
+    ``GITHUB_TOKEN`` is set: CI runners route github.com through an
+    anonymous-fetch proxy that requires the token in the URL for push.
+    Falls back to the plain ``origin`` push locally (credential helper).
+
+    Returns "" on success, else an error description.
+    """
+    repo_root = os.path.dirname(os.path.abspath(data_dir))
+
+    def _run(*args: str) -> subprocess.CompletedProcess:
+        return subprocess.run(["git", *args], cwd=repo_root,
+                              capture_output=True, text=True)
+
+    try:
+        r = _run("status", "--short")
+        if r.returncode != 0 or not r.stdout.strip():
+            return ""  # nothing to commit
+        identity = ("-c", "user.name=vllm-report-bot",
+                    "-c", "user.email=vllm-report-bot@users.noreply.github.com")
+        r = _run("add", "-A")
+        if r.returncode != 0:
+            return f"git add failed: {r.stderr.strip()[:200]}"
+        msg = f"lessons: {datetime.now(TZ_CN).strftime('%Y-%m-%d %H:%M')} auto-recorded"
+        r = _run(*identity, "commit", "-m", msg)
+        if r.returncode != 0:
+            return f"git commit failed: {r.stderr.strip()[:200]}"
+        token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN") or ""
+        targets: list[str] = []
+        if token:
+            targets.append(
+                "https://x-access-token:{token}@gh-proxy.test.osinfra.cn/"
+                "https://github.com/vllm-ascend/vllm-report.git".format(token=token))
+            targets.append(
+                "https://x-access-token:{token}@github.com/"
+                "vllm-ascend/vllm-report.git".format(token=token))
+        targets.append("origin")
+        last_err = ""
+        for target in targets:
+            r = _run("push", target, "main")
+            if r.returncode == 0:
+                return ""
+            last_err = r.stderr.strip()[:300]
+        return f"git push failed: {last_err}"
+    except FileNotFoundError:
+        return "git not available"
+
+
 async def tool_submit_lesson(
     title: str,
     symptom: str,
@@ -851,7 +906,12 @@ async def tool_submit_lesson(
     keywords: Optional[list[str]] = None,
     example: Optional[str] = None,
 ) -> str:
-    """提交一条适配经验到 lessons/<date>.json。按当天文件追加，避免并发冲突。"""
+    """提交一条适配经验到 lessons/<date>.json。按当天文件追加，避免并发冲突。
+
+    写文件后自动 commit + push 到远端（见 _persist_lesson_to_remote），
+    这样调用方（如 main2main flow 的短生命周期 clone）提交的经验能立即
+    固化到仓库，而不是随 clone 销毁而丢失。
+    """
     if not title or not root_cause or not fix_guidance:
         return json.dumps({"error": "title, root_cause and fix_guidance are required"},
                           ensure_ascii=False)
@@ -883,11 +943,15 @@ async def tool_submit_lesson(
     existing.append(lesson)
     save_json_atomic(fpath, data)
 
-    return json.dumps({
+    persist_err = _persist_lesson_to_remote()
+    resp = {
         "status": "submitted",
         "id": lesson["id"],
         "file": os.path.relpath(fpath, data_dir),
-    }, ensure_ascii=False, indent=2)
+    }
+    if persist_err:
+        resp["persist_warning"] = persist_err
+    return json.dumps(resp, ensure_ascii=False, indent=2)
 
 
 async def tool_update_adaptation_status(sha: str, status: str, notes: Optional[str] = None) -> str:

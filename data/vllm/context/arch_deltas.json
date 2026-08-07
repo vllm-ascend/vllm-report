@@ -841,6 +841,162 @@
       "interface_changes": "修复无权重（weightless）RMSNorm 融合时错误使用模型 hidden_size 的问题。RMSNormFuser 原先在 norm 无 weight 参数时回退到 model_config.get_hidden_size()，这在 norm 作用于子维度（如 Llama 4 的 qk_norm 在 head_dim 上归一化）时会给融合后的 norm 一个错误宽度，导致 TP 模式下 TPAwareNorm 的 gather 检查拒绝输入。修复后 weightless norm 的 hidden_size 取 0（表示未声明宽度），融合后的 norm 直接在其实际输入宽度上归一化，与未融合行为及 vLLM 原生 RMSNorm(hidden_size=head_dim) 一致。测试新增 weightless norm 在 TP=2 仿真下的等价性验证，并把原有测试改为使用 default_vllm_config fixture。风险低，不影响带 weight 的 norm 路径。",
       "change_summary": "fix: fuse weightless RMSNorms at their declared width (#50867)",
       "ascend_impact": false
+    },
+    "2fa490470ddf0fe578f7b70cd3aa8f6c1e06b2c6": {
+      "date": "2026-08-06",
+      "affected_modules": [
+        "ascend_affected"
+      ],
+      "affected_interfaces": [
+        "ascend_affected"
+      ],
+      "interface_changes": "引入 mm_device_do_normalize 多模态预处理优化：新增配置字段（默认 None，经 ModelConfig._resolve_mm_device_do_normalize 解析后对支持的模型默认开启），MultiModalConfig 在开启时强制 HF processor 跳过 do_normalize/do_rescale，使原始像素以 uint8 一路传到设备端，由新增的 FusedInputNorm（frozen BatchNorm1d，把 rescale_factor 折入 mean/std）在 GPU 上完成归一化，减半 PCIe 传输量。Qwen2-VL 与 Qwen2.5-VL 声明支持并接入，registry _ModelInfo 与 SupportsMultiModal 协议新增 supports_mm_device_do_normalize 标志，processor.py 重构出 get_processor_config。该改动改变多模态数据 pipeline 语义并影响配置哈希，需关注设备端 batch_norm 与 CPU 归一化的数值一致",
+      "change_summary": "[Model] Fused mm preprocess normalisation on the Device (#50411)",
+      "ascend_impact": false
+    },
+    "537046164944cbd34ac940d8655f91704e5a0bf1": {
+      "date": "2026-08-06",
+      "affected_modules": [
+        "ascend_affected"
+      ],
+      "affected_interfaces": [
+        "ascend_affected"
+      ],
+      "interface_changes": "修复 hybrid prefix caching 与 hidden-state extraction 组合时的 block size 对齐问题。get_kv_cache_groups 在将 hidden-state 层加回分组时，原逻辑用 max(common_page // per_token, 1) 计算 block size，可能不整除主 group 的 block size，破坏 prefix cache 的页对齐粒度。修复后先取所有 group block_size 的 gcd 作为 group_block_size，再用新增的 _largest_divisor_at_most 选择不超过 max_block_size 的最大整除值，并记录每块浪费字节的日志。新增测试验证 hidden state group 的 block size 被正确 resolve 为 136（而非 544）。属于共享 KV cache 核心逻辑，行为改进且向后兼容。",
+      "change_summary": "[BugFix][KV Cache] Fix hybrid prefix caching with hidden-state extraction (#51108)",
+      "ascend_impact": false
+    },
+    "c0202c560333e8e475819a93a7cc00d9b2a115db": {
+      "date": "2026-08-06",
+      "affected_modules": [
+        "ascend_affected"
+      ],
+      "affected_interfaces": [
+        "ascend_affected"
+      ],
+      "interface_changes": "让 draft_model 推测解码默认启用 async scheduling。VllmConfig.__post_init__ 中的警告条件增加 `draft_model` 排除项（与 dspark 并列），使 draft_model 不再触发 async scheduling 相关警告且默认开启 async_scheduling。删除 e2e 测试中全部 xfail 标记和自定义 AsyncSchedulingNotEnabledError，新增 test_draft_model_enables_async_scheduling_by_default 验证配置默认值。这是对 issue #38929 的收敛修复。",
+      "change_summary": "[Bugfix][Spec Decode] Auto-enable async scheduling for draft models (#48341)",
+      "ascend_impact": false
+    },
+    "81bc196913653c9e06b957e39a606002a09db171": {
+      "date": "2026-08-06",
+      "affected_modules": [
+        "ascend_affected"
+      ],
+      "affected_interfaces": [
+        "ascend_affected"
+      ],
+      "interface_changes": "Model Runner V2 的推测解码正确性/内存优化：draft logits 缓存从「应用温度后的 float32」改为「应用温度前的 LM head dtype」。gumbel_sample Triton 内核现在先缓存原始 logits（保持 bit-exact），再应用温度；rejection sampler 各内核在加载 draft logits 时再除以温度。这样避免温度除法后在 bf16/fp16 下无法表示而导致验证分布与 draft 实际采样分布不一致的问题。DraftModelSpeculator.draft_logits 从 float32 改为 head_dtype 以节省显存，DSpark 调用点同步更新。测试覆盖 bf16/fp32 的分布一致性、缓存值 bitwise 对比及 per-token column 模式。风险：gumbel_sample 关键字参数重命名（output_processed_logits→logits_cache）且语义变化，任何 OOT 调用方（含 vllm-ascend spec decode）需同步。",
+      "change_summary": "[Model Runner V2] Cache draft logits in model's LM head dtype (#50910)",
+      "ascend_impact": true
+    },
+    "b50fdebce0698c1f2d57ba7ff94211323655557e": {
+      "date": "2026-08-06",
+      "affected_modules": [
+        "ascend_affected"
+      ],
+      "affected_interfaces": [
+        "ascend_affected"
+      ],
+      "interface_changes": "修复 enable_lora=True 时 level-2 sleep/wake/reload 的权重恢复问题。LoRA 包装会把参数移到 base_layer 下并新增 LoRA stacked tensors（普通属性，不参与 named_parameters），旧的 reload_weights 按 checkpoint 名直接 get_parameter 会失败或恢复不完整。修复方案：(1) BaseLayerWithLoRA 新增 load_weights 委托到 base_layer 或 AutoWeightsLoader；(2) GPUModelRunner.reload_weights 在 LoRA 开启时把 xxx.base_layer.yyy 归一化为 xxx.yyy，通过 _get_parameter_for_reload 解析到被包装参数；(3) 新增 LoRAModelRunnerMixin.reset_lora_state()，reload 后清理 lora_manager 适配器状态并恢复 LogitsProcessorWithLoRA 的 TP 分片映射",
+      "change_summary": "[Bugfix] Fix level-2 sleep/wake/reload with enable_lora=True (#39935)",
+      "ascend_impact": true
+    },
+    "8cfa01cdd2357b4137f06c605e11634bef7cf8ba": {
+      "date": "2026-08-06",
+      "affected_modules": [
+        "ascend_affected"
+      ],
+      "affected_interfaces": [
+        "ascend_affected"
+      ],
+      "interface_changes": "修复多节点 dense（非 MoE）模型独立 DP rank 重配置的 bug。原 EngineCoreProc/EngineCoreActor 对非 MoE DP rank 只重置 data_parallel_size/local/rank，没有按 DP 组内的 nnodes/node_rank 调整 nnodes 和 node_rank，导致多节点 dense DP 在独立 rank 上错误使用全局节点信息。新增 ParallelConfig.reconfigure_for_independent_dp_rank() 统一处理并补充回归测试。纯共享逻辑 bugfix，不影响接口签名。",
+      "change_summary": "[BugFix] Dense multinode DP rescope with regression test (#49212)",
+      "ascend_impact": true
+    },
+    "7c77868cdf57c3f711ba971fa68d421b5b39a9c4": {
+      "date": "2026-08-06",
+      "affected_modules": [
+        "ascend_affected"
+      ],
+      "affected_interfaces": [
+        "ascend_affected"
+      ],
+      "interface_changes": "修复非 gated MoE（is_act_and_mul=False，即 MoE 未融合 gate/up）时 w13 权重按固定 2 个 shard 分配/迭代的错误。新增 FusedMoEConfig.w13_num_shards 属性（gated=2，非 gated=1），将 AutoAWQ、AutoGPTQ、BitsAndBytes、CompressedTensors（W4A4/W4A8/W8A8）、FP8、Humming、INC、MoeWNA16、MXFP4、Quark、OnlineMoE 等量化方法的 w13 尺寸从 2 * intermediate_size_per_partition 改为 w13_num_shards * intermediate_size_per_partition；FP8 per-tensor scale 维度与 online/fp8 的 padding 清零逻辑也按 shard 循环调整。风险：所有调用方（含 OOT 量化方法/测试 mock）的 moe 对象需具备 w13_num_shards 属性；权重 shape 变化影响 checkpoin",
+      "change_summary": "[Bugfix] Size and iterate w13 by shard count for non-gated MoE (#51125)",
+      "ascend_impact": false
+    },
+    "811622c410c2f1baf2fa7056ca19753264b95815": {
+      "date": "2026-08-06",
+      "affected_modules": [
+        "ascend_affected"
+      ],
+      "affected_interfaces": [
+        "ascend_affected"
+      ],
+      "interface_changes": "让 PCPManager 构造可扩展：GPUModelRunner 新增 pcp_manager_cls property（默认返回 pcp.PCPManager），maybe_build_pcp_manager 新增 cls: type[PCPManager] = PCPManager 参数，并在 validate_config 与构造时使用该 cls。这样 OOT 平台 runner 可以通过覆写属性注入自定义 PCP 管理器，无需修改上游逻辑。纯增量重构，向后兼容（默认参数保持原行为）。",
+      "change_summary": "[Refactor][PCP] Make PCPManager construction extensible (#50066)",
+      "ascend_impact": false
+    },
+    "b30291cf0c9a15898589f0347906bad07f3b538b": {
+      "date": "2026-08-06",
+      "affected_modules": [
+        "ascend_affected"
+      ],
+      "affected_interfaces": [
+        "ascend_affected"
+      ],
+      "interface_changes": "EPD（Encode-Prefill-Decode）分解部署优化：消除 decoder 侧重复的多模态图像预处理，并支持把 HF 多模态处理器放到加速器上执行。核心变化：(1) ECTransferConfig 增加 is_encode_only；(2) MultiModalConfig 增加 mm_processor_device 折叠/校验、mm_embeds_from_ec_connector 派生字段，VllmConfig.__post_init__ 新增三个解析/校验步骤；(3) 新增 --mm-processor-device CLI 参数；(4) MultiModalDataParser 引入 embedding_fields 角色机制（values/metadata），EC consumer 可省略 embedding 张量（由 EC connector 提供），Qwen2VL/MiniCPMV/Keye/HunyuanVL/LlavaOnevision2 等 parser 声明 embedding_fields；(5) 例程 disagg_epd_proxy.py 把",
+      "change_summary": "[EPD] Remove duplicate image preprocessing in EPD and enable preprocess on GPU (#50390)",
+      "ascend_impact": false
+    },
+    "373fe8b83ee772d27b1a5b2b908618a1a414bb11": {
+      "date": "2026-08-06",
+      "affected_modules": [
+        "ascend_affected"
+      ],
+      "affected_interfaces": [
+        "ascend_affected"
+      ],
+      "interface_changes": "大规模 MoE 遗留代码清理：移除旧式 modular kernel 初始化路径。删除 DeviceCommunicatorBase/GroupCoordinator/模块级 prepare_communication_buffer_for_model（模型无关的通信 buffer 预留在新架构中不再需要，quant method 直接持有 ModularKernel）；删除 FusedMoEMethodBase.maybe_make_prepare_finalize/select_gemm_impl、FusedMoEModularMethod.make、MoERunner.maybe_init_modular_kernel 及 MoERunnerInterface 上的抽象方法；GPUModelRunner（V1/V2）load_model 不再调用 prepare_communication_buffer_for_model；FusedMoEWithLoRA 旧路径直接 RuntimeError；ElasticEP 移除 prepare_new_worker。风险：破坏性清理——依",
+      "change_summary": "[MoE Refactor] Remove MoE legacy code (#51078)",
+      "ascend_impact": false
+    },
+    "8f158d0ee2475c64f66ee9ebd55a3606209db92f": {
+      "date": "2026-08-06",
+      "affected_modules": [
+        "ascend_affected"
+      ],
+      "affected_interfaces": [
+        "ascend_affected"
+      ],
+      "interface_changes": "MoE 激活函数支持元数据共享重构：新增 ApplyMoEActivationConfig dataclass（clamp_limit/alpha/beta/activation_situ_beta/activation_situ_linear_beta），由 FusedMoEConfig + FusedMoEQuantConfig 在 FusedMoEExperts 基类构造时统一生成 self.activation_config；apply_moe_activation 签名从多个散落 kwarg 收敛为单个 activation_config；新增 apply_moe_activation_supported() 作为唯一支持矩阵，Cutlass/Marlin/Triton/Humming/MXFP8 等专家类的 _supports_activation 全部改为引用该函数；marlin/cutlass run 函数透传 activation_config。风险：apply_moe_activation 是公开函数，签名变化会破坏所有按旧 kwarg 调用的 OOT 代码；各专家",
+      "change_summary": "[MoE] Share apply_moe_activation support metadata (#44359)",
+      "ascend_impact": false
+    },
+    "23c0f337b7c25508fce2b98cbf655bdc8cf166b4": {
+      "date": "2026-08-06",
+      "affected_modules": [
+        "ascend_affected"
+      ],
+      "affected_interfaces": [
+        "ascend_affected"
+      ],
+      "interface_changes": "修复 resolve_kv_cache_block_sizes 中 MambaSpec 的 block size 可除性判断。原条件比较 `g.kv_cache_spec.block_size != cache_config.block_size`；当非 align 模式的 Mamba cache 恰好使用与 cache_config.block_size 相同的 block_size 时，会错误地跳过回退，导致后续 'Each KV cache group's real block_size must be divisible by h_block_size' 断言失败。改为直接检查 `g.kv_cache_spec.mamba_cache_mode != 'align'`，使回退逻辑与 align 模式的实际语义（block size 对齐到 cache_config.block_size）一致。此变更影响 hybrid KV cache（含 Mamba/SSM/GDN 层）的 block size 解析路径，属于核心调度/KV cache 逻辑的小型修复。",
+      "change_summary": "[CI bug] Fix `Each KV cache group's real block_size must be divisible by has h_block_size` (#51180)",
+      "ascend_impact": false
+    },
+    "d4da0c55af3aa231b6209bf77871f3ed36eab0d2": {
+      "date": "2026-08-06",
+      "affected_modules": [
+        "ascend_affected"
+      ],
+      "affected_interfaces": [
+        "ascend_affected"
+      ],
+      "interface_changes": "大型功能提交：为 Ling 3.0 Flash 引入 BailingMoeV3ForCausalLM 完整支持，架构为 MLA 全注意力层 + Kimi Delta Attention（KDA）线性注意力层 + Bailing MoE 的混合模型。主要实现：(1) bailing_moe_v3.py 定义门控 MLA（fused_qkv_a_proj/q_b_proj/kv_b_proj/g_proj，支持 head-wise/element-wise gate）、KDA 层（fused qkvb_proj、causal_conv1d、chunk_kda/fused_recurrent_kda 内核、dt_bias/A_log 等）、sigmoid scoring + expert_bias 的门控 MoE（分组 top-k）；(2) 通过 direct_register_custom_op 注册 vllm::bailing_v3_kda_attention 自定义算子，将 KDA 状态更新置于编译图外（no_compile_layers）执行，并注册为 splitting_op；(3",
+      "change_summary": "[Model][Frontend] Add Ling 3.0 Flash BF16, MTP, and parser support (#51045)",
+      "ascend_impact": false
     }
   }
 }

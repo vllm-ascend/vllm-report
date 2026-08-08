@@ -1,0 +1,139 @@
+{
+  "date": "2026-08-08",
+  "repo": "vllm-project/vllm-ascend",
+  "generated_at": "2026-08-09T03:00:19.687415+08:00",
+  "daily_summary": "当日变更聚焦于三方面：(1) 多节点 e2e 测试与文档中的环境变量体系调整，用 ASCEND_ENABLE_USE_FABRIC_MEM / HCCL_INTRA_ROCE_ENABLE 替换已废弃的 ASCEND_BUFFER_POOL，并在 DeepSeek-V3.1T 等 A3 HCCS 场景下改用 fabric memory 路径；(2) 量化模块去旧迎新，移除已淘汰的 W4A8 Linear 与 W8A8 PDMix MoE 方案，W4A8 MoE 收敛为仅支持 per-channel 权重格式；(3) fused MoE 运行时契约简化，移除 FusedMoEResult 数据类、log2phy 在 builder 侧的冗余管道与 zero-experts 逻辑，将 shared expert 的 SwiGLU 参数上移到 AscendSharedExperts。另有 Qwen-VL-Dense 文档更新和 GLM-5.2 DSpark 验收测试的临时跳过。整体属于重构与清理为主、无新功能的日常迭代。",
+  "test_impact_summary": "当日变更对测试看护影响显著：量化方案删除后，a2 目录下 487 行 W4A8 Linear/MoE 单测被整体移除并重建为纯 MoE 单测，同时 e2e 模型列表、示例与 nightly 配置全部切换为 per-channel W4A8 权重，需持续关注新权重的正确性与性能回归；fused MoE 契约变更同步修改了 3 个测试文件的 mock 数据结构（FusedMoEResult→(routed_out, FusedMoEEvents) 元组），说明相关单测已随代码更新，但建议补充覆盖 shared expert 事件流与 log2phy 迁移后路由路径的集成断言；环境变量替换涉及约 31 个文件，需在 CI 与多节点周级测试中验证 fabric memory 路径的兼容性；GLM-5.2 DSpark 测试因 checkpoint 缺少 confidence_head 被临时跳过，存在失去看护的窗口，需尽快在模型侧修复后恢复。",
+  "commits": [
+    {
+      "sha": "d2e818f572299c93f1f7f3b2aed05b615f58b527",
+      "comment": "将 5 个 DeepSeek-V3.1T 外部 DP 多节点测试配置中的 HCCL_INTRA_ROCE_ENABLE 替换为 ASCEND_ENABLE_USE_FABRIC_MEM。这些配置对应 A3 HCCS 场景（npu_per_node: 16），应启用 fabric memory 统一寻址直传路径；而 HCCL_INTRA_ROCE_ENABLE 仅适用于 RoCE 部署路径。变更与 f82d49c8 中 ASCEND_BUFFER_POOL 的日落方向一致，是对该替换的后续修正——在 A3 HCCS 场景下不应使用 RoCE 环境变量。仅涉及 YAML 测试配置，无生产代码影响，风险极低。",
+      "tags": [
+        "test",
+        "chore",
+        "low-risk",
+        "e2e-config",
+        "hcom"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "变更本身即测试配置修正，5 个 YAML 已同步替换。需在周级多节点 e2e 中观察 A3 HCCS 场景下 fabric memory 路径的稳定性和性能，但无需为此新增额外测试代码。",
+        "suggested_test_areas": [
+          "tests/e2e/weekly/multi_node/external_dp/config/DeepSeek_V3.1T_MTP1_128K_1K_PD.yaml",
+          "tests/e2e/weekly/multi_node/external_dp/config/DeepSeek_V3.1T_MTP1_3_5K_1_5K_PD.yaml",
+          "tests/e2e/weekly/multi_node/external_dp/config/DeepSeek_V3.1T_MTP1_PD.yaml",
+          "tests/e2e/weekly/multi_node/external_dp/config/DeepSeek_V3.1T_MTP3_PD.yaml",
+          "tests/e2e/weekly/multi_node/external_dp/config/DeepSeek_V3.1T_layerwise_PD.yaml"
+        ]
+      },
+      "message": "[Test][Misc] Replace HCCL_INTRA_ROCE_ENABLE with ASCEND_ENABLE_USE_FABRIC_MEM in DeepSeek-V3.1T configs (#13857)\n\n### What this PR does / why we need it?\n\nThis PR replaces the `HCCL_INTRA_ROCE_ENABLE` environment variable with\n`ASCEND_ENABLE_USE_FABRIC_MEM` in 5 DeepSeek-V3.1T YAML configurations.\nThese configurations represent A3 HCCS scenarios (`npu_per_node: 16`)\nwhich should utilize the fabric memory path for optimal performance.\n\n### Does this PR introduce _any_ user-facing change?\n\nNo.\n\n### How was this patch tested?\n\nTested via existing E2E weekly multi-node tests.\n\n- vLLM version: v0.26.0\n\n- vLLM main: vllm-project/vllm@0351e9a\n\nSigned-off-by: lizy124 <1950471827@qq.com>"
+    },
+    {
+      "sha": "efda0446db94fcfc57682d02dee3276fa8dea31e",
+      "comment": "量化方案的大规模清理与重构。移除了 AscendW4A8DynamicLinearMethod（W4A8 Linear）和 AscendW8A8PDMixFusedMoeMethod（W8A8 PDMix MoE），理由是该临时方案无演进计划、性能差且维护成本高。AscendW4A8DynamicFusedMoEMethod 被大幅简化：仅支持 per-channel 权重（group_size>0 时直接抛 ValueError），删除旧版 quant_version != \"1.0.0\" 的两步量化和 per-group scale_second 支持，将 pack/scale 处理收敛为 _pack_to_int32、_process_scale、_pack_int4_to_int8 三个辅助方法。COMPRESSED_TENSORS_METHOD 路径也同步收敛为 per-channel。同时更新了 docs、示例脚本中的量化配置（strategy: channel）、模型列表和测试。注意 build_weight 中 COMPRESSED_TENSORS_METHOD 仍返回 [E, 2*IN, H] 的未打包 int8 weight，而 modelslim 返回 [E, IN, H] 的已打包格式，两者的下游处理分支（compressed_tensors 多一步 _pack_int4_to_int8）保持区分，逻辑正确。潜在影响是依赖旧 W4A8 权重格式的存量用户需要重新量化模型。",
+      "tags": [
+        "refactor",
+        "quantization",
+        "medium-risk",
+        "w4a8",
+        "moe"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "已同步更新测试：删除了 tests/ut/quantization/methods/a2/test_w4a8.py（487 行线性+MoE 混合测试），新建 tests/ut/quantization/methods/test_w4a8.py 仅覆盖 MoE 路径，并新增 per-group 拒绝测试；test_w8a8_pdmix.py 也删除了 MoE 部分。但仍需关注：模型数据集列表从 Qwen3-30B-A3B-Instruct-2507-quantized.w4a8 切换到 Qwen3-30B-A3B-quantized.w4a8，nightly e2e 的模型权重已更换，需要确认新权重可用性和精度基线。",
+        "suggested_test_areas": [
+          "tests/ut/quantization/methods/test_w4a8.py",
+          "tests/ut/quantization/methods/test_w8a8_pdmix.py",
+          "tests/e2e/nightly/single_node/models/configs/Qwen3-30B-A3B-W4A8-llm-compressor.yaml",
+          ".github/workflows/misc/model_dataset_list.json",
+          "examples/quantization/llm-compressor/w4a8_dynamic_moe.py"
+        ]
+      },
+      "message": "[Refactor][quantization]Remove deprecated W4A8Linear/W8A8PDMixMoE schemes and sync W4A8 MoE refactor (#13713)\n\n### What this PR does / why we need it?\n\n- Part of https://github.com/vllm-project/vllm-ascend/issues/13318\n\nSome quantization modes are sunset in this PR, including\n\n- W4A8 Linear\n- W4A8 Per-Group MoE(2 weight formats)\n- W8A8 PDMix MoE\n\nThe reasons are as follows:\n- It was a temporary solution and will not have any new evolution plan\nin the future.\n-    The performance is poor, and there are better alternatives.\n- The application scope is small, and the maintenance difficulty is\nincreased.\n\n### Does this PR introduce _any_ user-facing change?\n\nno\n\n### How was this patch tested?\n\n\n- vLLM version: v0.26.0\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/0351e9aa1fdf1a51329d1906881528dfe61fc88e\n\n---------\n\nSigned-off-by: wangkunpeng <1289706727@qq.com>"
+    },
+    {
+      "sha": "1a0e6a7921d690ed19f49844c9e3259d2855841d",
+      "comment": "Qwen-VL-Dense 教程文档更新。标题从 Qwen3-VL-2B/4B/8B/32B 改为 8B/32B，移除了 2B/4B 的部署说明（可能不再推荐或不受支持），新增 Ascend950DT 系列（96G×8 节点）的 docker 启动与 vLLM serve 命令，补充了 w8a8-mxfp8 量化权重下载链接，并为 A2/A3/300I DUO 场景补充了完整的环境变量与性能相关参数（如 --async-scheduling、--mm-processor-cache-gb 0、compilation-config 等）。部分命令中存在 --dtype 重复（Atlas 300I DUO 段先 --dtype float16 后又 --dtype bfloat16），以及 ASCEND950DT 段 docker 镜像 tag 为 #TODO 占位符，需要注意修正。纯文档变更，无代码影响。",
+      "tags": [
+        "docs",
+        "low-risk",
+        "qwen-vl"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "仅文档变更，不涉及任何测试逻辑。但文档中新增的 Ascend950DT 部署命令与量化权重（Eco-Tech/Qwen3-VL-8B/32B-Instruct-w8a8-mxfp8）建议在后续 e2e 中覆盖验证，确保文档可执行。",
+        "suggested_test_areas": [
+          "docs/source/tutorials/models/Qwen-VL-Dense.md"
+        ]
+      },
+      "message": "[doc]update qwenvl-dense document (#13851)\n\n### What this PR does / why we need it?\n[doc]update qwenvl-dense document- #13851\n\n### Does this PR introduce _any_ user-facing change?\nNone\n### How was this patch tested?\n\n- vLLM version: v0.26.0\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/0351e9aa1fdf1a51329d1906881528dfe61fc88e\n\nSigned-off-by: Wangbei25 <wangbei41@huawei.com>"
+    },
+    {
+      "sha": "168ecfcba983fa326784c49e091f6a7f74c0b7b6",
+      "comment": "fused MoE 运行时契约的简化重构。核心变化：(1) 删除 FusedMoEResult dataclass，forward_impl 改为返回 (routed_out, FusedMoEEvents) 元组；(2) log2phy 不再作为参数在 build_fused_experts_input 中传递，而是统一在 AscendRoutedExperts._select_experts 内对 topk_ids 做映射，消除了 builder 调用点的大量重复逻辑；(3) shared expert 的 swiglu_limit/alpha/beta 参数从 FusedMoEEvents 中移除，改由 AscendSharedExperts 在 __init__ 时从 moe_config 读取并缓存，解决了事件对象与参数生命周期耦合的问题；(4) 删除 zero_experts_compute 相关代码，简化路由校验；(5) AscendRoutedExperts 不再通过构造参数接收 router，改由 AscendMoERunner.__init__ 设置 self.routed_experts.router = router，并通过 register_ascend_customop 注册 MoERunner/RoutedExperts（含 310P 分支），patch_fused_moe.py 相应移除动态类选择逻辑。重构后 310P 的统一注册路径更清晰。注意行为变化：log2phy 映射从 token_dispatch 前移动到 _select_experts 中，需确保 eplb_state 更新的统计口径仍使用映射前的 topk_ids（代码中在映射后仍通过 try 块调用 record_local_expert_load，需确认其参数来源），另外 Qwen3DSpark 的 confidence_head 缺失时从抛 RuntimeError 改为静默禁用，提升了健壮性但可能掩盖配置错误。",
+      "tags": [
+        "refactor",
+        "ops",
+        "fused-moe",
+        "medium-risk",
+        "eplb"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "测试已同步适配：test_fused_moe.py 中 FusedMoEResult 改为 (routed_out, FusedMoEEvents) 元组断言，_select_experts 测试改为通过 get_moe_num_logical_experts mock 替代原先的 zero_expert 断言；test_moe_runtime_args.py 移除 log2phy 参数验证；_310p 测试也适配了 FusedMoEEvents 结构化。但这次改动涉及 log2phy 应用时机的移动（从 comm method 前移到 router），现有单测 monkeypatch 了 get_forward_context 和 get_moe_num_logical_experts，建议补充一个集成级测试验证 log2phy 映射后 topk_ids 与 expert 统计的一致性，以及 zero expert 移除后与上游 FusedMoE 的 num_logical_experts 校验兼容性。",
+        "suggested_test_areas": [
+          "tests/ut/ops/test_fused_moe.py",
+          "tests/ut/ops/test_moe_runtime_args.py",
+          "tests/ut/_310p/fused_moe/test_shared_fused_moe_310.py",
+          "vllm_ascend/ops/fused_moe/routed_experts.py（新增 log2phy 映射后的 eplb 统计测试）"
+        ]
+      },
+      "message": "[Refactor][Ops] Simplify fused MoE runtime contracts (#13759)\n\n## What this PR does / why we need it?\n\nSimplify the fused MoE runtime contract by removing redundant dynamic\nEPLB and log2phy plumbing from builder call sites, moving shared-expert\nSwiGLU clamp parameters onto the shared expert executor, and updating\nrouted and quantized paths plus tests to match the streamlined\ninterface.\n\nRemove  zero experts code in longcat.\n\n## Does this PR introduce _any_ user-facing change?\n\nNo. This is an internal refactor of the fused MoE runtime contract and\nits test coverage.\n\n## How was this patch tested?\n\n- git diff --check\n- Local review of the affected fused MoE runtime and test updates\n\n- vLLM version: v0.26.0\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/0351e9aa1fdf1a51329d1906881528dfe61fc88e\n\n---------\n\nSigned-off-by: weijinqian0 <1184188277@qq.com>"
+    },
+    {
+      "sha": "f82d49c8f960ba83380a3966ee2eaf72f8ee4be9",
+      "comment": "全仓库日落 ASCEND_BUFFER_POOL 环境变量。按硬件和部署路径分别替换为 ASCEND_ENABLE_USE_FABRIC_MEM=1（A3 fabric memory 统一寻址直传）或 HCCL_INTRA_ROCE_ENABLE=1（RoCE 路径），涉及 kv_pool 特性文档、Mooncake PD 分离部署教程、DeepSeek-V3.1/Kimi-K2.5/K2.6/K2.7 模型部署文档，以及 25+ 个测试配置文件。此前 ASCEND_BUFFER_POOL 是 A3 上不支持 fabric memory 时的 fallback 缓冲区方案，现在硬件与 CANN 版本成熟后直接启用更优的直传路径。变更覆盖面广但均为机械替换，方向与 d2e818f 一致。需要注意部分配置（如 QWEN3_235B_PD）启用了 ASCEND_A3_ENABLE + VLLM_ASCEND_ENABLE_FUSED_MC2 又加 fabric mem，需确认组合场景下 Mooncake 与 MC2 的共存无冲突。",
+      "tags": [
+        "chore",
+        "docs",
+        "test",
+        "low-risk",
+        "hcom",
+        "mooncake"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "虽然所有 ASCEND_BUFFER_POOL 出现点均已替换，但替换后的环境变量在不同硬件（A2 RoCE vs A3 fabric）下语义不同，需确保对应测试配置运行在正确硬件路径上。例如 single_node 的 test_qwen3_30b_acc.py 改为 ASCEND_ENABLE_USE_FABRIC_MEM=1，若 CI 跑在 A2 上可能不生效或不必要。建议在测试基础设施层增加对环境变量与硬件类型匹配性的校验或注释说明。",
+        "suggested_test_areas": [
+          "tests/e2e/weekly/multi_node/external_dp/config/DeepSeek_V3.2T_MTP2_PD.yaml",
+          "tests/e2e/weekly/multi_node/external_dp/config/QWEN3_235B_PD.yaml",
+          "tests/e2e/weekly/single_node/models/test_qwen3_30b_acc.py",
+          "tests/e2e/weekly/multi_node/external_dp/config/Kimi-K2.6-W4A8-*.yaml"
+        ]
+      },
+      "message": "[Doc] Sunset ASCEND_BUFFER_POOL environment variable (#13820)\n\n### What this PR does / why we need it?\n\nSunsets the `ASCEND_BUFFER_POOL` environment variable across the entire\nrepository (docs, tutorials, locale translations, and test\nconfigurations).\n\n### Does this PR introduce _any_ user-facing change?\n\nYes. `ASCEND_BUFFER_POOL` is removed and replaced by\n`ASCEND_ENABLE_USE_FABRIC_MEM=1` or `HCCL_INTRA_ROCE_ENABLE=1` depending\non the hardware and deployment path.\n\n### How was this patch tested?\n\nVerified zero remaining `ASCEND_BUFFER_POOL` occurrences across the\nentire repository. Updated e2e multi-node and single-node test\nconfigurations.\n\n- vLLM version: v0.26.0\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/0351e9aa1fdf1a51329d1906881528dfe61fc88e\n\n---------\n\nSigned-off-by: lizy124 <1950471827@qq.com>"
+    },
+    {
+      "sha": "21eedaf041722d9f5fb9c3fe8857d8c161d511a5",
+      "comment": "临时跳过 GLM-5.2 DSpark 8 卡验收测试 test_glm_5_2_dspark_acceptance_tp8，原因是用例所需的 confidence_head 张量未出现在 checkpoint 中。这是与 168ecfcb 中 AscendQwen3DSparkForCausalLM.load_weights 行为变更（confidence_head 缺失时不再抛 RuntimeError 而是静默禁用）相关的问题——上游模型权重与代码假设不一致。跳过是合理的止损措施，但应尽快修复 checkpoint 或模型加载逻辑后恢复，避免长期失去 DSpark 验收测试的看护。",
+      "tags": [
+        "ci",
+        "test",
+        "low-risk",
+        "spec-decode",
+        "dspark"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "测试被 @pytest.mark.skip 临时跳过，CI 上将不再执行该验收用例，存在回归盲区。需要跟进 confidence_head checkpoint 问题：要么更新模型权重提供 confidence_head 张量，要么调整代码逻辑匹配实际权重（可参考 168ecfcb 已做的容错处理），修复后移除 skip 标记并恢复测试。",
+        "suggested_test_areas": [
+          "tests/e2e/pull_request/eight_card/test_glm5_2.py",
+          "vllm_ascend/models/qwen3_dspark.py（confidence_head 加载逻辑）"
+        ]
+      },
+      "message": "[CI]Skip error glm5.2 dspark test (#13832)\n\n### What this PR does / why we need it?\n\nThis PR temporarily skips the GLM-5.2 DSpark acceptance test\n(`test_glm_5_2_dspark_acceptance_tp8`) because the required\n`confidence_head` tensors were not found in the checkpoint.\n\n### Does this PR introduce _any_ user-facing change?\n\nNo.\n\n### How was this patch tested?\n\nSigned-off-by: wangkunpeng <1289706727@qq.com>"
+    }
+  ],
+  "architecture_based_on_sha": "e04f251a5895969d1c1f4ac9a3807177a0c4769c",
+  "architecture_generated_at": "2026-08-01T20:25:03.693997+08:00"
+}

@@ -1141,6 +1141,78 @@
       "interface_changes": "Transformers modeling backend 的 input embedding 替换逻辑全面泛化。原实现只处理裸 nn.Embedding 与带 embed_scale 的特殊缩放类，新 replace_embedding_class 支持三种形态：裸 nn.Embedding 直接替换为 VocabParallelEmbedding；继承 nn.Embedding 的子类（如 Transformers 的 *ScaledWordEmbedding）通过 __class__ 重绑定到动态生成的 _rebase_on_vocab_parallel 子类，使 VocabParallelEmbedding 在 MRO 中排在 nn.Embedding 之前，从而保留子类的缩放 forward 与额外状态；组合模块递归查找并替换其中唯一的 nn.Embedding，数量不为 1 时报错。移除了 ScaledVocabParallelEmbedding 特例类。CausalMixin.tie_weights 改为遍历 input embeddings 的 modules 查找第一",
       "change_summary": "Fully generalise input embedding handling in Transformers modelling backend (#51247)",
       "ascend_impact": true
+    },
+    "58d3918e3ea0a544ffedadad2ba84559e9c51d8f": {
+      "date": "2026-08-08",
+      "affected_modules": [
+        "ascend_affected"
+      ],
+      "affected_interfaces": [
+        "ascend_affected"
+      ],
+      "interface_changes": "修复混合 Mamba+FA 前缀缓存中 truncate_computed_blocks 的截断语义。此前该方法对所有 KV cache group 都断言本地 block 数必须覆盖对齐的 token 端点；当外部 KV（connector/external state）能提供最终 Mamba state 时，本地 Mamba group 允许提前结束（改为 min 截断），而非 Mamba group 仍必须严格覆盖端点（保持断言）。这样调度器可以在 FA 前缀命中比 Mamba state 更深时安全地恢复到更深边界，只要外部 state 补齐 Mamba 状态；没有外部命中时仍回退到所有 group 一致的收敛边界。新增单元测试验证：短 Mamba group 可截断、短 FA group 报错、查找结果本身不被修改。实现干净，仅影响 MambaSpec 相关路径，对纯 attention/MLA 模型行为不变。",
+      "change_summary": "[BugFix] Preserve divergent FA hits with external Mamba state (#51468)",
+      "ascend_impact": true
+    },
+    "1c94e8dc7da43d12c8686f05cc5d2eab3fd9528f": {
+      "date": "2026-08-08",
+      "affected_modules": [
+        "ascend_affected"
+      ],
+      "affected_interfaces": [
+        "ascend_affected"
+      ],
+      "interface_changes": "新增 nvfp4_4over6 KV cache 量化 dtype：在 NVFP4 布局基础上，写入 KV cache 时对每个 16 元素组分别按 max/6 与 max/4 两种 scale 计算 FP4 候选，选择平方重建误差更小的结果（round-to-nearest-even e2m1 量化）。kernel 侧通过 NVFP4KVScaleSearch 模板参数区分 DEFAULT / FOUR_OVER_SIX 路径；FlashInfer 读取侧将 nvfp4_4over6 视为与 nvfp4 相同的 NVFP4 布局（scale search 只影响写入端 scale 选择）；vLLM 侧 CacheDType 增加新字面量，get_kv_quant_mode / is_quantized_kv_cache / FlashInferBackend 等从精确匹配改为 startswith('nvfp4') 前缀匹配。测试验证 4-over-6 模式对包含 6.0/4.5 混合幅度输入的 MSE 更低。功能仅对 SM100+（Blackwell）生效，向后兼容。风险点在于前缀",
+      "change_summary": "Add NVFP4 KV 4-over-6 scale search (#45187)",
+      "ascend_impact": true
+    },
+    "70456e5e6fb4ee86b8ffd985f918e44ba632d925": {
+      "date": "2026-08-08",
+      "affected_modules": [
+        "ascend_affected"
+      ],
+      "affected_interfaces": [
+        "ascend_affected"
+      ],
+      "interface_changes": "修复量化导出（如 GPTQ、llm-compressor NVFP4）中全零 per-expert bias 在模型 expert 无 bias 参数时的加载失败问题。RoutedExperts.load_weights 将 getattr(self, param_name) 改为 getattr(self, param_name, None)，对缺失的 w13_bias/w2_bias 直接 continue 跳过；但 fused bias 名称（down_proj_bias / gate_up_proj_bias / down_proj.bias 等）因不会通过 WeightsMapper 改写为真实参数，为避免静默丢弃真实 bias 仍抛出 AttributeError。测试覆盖 bias-free 模型忽略 checkpoint bias、有 bias 模型正常加载、异常名称仍报错三类场景。该行为与 AutoWeightsLoader 对齐，属于 MoE 权重加载的健壮性修复，无破坏性。",
+      "change_summary": "[Bugfix] when loading weights skip empty expert bias if model does not support them (#50937)",
+      "ascend_impact": true
+    },
+    "3518110f2f4532c4605d8b1ea2a9bdc7d61b9f04": {
+      "date": "2026-08-08",
+      "affected_modules": [
+        "ascend_affected"
+      ],
+      "affected_interfaces": [
+        "ascend_affected"
+      ],
+      "interface_changes": "大型功能提交：新增在线 MXFP4 量化（--quantization mxfp4，Linear 与 MoE 双路径）。核心实现包括：(1) Mxfp4OnlineLinearMethod / Mxfp4OnlineMoEMethod，在权重加载时将 bf16/fp16 权重量化为 MXFP4（e2m1 数据 + block-32 e8m0 scale）；(2) mxfp4_utils.py 新增 Triton 实现的 downcast_to_mxfp/_compute_quant_and_scale 以及平台分发的 mxfp4_quantize()（XPU→自定义 op，ROCm+aiter→quark，其余→Triton）；(3) 注册 kMxfp4Static QuantKey 到在线方法注册表，并在 _ONLINE_SHORTHANDS 增加 'mxfp4' 缩写；(4) EmulationMxfp4LinearKernel 与 OCP_MX MoE emulation 加入 has_quark() 依赖门控；(5) Fp8PerBlockOnlineMoEMethod._ze",
+      "change_summary": "[Online quantization] Add online MXFP4 quantization support (#49347)",
+      "ascend_impact": true
+    },
+    "a671679e9f04742aecb2c9b35cd513a024c1321f": {
+      "date": "2026-08-08",
+      "affected_modules": [
+        "ascend_affected"
+      ],
+      "affected_interfaces": [
+        "ascend_affected"
+      ],
+      "interface_changes": "为 MRv2（VLLM_USE_V2_MODEL_RUNNER）增加 weight offloading 支持：在 GPUModelRunner.__init__ 中调用 set_offloader(create_offloader(self.vllm_config.offload_config))，模型加载完成后（update_max_model_len 附近）调用 get_offloader().post_init()。由于 GPUModelRunner 是 vLLM v1 架构 GPU 平台的核心基类，所有继承它的 runner（包括 vllm-ascend 的 NPUModelRunner）都会自动执行这些钩子。默认 offload_config 为空时不应改变现有行为；开启 CPU offload 时依赖 pin memory/UVA 等机制，在 NPU 上的可用性需要验证。测试将 CPU offload 与 prefetch offload 用例扩展了 use_v2_model_runner 开关参数。",
+      "change_summary": "[MRv2 Feature] MR v2 weight offloading support (#51413)",
+      "ascend_impact": true
+    },
+    "fcde8e1460589849c8142d617420ccdc406d5bc9": {
+      "date": "2026-08-08",
+      "affected_modules": [
+        "ascend_affected"
+      ],
+      "affected_interfaces": [
+        "ascend_affected"
+      ],
+      "interface_changes": "大规模重构 Humming linear/MoE 后端，从依赖 layer 对象运行时属性（layer.humming_metas/locks/compute_config 等）改为显式 LayerConfig 驱动：(1) HummingExpertsBase 构造函数移除 layer 参数，从新的 HummingMoEQuantConfig（携带 w1/w2 的 LayerConfig）读取配置；(2) 新增 prepare_layer_config / transform_humming_tensors / humming_forward / may_quant_input / get_heuristics_config 等底层 API 替代 HummingMethod 系列方法，locks 缓冲由 kernel 实例自持；(3) make_fp8/int8/wna16/mxfp4/nvfp4_moe_kernel 全部移除 layer 参数（此前仅 Humming 分支使用），所有调用方同步更新；(4) NVFP4 MoE 的 global scale 属性由 w13_glob",
+      "change_summary": "[Refactor] refactor humming linear and moe backends to use explicit layer configs (#49610)",
+      "ascend_impact": true
     }
   }
 }

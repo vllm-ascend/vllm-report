@@ -886,6 +886,19 @@ def _persist_lesson_to_remote() -> str:
                 "https://x-access-token:{token}@github.com/"
                 "vllm-ascend/vllm-report.git".format(token=token))
         targets.append("origin")
+        # Rebase onto the remote before pushing: the daily data-update bot
+        # commits to main between our clone and this submit, so a bare push
+        # would be rejected as non-fast-forward.  Fetch + rebase keeps our
+        # commit on top; on conflict abort and report (the caller can retry).
+        fetch_target = targets[0] if targets else "origin"
+        r = _run("fetch", fetch_target, "main")
+        if r.returncode != 0:
+            return f"git fetch failed: {r.stderr.strip()[:200]}"
+        r = _run("rebase", "FETCH_HEAD")
+        if r.returncode != 0:
+            _run("rebase", "--abort")
+            return (f"git rebase onto remote failed: "
+                    f"{r.stderr.strip()[:200]}")
         last_err = ""
         for target in targets:
             r = _run("push", target, "main")

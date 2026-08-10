@@ -17,11 +17,11 @@
       "symptom": "test_disaggregated_encoder[1-Qwen/Qwen2.5-VL-7B-Instruct]: the ENCODE server becomes healthy, but the DECODE (EC consumer) server never does. Its EngineCore dies in profile_run with \"ValueError: batch_norm eps must be positive, but got 0.0\" (vision.py F.batch_norm), right after \"Encoder cache will be initialized with a budget of 16384 tokens, and profiled with 1 video items\". The test then spins its health-wait loop (READY spam) until the suite timeout SIGKILLs it (exit -9). Same crash on the a3-2 PR CI matrix and on vllm main 073c510c/0820125ae.",
       "root_cause": "vllm main PR #50411 (\"Fused mm preprocess normalisation on the Device\", merged 2026-08-06) rewrote Qwen2_5_VLInputNorm.forward to call F.batch_norm with HARDCODED eps=0.0 (vllm/model_executor/models/vision.py:727). torch 2.11 rejects eps<=0 unconditionally (torch/nn/functional.py:2844); torch 2.12+ only checks during training, so upstream vllm CI (torch 2.12+) passes while vllm-ascend containers (torch 2.11) crash deterministically. Still present at vllm main HEAD as of 2026-08-10.",
       "fix_guidance": [
-        "vllm-ascend workaround: add a patch/platform entry (precedent: patch_fused_moe, patch_mla_prefill_backend) that wraps Qwen2_5_VLInputNorm.forward and passes eps=1e-5 instead of 0.0 (eval mode, eps is cosmetic — the normalization result is identical).",
-        "OR bump the CI container torch to 2.12+, where batch_norm(eps=0) is allowed outside training (upstream fix path).",
+        "vllm-ascend workaround: create vllm_ascend/patch/platform/patch_vision.py that monkeypatches FusedInputNorm.forward to replace eps=0.0 with eps=1e-5 (eval mode, result is identical). Reference implementation (PR vllm-ascend/vllm-ascend#13477):",
+        "```python\n# vllm_ascend/patch/platform/patch_vision.py\nimport contextlib\nimport torch\n\ndef _patched_fused_input_norm_forward(self, grid_thw, visual_dtype):\n    if self.is_identity:\n        return grid_thw.to(visual_dtype)\n    assert grid_thw.ndim == 2\n    patches, size = grid_thw.shape\n    patch_size = size // self.channel\n    grid_thw = grid_thw.view(patches, self.channel, patch_size)\n    grid_thw = torch.nn.functional.batch_norm(\n        grid_thw.to(self.dtype),\n        running_mean=self.running_mean,\n        running_var=self.running_var,\n        weight=self.weight,\n        bias=self.bias,\n        training=False,\n        eps=1e-5,\n    )\n    return grid_thw.view(patches, size).to(visual_dtype)\n\ndef install_patch():\n    from vllm.model_executor.models.vision import FusedInputNorm\n    FusedInputNorm.forward = _patched_fused_input_norm_forward\n\nwith contextlib.suppress(ImportError):\n    install_patch()\n```",
+        "Register the patch in vllm_ascend/patch/platform/__init__.py (follow patch_fused_moe / patch_mla_prefill_backend precedent).",
         "Do NOT treat this as an env flake: it recurs on every run/matrix (vllm main + torch 2.11).",
-        "The test also requires the vllm-ascend/mm_request modelscope dataset + Qwen2.5-VL-7B-Instruct cached on the runner; without them it fails earlier at collection/model load.",
-        "Note: the flow now inlines error-signature excerpts (not just the log tail) so this traceback reaches the adapter even after the 30-min READY spam."
+        "The test also requires the vllm-ascend/mm_request modelscope dataset + Qwen2.5-VL-7B-Instruct cached on the runner; without them it fails earlier at collection/model load."
       ],
       "tags": [
         "e2e",
@@ -31,7 +31,7 @@
         "torch",
         "disaggregation"
       ],
-      "example": "run 31322838012 rerun: decode engine crashed at profile_run with the eps error, but the old error_logs tail-cut only showed READY spam, so the adapter could not see the cause. Fixed by error-excerpt extraction in main2main_flow.",
+      "example": "PR vllm-ascend/vllm-ascend#13477 used this exact patch and the test passed. Run 31322838012 rerun: decode engine crashed at profile_run with the eps error, but the old error_logs tail-cut only showed READY spam, so the adapter could not see the cause — fixed by error-excerpt extraction in main2main_flow.",
       "created_at": "2026-08-10T13:03:59+0800",
       "hits": 0
     }

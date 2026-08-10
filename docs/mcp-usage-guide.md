@@ -1,6 +1,6 @@
 # vllm-report 使用指南 — AI Agent 驱动的 main2main 适配
 
-> 第三方 main2main 工具（Claude Code、OpenCode、Codex CLI 等）
+> 第三方 main2main 工具（OpenCode、Codex CLI 等）
 > 如何利用 vllm-report 知识库进行 vllm-ascend 代码升级和适配
 
 ---
@@ -8,27 +8,13 @@
 ## 前置条件
 
 1. vllm-report 项目数据已正常生成（index.json、arch.json、analysis JSON 等）
-2. MCP Server 已配置（Claude Code / OpenCode 场景）或可直接读取 JSON 文件（其他工具场景）
+2. MCP Server 已配置（OpenCode 场景）或可直接读取 JSON 文件（其他工具场景）
 
 ---
 
 ## 第三方工具对接方式
 
-### 方式一：Claude Code（原生 MCP）
-
-使用 `claude mcp add` 命令添加（Claude Code 不支持通过配置文件加载 MCP）：
-
-```bash
-claude mcp add vllm-report -- python -m src.mcp_server_app \
-    --data-dir /path/to/vllm-report/data \
-    --ascend-repo-path /path/to/vllm-ascend
-```
-
-`--ascend-repo-path` 用于读取 vllm-ascend 项目中的基线文件（`.github/vllm-main-verified.commit` 和 `.github/vllm-release-tag.commit`），使 MCP Server 能回答"当前已验证到哪个 commit"的问题。
-
-配置后，在 vllm-ascend 项目目录下打开 Claude Code，自动拥有所有知识库能力。可用 `claude mcp list` 验证连接状态。
-
-### 方式二：OpenCode（原生 MCP）
+### 方式一：OpenCode（原生 MCP）
 
 OpenCode 完全支持 MCP 协议，在项目 `opencode.json` 或 `opencode.jsonc` 中配置：
 
@@ -47,7 +33,19 @@ OpenCode 完全支持 MCP 协议，在项目 `opencode.json` 或 `opencode.jsonc
 
 或在 `~/.config/opencode/opencode.json` 中全局配置。配置后重启 opencode 生效。
 
-### 方式三：HTTP 包装（任意工具）
+也可用命令添加：
+
+```bash
+opencode mcp add vllm-report -- python -m src.mcp_server_app \
+    --data-dir /path/to/vllm-report/data \
+    --ascend-repo-path /path/to/vllm-ascend
+```
+
+`--ascend-repo-path` 用于读取 vllm-ascend 项目中的基线文件（`.github/vllm-main-verified.commit` 和 `.github/vllm-release-tag.commit`），使 MCP Server 能回答"当前已验证到哪个 commit"的问题。
+
+配置后，在 vllm-ascend 项目目录下打开 opencode，自动拥有所有知识库能力。可用 `opencode mcp list` 验证连接状态。
+
+### 方式二：HTTP 包装（任意工具）
 
 用 socat 将 MCP Server 包装为 TCP 服务：
 

@@ -1,15 +1,15 @@
 # vllm-report
 
-[vllm](https://github.com/vllm-project/vllm) 和 [vllm-ascend](https://github.com/vllm-project/vllm-ascend) 的每日 commit 监控与 AI 分析系统。提供知识库供 AI Agent（Claude Code、OpenCode）使用，支持 vllm-ascend 代码升级和 main2main 适配。
+[vllm](https://github.com/vllm-project/vllm) 和 [vllm-ascend](https://github.com/vllm-project/vllm-ascend) 的每日 commit 监控与 AI 分析系统。提供知识库供 AI Agent（OpenCode 等）使用，支持 vllm-ascend 代码升级和 main2main 适配。
 
 ## 功能
 
 - **每日 Commit 抓取** — 每天北京时间 02:00 自动通过 GitHub Actions 抓取新 commit（含完整 diff）
 - **双阶段 AI 分析** —
   - **Phase 1**：DeepSeek API 批量分析（意图、风险、ascend 影响、测试影响），附带路径预筛选（path-based triage）自动跳过非 ascend 相关 commit（tests/docs/CI/平台特化代码），降低 LLM API 成本
-  - **Phase 2**：Claude Code Agent 深度分析 ascend_affected 的 commit——通过读取实际源码识别具体影响接口、适配工作量和适配指南
+  - **Phase 2**：opencode Agent 深度分析 ascend_affected 的 commit——通过读取实际源码识别具体影响接口、适配工作量和适配指南
 - **Diff 感知的架构影响标记** — 修改关键接口文件的 commit 自动获得 `architecture_impact` 标记（affected_interfaces、recommend_refresh），根据跨项目关系规则的文件路径匹配检测
-- **架构上下文缓存** — 每周通过 Claude Code Agent 自动生成项目架构摘要，注入 AI 分析 prompt 以提高影响判断的准确性
+- **架构上下文缓存** — 每周通过 opencode Agent 自动生成项目架构摘要，注入 AI 分析 prompt 以提高影响判断的准确性
 - **知识库** — architecture.json 的 `knowledge_base` 字段包含 patch 目录、开发工作流、测试指南
 - **Patch 目录提取** — 通过 `_extract_patches.py` 对 vllm-ascend 的 `patch/__init__.py` 进行确定性正则解析，生成结构化 JSON，无需 LLM 调用
 - **检索索引** — 关键词/标签/模块索引，支持跨日期快速搜索
@@ -55,13 +55,13 @@ vllm-report/
 │   ├── mcp_server_app.py             # MCP Server（stdio 模式，25 个工具）
 │   ├── data/
 │   │   ├── __init__.py
-│   │   ├── _claude_client.py         # Claude Code CLI 封装
+│   │   ├── _opencode_client.py       # opencode CLI 封装
 │   │   ├── _extract_patches.py       # Patch 目录提取器（确定性解析）
 │   │   ├── _source_repo.py           # 仓库发现/拉取/克隆（内部模块）
 │   │   ├── _track_arch_delta.py      # 架构增量链（内部模块）
 │   │   ├── fetch_commits.py          # 抓取 commit 数据
 │   │   ├── analyze_commits.py        # 双阶段 AI 分析
-│   │   ├── deep_analyze_commits.py   # Phase 2 Claude Code 深度分析
+│   │   ├── deep_analyze_commits.py   # Phase 2 opencode 深度分析
 │   │   ├── generate_context.py       # 架构上下文生成
 │   │   ├── build_index.py            # 检索索引构建器
 │   │   └── track_adaptation.py       # 适配状态 CLI 工具
@@ -109,7 +109,7 @@ export LLM_API_KEY="sk-your-deepseek-key"
 ### 3. 生成架构上下文
 
 ```bash
-# 为 vllm 生成（使用 Claude Code Agent 读取源码）
+# 为 vllm 生成（使用 opencode Agent 读取源码）
 python src/data/generate_context.py --repo vllm-project/vllm --force
 
 # 为 vllm-ascend 生成
@@ -143,7 +143,7 @@ python src/data/analyze_commits.py --repo vllm-project/vllm --catch-up
 
 分析分两阶段：
 1. **Phase 1**：DeepSeek 批量分析所有 commit。包含路径预筛选（path-based triage）——仅修改 tests/docs/CI/平台特化代码的 commit 自动跳过（无 LLM 成本），使用 architecture.json 中的 `not_used_by_ascend` 路径列表（每周自动更新）
-2. **Phase 2**：Claude Code Agent 深度分析 ascend_affected 的 commit（识别具体影响接口、适配工作量、适配指南）
+2. **Phase 2**：opencode Agent 深度分析 ascend_affected 的 commit（识别具体影响接口、适配工作量、适配指南）
 
 ### 5. 构建检索索引
 
@@ -180,13 +180,6 @@ python -m src.mcp_server_app \
 
 在 AI 工具中配置：
 
-**Claude Code**（命令行）：
-```bash
-claude mcp add vllm-report -- python -m src.mcp_server_app \
-    --data-dir /path/to/vllm-report/data \
-    --ascend-repo-path /path/to/vllm-ascend
-```
-
 **OpenCode**（`opencode.json` 或 `opencode.jsonc`）：
 ```jsonc
 {
@@ -200,6 +193,13 @@ claude mcp add vllm-report -- python -m src.mcp_server_app \
 }
 ```
 
+或用命令添加：
+```bash
+opencode mcp add vllm-report -- python -m src.mcp_server_app \
+    --data-dir /path/to/vllm-report/data \
+    --ascend-repo-path /path/to/vllm-ascend
+```
+
 ### 8. 查看 Dashboard
 
 ```bash
@@ -211,8 +211,7 @@ python serve.py
 
 详见 [docs/mcp-usage-guide.md](docs/mcp-usage-guide.md) 的使用场景说明：
 
-- **Claude Code**（原生 MCP）：`claude mcp add vllm-report -- python -m src.mcp_server_app ...`
-- **OpenCode**（原生 MCP）：在 `opencode.json` 或 `opencode.jsonc` 中配置 `mcp`
+- **OpenCode**（原生 MCP）：`opencode mcp add vllm-report -- python -m src.mcp_server_app ...` 或在 `opencode.json` / `opencode.jsonc` 中配置 `mcp`
 - **其他工具**：通过 `socat` 包装为 HTTP 访问，或直接从 `data/` 目录读取 JSON 文件
 
 ## GitHub Actions 配置
@@ -222,10 +221,9 @@ python serve.py
 | Secret | 说明 |
 |--------|------|
 | `DEEPSEEK_API_KEY` | DeepSeek API Key（Phase 1 批量分析） |
-| `CLAUDE_AUTH_TOKEN` | Claude Code 认证 Token（Phase 2 深度分析 + 架构生成） |
-| `CLAUDE_BASE_URL` | Claude Code API 地址 |
-| `CLAUDE_MODEL` | Claude Code 模型名称（如 `astron-code-latest`） |
-| `CLAUDE_SMALL_FAST_MODEL` | Claude Code 小模型名称（如 `astron-code-latest`） |
+| `OPENCODE_AUTH_TOKEN` | opencode 使用的 OpenAI 兼容 API Key（Phase 2 深度分析 + 架构生成） |
+| `OPENCODE_BASE_URL` | OpenAI 兼容 API 地址 |
+| `OPENCODE_MODEL` | opencode 使用的 provider/model 选择器（如 `deepseek/deepseek-v4-flash`，CI 默认使用此值） |
 | `GITHUB_TOKEN` | 默认 Token（自动提供） |
 
 ### 可选 Secrets（邮件报告）
@@ -233,8 +231,8 @@ python serve.py
 
 ### 工作流
 
-- **`daily-commit.yml`** — 每天 02:00 CST 运行：抓取 → Phase 1 DeepSeek 分析 → Phase 2 Claude Code 分析 → 构建索引 → 清理过期数据 → 部署
-- **`weekly-context.yml`** — 每周一 08:00 CST 运行：检出 vllm/vllm-ascend 源码 → 通过 Claude Code 生成架构 → 交叉分析 → 重建索引
+- **`daily-commit.yml`** — 每天 02:00 CST 运行：抓取 → Phase 1 DeepSeek 分析 → Phase 2 opencode 分析 → 构建索引 → 清理过期数据 → 部署
+- **`weekly-context.yml`** — 每周一 08:00 CST 运行：检出 vllm/vllm-ascend 源码 → 通过 opencode 生成架构 → 交叉分析 → 重建索引
 - **`pages.yml`** — 推送 `site/` 或 `data/` 时部署 GitHub Pages
 
 ## 数据格式
@@ -255,21 +253,21 @@ python serve.py
 
 ## 架构知识库
 
-架构知识存储在 `data/{repo}/context/architecture.json` 中，每周由 Claude Code Agent 通过读取实际源码自动生成。覆盖 **11 个维度**，两个文件分别约 70KB（vllm）和 90KB（vllm-ascend）。
+架构知识存储在 `data/{repo}/context/architecture.json` 中，每周由 opencode Agent 通过读取实际源码自动生成。覆盖 **11 个维度**，两个文件分别约 70KB（vllm）和 90KB（vllm-ascend）。
 
 ### 知识维度
 
 | 维度 | 大小 | 说明 | 维护方式 |
 |------|------|------|---------|
-| `overview` | ~0.2KB | 项目概述——是什么、解决什么问题 | Claude Code（每周） |
-| `modules` | ~6.5KB | 核心模块列表（名称、路径、关键类、描述）——vllm 23 个模块，vllm-ascend 25 个 | Claude Code（每周） |
-| `key_abstractions` | ~12KB | 关键抽象/类，含继承关系（`inherits_from`）、关键方法签名、ascend 实现类名 | Claude Code（每周） |
-| `implementation_principles` | ~5KB | 实现原理——核心工作流（调度循环、attention 后端选择、平台插件加载等） | Claude Code（每周） |
-| `module_dependencies` | ~0.3KB | 模块间依赖关系文字描述 | Claude Code（每周） |
-| `hardware_abstraction` | ~1.3KB | 硬件适配层——平台无关接口 vs 平台特有实现 | Claude Code（每周） |
-| `interface_surface` | ~7.7KB | 接口面——`inheritable_interfaces`（8 个 ascend 继承/复写的接口）+ `not_used_by_ascend`（63 个可跳过的平台特化路径） | Claude Code（每周） |
-| `test_structure` | ~0.1KB | 测试结构概览 | Claude Code（每周） |
-| `cross_project_relationship` | ~13KB | 跨项目映射——`patch_impact_map`（24 个 vllm 被 patch 模块→ascend patch 文件）、`impact_judgment_rules`（必然/可能/绝不影响路径）、`vllm_to_ascend_map` | Claude Code（每周，交叉分析） |
+| `overview` | ~0.2KB | 项目概述——是什么、解决什么问题 | opencode（每周） |
+| `modules` | ~6.5KB | 核心模块列表（名称、路径、关键类、描述）——vllm 23 个模块，vllm-ascend 25 个 | opencode（每周） |
+| `key_abstractions` | ~12KB | 关键抽象/类，含继承关系（`inherits_from`）、关键方法签名、ascend 实现类名 | opencode（每周） |
+| `implementation_principles` | ~5KB | 实现原理——核心工作流（调度循环、attention 后端选择、平台插件加载等） | opencode（每周） |
+| `module_dependencies` | ~0.3KB | 模块间依赖关系文字描述 | opencode（每周） |
+| `hardware_abstraction` | ~1.3KB | 硬件适配层——平台无关接口 vs 平台特有实现 | opencode（每周） |
+| `interface_surface` | ~7.7KB | 接口面——`inheritable_interfaces`（8 个 ascend 继承/复写的接口）+ `not_used_by_ascend`（63 个可跳过的平台特化路径） | opencode（每周） |
+| `test_structure` | ~0.1KB | 测试结构概览 | opencode（每周） |
+| `cross_project_relationship` | ~13KB | 跨项目映射——`patch_impact_map`（24 个 vllm 被 patch 模块→ascend patch 文件）、`impact_judgment_rules`（必然/可能/绝不影响路径）、`vllm_to_ascend_map` | opencode（每周，交叉分析） |
 | `knowledge_base` | ~3KB (vllm) / ~21KB (vllm-ascend) | 知识库——见下方子字段说明 | 混合 |
 | `repo` / `generated_at` / `commit_sha` | — | 元信息：所属仓库、生成时间、基于的 commit | 自动生成 |
 
@@ -292,7 +290,7 @@ python serve.py
 
 ### 动态维护机制
 
-- **`interface_surface.not_used_by_ascend`** — 每周由 Claude Code 在架构生成时自动更新，始终反映当前代码库状态：哪些路径是纯 CUDA/ROCm/FlashInfer 平台特化代码、ascend 绝不会触及
+- **`interface_surface.not_used_by_ascend`** — 每周由 opencode 在架构生成时自动更新，始终反映当前代码库状态：哪些路径是纯 CUDA/ROCm/FlashInfer 平台特化代码、ascend 绝不会触及
 - **`patch_catalog`** — 每次 `patch/__init__.py` 变更时由 `_extract_patches.py` 自动更新，无需 LLM 调用
 - **`development_workflows` 和 `testing_guide`** — 硬编码模板，极少变更
 

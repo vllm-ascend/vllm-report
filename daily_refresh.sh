@@ -6,7 +6,7 @@
 #   1. vllm 和 vllm-ascend 的本地仓库（或让脚本自动 clone）
 #   2. Python 3.11+ 环境，已安装 requirements.txt
 #   3. 环境变量 LLM_API_KEY（用于 Phase 1 分析）
-#   4. Claude Code CLI（用于 Phase 2 深度分析，可选）
+#   4. opencode CLI（用于 Phase 2 深度分析，可选）
 # =============================================================================
 
 set -euo pipefail
@@ -58,9 +58,9 @@ usage() {
 
 环境变量:
   LLM_API_KEY               DeepSeek API Key（Phase 1 必需）
-  ANTHROPIC_AUTH_TOKEN      Claude Code Auth Token（Phase 2 可选）
-  ANTHROPIC_BASE_URL        Claude Code Base URL（可选）
-  ANTHROPIC_MODEL           Claude Code 模型名（可选）
+  OPENCODE_MODEL            opencode 使用的 provider/model 选择器（如 deepseek/deepseek-v4-flash，Phase 2 可选）
+  OPENCODE_BASE_URL         OpenAI 兼容 API Base URL（仅当 opencode 配置未内置时使用）
+  OPENCODE_AUTH_TOKEN       OpenAI 兼容 API Key（仅当 opencode 配置未内置时使用）
 
 示例:
   # 基本用法（分析昨天的 commit）
@@ -167,13 +167,13 @@ if [ "$SKIP_ANALYZE" = "false" ]; then
     info "LLM_API_KEY 已设置"
 fi
 
-# 检查 Claude Code（Phase 2）
+# 检查 opencode（Phase 2）
 if [ "$SKIP_DEEP_ANALYZE" = "false" ]; then
-    if command -v claude &>/dev/null; then
-        info "Claude Code CLI: $(claude --version 2>/dev/null || echo 'found')"
+    if command -v opencode &>/dev/null; then
+        info "opencode CLI: $(opencode --version 2>/dev/null || echo 'found')"
     else
-        warn "Claude Code CLI 未找到。Phase 2 深度分析将跳过。"
-        warn "安装方式: npm install -g @anthropic-ai/claude-code"
+        warn "opencode CLI 未找到。Phase 2 深度分析将跳过。"
+        warn "安装方式: npm install -g @opencode-ai/cli"
         SKIP_DEEP_ANALYZE=true
     fi
 fi

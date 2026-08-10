@@ -81,7 +81,7 @@ data/
 
 **兼容性：**
 - `modules`、`key_abstractions`、`interface_surface`：稳定
-  - `interface_surface.not_used_by_ascend` 由 Claude Code 每周自动更新，反映当前代码库状态
+  - `interface_surface.not_used_by_ascend` 由 opencode 每周自动更新，反映当前代码库状态
 - `cross_project_relationship`：稳定
 - `knowledge_base`：稳定（新增字段，向后兼容）
 

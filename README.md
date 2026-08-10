@@ -7,9 +7,9 @@ Daily commit monitor and AI analysis for [vllm](https://github.com/vllm-project/
 - **Daily Commit Fetching** — Automatically fetches new commits (with full diff) via GitHub Actions daily at 02:00 CST
 - **Two-Phase AI Analysis** —
   - **Phase 1**: Bulk analysis via DeepSeek API (intent, risk, ascend impact, test impact) with path-based triage that auto-skips non-ascend-relevant commits (tests/docs/CI/platform-specific code), reducing LLM API costs
-  - **Phase 2**: Deep analysis via Claude Code agent for ascend_affected commits — identifies specific affected interfaces, adaptation effort, and adaptation guide by reading actual source files
+  - **Phase 2**: Deep analysis via opencode agent for ascend_affected commits — identifies specific affected interfaces, adaptation effort, and adaptation guide by reading actual source files
 - **Diff-Aware Architecture Impact** — Commits modifying key interface files get `architecture_impact` markers (affected_interfaces, recommend_refresh), detected automatically from file paths against cross-project relationship rules
-- **Architecture Context Cache** — Weekly auto-generated project architecture summaries via Claude Code agent, injected into AI analysis prompts for precise impact judgment
+- **Architecture Context Cache** — Weekly auto-generated project architecture summaries via opencode agent, injected into AI analysis prompts for precise impact judgment
 - **Knowledge Base** — `knowledge_base` field in architecture.json includes patch catalog, development workflows, and testing guide
 - **Patch Catalog Extraction** — Deterministic regex-based parsing of vllm-ascend's `patch/__init__.py`, producing structured JSON without LLM costs
 - **Search Index** — Keyword/tag/module index for fast cross-date search
@@ -55,13 +55,13 @@ vllm-report/
 │   ├── mcp_server_app.py             # MCP Server (stdio-based, 27 tools)
 │   ├── data/
 │   │   ├── __init__.py
-│   │   ├── _claude_client.py         # Claude Code CLI wrapper
+│   │   ├── _opencode_client.py       # opencode CLI wrapper
 │   │   ├── _extract_patches.py       # Patch catalog extractor (deterministic)
 │   │   ├── _source_repo.py           # Local repo discovery/pull/clone (internal)
 │   │   ├── _track_arch_delta.py      # Architecture delta chain (internal)
 │   │   ├── fetch_commits.py          # Fetch commit data
 │   │   ├── analyze_commits.py        # Two-phase AI analysis
-│   │   ├── deep_analyze_commits.py   # Phase 2 deep analysis via Claude Code
+│   │   ├── deep_analyze_commits.py   # Phase 2 deep analysis via opencode
 │   │   ├── generate_context.py       # Architecture context generation
 │   │   ├── build_index.py            # Search index builder
 │   │   └── track_adaptation.py       # Adaptation status CLI
@@ -109,7 +109,7 @@ export LLM_API_KEY="sk-your-deepseek-key"
 ### 3. Generate Architecture Context
 
 ```bash
-# Generate for vllm (uses Claude Code agent to read source code)
+# Generate for vllm (uses opencode agent to read source code)
 python src/data/generate_context.py --repo vllm-project/vllm --force
 
 # Generate for vllm-ascend
@@ -143,7 +143,7 @@ python src/data/analyze_commits.py --repo vllm-project/vllm --catch-up
 
 The analysis runs in two phases:
 1. **Phase 1**: DeepSeek batch analysis for all commits. Includes path-based triage — commits modifying only tests/docs/CI/platform-specific code are auto-skipped (no LLM cost), using the `not_used_by_ascend` path list from architecture.json (regenerated weekly).
-2. **Phase 2**: Claude Code agent deep analysis for ascend_affected commits (identifies specific interfaces, adaptation effort, and guide).
+2. **Phase 2**: opencode agent deep analysis for ascend_affected commits (identifies specific interfaces, adaptation effort, and guide).
 
 ### 5. Build Search Index
 
@@ -180,13 +180,6 @@ python -m src.mcp_server_app \
 
 Configure in your AI tool:
 
-**Claude Code** (CLI):
-```bash
-claude mcp add vllm-report -- python -m src.mcp_server_app \
-    --data-dir /path/to/vllm-report/data \
-    --ascend-repo-path /path/to/vllm-ascend
-```
-
 **OpenCode** (in `opencode.json` or `opencode.jsonc`):
 ```jsonc
 {
@@ -200,6 +193,13 @@ claude mcp add vllm-report -- python -m src.mcp_server_app \
 }
 ```
 
+Or via CLI:
+```bash
+opencode mcp add vllm-report -- python -m src.mcp_server_app \
+    --data-dir /path/to/vllm-report/data \
+    --ascend-repo-path /path/to/vllm-ascend
+```
+
 ### 8. View Dashboard
 
 ```bash
@@ -211,8 +211,7 @@ python serve.py
 
 See [docs/mcp-usage-guide.md](docs/mcp-usage-guide.md) for detailed usage scenarios:
 
-- **Claude Code** (native MCP): `claude mcp add vllm-report -- python -m src.mcp_server_app ...`
-- **OpenCode** (native MCP): Configure `mcp` in `opencode.json` or `opencode.jsonc`
+- **OpenCode** (native MCP): `opencode mcp add vllm-report -- python -m src.mcp_server_app ...` or configure `mcp` in `opencode.json` / `opencode.jsonc`
 - **Other tools**: Wrap MCP Server with `socat` for HTTP access, or read JSON files directly from `data/`
 
 ## GitHub Actions Setup
@@ -222,18 +221,18 @@ See [docs/mcp-usage-guide.md](docs/mcp-usage-guide.md) for detailed usage scenar
 | Secret | Description |
 |--------|-------------|
 | `DEEPSEEK_API_KEY` | API key for DeepSeek (Phase 1 bulk analysis) |
-| `CLAUDE_AUTH_TOKEN` | Auth token for Claude Code (Phase 2 deep analysis + architecture generation) |
-| `CLAUDE_BASE_URL` | API base URL for Claude Code |
-| `CLAUDE_MODEL` | Claude Code model name (e.g. `astron-code-latest`) |
-| `CLAUDE_SMALL_FAST_MODEL` | Claude Code small fast model name (e.g. `astron-code-latest`) |
+| `OPENCODE_AUTH_TOKEN` | OpenAI-compatible API key used by opencode (Phase 2 deep analysis + architecture generation) |
+| `OPENCODE_BASE_URL` | OpenAI-compatible API base URL |
+| `OPENCODE_MODEL` | opencode provider/model selector (e.g. `deepseek/deepseek-v4-flash`; the CI defaults to this) |
+| `GITHUB_TOKEN` | Default token (auto-provided) |
 | `GITHUB_TOKEN` | Default token (auto-provided) |
 
 ### Optional Secrets (for Email Report)
 
 ### Workflows
 
-- **`daily-commit.yml`** — Runs daily at 02:00 CST: fetch → Phase 1 DeepSeek analysis → Phase 2 Claude Code analysis → build index → clean stale data → deploy
-- **`weekly-context.yml`** — Runs weekly on Monday 08:00 CST: checkout vllm/vllm-ascend source → generate architecture via Claude Code → cross-reference → rebuild index
+- **`daily-commit.yml`** — Runs daily at 02:00 CST: fetch → Phase 1 DeepSeek analysis → Phase 2 opencode analysis → build index → clean stale data → deploy
+- **`weekly-context.yml`** — Runs weekly on Monday 08:00 CST: checkout vllm/vllm-ascend source → generate architecture via opencode → cross-reference → rebuild index
 - **`pages.yml`** — Deploys GitHub Pages on push to `site/` or `data/`
 
 ## Data Format
@@ -254,21 +253,21 @@ See [docs/data-spec.md](docs/data-spec.md) for complete data format specificatio
 
 ## Architecture Knowledge
 
-The architecture knowledge is stored in `data/{repo}/context/architecture.json`, generated weekly by Claude Code agent reading actual source code. It covers **11 dimensions** across two files (~70KB for vllm, ~90KB for vllm-ascend).
+The architecture knowledge is stored in `data/{repo}/context/architecture.json`, generated weekly by opencode agent reading actual source code. It covers **11 dimensions** across two files (~70KB for vllm, ~90KB for vllm-ascend).
 
 ### Dimensions
 
 | Dimension | Size | Description | Who Maintains |
 |-----------|------|-------------|---------------|
-| `overview` | ~0.2KB | Project overview — what it is, what problem it solves | Claude Code (weekly) |
-| `modules` | ~6.5KB | Core module list (name, path, key_classes, description) — 23 modules for vllm, 25 for vllm-ascend | Claude Code (weekly) |
-| `key_abstractions` | ~12KB | Key classes/interfaces with inheritance (`inherits_from`), key method signatures, ascend implementations | Claude Code (weekly) |
-| `implementation_principles` | ~5KB | Implementation principles — how core workflows work (scheduler loop, attention backend selection, platform plugin loading, etc.) | Claude Code (weekly) |
-| `module_dependencies` | ~0.3KB | Text description of inter-module dependency graph | Claude Code (weekly) |
-| `hardware_abstraction` | ~1.3KB | Hardware abstraction layer — platform-independent interfaces vs platform-specific implementations | Claude Code (weekly) |
-| `interface_surface` | ~7.7KB | Interface surface — `inheritable_interfaces` (8 interfaces that ascend inherits/overrides) + `not_used_by_ascend` (63 paths that are platform-specific and can be skipped) | Claude Code (weekly) |
-| `test_structure` | ~0.1KB | Test structure overview | Claude Code (weekly) |
-| `cross_project_relationship` | ~13KB | Cross-project mapping — `patch_impact_map` (24 vllm patched modules → ascend patch files), `impact_judgment_rules` (definitely/potentially/never_affected_paths), `vllm_to_ascend_map` | Claude Code (weekly, cross-reference) |
+| `overview` | ~0.2KB | Project overview — what it is, what problem it solves | opencode (weekly) |
+| `modules` | ~6.5KB | Core module list (name, path, key_classes, description) — 23 modules for vllm, 25 for vllm-ascend | opencode (weekly) |
+| `key_abstractions` | ~12KB | Key classes/interfaces with inheritance (`inherits_from`), key method signatures, ascend implementations | opencode (weekly) |
+| `implementation_principles` | ~5KB | Implementation principles — how core workflows work (scheduler loop, attention backend selection, platform plugin loading, etc.) | opencode (weekly) |
+| `module_dependencies` | ~0.3KB | Text description of inter-module dependency graph | opencode (weekly) |
+| `hardware_abstraction` | ~1.3KB | Hardware abstraction layer — platform-independent interfaces vs platform-specific implementations | opencode (weekly) |
+| `interface_surface` | ~7.7KB | Interface surface — `inheritable_interfaces` (8 interfaces that ascend inherits/overrides) + `not_used_by_ascend` (63 paths that are platform-specific and can be skipped) | opencode (weekly) |
+| `test_structure` | ~0.1KB | Test structure overview | opencode (weekly) |
+| `cross_project_relationship` | ~13KB | Cross-project mapping — `patch_impact_map` (24 vllm patched modules → ascend patch files), `impact_judgment_rules` (definitely/potentially/never_affected_paths), `vllm_to_ascend_map` | opencode (weekly, cross-reference) |
 | `knowledge_base` | ~3KB (vllm) / ~21KB (vllm-ascend) | Knowledge base — see below for sub-fields | Mixed |
 | `repo` / `generated_at` / `commit_sha` | — | Metadata: which repo, when generated, which commit it's based on | Auto-generated |
 
@@ -293,7 +292,7 @@ The `knowledge_base` field contains three sub-fields:
 
 ### Dynamic Maintenance
 
-- **`interface_surface.not_used_by_ascend`** — Regenerated weekly by Claude Code during architecture generation. Reflects current codebase state: paths that are pure CUDA/ROCm/FlashInfer platform-specific code that ascend never touches.
+- **`interface_surface.not_used_by_ascend`** — Regenerated weekly by opencode during architecture generation. Reflects current codebase state: paths that are pure CUDA/ROCm/FlashInfer platform-specific code that ascend never touches.
 - **`patch_catalog`** — Updated by `_extract_patches.py` every time `patch/__init__.py` changes. No LLM call needed.
 - **`development_workflows` and `testing_guide`** — Hardcoded templates that rarely change.
 

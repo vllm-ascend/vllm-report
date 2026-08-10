@@ -102,7 +102,7 @@ print(f'interface_surface inheritable_interfaces: {len(d.get(\"interface_surface
 
 ### 1.4 生成交叉引用
 
-交叉引用会读取两个架构文件，让 Claude Code 分析跨项目关系。用 `--checkout` 确保 vllm 源码在基线 commit 状态，Claude Code 可以探索源码来生成更准确的 `definitely_affected_paths` 等规则。
+交叉引用会读取两个架构文件，让 opencode 分析跨项目关系。用 `--checkout` 确保 vllm 源码在基线 commit 状态，opencode 可以探索源码来生成更准确的 `definitely_affected_paths` 等规则。
 
 ```bash
 cd ~/code/vllm-report
@@ -144,7 +144,7 @@ python3 src/data/analyze_commits.py \
   --local-repo ~/code/vllm \
   --force
 
-# Phase 2: Claude Code 深度分析（针对 ascend_affected 的 commit）
+# Phase 2: opencode 深度分析（针对 ascend_affected 的 commit）
 python3 src/data/deep_analyze_commits.py \
   --repo vllm-project/vllm \
   --date 2026-07-27 \
@@ -237,7 +237,7 @@ python3 src/data/analyze_commits.py \
   --local-repo ~/code/vllm \
   --force
 
-# Phase 2: Claude Code 深度分析
+# Phase 2: opencode 深度分析
 python3 src/data/deep_analyze_commits.py \
   --repo vllm-project/vllm \
   --date $DATE \
@@ -366,7 +366,7 @@ print(f'deltas 已清空: {len(d[\"deltas\"])}')  # 应该为 0
 |------|------|----------|--------------|
 | `fetch_commits.py` | 从本地 git 获取某天的 commit 数据（含 diff/patch） | 每日 | pull |
 | `analyze_commits.py` | Phase 1: DeepSeek 批量分析 commit | 每日 | 无 |
-| `deep_analyze_commits.py` | Phase 2: Claude Code 深度分析 ascend_affected commit | 每日（仅当有 ascend_affected 时） | checkout 到父 commit 再恢复 |
+| `deep_analyze_commits.py` | Phase 2: opencode 深度分析 ascend_affected commit | 每日（仅当有 ascend_affected 时） | checkout 到父 commit 再恢复 |
 | `generate_context.py` | 生成/刷新架构知识库 + 交叉引用 | 初始化时 / 用户主动刷新 | pull（--checkout 时）+ checkout 再恢复 |
 | `build_index.py` | 构建检索索引 | 每次数据更新后 | 无 |
 | `track_adaptation.py` | 管理适配状态跟踪（仅 init/status/list） | 每次数据更新后 | 无 |

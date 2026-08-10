@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Phase 2: 用 Claude Code 深度分析 ascend_affected 的 commit。
+Phase 2: 用 opencode agent 深度分析 ascend_affected 的 commit。
 
 用法：
   python src/data/deep_analyze_commits.py \
@@ -13,7 +13,7 @@ Phase 2: 用 Claude Code 深度分析 ascend_affected 的 commit。
   1. 读取 Phase 1 的分析结果，找出 ascend_affected=true 且尚未深度分析的 commit
   2. 对每个 commit：
      a. 临时 checkout vllm 源码到该 commit 的父 commit（还原分析时的代码状态）
-     b. 调用 Claude Code（agent 模式），读取架构文件和实际源码
+     b. 调用 opencode（agent 模式），读取架构文件和实际源码
      c. 获取深度分析结果（affected_interfaces、adaptation_effort、adaptation_guide、risk）
      d. 写回 deep_analysis 字段到分析文件（每个 commit 完成后即时保存）
      e. 恢复 vllm 源码到原来的 HEAD
@@ -31,7 +31,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from data._source_repo import repo_dir_name
 from data._track_arch_delta import get_deltas_up_to, add_delta, load_deltas, deltas_path, save_json_atomic as save_deltas
 from data._source_cache import SourceContextCache
-from data._claude_client import call_claude
+from data._opencode_client import call_opencode
 
 TZ_CN = timezone(timedelta(hours=8))
 
@@ -82,7 +82,7 @@ def deep_analyze_commits(repo, date, data_dir, local_repo):
         print("No ascend_affected commits without deep_analysis found")
         return True
 
-    print(f"Deep analyzing {len(to_analyze)} ascend_affected commits via Claude Code...")
+    print(f"Deep analyzing {len(to_analyze)} ascend_affected commits via opencode...")
 
     commits_path = os.path.join(repo_dir, "commits", f"{date}.json")
     commits_data = load_json(commits_path)
@@ -228,7 +228,7 @@ Patch summary:
                 "required": ["ascend_affected_confirmed", "affected_interfaces", "adaptation_effort", "adaptation_guide"],
             }
 
-            result = call_claude(
+            result = call_opencode(
                 prompt=prompt,
                 json_schema=deep_analysis_schema,
                 add_dirs=[local_repo, data_dir_abs],
@@ -287,7 +287,7 @@ def get_repo_dir(data_dir, repo):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Deep analyze ascend_affected commits via Claude Code")
+    parser = argparse.ArgumentParser(description="Deep analyze ascend_affected commits via opencode")
     parser.add_argument("--repo", required=True, help="GitHub repo (owner/repo)")
     parser.add_argument("--date", required=True, help="Date to analyze (YYYY-MM-DD, UTC+8)")
     parser.add_argument("--local-repo", required=True, help="Path to local repo source code")

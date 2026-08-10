@@ -27,10 +27,10 @@
   2. 如果指定了 --checkout，先 pull 最新代码确保目标 commit 存在，然后临时 checkout
   3. 完成后自动恢复 HEAD
   4. 遍历本地源码目录，构建目录树
-  5. 调用 Claude Code（agent 模式），读取关键接口文件，生成结构化架构摘要
+  5. 调用 opencode（agent 模式），读取关键接口文件，生成结构化架构摘要
   6. 保存架构摘要到 data/{repo}/context/architecture.json
   7. 如果是 vllm 仓库，重置 arch_deltas.json（新基线，增量清空）
-  8. 交叉引用模式：读取两个架构文件，调用 Claude Code 分析跨项目关系
+  8. 交叉引用模式：读取两个架构文件，调用 opencode 分析跨项目关系
   9. 将 cross_project_relationship 写入两个架构文件
 """
 import argparse
@@ -42,7 +42,7 @@ from datetime import datetime, timezone, timedelta
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from data._source_repo import ensure_repo, get_current_sha, repo_dir_name, _find_upstream_remote, KNOWN_REPOS
 from data._track_arch_delta import reset_deltas
-from data._claude_client import call_claude
+from data._opencode_client import call_opencode
 
 TZ_CN = timezone(timedelta(hours=8))
 
@@ -521,7 +521,7 @@ def build_tree(local_repo, source_dir, max_depth=4):
 
 
 def generate_context(repo, data_dir, force, local_repo=None, checkout_sha=None):
-    """Phase 1: Generate architecture.json for a single repo using Claude Code agent."""
+    """Phase 1: Generate architecture.json for a single repo using opencode agent."""
     repo_dir = os.path.join(data_dir, repo_dir_name(repo))
     context_path = os.path.join(repo_dir, "context", "architecture.json")
 
@@ -583,15 +583,14 @@ def generate_context(repo, data_dir, force, local_repo=None, checkout_sha=None):
 
         arch_schema = _build_architecture_schema()
 
-        print("Calling Claude Code (agent mode) to synthesize architecture summary...")
-        context = call_claude(
+        print("Calling opencode (agent mode) to synthesize architecture summary...")
+        context = call_opencode(
             prompt=prompt,
             json_schema=arch_schema,
-            max_budget_usd=None,
             add_dirs=[local_repo],
         )
         if context is None:
-            print("Failed to get response from Claude Code")
+            print("Failed to get response from opencode")
             return False
 
         if not isinstance(context, dict):
@@ -638,7 +637,7 @@ def generate_cross_reference(data_dir, force, vllm_local=None, ascend_local=None
     """Phase 2: Cross-reference vllm and vllm-ascend architectures.
 
     Reads both architecture.json files, sends them to the LLM along with
-    local repo paths (if available) so Claude Code can read source files
+    local repo paths (if available) so opencode can read source files
     for more accurate impact judgment rules.
     """
     vllm_dir = os.path.join(data_dir, repo_dir_name("vllm-project/vllm"))
@@ -694,15 +693,14 @@ def generate_cross_reference(data_dir, force, vllm_local=None, ascend_local=None
 
     cross_ref_schema = _build_cross_ref_schema()
 
-    print("Calling Claude Code (agent mode) for cross-reference...")
-    cross_ref = call_claude(
+    print("Calling opencode (agent mode) for cross-reference...")
+    cross_ref = call_opencode(
         prompt=prompt,
         json_schema=cross_ref_schema,
-        max_budget_usd=None,
         add_dirs=[d for d in [vllm_local, ascend_local] if d],
     )
     if cross_ref is None:
-        print("Failed to get cross-reference from Claude Code")
+        print("Failed to get cross-reference from opencode")
         return False
 
     # Write cross_project_relationship into both architecture files

@@ -7,20 +7,6 @@ Provides 14 tools for AI agents to query vllm-report's knowledge base.
 Usage:
   python -m src.mcp_server_app --data-dir /path/to/vllm-report/data --ascend-repo-path /path/to/vllm-ascend
 
-Claude Code config (~/.claude/settings.local.json):
-  {
-    "mcpServers": {
-      "vllm-report": {
-        "command": "python",
-        "args": [
-          "-m", "src.mcp_server_app",
-          "--data-dir", "/path/to/vllm-report/data",
-          "--ascend-repo-path", "/path/to/vllm-ascend"
-        ]
-      }
-    }
-  }
-
 opencode config (~/.config/opencode/opencode.jsonc):
   {
     "mcp": {

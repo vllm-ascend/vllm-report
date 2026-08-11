@@ -667,6 +667,65 @@ async def tool_get_commit_diff(repo: str, sha: str) -> str:
         return json.dumps({"error": f"Failed to fetch diff: {str(e)}"}, ensure_ascii=False)
 
 
+
+async def tool_get_commit_impact_batch(shas: list[str]) -> str:
+    """批量查询 commits 的 ascend 影响分析。用于 plan_steps 阶段的确定性路由。
+
+    用 commits-index.json 做 O(1) sha→date 映射, 然后只读对应日期的
+    analysis/<date>.json (避免遍历所有日期文件)。
+
+    返回每个 sha 的 (analyzed, ascend_affected, tags, needs_test_update,
+    suggested_test_areas)。未在 commits-index.json 中找到的 sha → analyzed=False。
+    """
+    if not shas:
+        return json.dumps({"results": []}, ensure_ascii=False, indent=2)
+
+    commits_index_path = get_commits_index_path(data_dir, "vllm")
+    commits_index = load_json(commits_index_path) or {}
+
+    # 按 date 分桶, 一次只读需要的日期文件
+    by_date: dict[str, list[str]] = {}
+    for sha in shas:
+        # commits-index 用完整 sha 做 key
+        entry = commits_index.get(sha) or commits_index.get(sha.lower())
+        date = entry.get("date") if entry else None
+        if date:
+            by_date.setdefault(date, []).append(sha)
+
+    # 读对应日期的 analysis 文件, 建 sha → impact 映射
+    impacts: dict[str, dict] = {}
+    for date, date_shas in by_date.items():
+        analysis_path = get_analysis_path(data_dir, "vllm", date)
+        analysis = load_json(analysis_path)
+        if not analysis:
+            continue
+        date_set = set(date_shas)
+        for commit in analysis.get("commits", []):
+            sha = commit.get("sha", "")
+            if sha in date_set:
+                ai = commit.get("ascend_impact") or {}
+                impacts[sha] = {
+                    "sha": sha,
+                    "analyzed": True,
+                    "ascend_affected": bool(ai.get("ascend_affected", False)),
+                    "tags": commit.get("tags", []) or [],
+                    "needs_test_update": bool(ai.get("needs_test_update", False)),
+                    "suggested_test_areas": ai.get("suggested_test_areas", []) or [],
+                    "functionality": ai.get("functionality", ""),
+                    "testing": ai.get("testing", ""),
+                }
+
+    # 组装结果, 按输入顺序; 未找到的 sha → analyzed=False
+    results = []
+    for sha in shas:
+        if sha in impacts:
+            results.append(impacts[sha])
+        else:
+            results.append({"sha": sha, "analyzed": False})
+
+    return json.dumps({"results": results}, ensure_ascii=False, indent=2)
+
+
 async def tool_get_adaptation_guide(sha: str) -> str:
     """返回某个 commit 的适配指南（markdown 格式）"""
     # Search for this SHA across all analysis files
@@ -1502,6 +1561,21 @@ TOOLS = [
         },
     ),
     Tool(
+        name="get_commit_impact_batch",
+        description="Batch query ascend-impact analysis for a list of vllm commits (JSON, structured). Used by plan_steps for deterministic routing.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "shas": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Full vllm commit SHAs to query",
+                }
+            },
+            "required": ["shas"],
+        },
+    ),
+    Tool(
         name="get_pending_adaptations",
         description="Get list of pending/unknown adaptation commits",
         inputSchema={"type": "object", "properties": {}},
@@ -1740,6 +1814,8 @@ async def handle_call_tool(ctx, params: CallToolRequestParams) -> CallToolResult
             result = await tool_get_adaptation_baseline()
         elif name == "get_commit_diff":
             result = await tool_get_commit_diff(args["repo"], args["sha"])
+        elif name == "get_commit_impact_batch":
+            result = await tool_get_commit_impact_batch(args["shas"])
         elif name == "get_adaptation_guide":
             result = await tool_get_adaptation_guide(args["sha"])
         elif name == "get_pending_adaptations":

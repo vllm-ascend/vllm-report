@@ -268,7 +268,19 @@
           "上游 tests/v1/core/test_scheduler.py 中 mamba_align 用例的 Ascend 对应验证"
         ]
       },
-      "message": "[V1][Scheduler] Apply Mamba alignment before encoder caps (#51603)\n\nSigned-off-by: Jiangyun Zhu <riverclouds.zhu@qq.com>\nCo-authored-by: Akshat Anand <40275336+cipheraxat@users.noreply.github.com>\nCo-authored-by: Codex <codex@openai.com>"
+      "message": "[V1][Scheduler] Apply Mamba alignment before encoder caps (#51603)\n\nSigned-off-by: Jiangyun Zhu <riverclouds.zhu@qq.com>\nCo-authored-by: Akshat Anand <40275336+cipheraxat@users.noreply.github.com>\nCo-authored-by: Codex <codex@openai.com>",
+      "deep_analysis": {
+        "ascend_affected_confirmed": true,
+        "affected_interfaces": [
+          "vllm_ascend/core/recompute_scheduler.py — RecomputeScheduler.schedule() (and inherited AsyncRecomputeScheduler)",
+          "vllm_ascend/core/scheduler_profiling_chunk.py — ProfilingChunkScheduler.schedule()",
+          "vllm_ascend/patch/platform/patch_balance_schedule.py — BalanceScheduler (rebinds vllm.v1.core.sched.scheduler.Scheduler with a copied schedule() body)",
+          "vllm_ascend/tests/ut/patch/platform/test_patch_balance_schedule.py — _SCHEDULER_METHOD_SEAMS seam guard"
+        ],
+        "adaptation_effort": "medium",
+        "adaptation_guide": "Upstream commit 243c63baf523 fixes a scheduler deadlock: for hybrid attention+Mamba models (need_mamba_block_aligned_split=True) with multimodal requests, applying _mamba_block_aligned_split AFTER _try_schedule_encoder_inputs lets encoder budget/cache caps shrink num_new_tokens below a valid Mamba block boundary, so alignment returns 0 and the request never makes progress. The fix (1) applies _mamba_block_aligned_split BEFORE _try_schedule_encoder_inputs in both the running-requests loop and the prefill loop, (2) in the prefill loop DROPS the 'and not load_kv_async' guard and adds 'if num_new_tokens == 0: break' right after alignment, and (3) refactors encoder_window_end inside _try_schedule_encoder_inputs (behavior-neutral; Ascend inherits this method, so no change needed there).\n\nvllm-ascend keeps three copies of the old upstream schedule() body and must port the reordering to each (all currently do encoder caps first, then mamba alignment):\n\n1. vllm_ascend/core/recompute_scheduler.py: move the `if self.need_mamba_block_aligned_split:` block (currently lines 294-295 in the running loop, 675-683 in the prefill loop) to BEFORE the _try_schedule_encoder_inputs calls (lines 286, 663). In the prefill loop remove the `and not load_kv_async` condition and keep the `if num_new_tokens == 0: break`.\n\n2. vllm_ascend/core/scheduler_profiling_chunk.py: same reordering — running loop: mamba alignment (currently lines 345-346) must move before _try_schedule_encoder_inputs (lines 300-312); prefill loop: move mamba alignment (currently 593-601) before _try_schedule_encoder_inputs (lines 576-591). Decide deliberately where the PROFILING CHUNK dynamic-sizing block sits relative to alignment so it cannot shrink a chunk below a block boundary and re-introduce the stall.\n\n3. vllm_ascend/patch/platform/patch_balance_schedule.py (BalanceScheduler): port the same reordering into the copied schedule() body — running loop lines 255-274, prefill loop lines 581-594 — including dropping the `not load_kv_async` guard in the prefill loop. Update the seam-guard test if needed (the seams _try_schedule_encoder_inputs/_mamba_block_aligned_split themselves still exist with unchanged signatures, so the existing guard keeps passing).\n\nAdd regression coverage mirroring upstream tests test_mamba_align_encoder_cache_cap_makes_progress and test_mamba_align_eagle_schedules_encoder_at_boundary in tests/ut (no NPU needed for scheduler logic).",
+        "risk": "Medium. The reordering changes scheduling semantics for hybrid Mamba + multimodal requests: chunks now end on valid Mamba cacheable boundaries before encoder caps apply, so num_new_tokens can end up larger than the old encoder-cap-limited value in the running loop. The prefill-loop removal of the 'not load_kv_async' guard is a behavioral change on the Ascend KV-transfer/recompute path (load_kv_async drives async receive in RecomputeScheduler); alignment with num_external_computed_tokens during async loads must be validated against the RecomputeScheduler's KV-connector flow to avoid clipping/rounding issues. ProfilingChunkScheduler needs careful interleaving of the profiling-chunk prediction with alignment. Scheduler-divergence risk is ongoing because these are copied upstream bodies — a follow-up to reduce duplication (reuse upstream schedule via hooks) would prevent recurrence."
+      }
     },
     {
       "sha": "d89ba6481bd0cbe99e1c83ed169131682b366dbd",
@@ -312,7 +324,7 @@
         "heterogeneous"
       ],
       "ascend_impact": {
-        "ascend_affected": true,
+        "ascend_affected": false,
         "functionality": "ModelArchitectureConfig 新增 per_layer_overrides 字段与 __getitem__/from_layers（同构模型保持 None，向后兼容）；ModelConfig.get_num_kv_heads/get_num_attention_heads 新增可选 arch_config 参数（向后兼容）；get_quant_config 的 head 计数改为从 model_arch_config 读取。vllm-ascend 的 NPUPlatform.check_and_update_config 与 AscendConfig 若读取 head 相关配置或调用上述方法，需要在 Gemma4 异构模型（per-layer head_dim/num_kv_heads 不同）下确认 KV cache spec 与 attention 后端配置正确；transformers fuser 的 head 数推导变更影响该后端的 QKV 融合路径。",
         "testing": "需要新增/更新配置测试：异构 head 维度下 model_arch_config[layer] 解析与 KV cache spec 生成；如 Ascend 支持 Gemma4，需验证 KV cache 初始化与 attention 后端的每层 head 维度一致性。",
         "needs_test_update": true,
@@ -321,7 +333,14 @@
           "Gemma4 异构 head/量化配置测试（如 Ascend 支持该模型）"
         ]
       },
-      "message": "Fix Gemma 4 for upcoming Transformers version (#49797)\n\nSigned-off-by: Harry Mellor <19981378+hmellor@users.noreply.github.com>"
+      "message": "Fix Gemma 4 for upcoming Transformers version (#49797)\n\nSigned-off-by: Harry Mellor <19981378+hmellor@users.noreply.github.com>",
+      "deep_analysis": {
+        "ascend_affected_confirmed": false,
+        "affected_interfaces": [],
+        "adaptation_effort": "low",
+        "adaptation_guide": "",
+        "risk": ""
+      }
     },
     {
       "sha": "81840a172f2886f4c59dafd9dce9917bb789280c",
@@ -416,7 +435,21 @@
           "BailingMoeV3/Ling-3.0 block-FP8 权重加载测试（如 Ascend 支持）"
         ]
       },
-      "message": "`[Model][Quantization] Add Ling-3.0-flash-fp8 support` (#51265)\n\nSigned-off-by: Isotr0py <Isotr0py@outlook.com>\nCo-authored-by: Isotr0py <Isotr0py@outlook.com>\nCo-authored-by: mergify[bot] <37929162+mergify[bot]@users.noreply.github.com>"
+      "message": "`[Model][Quantization] Add Ling-3.0-flash-fp8 support` (#51265)\n\nSigned-off-by: Isotr0py <Isotr0py@outlook.com>\nCo-authored-by: Isotr0py <Isotr0py@outlook.com>\nCo-authored-by: mergify[bot] <37929162+mergify[bot]@users.noreply.github.com>",
+      "deep_analysis": {
+        "ascend_affected_confirmed": true,
+        "affected_interfaces": [
+          "vllm_ascend/quantization/modelslim_config.py (AscendModelSlimConfig / get_packed_modules_mapping)",
+          "vllm_ascend/quantization/fp8_config.py (AscendFp8Config)",
+          "vllm_ascend/patch/worker/patch_fused_moe.py (FusedMoE -> AscendMoERunner)",
+          "vllm_ascend/attention/ (AscendMLABackend + KDA/SSM attention metadata)",
+          "vllm_ascend/ops/ (KDA custom ops for bailing_v3_kda_attention)",
+          "New worker patch for bailing_moe_v3 / bailing_moe_v3_mtp weight loading"
+        ],
+        "adaptation_effort": "medium",
+        "adaptation_guide": "This commit adds block-FP8 (Ling-3.0-flash-fp8) support to the BailingMoeV3 model, extending the earlier BF16 Ling-3.0 commit (d4da0c55af3a). No existing vllm-ascend code breaks (the is_layer_skipped signature change to match_mode is absorbed by ascend's own fork is_layer_skipped_ascend, and the new Fp8Config.ignored_layers_match_mode field is additive since AscendFp8Config subclasses QuantizationConfig, not Fp8Config), so this is model-porting work rather than breakage fixing. To run Ling-3.0-flash-fp8 on NPU, vllm-ascend needs: (1) a new worker patch (e.g. patch_bailing_moe_v3.py) for BailingMoeV3ForCausalLM.load_weights covering the new hf_to_vllm_mapper ({'.attention.': '.self_attn.'}) remap, the FP8 shared-expert checkpoint padding helpers (_pad_block_fp8_mlp_checkpoint_tensor/_maybe_pad_block_fp8_shared_expert_checkpoint_tensor) and the new qkv_proj/b_proj split path in BailingMoeV3KimiDeltaAttention (separate_b_proj); (2) verify/support Fp8Config with weight_block_size (block-wise FP8 scales) on NPU - FP8 is in NPUPlatform.supported_quantization, but block-scale FP8 linear needs validation; (3) provide an NPU implementation of the KDA custom ops (vllm.third_party.flash_linear_attention.ops.kda: chunk_kda/fused_kda_gate/fused_recurrent_kda) used by bailing_v3_kda_attention; (4) ensure AscendMoERunner (via patch_fused_moe.py) handles the padded shared-expert intermediate size (_get_block_fp8_mlp_padded_intermediate_size) and fp8 shared experts; (5) add a bailing_moe_v3 model_type entry to get_packed_modules_mapping in modelslim_config.py (like the existing bailing_hybrid entry) since packed_modules_mapping now adds qkv_proj; (6) verify MLA attention (BailingMoeV3MLAAttention via MultiHeadLatentAttentionWrapper) and the MTP draft (bailing_moe_v3_mtp.py, now ReplicatedLinear eh_proj + hf_to_vllm_mapper) under NPU spec-decode/MTP.",
+        "risk": "Medium. No regression risk to existing ascend-supported models since nothing in vllm-ascend depends on the changed vllm files. The main risk is in porting a new hybrid (MLA + KDA/SSM + MoE) model with block-FP8 quantization: NPU FP8 block-scale support is uncertain, the KDA kernel requires a custom NPU op, padded shared-expert weight loading is error-prone under TP sharding, and MTP spec-decode adds integration surface. If Ling-3.0-fp8 is not yet targeted for NPU, this work can be deferred with no impact."
+      }
     },
     {
       "sha": "3b4c86e489c532f109e602c67b38ac94dc5b78fe",
@@ -508,7 +541,18 @@
         "needs_test_update": false,
         "suggested_test_areas": []
       },
-      "message": "[BugFix] Use file:// rendezvous for single-node executors to eliminate startup port races (#50999)\n\nSigned-off-by: Parsa Mazaheri <p_mazaheri@apple.com>\nSigned-off-by: aoshen02 <aoshen02@users.noreply.github.com>\nSigned-off-by: aoshen02 <aoshen@inferact.ai>\nCo-authored-by: Parsa Mazaheri <p_mazaheri@apple.com>\nCo-authored-by: aoshen02 <aoshen02@users.noreply.github.com>\nCo-authored-by: Claude <noreply@anthropic.com>"
+      "message": "[BugFix] Use file:// rendezvous for single-node executors to eliminate startup port races (#50999)\n\nSigned-off-by: Parsa Mazaheri <p_mazaheri@apple.com>\nSigned-off-by: aoshen02 <aoshen02@users.noreply.github.com>\nSigned-off-by: aoshen02 <aoshen@inferact.ai>\nCo-authored-by: Parsa Mazaheri <p_mazaheri@apple.com>\nCo-authored-by: aoshen02 <aoshen02@users.noreply.github.com>\nCo-authored-by: Claude <noreply@anthropic.com>",
+      "deep_analysis": {
+        "ascend_affected_confirmed": true,
+        "affected_interfaces": [
+          "AscendMultiprocExecutor._init_executor (vllm_ascend/patch/platform/patch_multiproc_executor.py) — overrides upstream MultiprocExecutor._init_executor that this commit changed; keeps the old tcp:// loopback + get_open_port() rendezvous, so upstream's file:// rendezvous fix (eliminating startup port races) does not apply to Ascend's multiprocess path",
+          "NPUWorker._init_worker_distributed_environment (vllm_ascend/worker/worker.py) — receives the new file:// distributed_init_method from the un-patched upstream UniProcExecutor._distributed_args and calls init_distributed_environment(..., backend=\"hccl\"), which now constructs a torch.distributed.FileStore and calls torch.distributed.init_process_group(backend=\"hccl\", init_method=None, store=store, ...)",
+          "vllm_ascend/distributed/parallel_state.py — depends on upstream init_distributed_environment / _init_process_group_for_split_group (new store param) for all NPU distributed group creation; must validate hccl backend works with store-based init"
+        ],
+        "adaptation_effort": "low",
+        "adaptation_guide": "1) Update vllm_ascend/patch/platform/patch_multiproc_executor.py to match upstream: replace the import on line 12 (get_distributed_init_method, get_loopback_ip, get_open_port) with get_file_store_init_method, and change line 46 from `get_distributed_init_method(get_loopback_ip(), get_open_port())` to `get_file_store_init_method()`. This aligns the Ascend multiprocess path with upstream and eliminates the same startup port race. 2) Validate the single-process path: since vllm-ascend does not override UniProcExecutor, single-NPU runs (world_size==1 / VLLM_ENABLE_V1_MULTIPROCESSING=0) now pass a file:// URL into NPUWorker._init_worker_distributed_environment and exercise the new FileStore branch in upstream init_distributed_environment with backend='hccl'. Confirm torch_npu hccl supports torch.distributed.init_process_group(store=FileStore, init_method=None, ...) on NPU; if not, add a platform patch overriding UniProcExecutor._distributed_args to keep the tcp:// loopback method (get_distributed_init_method(get_loopback_ip(), get_open_port())). 3) Run a single-device startup smoke test on NPU to confirm the FileStore file is created and hccl init succeeds, and run TP>1 multiproc startup to confirm no port race regression.",
+        "risk": "Low for the multiproc path — the AscendMultiprocExecutor patch keeps compiling (all imported helpers still exist) but silently diverges from upstream behavior and misses the port-race bugfix; if left unadapted it is only a missed fix, not a break. Medium for the single-process/UniProcExecutor path — it newly routes a file:// init method (from un-patched upstream) into the hccl backend init; if torch_npu's hccl does not handle store-based rendezvous (init_method=None + store=FileStore), single-NPU startup could fail; FileStore also depends on a writable temp dir shared across worker processes (single-node, so normally fine)."
+      }
     },
     {
       "sha": "0820125ae99f719f3cd8b0c26c0d3f9789e187e3",

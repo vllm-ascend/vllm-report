@@ -222,10 +222,9 @@ See [docs/mcp-usage-guide.md](docs/mcp-usage-guide.md) for detailed usage scenar
 |--------|-------------|
 | `DEEPSEEK_API_KEY` | API key for DeepSeek (Phase 1 bulk analysis) |
 | `OPENCODE_AUTH_TOKEN` | OpenAI-compatible API key used by opencode (Phase 2 deep analysis + architecture generation) |
-| `OPENCODE_BASE_URL` | OpenAI-compatible API base URL |
-| `OPENCODE_MODEL` | opencode provider/model selector (e.g. `deepseek/deepseek-v4-flash`; the CI defaults to this) |
 | `GITHUB_TOKEN` | Default token (auto-provided) |
-| `GITHUB_TOKEN` | Default token (auto-provided) |
+
+> Note: The opencode model is hardcoded to `deepseek/deepseek-v4-flash` and the base URL to `https://api.deepseek.com/v1` in the workflows (the model maps to `deepseek-chat` in `opencode.json`). To change providers, edit the `opencode.json` block and the `OPENCODE_MODEL="..."` invocations in the workflows.
 
 ### Optional Secrets (for Email Report)
 

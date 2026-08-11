@@ -1,0 +1,326 @@
+{
+  "date": "2026-08-11",
+  "repo": "vllm-project/vllm-ascend",
+  "generated_at": "2026-08-12T03:49:16.465318+08:00",
+  "daily_summary": "当日 vllm-ascend 主线包含 15 个 commit，主要方向包括：(1) 最重要的功能是新增 SfaRemoteD2HConnector，实现 SFA KV cache 从 Prefill 到 Decode 的 MemFabric pull 传输，支持 1M token 序列场景下的 KV cache offload，同时重构了 layerwise KV buffer 复用语义（按 main component 分组）；(2) DSA attention metadata 重构与统一；(3) fused MoE dataclass 导入路径清理；(4) Mooncake 连接器支持 do_virtual 虚拟请求；(5) vLLM main 基线升级适配（FusedMoE→FusedMoEFactory、FusedInputNorm eps patch、mamba 内核签名适配等）；(6) MRV2 补齐 SFA indexer cache 支持；(7) 依赖栈升级 CANN 9.1.0 / PTA 2.10.0.post4 / Triton 3.2.2，附带平台配置回写 additional_config；(8) 大量 CI/Doc 维护工作（多节点配置显式化、action 版本升级、workflow 取消行为、测试耗时自动更新、文档翻译等）。",
+  "test_impact_summary": "当日变更对测试看护影响较大。最突出的是 SFA PD RD2H connector 引入了约 1900 行新单测（覆盖协议、线程、调度器、TP 映射、MemFabric 引擎、MultiConnector 编排），并更新了 ascend_store/worker 相关测试以适配 layerwise cache layout 语义变更；DSA 重构新增 test_dsa_v1.py 覆盖 metadata 构建。同时存在几个测试缺口需要关注：MRV2 SFA indexer 路径无新增测试，需补充 MRV2 下 SFA 模型初始化和执行覆盖；Mooncake do_virtual=True 分支无自动化测试；patch_vision（FusedInputNorm eps 替换）没有专门测试；mamba postprocess 内核签名变更缺乏直接测试；平台配置回写 additional_config 的行为无明确测试。依赖升级（CANN/torch-npu/Triton）要求全量 CI 回归，并已对 GDN 测试增加 _probe_fused_chunk mock。整体看，新增功能（KV offload connector、MRV2 SFA）是测试看护的重点，而一些适配性改动（patch、配置传播、内核签名）测试覆盖相对薄弱。",
+  "commits": [
+    {
+      "sha": "af337dfa8def7d1275d05c854071c299c5ef7d3c",
+      "comment": "对 DSA attention metadata 的重构。移除了 AscendDSAPrefillMetadata / AscendDSADecodeMetadata / AscendDSAMetadata 中的冗余字段（query_lens、context_lens、input_positions、max_query_len、max_seq_lens、seq_lens_list、max_seqlen_kv/q、attn_mask、cp_seq_len、batch_seq_mask 等），将 Hadamard 初始化提取为独立的 _init_hadamard 方法，并将 prefill/decode 的 sas/qli metadata 构建统一收敛为 _build_sas_metadata / _build_qli_metadata 两个核心方法，由 prefill/decode wrapper 按阶段传入不同参数。cmp_ratio 的计算被归一化为三档（1/4/128），cmp_topk 与 has_cmp_kv 的取值逻辑也集中在构建方法内。同时从 dsa_cp.py 中移除了无用的类变量（aclgraph_support、hadamard、start_pos_prefill、req_sas_metadata、req_qli_metadata 等），block_size 改为实例属性。整体是纯重构，不改变对外行为，但 DSA 是较新的复杂特性，metadata 结构变化需要与 DSA forward 路径的消费逻辑配合验证。",
+      "tags": [
+        "refactor",
+        "medium-risk",
+        "attention",
+        "dsa"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "重构改变了 metadata 构建路径并新增了单测，覆盖了 sas/qli 构建参数、缓存复用和 output_buffer 行为；但没有覆盖 forward 阶段实际消费这些 metadata 的集成路径，且 dsa_cp.py 的类变量清理也需要确认其 builder 复用关系。",
+        "suggested_test_areas": [
+          "tests/ut/attention/test_dsa_v1.py",
+          "tests/ut/attention/context_parallel/",
+          "tests/ut/attention/a2/test_attention_v1.py"
+        ]
+      },
+      "message": "[Refactor][DSA][2/N] rectify the dsa_cp metadata data (#13918)\n\n### What this PR does / why we need it?\nRectify the dsa_v1 metadata data.  \n1. Remove useless variables from AscendDSAPrefillMetadata,\nAscendDSADecodeMetadata, and AscendDSAMetadata.\n2. Extract the initialization Hadamard function.  \n3. Unify the construction logic for sas metadata and qli metadata with\ndifferent compression methods.\n\nRFC： https://github.com/vllm-project/vllm-ascend/issues/13652\n### Does this PR introduce _any_ user-facing change?\nno\n\n### How was this patch tested?\n\n\n- vLLM version: v0.26.0\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/58d3918e3ea0a544ffedadad2ba84559e9c51d8f\n\n---------\n\nSigned-off-by: weiguihua2 <weiguihua2@huawei.com>"
+    },
+    {
+      "sha": "1aad8745e4a3e02644c76d8a44bcbbd0a4113f59",
+      "comment": "文档修复，将 PR #14011（cherry-pick 到 v0.23.0）重新同步回 main。为 GLM-5.2 的 1M 部署示例添加警告：在 v0.23.0 中 DCP 与 enable_sparse_sfa_c8（sfa_c8）同时启用存在已知问题（含性能下降），因此从所有 1M 部署示例命令中移除 enable_sparse_sfa_c8: true，保留独立的 enable_sparse_li_c8（仍推荐）。更新了推荐参数表。这是用户指导性文档变更，避免用户复现已知的坏配置组合。",
+      "tags": [
+        "docs",
+        "low-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "纯文档变更，不涉及代码或测试逻辑。"
+      },
+      "message": "[Doc] Reapply GLM-5.2 DCP and sfa_c8 guidance (#14017)\n\nSyncs PR #14011 (cherry-picked to releases/v0.23.0) to the main branch.\n\nReapplies PR #13654 to main. This is a documentation fix for\ndocs/source/tutorials/models/GLM5.2.md:\n- Adds a warning that DCP and Sparse Flash Attention C8\n(enable_sparse_sfa_c8, a.k.a. sfa_c8) are experimental features in\nv0.23.0, and enabling them together has known issues in this release,\nincluding performance degradation. Removes enable_sparse_sfa_c8: true\nfrom all 1M deployment example commands (the examples enable DCP, which\nshould not be combined with sfa_c8 in v0.23.0). enable_sparse_li_c8 is\nkept since it is independent and remains recommended.\n- Updates the recommended parameter table accordingly.\n\nWhy needed: the previous examples recommended combining DCP with sfa_c8,\nwhich is a known-bad configuration in v0.23.0; this prevents users from\nreproducing the performance issue.\n\n### Does this PR introduce _any_ user-facing change?\n\n### How was this patch tested?\n\n- vLLM version: v0.26.0\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/58d3918e3ea0a544ffedadad2ba84559e9c51d8f\n\n---------\n\nSigned-off-by: QiuChunshuo <qiuchunshuo@huawei.com>\nSigned-off-by: w30084620 <w30084620@huawei.com>\nCo-authored-by: QiuChunshuo <qiuchunshuo@huawei.com>\nCo-authored-by: w30084620 <w30084620@huawei.com>\nCo-authored-by: Claude <noreply@anthropic.com>"
+    },
+    {
+      "sha": "7a25ef83a605f4709a9f67af12a9bc0f5051e705",
+      "comment": "新增 SfaRemoteD2HConnector，将 SFA KV cache 从远端 Prefill NPU 通过 MemFabric pull 模式直接传输到 Decode 侧 CPU pinned pool（main K/V）和 rank-local HBM（indexer KV）。这是一个完整的 KV Connector V1 实现，包含协议层（protocol.py）、D 侧读线程（read_thread.py）、P 侧发送线程（send_thread.py）、两侧调度器（scheduler.py）和 worker（worker.py），以及进程级 MemFabric 单例引擎（memfabric_transfer_engine.py）。该连接器支持不等价 TP（p_tp >= d_tp 且整除，contributor group 机制）、OpenAI prompt 列表批量展开、层级就绪/完成传播、传输重试与优雅关闭。同时修改了 AscendMultiConnector 以支持 layerwise PD completion 顺序控制（PD provider 先于 store），并重构了 layerwise_cache_layout：从按完整 cache signature 分组改为按 main cache spec 分组，indexer cache 作为子集跟随 main 共享；修复了 MTP 场景下 layerwise load 使用安全范围的问题（use_eagle），并让 SFA attention 在每层 scatter 完成后调用 notify_kv_cache_written。该 PR 风险较高，涉及多模块协同、新协议和新线程模型，且改变了 layerwise buffer 复用的既有语义。",
+      "tags": [
+        "feature",
+        "high-risk",
+        "distributed",
+        "kv-offload",
+        "attention",
+        "sfa"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "新增连接器需要覆盖协议编解码、读写线程、调度器、TP rank 映射、控制端口计算、完成传播、失败处理等大量测试点；layerwise_cache_layout 的语义变更（按 main component 分组、buffer_slots 取代 shared_buffer_layers）要求既有测试同步更新，并需要验证 indexer-only 差异不再阻止 main cache 复用。",
+        "suggested_test_areas": [
+          "tests/ut/kv_offload/test_sfa_pd_rd2h_connector.py",
+          "tests/ut/kv_offload/test_memfabric_transfer_engine.py",
+          "tests/ut/kv_offload/test_ascend_multi_connector.py",
+          "tests/ut/distributed/ascend_store/test_layerwise_cache_layout.py",
+          "tests/ut/distributed/ascend_store/test_pool_worker.py",
+          "tests/ut/distributed/ascend_store/test_pool_scheduler.py",
+          "tests/ut/worker/a2/test_worker_v1.py"
+        ]
+      },
+      "message": "[Feature][KV Transfer] Add SFA PD RD2H connector for kv cache offload (#12831)\n\n## What this PR does / why we need it\n\nBuilding on the sparse decode offload support introduced in #13026, this\nPR introduces `SFAPDRD2HConnector`, a decode-offload-specific connector\nfor transferring SFA KV cache from remote Prefill workers directly into\nDecode-side storage.\n\nThe connector uses a MemFabric pull-based RD2H path:\n\n- Main SFA K/V is transferred into the Decode-side pinned CPU KV cache\npool managed by `KVOffloadDecodeManager`.\n- Indexer KV is transferred into rank-local device memory.\n- Prefill workers expose their KV addresses and notify Decode workers\nwhen each layer is ready.\n- Decode workers own the transfer destinations and pull the required KV\ndata before the request enters decode execution.\n\nThe implementation also provides:\n\n- Separate main/indexer cache mappings.\n- Multi-TP rank mapping and transfer ownership.\n- Batched request handling.\n- Layer-level readiness and completion propagation.\n- Transfer retry, error reporting, and graceful shutdown.\n- Integration with `AscendMultiConnector`.\n- A diagnostic tool for validating MemFabric RD2H transfers.\n\nThe connector implementation is located under `kv_p2p/sfa_pd_rd2h`\nbecause it transfers KV data between disaggregated Prefill and Decode\ninstances.\n\nThis is a stacked PR based on the Decode offload PR. Layerwise Prefill\nKV pool reuse and sparse-C8 compatibility are outside the scope of this\nPR and will be submitted separately.\n\nRelated RFC: https://github.com/vllm-project/vllm/issues/48203\n\n## Performance\n\nThis PR introduces KV cache offloading to enable serving sequences of up\nto 1M tokens. On GLM-5.2:\n\n- During Prefill, it reduces the peak HBM footprint of the KV cache by\nup to 90%, with no significant degradation in end-to-end performance.\n- During Decode, it reduces the peak HBM footprint of the KV cache by\nmore than 90% and supports up to nine concurrent 1M-token sequences.\n\n## Does this PR introduce any user-facing change?\n\nYes. It introduces a new KV connector named `SFAPDRD2HConnector`.\n\nConfiguration and deployment documentation will be provided in a\nfollow-up documentation PR.\n\n## How was this patch tested?\n\n\n- vLLM version: v0.26.0\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/0351e9aa1fdf1a51329d1906881528dfe61fc88e\n\n---------\n\nSigned-off-by: F.Liu <1661888967@qq.com>"
+    },
+    {
+      "sha": "27bc2b451b29e134adb2250b0c12f5f294cfdf03",
+      "comment": "清理 fused MoE dataclass 的遗留 re-export。此前 token_dispatcher.py 作为兼容 facade 重新导出 fused_experts / moe_mlp / moe_quant / router_input / prepare_finalize 中的符号；本次将该兼容层完全移除，所有调用方改为从拥有该 dataclass 的模块直接导入。MoEActivation 的导入路径也统一更新为 vllm.model_executor.layers.fused_moe.activation。这是纯 import 重构，不改变运行时行为，但所有引用方必须同步更新，否则会直接 ImportError；PR 已同步更新了全部源码和测试引用。",
+      "tags": [
+        "refactor",
+        "low-risk",
+        "ops",
+        "fused-moe"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "facade 导出移除后所有测试必须从正确模块导入；同时删除了 test_moe_runtime_args.py 中验证 facade 导出的测试，需要确保其余测试不受影响且覆盖新导入路径。",
+        "suggested_test_areas": [
+          "tests/ut/ops/test_moe_runtime_args.py",
+          "tests/ut/ops/test_moe_comm_method.py",
+          "tests/ut/ops/test_moe_mlp.py",
+          "tests/ut/ops/a2/test_token_dispatcher.py",
+          "tests/ut/_310p/fused_moe/test_moe_mlp_310.py",
+          "tests/ut/lora/test_quant_moe.py"
+        ]
+      },
+      "message": "[Refactor][Ops] Clean up fused MoE dataclass imports (#13938)\n\nRelated to: https://github.com/vllm-project/vllm-ascend/issues/13220\n\n## What this PR does / why we need it?\n\nRemove the legacy fused MoE dataclass re-exports from `token_dispatcher`\nand update fused MoE runtime code plus related tests to import from the\nowning dataclass modules directly. This keeps the post-dataclass-split\nownership boundary consistent and avoids depending on compatibility\nexports that are no longer needed.\n\nAlso switch `MoEActivation` imports to the current upstream activation\nmodule path.\n\n## Does this PR introduce _any_ user-facing change?\n\nNo.\n\n## How was this patch tested?\n\n- `git diff --check`\n- `python -m py_compile vllm_ascend/ops/fused_moe/moe_comm_method.py\nvllm_ascend/_310p/fused_moe/moe_comm_method.py\nvllm_ascend/lora/quant_moe.py\nvllm_ascend/ops/fused_moe/dataclass/fused_experts.py\nvllm_ascend/ops/fused_moe/dataclass/moe_mlp.py\nvllm_ascend/ops/fused_moe/dataclass/token_dispatcher.py`\n- `python -m pytest --version` currently fails in this local environment\nbecause the active interpreter (`/Users/jc/miniconda3/bin/python`) does\nnot have `pytest` installed\n\n- vLLM version: v0.26.0\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/0351e9aa1fdf1a51329d1906881528dfe61fc88e\n\n---------\n\nSigned-off-by: weijinqian0 <1184188277@qq.com>"
+    },
+    {
+      "sha": "cdd996fd50fea8feeb54a2ca199481b0486cd062",
+      "comment": "为 MooncakeConnector 增加 do_virtual 请求支持。ReqMeta 新增 do_virtual 字段（默认 False），MooncakeConnectorMetadata.add_new_req 从 kv_transfer_params 读取该标志，MooncakeConnectorWorker.start_load_kv 中遇到 do_virtual=True 时，直接通过 KVCacheTaskTracker.add_not_transfer_request 将请求标记为完成，并跳过后续 Mooncake KV receive/transfer 路径。该功能用于虚拟执行流：decode 侧请求走正常 KV transfer 完成路径，但不实际执行远端 KV cache 接收。默认值 False 保持现有行为不变。实现简洁，但 PR 说明该功能仅通过手工 Ascend 1P1D 环境验证，缺少自动化测试。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "distributed",
+        "mooncake"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "现有测试仅在构造函数中补充 do_virtual=False 的默认值；do_virtual=True 分支没有任何自动化测试，其正确性依赖手工验证，应补充单测验证 add_not_transfer_request 被调用且传输路径被跳过。",
+        "suggested_test_areas": [
+          "tests/ut/kv_offload/test_mooncake_connector.py"
+        ]
+      },
+      "message": "[BugFix] Support virtual requests in Mooncake connector (#13669)\n\n### What this PR does / why we need it?\n\nThis PR adds support for the optional `do_virtual` flag in\n`MooncakeConnector`.\n\nWhen `do_virtual` is enabled for a decode-side KV receive request, this\nchange:\n\n- propagates `do_virtual` from `kv_transfer_params` to `ReqMeta`;\n- marks the request as completed through\n  `KVCacheTaskTracker.add_not_transfer_request`;\n- skips submitting the request to the remaining Mooncake KV receive and\n  transfer path.\n\nThis is needed for virtual execution flows where the decode-side request\nshould follow the normal KV transfer completion path without performing\nan actual remote KV cache receive operation.\n\nThe default value of `do_virtual` is `False`, so the existing Mooncake\nKV transfer behavior remains unchanged when the flag is not specified.\n\n### Does this PR introduce _any_ user-facing change?\n\nYes.\n\nThis PR adds an optional `do_virtual` field to the per-request\n`kv_transfer_params` handled by `MooncakeConnector`.\n\nWhen `do_virtual` is set to `True`, the decode-side KV receive request\nis\nmarked as completed through `add_not_transfer_request`, and the actual\nMooncake KV receive path is skipped.\n\nWhen the field is omitted or set to `False`, the existing behavior is\nunchanged.\n\n### How was this patch tested?\n\n- Ran Ruff lint checks:\n\n```bash\nruff check \\\n  vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py\n```\n\n- Formatted the modified file with Ruff:\n\n```bash\nruff format \\\n  vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py\n```\n\n- Ran a Python syntax check:\n\n```bash\npython -m py_compile \\\n  vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py\n```\n\n- Manually tested the change in an Ascend 1P1D deployment with:\n  - `MooncakeConnectorV1`\n  - Prefill TP size: 2\n  - Decode TP size: 2\n  - Model: `Qwen3-30B-A3B-W8A8`\n\n- Sent a decode-side request with `do_virtual=true` and dummy remote KV\n  transfer metadata.\n\n- Temporarily added a log in the `do_virtual` branch and verified that:\n  - the request entered the virtual completion branch;\n  - `add_not_transfer_request` was executed;\n  - the subsequent Mooncake KV transfer scheduling path was skipped;\n  - the decode server completed the request and returned a response\n    successfully without performing an actual remote KV cache transfer.\n\nThe temporary validation log was removed from the final patch.\n\nNo automated test was added. The change was validated through the manual\nAscend 1P1D smoke test described above.\n\n- vLLM version: v0.26.0\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/0351e9aa1fdf1a51329d1906881528dfe61fc88e\n\n---------\n\nSigned-off-by: xyy59516 <xyy59516@gmail.com>"
+    },
+    {
+      "sha": "3b98a0342274df4f6c876436c467b4df31fc31dc",
+      "comment": "CI/E2E 配置改进。为 nightly/weekly 的 A2/A3 多节点测试矩阵显式指定 config_base_path（internal_dp/config 或 external_dp/config），避免外部 DP 用例错误回退到内部 DP runner；移除隐式 config-path fallback，使新增多节点用例必须声明配置目录；同时移除 weekly 矩阵中引用了不存在 YAML 文件的条目（如部分 DeepSeek-V4/Kimi 用例迁移到 double_node 并补上 config_base_path）。这是纯 CI 工作流配置变更，不涉及产品代码。",
+      "tags": [
+        "ci",
+        "low-risk",
+        "test"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "仅调整 CI workflow 和测试矩阵配置，不改变测试逻辑本身；需关注多节点用例的 config_base_path 是否正确解析。"
+      },
+      "message": "[CI][E2E] Make multi-node config paths explicit for nightly and weekly tests (#13978)\n\n### What this PR does / why we need it?\n\nThis PR makes the config path explicit for A2/A3 multi-node nightly and\nweekly tests.\n\nPreviously:\n\n- Nightly multi-node jobs did not pass `config_base_path`, so external\nDP cases could incorrectly fall back to the internal DP test runner.\n- Weekly A3 selected internal or external DP through hardcoded job-level\npaths, making its behavior inconsistent with nightly tests.\n\nThis PR:\n\n- Passes `matrix.test_config.config_base_path` through the Nightly A2,\nNightly A3, and Weekly A3 multi-node workflows.\n- Adds an explicit `config_base_path` to every current A2/A3 multi-node\ntest case.\n- Supports internal and external DP cases consistently in both the\n`multi_node` and `double_node` matrices.\n- Removes the implicit config-path fallback so newly added multi-node\ncases must declare their config directory.\n- Removes weekly matrix entries whose referenced YAML files are not\npresent in the weekly config directory.\n\nThis prevents external DP cases from being routed through the internal\nDP test entry and makes the test configuration easier to understand and\nmaintain.\n\n### Does this PR introduce _any_ user-facing change?\n\nNo. This is a CI/E2E test configuration change only.\n\n### How was this patch tested?\n\nBy running the test.\n\n- vLLM version: v0.26.0\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/0351e9aa1fdf1a51329d1906881528dfe61fc88e\n\nSigned-off-by: chen-commits <1636718796@qq.com>\nSigned-off-by: chen <1636718796@qq.com>"
+    },
+    {
+      "sha": "7485331ddec0514fe05dafd48678e72011e64c48",
+      "comment": "升级核心依赖栈：CANN 9.0.1→9.1.0（310P 从 beta 镜像切换到正式镜像）、torch-npu 2.10.0.post2→2.10.0.post4、triton-ascend 3.2.1→3.2.2。同步更新了 Dockerfile、CI 镜像标签、csrc version.info、requirements/pyproject、安装文档等。UVA 仍因 triton-ascend #783 问题保持禁用。另外从 #13799 cherry-pick 了平台配置传播：NPUPlatform 在修改 enable_npugraph_ex / enable_static_kernel / recompute_scheduler_enable 后同时写回 vllm_config.additional_config，确保 spawn 的 EngineCore/worker 子进程重建有效配置而非恢复默认值。由于升级后 torch_npu.npu_chunk_gated_delta_rule 可用，GDN fused probe 会成功，相关单测显式 mock _probe_fused_chunk 返回 False 以保持走 mocked Triton 路径。",
+      "tags": [
+        "chore",
+        "medium-risk",
+        "dependencies",
+        "platform",
+        "ci"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "依赖升级需要全量 CI 回归；GDN 测试已增加 _probe_fused_chunk mock 以适配新 CANN；platform.py 的 additional_config 回写是行为变更，现有测试未覆盖多进程 spawn 场景下配置传播的正确性。",
+        "suggested_test_areas": [
+          "tests/ut/ops/a2/test_gdn_layerwise_kv.py",
+          "tests/ut/ops/a2/test_gdn_chunk_meta.py",
+          "tests/ut/platform/",
+          "CI 全量回归"
+        ]
+      },
+      "message": "[Misc] Upgrade CANN(9.1.0), PTA(2.10.0.post4), and Triton(3.2.2) (#13901)\n\n### What this PR does / why we need it?\nThis PR upgrades the dependency stack used by the `main` branch:\n\n- Upgrade CANN from 9.0.1 to 9.1.0.\n  - Replace the 310P 9.1.0 beta images with the 9.1.0 final images.\n- Synchronize A2, A3, A5, and 310P images across Ubuntu, openEuler,\nexisting wheel builds, CI, nightly tests, and CSRC cache jobs.\n- Upgrade PTA (`torch-npu`) from 2.10.0.post2 to 2.10.0.post4.\n- Upgrade Triton Ascend from 3.2.1 to 3.2.2.\n- Update dependency metadata, installation documentation, Dockerfiles,\nCI image tags, and CANN package requirements accordingly.\n- Keep UVA disabled for Triton Ascend 3.2.2 because it is still affected\nby the pinned-memory pointer validation issue tracked in\n[triton-ascend#783](https://github.com/triton-lang/triton-ascend/issues/783).\n\nThe platform configuration propagation change is cherry-picked from\n[#13799](https://github.com/vllm-project/vllm-ascend/pull/13799),\noriginally authored by @yiz-liu.\n\nThis change synchronizes platform-derived Ascend configuration overrides\nback to `vllm_config.additional_config`. This ensures that spawned\nEngineCore and worker processes reconstruct the effective values of\n`enable_npugraph_ex`, `enable_static_kernel`, and\n`recompute_scheduler_enable` instead of restoring stale defaults.\n\n#### GDN unit test compatibility\n\nAfter upgrading CANN and torch-npu,\n`torch_npu.npu_chunk_gated_delta_rule`\nbecomes available and the GDN fused-op probe succeeds. This causes\n`test_npu_connector_observes_updated_gdn_state_after_compile` to enter\nthe\nreal fused CANN path instead of the mocked Triton path.\n\nThe test was originally added to verify that the layerwise KV connector\nobserves updated convolution and SSM states after eager and\n`torch.compile` executions. Its numerical kernels are intentionally\nmocked,\nand it uses lightweight FP32 tensors with a head dimension of 2. These\ninputs\ndo not satisfy the fused CANN operator constraints, which require BF16\nquery\ninputs and production-compatible dimensions.\n\nExplicitly mock `_probe_fused_chunk()` to return `False` in this test so\nit\ncontinues using the mocked Triton path. This keeps the test focused on\nthe KV\nconnector and compilation behavior without changing production GDN\nbehavior.\n\n-\nhttps://github.com/vllm-project/vllm-ascend/actions/runs/31356537202/job/93361160358?pr=13901#step:17:3286\n<img width=\"2044\" height=\"665\" alt=\"image\"\nsrc=\"https://github.com/user-attachments/assets/56273575-24f6-4d7f-8f81-32f92bce8371\"\n/>\n\n### Does this PR introduce _any_ user-facing change?\n\n### How was this patch tested?\n\n\n- vLLM version: v0.26.0\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/0351e9aa1fdf1a51329d1906881528dfe61fc88e\n\n---------\n\nSigned-off-by: MrZ20 <2609716663@qq.com>"
+    },
+    {
+      "sha": "e07969ed8ec8cc6542a23714b2d5b9c7a4a83423",
+      "comment": "自动翻译工作流生成的 51 个文档翻译文件更新（zh_CN .po），包括 MiniMax-M3、EPLB、SFA KV offload、install/quick_start、release notes 等新增或更新文档的中文翻译同步。纯文档变更，不涉及代码。",
+      "tags": [
+        "docs",
+        "low-risk",
+        "translation"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "纯文档翻译同步，无代码或测试影响。"
+      },
+      "message": "[Doc] Translated Doc files 2026-08-10 (#13891)\n\n## Auto-Translation Summary\n\nTranslated **51** file(s)\n\n[Workflow\nrun](https://github.com/vllm-project/vllm-ascend/actions/runs/31349731884)\n- vLLM version: v0.26.0\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/0351e9aa1fdf1a51329d1906881528dfe61fc88e\n\nSigned-off-by: wangxiyuan <wangxiyuan@users.noreply.github.com>\nCo-authored-by: wangxiyuan <wangxiyuan@users.noreply.github.com>"
+    },
+    {
+      "sha": "78a9196ad22d1aeb51ca9d68fe01d4a8df491bff",
+      "comment": "自动更新 test_config.yaml 中各 e2e/ut 测试的 estimated_times（基于 CI 实际耗时中位数 + 10% 安全缓冲，取整到 10 秒）。部分测试估计值变化较大（如 model_runner_v2/test_basic.py 从 1370→2440、four_card/context_parallel/test_accuracy.py 从 2040→680、eight_card/test_glm5_2.py 从 3600→1890、two_card/lora/test_qwen35_densemodel_lora_tp.py 从 600→1790），反映近期 CI 耗时波动。纯 CI 配置维护。",
+      "tags": [
+        "ci",
+        "low-risk",
+        "test"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "estimated_times 是 CI 调度参数，不改变测试逻辑；但较大波动可能暗示部分测试稳定性或资源竞争问题，建议关注。"
+      },
+      "message": "[CI] Auto-update estimated test times in test_config.yaml (#13952)\n\n## Summary\n\nThis PR was auto-generated by the **Update estimated test times**\n[workflow](https://github.com/vllm-project/vllm-ascend/actions/runs/31373347064).\n\nIt updates the `estimated_times` values in\n`.github/workflows/scripts/test_config.yaml` based on actual elapsed\ntimes collected from CI workflow runs.\n\n### Methodology\n\n- Each test job uploads its elapsed time as a `timing-data-*` artifact\nupon completion.\n- The workflow aggregates all collected timing artifacts across jobs.\n- For each test, the **median** elapsed time is computed to reduce\noutlier impact.\n- A **10% safety buffer** is applied and the result is rounded to the\nnearest 10 seconds.\n\n### Review Checklist\n\n- [ ] Verify that updated `estimated_time` values are within a\nreasonable range.\n- [ ] Confirm no test entries are missing or unexpectedly removed.\n\n- vLLM version: v0.26.0\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/0351e9aa1fdf1a51329d1906881528dfe61fc88e\n\nSigned-off-by: github-actions[bot] <github-actions[bot]@users.noreply.github.com>\nCo-authored-by: github-actions[bot] <github-actions[bot]@users.noreply.github.com>"
+    },
+    {
+      "sha": "8329fabb3ed5a34e8aaf4ed27e82b75c680a5308",
+      "comment": "Dependabot 将 actions/upload-artifact 从 v4 升级到 v7，涉及 _manual-hitest.yaml 单个 workflow 文件。纯 CI 依赖升级。",
+      "tags": [
+        "ci",
+        "low-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "CI action 版本升级，与产品代码及测试逻辑无关。"
+      },
+      "message": "[CI] Bump actions/upload-artifact from 4 to 7 (#12392)\n\nBumps [actions/upload-artifact](https://github.com/actions/upload-artifact) from 4 to 7.\n\n- vLLM version: v0.26.0\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/0351e9aa1fdf1a51329d1906881528dfe61fc88e\n\nSigned-off-by: dependabot[bot] <support@github.com>\nCo-authored-by: dependabot[bot] <49699333+dependabot[bot]@users.noreply.github.com>"
+    },
+    {
+      "sha": "e44642132483ede272d7c2f6a1a8d8ce9091b182",
+      "comment": "Dependabot 将 actions/download-artifact 从 v5/v7 升级到 v8，涉及 _analyze_failure.yaml 和 _selected_tests.yaml 两个 workflow 文件。纯 CI 依赖升级。",
+      "tags": [
+        "ci",
+        "low-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "CI action 版本升级，与产品代码及测试逻辑无关。"
+      },
+      "message": "[CI] Bump actions/download-artifact from 5 to 8 (#12393)\n\nBumps [actions/download-artifact](https://github.com/actions/download-artifact) from 5 to 8.\n\n- vLLM version: v0.26.0\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/0351e9aa1fdf1a51329d1906881528dfe61fc88e\n\nSigned-off-by: dependabot[bot] <support@github.com>\nCo-authored-by: dependabot[bot] <49699333+dependabot[bot]@users.noreply.github.com>"
+    },
+    {
+      "sha": "c7972a3dcaad34c3293f1a68223b800d6dc0865a",
+      "comment": "Main2Main 基线升级：将 vLLM main 锚点从 2e09247c 更新到 58d3918e，并适配该窗口内的上游契约变化。核心变更包括：(1) 上游 #44941 将 FusedMoE 重命名为 FusedMoEFactory，patch_fused_moe.py 通过 vllm_version_is(\"0.26.0\") 版本门控分别 patch 两个符号，deepseek_v4 / minimax_m3 / fused_moe.py / routed_experts.py 同步更新 import；(2) 上游 #49389/#50721 移除 calculate_kv_scales 和 clear_buffer，model_runner_v1.py 增加版本门控；(3) 新增 patch_vision.py 将 FusedInputNorm.forward 的 eps=0.0 替换为 1e-5，以兼容 vllm-ascend 内置 PyTorch 2.10.0 要求 eps>0 的限制；(4) mamba postprocess Triton 内核适配上游 #50432 签名（新增 CONV_STATE_DIM_FIRST、HAS_IDX_MAPPING、PRECOMPUTED_NEW_COMPUTED、DS conv 行复制、idx_mapping 等）；(5) DeepSeek-V4 reasoning effort 映射、HunyuanVL image placeholder、hybrid model chunked prefill 等版本门控。该 PR 同时保持 v0.26.0 lane 和 main lane 的兼容性。",
+      "tags": [
+        "chore",
+        "medium-risk",
+        "patch",
+        "ops",
+        "model-runner",
+        "compatibility"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "FusedMoEFactory 重命名影响多个模型测试的 monkeypatch 目标；test_extract_hidden_states 启用 chunked_prefill；test_deepseek_v4_thinking 增加版本门控；mamba 内核签名变更后需要验证调用方传参完整性；新增 patch_vision 无专门测试。",
+        "suggested_test_areas": [
+          "tests/ut/models/test_deepseek_v4_moe.py",
+          "tests/ut/models/minimax_m3/test_minimax_m3.py",
+          "tests/ut/patch/platform/test_deepseek_v4_thinking.py",
+          "tests/e2e/pull_request/one_card/spec_decode/test_extract_hidden_states.py",
+          "tests/ut/spec_decode/test_speculators_vwn_eagle3.py",
+          "tests/ut/ops/triton/mamba/",
+          "新增 patch_vision 相关测试"
+        ]
+      },
+      "message": "[CI]Main2Main 0807 (#13477)\n\n### What this PR does / why we need it?\n\n#### Upgrade baseline\n\n- Update the verified vLLM main anchor from\n[`2e09247c2d7b6b97d13af6e71a85bf8d1271deb6`](https://github.com/vllm-project/vllm/commit/2e09247c2d7b6b97d13af6e71a85bf8d1271deb6)\nto\n[`58d3918e3ea0a544ffedadad2ba84559e9c51d8f`](https://github.com/vllm-project/vllm/commit/58d3918e3ea0a544ffedadad2ba84559e9c51d8f).\nThe full upstream range is available in this\n[comparison](https://github.com/vllm-project/vllm/compare/2e09247c...58d3918e3).\n- Preserve the vLLM `0.26.0` compatibility lane while adapting the main\nlane to the new upstream contracts. Version gates use\n`vllm_version_is(\"0.26.0\")` and are limited to real contract\ndifferences.\n- The changes are organized in the same order as the changed files in\nthis PR. Each item identifies the upstream change, the downstream\nadaptation, and why the adaptation is required.\n\n#### Changes by file\n\n##### 1. `.github/vllm-main-verified.commit`\n| Change | Upstream change | Downstream adaptation | Why |\n|---|---|---|---|\n| Update anchor to `58d3918e` | Upgrade window\n[0351e9aa...58d3918e](https://github.com/vllm-project/vllm/compare/0351e9aa...58d3918e).\n| Set anchor. | Source of truth for main2main workflow. |\n\n##### 2. `vllm_ascend/patch/platform/patch_fused_moe.py`\n| Change | Upstream change | Downstream adaptation | Why |\n|---|---|---|---|\n| Version-gate FusedMoE → FusedMoEFactory rename | [vllm\n#44941](https://github.com/vllm-project/vllm/pull/44941) renamed\n`FusedMoE` to `FusedMoEFactory`. | On main, capture and patch\n`FusedMoEFactory`; on v0.26.0, also patch legacy `FusedMoE`. | Both\nlanes need the Ascend runner patch at the correct binding. |\n\n##### 3. `vllm_ascend/models/deepseek_v4.py` /\n`vllm_ascend/models/minimax_m3/minimax_m3.py` /\n`vllm_ascend/ops/fused_moe/fused_moe.py` /\n`vllm_ascend/ops/fused_moe/routed_experts.py`\n| Change | Upstream change | Downstream adaptation | Why |\n|---|---|---|---|\n| Import and use `FusedMoEFactory`; remove dead `FusedMoE` re-export |\n[vllm #44941](https://github.com/vllm-project/vllm/pull/44941). |\nReplace `FusedMoE` with `FusedMoEFactory`. | Old symbol no longer exists\non main. Remove stale `FusedMoE` re-export from `fused_moe.py` and dead\nreference in `routed_experts.py` comment. |\n\n##### 4. `tests/ut/models/test_deepseek_v4_moe.py` /\n`tests/ut/models/minimax_m3/test_minimax_m3.py`\n| Change | Upstream change | Downstream adaptation | Why |\n|---|---|---|---|\n| Update monkeypatch target to `FusedMoEFactory` | [vllm\n#44941](https://github.com/vllm-project/vllm/pull/44941). | `\"FusedMoE\"`\n→ `\"FusedMoEFactory\"`. | Must match the symbol imported by models. |\n\n##### 5. `vllm_ascend/worker/model_runner_v1.py`\n| Change | Upstream change | Downstream adaptation | Why |\n|---|---|---|---|\n| Version-gate `calculate_kv_scales` removal | [vllm\n#49389](https://github.com/vllm-project/vllm/pull/49389) removed runtime\nKV-scale calculation. | Add `vllm_version_is(\"0.26.0\")` guard. | Ascend\nMRV1 still supports it on v0.26.0; attribute absent on main. |\n| Version-gate `clear_buffer()` removal | [vllm\n#50721](https://github.com/vllm-project/vllm/pull/50721) removed\n`clear_buffer()` from `RoutedExpertsCapturer`. | Wrap in\n`vllm_version_is(\"0.26.0\")` guard. | On main, each routed layer\noverwrites current step's token rows. |\n\n##### 6. `vllm_ascend/models/layer/attention/layer.py`\n| Change | Upstream change | Downstream adaptation | Why |\n|---|---|---|---|\n| Remove dead `Q/K/V_SCALE_CONSTANT` references | [vllm\n#49389](https://github.com/vllm-project/vllm/pull/49389) removed env var\nregistrations. Module-level constants still exist. | Remove unused\n`q_range`/`k_range`/`v_range` initializations and dead `import envs`. |\nDead-code cleanup; `DSAAttention.forward()` never used these attributes.\n|\n\n##### 7. `tests/ut/patch/platform/test_deepseek_v4_thinking.py`\n| Change | Upstream change | Downstream adaptation | Why |\n|---|---|---|---|\n| Version-gate reasoning effort expectations | [vllm\n#50580](https://github.com/vllm-project/vllm/pull/50580) maps\n`low`/`minimal`/`medium` → `low`. | `vllm_version_is(\"0.26.0\")` guard. |\nv0.26.0 keeps old mapping; main uses new. |\n\n##### 8.\n`tests/e2e/pull_request/one_card/spec_decode/test_extract_hidden_states.py`\n| Change | Upstream change | Downstream adaptation | Why |\n|---|---|---|---|\n| Enable `chunked_prefill` for hybrid model | [vllm\n#50991](https://github.com/vllm-project/vllm/pull/50991) enabled prefix\ncache by default for Mamba/hybrid models. | `False` → `True`. | Hybrid\nmodel now requires chunked prefill. |\n\n##### 9. `vllm_ascend/patch/platform/patch_vision.py` (new) +\n`vllm_ascend/patch/platform/__init__.py`\n| Change | Upstream change | Downstream adaptation | Why |\n|---|---|---|---|\n| Patch `FusedInputNorm.forward` eps=0.0 → eps=1e-5 | [vllm\n#50411](https://github.com/vllm-project/vllm/pull/50411) added\n`FusedInputNorm` with `F.batch_norm(eps=0.0)`. | Monkey-patch forward to\nuse `eps=1e-5`; guarded with `contextlib.suppress(ImportError)`. |\nUpstream PyTorch 2.13.0 allows eps >= 0 for inference; vllm-ascend\nPyTorch 2.10.0 requires eps > 0 always. Release wheels lack\n`FusedInputNorm`. Remove this patch once bundled PyTorch >= 2.13.0. |\n\n##### 10. `vllm_ascend/ops/triton/mamba/postprocess.py`\n| Change | Upstream change | Downstream adaptation | Why |\n|---|---|---|---|\n| Add kernel signature parameters | [vllm\n#50432](https://github.com/vllm-project/vllm/pull/50432) changed\nsignature. | Add `CONV_STATE_DIM_FIRST`, `HAS_IDX_MAPPING`,\n`PRECOMPUTED_NEW_COMPUTED`, `state_dim_row_count/stride`,\n`idx_mapping_ptr` parameters, and `num_loops` for DS conv copy. | Must\nmatch upstream kernel contract. |\n\n##### 11. `tests/e2e/conftest.py` /\n`tests/ut/spec_decode/test_speculators_vwn_eagle3.py`\n| Change | Upstream change | Downstream adaptation | Why |\n|---|---|---|---|\n| HunyuanVL placeholder version gate; remove unused\n`maybe_calc_kv_scales` mock | [vllm\n#49691](https://github.com/vllm-project/vllm/pull/49691), #49389. |\nVersion gate and dead-mock removal. | Adapt to upstream contract\nchanges. |\n\n##### 12. `vllm_ascend/patch/__init__.py`\n| Change | Upstream change | Downstream adaptation | Why |\n|---|---|---|---|\n| Document FusedMoE → FusedMoEFactory rename and new patch_vision entry\n| — | Update patch registry documentation. | Keep the patch manifest in\nsync with reality. |\n\n#### Compatibility and review notes\n\n- Version gates use `vllm_version_is(\"0.26.0\")` exclusively; no\n`hasattr` fallbacks beyond the explicitly justified `clear_buffer` guard\n(where the upstream change is a method removal, not a rename).\n- The `FusedMoE` → `FusedMoEFactory` rename is applied consistently\nacross all call sites: `deepseek_v4.py`, `minimax_m3.py`,\n`fused_moe.py`, `routed_experts.py`, and `patch_fused_moe.py`.\n- The `layer.py` `Q/K/V_SCALE_CONSTANT` removal is a dead-code cleanup:\nthe `DSAAttention` class initialized these tensors from `envs`\nmodule-level constants (which still exist), but never used them in\n`forward()`.\n\n### Does this PR introduce _any_ user-facing change?\n\nNo. This is a compatibility update; no new Ascend-specific public API is\nintroduced.\n\n### How was this patch tested?\n\nCI on the branch. See Buildkite workflow run for detailed results.\n\n\n- vLLM version: v0.26.0\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/0351e9aa1fdf1a51329d1906881528dfe61fc88e\n\n---------\n\nSigned-off-by: liaoqidan <1107297340@qq.com>"
+    },
+    {
+      "sha": "cda592a6407cba7870c45b15a871ab40192b4e4f",
+      "comment": "改进非 nightly workflow 的取消行为。GitHub Actions 在 workflow 取消时会重新评估 job/step 条件，always() 在取消时仍为 true，可能导致依赖 job 继续排队或运行，阻碍 concurrency.cancel-in-progress 和 UI 取消的及时终止。将必要的失败处理条件从 always() 改为 !cancelled()，移除冗余的 always() 条件，涉及 pr_test、Main2Main、selected_tests、analyze_failure、push_build_precommit_cache、weekly 等 8 个 workflow。nightly workflow 因部分 job 需要无条件清理或协调而保持不变。",
+      "tags": [
+        "ci",
+        "low-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "纯 workflow 条件调整，不改变测试逻辑；需观察取消场景下 artifact 上传和失败报告是否按预期跳过。"
+      },
+      "message": "[CI] Improve workflow cancellation behavior (#13949)\n\n### What this PR does / why we need it?\nGitHub Actions reevaluates job and step conditions when a workflow is\ncancelled. Conditions using `always()` remain true during cancellation,\nwhich may keep dependent jobs queued or running, especially when custom\nrunners or reusable workflows are involved. This can prevent\n`concurrency.cancel-in-progress` and normal UI cancellation from\npromptly terminating an old run.\n\nThis PR improves cancellation behavior for non-nightly workflows:\n\n- Replaces necessary failure-handling conditions with `!cancelled()`,\nallowing jobs such as artifact uploads and failure reports to run after\nfailures while skipping them after cancellation.\n- Removes redundant `always()` conditions where jobs should only run\nafter their dependencies succeed.\n- Updates PR tests, E2E reporting, pre-commit cache handling, Main2Main,\nestimated-time updates, and weekly workflows.\n- Leaves nightly workflows unchanged because some nightly jobs require\nunconditional cleanup or coordination.\n\ncancel success:\nhttps://github.com/vllm-project/vllm-ascend/actions/runs/31394369115/job/93475456751\n### Does this PR introduce _any_ user-facing change?\n\n### How was this patch tested?\n\n\n- vLLM version: v0.26.0\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/0351e9aa1fdf1a51329d1906881528dfe61fc88e\n\n---------\n\nSigned-off-by: MrZ20 <2609716663@qq.com>\nSigned-off-by: Mrz20 <2609716663@qq.com>"
+    },
+    {
+      "sha": "a47fbe2648c55fa757c81df727fd1c0b844025ac",
+      "comment": "为 Model Runner V2 补齐 SFA（Sparse Flash Attention）indexer cache 支持。此前 MRV2 只处理普通 attention KV cache，导致 GLM-5 / DeepSeek-V3.2 等 SFA 模型在 MRV2 下初始化或执行失败。本次在 get_kv_cache_spec 中识别 DeepseekV32IndexerCache 并生成 AscendSFAIndexerCacheSpec；新增 _allocate_int8_cache_tensor 和 _allocate_sparse_c8_indexer_tensors 实现对齐分配（KV transfer 场景保持数据指针与 Mooncake/ADXL 对齐，C8 场景将 dsa_k 与 dsa_k_scale 合并到同一块底层存储以减少 HCCL/Mooncake 注册数）；_reshape_kv_cache_v2 按 backends get_kv_cache_shape 规则 reshape indexer cache；同时将 DeepseekV32IndexerCache.get_attn_backend 路由到 AscendSFAIndexerBackend，复用既有 bind_kv_cache 绑定同一层的多个 cache 模块。设计上尽量复用 MRV1/SFA 既有组件，不引入新的 cache-spec 类或 attention backend；范围限定为 non-C8 SFA indexer 路径。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "model-runner",
+        "attention",
+        "sfa"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "PR 未附带新增测试。MRV2 的 KV cache spec 构建、分配和 reshape 是新增逻辑，SFA 模型在 MRV2 下应覆盖\"初始化成功 + 推理正确\"两个层面；同时 C8 indexer 双张量分配的对齐/合并行为值得单测验证。",
+        "suggested_test_areas": [
+          "tests/ut/worker/v2/",
+          "tests/ut/worker/a2/test_model_runner_v1.py",
+          "tests/ut/attention/a2/test_sfa_v1.py",
+          "新增 MRV2 SFA indexer 分配/reshape 单测"
+        ]
+      },
+      "message": "[Feature][MRV2] SFA model runner v2 adaptation (#13069)\n\n### What this PR does / why we need it?\n\nThis PR adds the missing Sparse Flash Attention (SFA) indexer support to\nthe Ascend Model Runner V2.\n\nSFA models such as GLM-5 and DeepSeek-V3.2 use an additional indexer\ncache besides the normal attention KV cache. The Ascend Model Runner V1\nalready supports this cache layout, but the corresponding Model Runner\nV2 path did not\nproperly describe, allocate, reshape, bind, or prepare metadata for the\nindexer cache.\n\nAs a result, SFA models could fail during either engine initialization\nor request execution when Model Runner V2 was enabled.\n\nThis PR completes the non-C8 SFA indexer path by:\n\n- Recognizing `DeepseekV32IndexerCache` during Model Runner V2 KV-cache\nspecification.\n- Reusing the existing `AscendSFAIndexerCacheSpec` and\n`AscendSFAIndexerBackend` implementations.\n- Allocating and reshaping the indexer cache as an independent\nsingle-tensor cache.\n- Reusing the existing Ascend `bind_kv_cache` implementation to bind\nmultiple cache modules belonging to the same model layer, including the\nnormal attention cache and `indexer.k_cache`.\n- Passing the padded input-token count to the Ascend attention metadata\nbuilder so that positions, slot mapping, and RoPE metadata are\nconsistent with the actual Model Runner V2 input.\n- Keeping the existing SFA cache composition flow, which combines the\nnormal KV cache and indexer cache before invoking the Ascend SFA\nkernels.\n\nThe implementation intentionally reuses the existing Model Runner V1 and\nAscend SFA components where possible. It does not introduce a new\ncache-spec class, attention backend, cache-binding implementation, or\npatch file.\n\nScope：This PR currently supports the non-C8 SFA indexer-cache path.\n\n### Does this PR introduce _any_ user-facing change?\n\nThere are no changes to the public API, CLI arguments, model\nconfiguration, or launch scripts.\n\n### How was this patch tested?\n\n- vLLM version: v0.26.0\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/0351e9aa1fdf1a51329d1906881528dfe61fc88e\n\n---------\n\nSigned-off-by: joiandjoe <garancemr@icloud.com>\nSigned-off-by: ZhangwenTaoHW <zhangwentao101@huawei.com>\nCo-authored-by: joiandjoe <garancemr@icloud.com>"
+    },
+    {
+      "sha": "b37d397769ca7d4a71e40e64fa112311c8b1dadd",
+      "comment": "将 PR 和 nightly 的 MiniMax-M3 W8A8 e2e 覆盖切换到新 checkpoint Eco-Tech/MiniMax-M3-w8a8-0626，并在 model_dataset_list.json 注册该模型供 CI 下载。同步更新了 nightly 配置（MiniMax-M3-W8A8-A3.yaml）和 e2e 测试默认模型路径。无产品代码变更。",
+      "tags": [
+        "test",
+        "ci",
+        "low-risk",
+        "models"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "e2e 测试仅切换模型 checkpoint 路径，测试逻辑不变；需确认新 checkpoint 在 CI 上的精度/性能表现与旧版一致。"
+      },
+      "message": "[CI][Test] Update MiniMax-M3 W8A8 model to Eco-Tech/MiniMax-M3-w8a8-0626 (#13681)\n\nSwitch PR and nightly MiniMax-M3 W8A8 e2e coverage to the new\nEco-Tech/MiniMax-M3-w8a8-0626 checkpoint, and add it to\nmodel_dataset_list.json for CI downloads.\n\n- vLLM version: v0.26.0\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/0351e9aa1fdf1a51329d1906881528dfe61fc88e\n\nSigned-off-by: Bill845514379 <huangjianbao2@huawei.com>"
+    },
+    {
+      "sha": "6fadabbfb5e18c60aa328845b3145d91a8d2b955",
+      "comment": "纯文档变更，在 supported models matrix 中新增 \"Ascend 950 Products\" 分组，并补充 DeepSeek V4-Flash、DeepSeek V4-Pro、DeepSeek-V3.1、GLM-5.1、Qwen3.5-397B-A17B、Qwen3.6-27B 等模型的支持能力表格。表格列与现有 A2/A3 矩阵保持一致，包含 BF16、W8A8、Chunked Prefill、TP/PP/EP/DP、Piecewise/Fullgraph AclGraph、max-model-len 等关键维度。不影响任何代码逻辑，风险极低。",
+      "tags": [
+        "docs",
+        "low-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "文档-only 变更，不涉及代码路径和运行时行为，无需测试更新。",
+        "suggested_test_areas": []
+      },
+      "message": "[Doc][Feature] Add Ascend 950 Products to supported models matrix (#13920)\n\n### What this PR does / why we need it?\nThis PR updates the supported models documentation by adding a new\n\"Ascend 950 Products\" section to the core supported models matrix. It\nincludes support details for DeepSeek V4-Flash, DeepSeek V4-Pro,\nDeepSeek-V3.1, GLM-5.1, Qwen3.5-397B-A17B, and Qwen3.6-27B models.\n\n### Does this PR introduce _any_ user-facing change?\nNo, this is a documentation-only update.\n\n### How was this patch tested?\nNo testing is required as this is a documentation-only change.\n\n\n- vLLM version: v0.26.0\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/0351e9aa1fdf1a51329d1906881528dfe61fc88e\n\nSigned-off-by: x60087760 <xiechangxiu3@h-partners.com>\nCo-authored-by: x60087760 <xiechangxiu3@h-partners.com>"
+    },
+    {
+      "sha": "0c935eadd3e44876dbc99c442fef0c86a7faabdf",
+      "comment": "在 NPUModelRunner 的初始化流程中新增 set_potential_max_tokens(vllm_config) 调用，紧跟 set_cos_and_sin、set_mc2_tokens_capacity、set_mc2_mask 等 Ascend 初始化配置步骤。该调用的目的是在模型执行前设置 potential max tokens，以更好地管理 token 容量，避免后续 ACL Graph 捕获或注意力元数据构建时容量估计不足。变更单行且仅影响初始化路径，不影响对外接口；潜在风险是依赖 set_potential_max_tokens 的既有实现和导入路径，如果该函数随上游 vLLM 配置结构变化而缺失，会导致初始化失败，但整体风险低。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "model-runner"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "该行为变更未附带自动化测试，且 NPUModelRunner 初始化是后续图捕获和推理执行的基础，建议增加单测断言初始化后 potential_max_tokens 配置已正确设置，防止后续初始化顺序调整导致该调用被遗漏。",
+        "suggested_test_areas": [
+          "tests/ut/worker/v2/test_model_runner.py"
+        ]
+      },
+      "message": "[BugFix][MRV2] Add potential max tokens setting in NPUModelRunner (#13729)\n\n### What this commit does / why we need it?\nThis commit enhances the NPUModelRunner by introducing a new utility\nfunction, `set_potential_max_tokens`, which is now called during the\nmodel initialization process. This addition allows for better management\nof token capacity during model execution.\n\n### Does this commit introduce any user-facing change?\nNo.\n\n### How was this patch tested?\n- Verified that the new function integrates correctly with existing\nmodel initialization routines.\n- Conducted unit tests to ensure no regressions in model performance.\n\n\n- vLLM version: v0.26.0\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/0351e9aa1fdf1a51329d1906881528dfe61fc88e\n\nSigned-off-by: likailong <likailong5@huawei.com>"
+    },
+    {
+      "sha": "059df1f41933888e1f0f65ba1fd2f0e728a544f5",
+      "comment": "修复 SFA v1 元数据构建器在 DSA-CP graph padding 场景下的负序列长度问题。原逻辑在 num_local_tokens > 0 时直接计算 seq_lens - offset，当 padding slot 的全局 seq_lens 为 0 且该 slot 跨 rank 边界时，可能得到负数并写入 actual_seq_lengths_key。修复使用 torch.clamp_min(seq_lens - offset, 0) 将候选 key 长度钳制到非负值，同时保留 num_local_tokens > 0 的前置条件，对真实请求无副作用。新增回归测试精确复现 TP=8、graph-size=80、MTP3、rank-6 的边界场景，验证 padding 请求的 local key 序列长度为 0 且所有生成长度非负。改动集中在 SFA 元数据构建路径，风险低。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "attention",
+        "test"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "该提交已包含针对 DSA-CP graph padding 边界场景的回归测试，覆盖了负序列长度问题，现有测试更新已足够，无需额外修改。",
+        "suggested_test_areas": [
+          "tests/ut/attention/a2/test_sfa_v1.py"
+        ]
+      },
+      "message": "[BugFix][SFA] Guard DSA-CP graph padding sequence lengths (#13779)\n\n### What this PR does / why we need it?\n\nThis extends the DSA-CP graph-padding safeguard from\n[2b1ac612496e8306c6d7d95d175e93fad90057b1](https://github.com/vllm-project/vllm-ascend/commit/2b1ac612496e8306c6d7d95d175e93fad90057b1)\nto the equivalent metadata construction path in `sfa_v1.py`.\n\nThe SFA v1 metadata builder could calculate `seq_lens - offset` for a\ngraph-padding request whose global `seq_lens` is zero. When a padded\nfour-token slot crosses a rank-local boundary, this can produce a\nnegative `actual_seq_lengths_key` and pass invalid metadata to sparse\nattention.\n\nThis PR:\n\n- requires both a non-empty local request slice and a positive global\nsequence length;\n- clamps candidate rank-local key sequence lengths to zero;\n- adds a regression test for the TP=8, graph-size=80, MTP3-style rank-6\nboundary case.\n\n### Does this PR introduce _any_ user-facing change?\n\nNo API or configuration changes.\n\nIt prevents invalid negative SFA key sequence metadata for affected\nDSA-CP graph-padding layouts.\n\n### How was this patch tested?\n\nAdded `test_dsa_cp_metadata_builder_masks_graph_padding` in\n`tests/ut/attention/a2/test_sfa_v1.py`. The test reproduces the TP=8,\ngraph-size=80, rank-6 boundary case and verifies padded local key\nsequence lengths are zero and all generated lengths are non-negative.\n\nLocal checks completed:\n\n- `git diff --check`\n- Ruff lint and format checks for both changed Python files\n- codespell for both changed Python files\n- Python AST syntax parsing for both changed Python files\n\nThe `torch/torch_npu` unit test was not executed on the local PC because\nthis repository requires NPU-dependent tests to run in an Ascend\ncontainer. Run:\n\n```bash\npytest -sv tests/ut/attention/a2/test_sfa_v1.py::TestAscendSFAMetadataBuilder::test_dsa_cp_metadata_builder_masks_graph_padding\n```\n\n- vLLM version: v0.26.0\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/0351e9aa1fdf1a51329d1906881528dfe61fc88e\n\n---------\n\nSigned-off-by: QiuChunshuo <qiuchunshuo@huawei.com>"
+    }
+  ],
+  "architecture_based_on_sha": "e04f251a5895969d1c1f4ac9a3807177a0c4769c",
+  "architecture_generated_at": "2026-08-01T20:25:03.693997+08:00"
+}

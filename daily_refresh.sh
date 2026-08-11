@@ -173,7 +173,7 @@ if [ "$SKIP_DEEP_ANALYZE" = "false" ]; then
         info "opencode CLI: $(opencode --version 2>/dev/null || echo 'found')"
     else
         warn "opencode CLI 未找到。Phase 2 深度分析将跳过。"
-        warn "安装方式: npm install -g @opencode-ai/cli"
+        warn "安装方式: npm install -g opencode-ai"
         SKIP_DEEP_ANALYZE=true
     fi
 fi

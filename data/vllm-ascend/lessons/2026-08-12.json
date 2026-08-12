@@ -1,0 +1,41 @@
+{
+  "date": "2026-08-12",
+  "lessons": [
+    {
+      "id": "L20260812-001",
+      "title": "mamba postprocess e2e: sync upstream TEMPORAL_TILES kernel contract (triton-ascend compile chain)",
+      "keywords": [
+        "TEMPORAL_TILES",
+        "Keyword argument TEMPORAL_TILES was specified but unrecognised",
+        "UnsupportedLanguageConstruct",
+        "Mismatched type for copy_start",
+        "test_extract_hidden_states",
+        "hybrid_dummy_eager",
+        "postprocess_mamba_fused_kernel",
+        "EngineDeadError"
+      ],
+      "symptom": "run 31553496227 (2026-08-12): test_extract_hidden_states[hybrid_dummy_eager] failed 3/3 e2e attempts, each a NEW triton-ascend compile error: (1) KeyError: 'Keyword argument TEMPORAL_TILES was specified but unrecognised' (triton/runtime/jit.py run); (2) triton.compiler.errors.CompilationError: UnsupportedLanguageConstruct — triton-ascend rejects `if A and B and C:` 3-term boolean chains; (3) AssertionError: 'Mismatched type for copy_start between then block (int32) and else block (int64)'. Step exhausted 3 e2e retries -> run failed, no adaptation landed (steps=0/5).",
+      "root_cause": "vllm main added TEMPORAL_TILES constexpr + 3D grid (num_reqs, total_states, TEMPORAL_TILES=16) to postprocess_mamba_fused_kernel in vllm/v1/worker/mamba_utils.py (launch sites: run_fused_postprocess / run_fused_postprocess_align / run_fused_precopy). vllm-ascend monkey-patches this kernel via vllm_ascend/patch/worker/patch_mamba_utils.py -> vllm_ascend/ops/triton/mamba/postprocess.py; the Ascend kernel was not synced (missing param -> KeyError), and the sync attempts hit triton-ascend compiler constraints stricter than upstream triton.",
+      "fix_guidance": [
+        "Add `TEMPORAL_TILES: tl.constexpr = 1` as the LAST kernel param (default 1 preserves old 2D-grid callers; Triton pads 2D grids to (g0,g1,1) so program_id(2)=0).",
+        "Read `tile_idx = tl.program_id(2)`. Guard the num_accepted_tokens store with it, parenthesized: `if (src_block_idx == dest_block_idx and state_idx == 0) and tile_idx == 0:` — triton-ascend REJECTS 3-term boolean chains `if A and B and C:` (UnsupportedLanguageConstruct); nest with parentheses so each level has 2 terms.",
+        "Conv states are small: only tile_idx == 0 performs the copy (early return for tile_idx > 0 after the store guard).",
+        "Temporal states: partition the copy range across TEMPORAL_TILES CTAs — per_tile = tl.cdiv(tl.cdiv(copy_size, TEMPORAL_TILES), COPY_BLOCK_SIZE) * COPY_BLOCK_SIZE; tile_start = tile_idx.to(tl.int64) * per_tile; tile_end = tl.minimum(tile_start + per_tile, copy_size); loop range(tile_start, tile_end, COPY_BLOCK_SIZE).",
+        "ALL tile/range math must be int64: copy_size = state_inner_size.to(tl.int64) * state_elem_size.to(tl.int64). triton-ascend fails with 'Mismatched type for copy_start between then block (int32) and else block (int64)' on mixed int32/int64 loop bounds.",
+        "DT_UINT64 is unsupported on NPU (aclnnInplaceZero): do NOT port upstream's uint64-vectorized memcpy (_memcpy_u64_tiled uses tl.pointer_type(tl.uint64)); use uint8/int64 pointers and a byte-wise tiled copy loop instead.",
+        "Reference: upstream vllm/v1/worker/mamba_utils.py at the target main commit — kernel def ~line 250, _memcpy_u64_tiled ~line 34, _copy_mamba_state_block ~line 117, launch sites ~line 893 / 991 / 1028."
+      ],
+      "tags": [
+        "e2e-fix",
+        "mamba",
+        "triton-ascend",
+        "spec-decode",
+        "extract_hidden_states",
+        "sync-port"
+      ],
+      "example": "run https://github.com/vllm-project/vllm-ascend/actions/runs/31553496227 EngineCore traceback chain: KeyError TEMPORAL_TILES -> UnsupportedLanguageConstruct -> Mismatched type for copy_start. File: vllm_ascend/ops/triton/mamba/postprocess.py.",
+      "created_at": "2026-08-12T12:29:14.118671+08:00",
+      "hits": 0
+    }
+  ]
+}

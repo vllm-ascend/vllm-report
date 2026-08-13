@@ -1,0 +1,256 @@
+{
+  "date": "2026-08-13",
+  "repo": "vllm-project/vllm-ascend",
+  "generated_at": "2026-08-14T03:39:08.083904+08:00",
+  "daily_summary": "当日变更主要沿四个方向推进：(1) 推理功能增强——MRV2 SFA 支持 ACL Graph 模式，DFlash/DSpark 动态推测解码统一为共享调度器，新增 Gemma4 多模态 image token 映射；(2) 稳定性修复——W8A8 MXFP8 在 RL + ACL Graph 场景下的权重地址稳定性、Mooncake PP 路由对 MTP/Eagle 层的正确识别、disaggregated encoder 测试适配上游 API 变更；(3) 大规模 vLLM 版本适配——main2main 升级到 v0.27.1，清理 v0.26.0 兼容分支，NPU IPC weight transfer 全面切换到 stateful 引擎；(4) CI/文档/测试基础设施——nightly base image 日期自动回退、bisect 参数全链路透传、新增 310P 周级测试配置、DeepSeek V4 测试临时跳过、14 个文档文件自动翻译同步。",
+  "test_impact_summary": "当日测试看护变化较大：SFA graph 模式相关单测随 buffer 预分配与 DSA-CP 属性重命名同步更新；动态推测解码统一后 e2e test_dynamic.py 扩展为 dspark/dflash 双方法并新增 baseline，但 DynamicSpecScheduler 本身仍缺少独立 UT；v0.27.1 main2main 升级要求 v0.27.1 tag 与 main 双链路回归，weight transfer 相关单测/e2e 已切换 npu_ipc 与 stateful 引擎；W8A8 MXFP8 新增 data_ptr 稳定性单测；Mooncake 需补充 MTP 与 index-cache 混合路由用例；CI 侧新增两个周级 310P 配置（其中 35B 配置存在 `2threshold` 键名笔误需修复）、临时跳过 DeepSeek V4 四卡用例需在冲突解决后恢复、bisect 参数透传链需一次带参试运行验证。整体上功能类变更大多自带或同步更新了测试，但版本升级与 CI 编排类变更需要额外的集成回归。",
+  "commits": [
+    {
+      "sha": "b7bdfd59f590f0c7a58a1818faa71728a86719ef",
+      "comment": "为 MRV2 (ModelRunnerV2) 的 SFA 注意力后端增加 ACL Graph 模式支持。核心变更：(1) AscendSFAMetadataBuilder 在 __init__ 中预分配 actual_seq_lengths_query/key 及 spec 变体的设备端 buffer，build_metadata 时通过 zero_+copy_ 将运行时 query_start_loc/seq_lens 写入固定地址，保证图捕获/重放时序列长度张量地址稳定；(2) AscendSFADSACPMetadataBuilder 的 DSA-CP 私有属性重命名为 dsa_cp_ 前缀，避免与基类新增的同名属性冲突；(3) AscendSFAIndexerBackend 增加 get_impl_cls() 返回 None，aclgraph_utils 新增 _get_graph_update_backend 从 attention groups 中选择第一个可执行后端用于 update_full_graph_params，从而支持 SFA+Indexer 等 hybrid attention 组合下的全图参数更新。潜在风险：预分配 buffer 在 eager 路径也会被使用，需确保所有调用路径都先清零再拷贝；DSA-CP 属性重命名需确认无外部残留引用。",
+      "tags": [
+        "feature",
+        "attention",
+        "model-runner",
+        "medium-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "已同步更新 SFA metadata builder 单测（补 seq_lens/_seq_lens_cpu 字段、int32 类型）与 DSA-CP builder 的属性名；但 graph 模式下 SFA 的 e2e 覆盖仍建议补充，避免仅单测覆盖 buffer 重填逻辑。",
+        "suggested_test_areas": [
+          "tests/ut/attention/a2/test_sfa_v1.py",
+          "tests/ut/attention/test_sfa_cp.py",
+          "tests/e2e/pull_request/one_card（SFA graph 模式用例，如有）"
+        ]
+      },
+      "message": "[Feature] MRV2 Sfa support graph mode (#13958)\n\n### What this PR does / why we need it?\nSFA Graph Mode Support: Introduced support for SFA (Sparse Fine-grained\nAttention) in graph mode, including updates to attention metadata\nhandling and sequence length management.\nIndexer Cache Backend Integration: Routed SFA indexer cache layers to\nthe Ascend-specific backend by patching DeepseekV32IndexerCache and\nimplementing custom allocation logic for sparse C8 indexer tensors.\n### Does this PR introduce _any_ user-facing change?\nNO\n### How was this patch tested?\n\n\n- vLLM version: v0.26.0\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/58d3918e3ea0a544ffedadad2ba84559e9c51d8f\n\n---------\n\nSigned-off-by: joiandjoe <garancemr@icloud.com>\nSigned-off-by: Your Name <you@example.com>\nSigned-off-by: ZhangwenTaoHW <zhangwentao101@huawei.com>\nCo-authored-by: joiandjoe <garancemr@icloud.com>\nCo-authored-by: ZhangwenTaoHW <zhangwentao101@huawei.com>\nCo-authored-by: Your Name <you@example.com>\nCo-authored-by: chenaoxuan <cax1165@163.com>\nCo-authored-by: jayQH <qinhuaisheng@h-partners.com>"
+    },
+    {
+      "sha": "341e8494a02d1a81b408a54ecd81202481163423",
+      "comment": "纯 CI 变更。nightly 镜像构建增加 base_image_date 输入，默认 auto 时从当天起逐日回退（最多 30 天）查找 quay 上实际存在的 base image tag，避免当天镜像未发布导致构建失败；也支持指定 YYYYMMDD 固定日期。同时将 nightly/weekly 调度工作流的 cann_version 入参升级为 JSON 对象 base_image_tag（含 cann_version 与 base_image_date），并在 build job 输出 date 供下游 job 复用。默认值保持 2026.08.03 + auto，不影响既有行为。风险点在于 fromJSON 解析非法输入会使 workflow 失败。",
+      "tags": [
+        "ci",
+        "low-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "仅涉及 GitHub Actions 配置，无产品代码与测试逻辑变化；可通过手动触发 nightly 构建验证 auto 回退与指定日期两条路径。",
+        "suggested_test_areas": []
+      },
+      "message": "[CI] nightly base image date defaults to latest, with manual input support (#14224)\n\nWhat this PR does / why we need it?\nAdds a base_image_date option for nightly builds. Default auto\nbacktracks day by day (up to 30 days) to pick the latest date that\nactually has a quay base image, so the build no longer fails when\ntoday's image isn't out yet. You can also set a specific date (YYYYMMDD)\nto pin it. Only affects the daily build.\n\nDoes this PR introduce any user-facing change?\nNo This is for internal nightly testing only\n\nHow was this patch tested?\n1、**auto**:\n Inputs\n    target: a2\n    vllm_ascend_branch: main\n    build_type: daily\n    quay_daily_username: atlas_inference+robot\n    cann_version: 2026.08.03\n    base_image_date: auto\nbase_image_tag: {\"cann_version\":\"2026.08.03\",\"base_image_date\":\"auto\"}\nTag nightly-main-cann2026.08.03-20260813 not found, trying previous\nday...\nTag nightly-main-cann2026.08.03-20260812 not found, trying previous\nday...\nFound base image date: 20260811 (tag:\nnightly-main-cann2026.08.03-20260811)\n2、**specified date**:\n Inputs\n    target: a2\n    vllm_ascend_branch: main\n    build_type: daily\n    quay_daily_username: atlas_inference+robot\n    cann_version: 2026.08.03\n    base_image_date: 20260809\nbase_image_tag:\n{\"cann_version\":\"2026.08.03\",\"base_image_date\":\"20260809\"}\nload metadata for\nquay.io/atlas_inference/vllm-ascend:nightly-main-openeuler-cann2026.08.03-20260809\n- vLLM version: v0.27.1\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/58d3918e3ea0a544ffedadad2ba84559e9c51d8f\n\nSigned-off-by: duping <duping31@h-partners.com>"
+    },
+    {
+      "sha": "b4b04c5eb15532f87f55072b5d4cd4de77ef1fca",
+      "comment": "main2main 升级：将 CI 跟踪版本从 vLLM v0.26.0 升级到 v0.27.1，并让代码同时兼容 v0.27.1 与 main。主要内容：(1) 删除大量 vllm_version_is(\"0.26.0\") 分支（对应上游行为已在 v0.27.1 落地），包括 DeviceCommunicatorBase.use_all2all、KVConnectorBase_V1._kv_transfer_config、FusedMoEFactory 重命名、disable_tp、skip_attn→full_cudagraph、dflash 温度/种子参数、seq_lens_cpu_upper_bound/step 签名等；(2) 仍需要旧行为的 gate 提升到 0.27.1（model_runner_v1 的 clear_buffer/calculate_kv_scales、DeepSeek V4 tokenizer 映射）；(3) NPU IPC 权重传输全面切换到 stateful 的 NPUIPCTrainerWeightTransferEngine，删除 0.26 静态路径，并将示例/e2e 的 backend 从 \"ipc\" 改为 \"npu_ipc\"，避免上游 CUDA IPCWeightTransferEngine 调用 torch.cuda 在 Ascend 上崩溃。改动面广（distributed、weight transfer、spec decode、fused moe、vocab embedding、input batch、gumbel 采样），但多为\"删除旧分支+保留新签名\"的机械适配，风险集中在版本判断遗漏或签名不匹配。",
+      "tags": [
+        "refactor",
+        "ci",
+        "high-risk",
+        "distributed",
+        "spec_decode",
+        "model-runner"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "版本 gate 迁移后需确保 v0.27.1 tag 与 main 两条 CI 链路均通过；weight transfer 单测/e2e 已切换到 stateful engine 与 npu_ipc backend，需重点回归；spec_decode 签名变化、gumbel BLOCK_SIZE 恢复、fused_moe 减少逻辑统一也需现有 UT 验证。",
+        "suggested_test_areas": [
+          "tests/ut/distributed/weight_transfer/test_npu_ipc_engine.py",
+          "tests/e2e/pull_request/one_card/test_npu_ipc_weight_transfer.py",
+          "tests/ut/spec_decode/test_dspark_proposer.py",
+          "tests/ut/patch/platform/test_deepseek_v4_thinking.py"
+        ]
+      },
+      "message": "[CI][Misc] main2main vllm v0.27.1 (#14027)\n\n### What this PR does / why we need it?\n\nmain2main vllm upgrade to v0.27.1\n\n---\n\nUpdate CI tracking tag: `.github/vllm-release-tag.commit` from `v0.26.0`\nto `v0.27.1`, and adapt the codebase so vllm-ascend works on both vLLM\nv0.27.1 and vLLM main.\n\n#### 1. Version / CI / Docker / Documentation\n\n| File | Change Reason |\n|------|---------------|\n| `.github/vllm-release-tag.commit` | Update CI tracking tag: `v0.26.0`\n→ `v0.27.1` |\n| `Dockerfile`, `Dockerfile.310p`, `Dockerfile.310p.openEuler`,\n`Dockerfile.a3`, `Dockerfile.a3.openEuler`, `Dockerfile.a5`,\n`Dockerfile.a5.openEuler`, `Dockerfile.openEuler` | `ARG\nVLLM_TAG=v0.26.0` → `v0.27.1` |\n| `README.md`, `README.zh.md` | Update main branch description: CI\ncommitment for vLLM `v0.26.0` → `v0.27.1` tag |\n\n#### 2. Drop v0.26.0 version gates (v0.27.1 upstream matches main)\n\nAll `vllm_version_is(\"0.26.0\")` branches whose behavior v0.27.1 no\nlonger needs were removed, keeping only the current signatures. Upstream\nvLLM PRs that landed before v0.27.1:\n\n| File | Change Reason |\n|------|---------------|\n| `vllm_ascend/distributed/weight_transfer/__init__.py`,\n`npu_ipc_engine.py`, `examples/rl/rlhf_http_npu_ipc.py`,\n`tests/ut/distributed/weight_transfer/test_npu_ipc_engine.py`,\n`tests/e2e/pull_request/one_card/test_npu_ipc_weight_transfer.py` | Drop\nthe static `trainer_send_weights` path; the stateful\n`IPCTrainerWeightTransferEngine` (vllm #48981/#48042) exists at v0.27.1\nand the removed `IPCTrainerSendWeightsArgs` no longer imports |\n| `vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py`,\n`mooncake_hybrid_connector.py` | Drop 0.26.0 gate:\n`KVConnectorBase_V1.__init__` sets `_kv_transfer_config` at v0.27.1\n(vllm #50297) |\n| `vllm_ascend/distributed/device_communicators/npu_communicator.py` |\nDrop 0.26.0 gate: `DeviceCommunicatorBase.__init__` accepts\n`use_all2all` at v0.27.1 (vllm #47288) |\n|\n`vllm_ascend/worker/v2/spec_decode/{eagle,dspark,dflash,autoregressive}/...`,\n`vllm_ascend/worker/v2/sample/gumbel.py`,\n`vllm_ascend/spec_decode/dspark_proposer.py`,\n`tests/ut/spec_decode/test_dspark_proposer.py` | Drop 0.26.0 signature\ngates: `seq_lens_cpu_upper_bound`/`step` (vllm #44492),\n`skip_attn`→`full_cudagraph` (#49995), dflash kernel temperature/seeds\n(#50000), restored FP32 logit upcast (#49033), `sample_from_anchor` |\n| `vllm_ascend/worker/npu_input_batch.py`,\n`vllm_ascend/ops/vocab_parallel_embedding.py`,\n`vllm_ascend/_310p/ops/vocab_parallel_embedding.py` | Drop 0.26.0 gates:\n`use_replayssm`/`slot_mapping_modes` (vllm #48018), `disable_tp`\n(#49731) |\n| `vllm_ascend/patch/platform/patch_fused_moe.py`,\n`vllm_ascend/ops/fused_moe/fused_moe.py` | Drop 0.26.0 gates:\n`FusedMoE`→`FusedMoEFactory` rename (vllm #44941), fused_moe reduce\nkwargs |\n| `tests/e2e/conftest.py` | Hunyuan image-token wrapping no longer needs\na backport: upstream vLLM fixed `_call_hf_processor` natively (vllm\n#49691) |\n| `tests/e2e/pull_request/one_card/test_guided_decoding.py` | Drop\n0.26.0 branch: `VLLMValidationError` no longer subclasses `ValueError`\n(vllm #49665) |\n\n#### 3. Bump version gates to v0.27.1 (v0.27.1 still needs the old\nbehavior)\n\n| File | Change Reason |\n|------|---------------|\n| `vllm_ascend/worker/model_runner_v1.py` | `vllm_version_is(\"0.26.0\")`\n→ `vllm_version_is(\"0.27.1\")` for the routed-expert `clear_buffer()`\ncall (removed on main only, vllm #50721) and `calculate_kv_scales`\n(removed on main only, #49389) |\n| `tests/ut/patch/platform/test_deepseek_v4_thinking.py` |\n`vllm_version_is(\"0.26.0\")` → `vllm_version_is(\"0.27.1\")`: the\ndeepseek-v4 reasoning-effort tokenizer mapping is unchanged at v0.27.1\n(changed only on main, #50580/#51727) |\n\n#### 4. Weight transfer backend fix\n\n| File | Change Reason |\n|------|---------------|\n| `tests/e2e/pull_request/one_card/test_npu_ipc_weight_transfer.py`,\n`examples/rl/rlhf_http_npu_ipc.py` | Use `npu_ipc` backend instead of\n`ipc` for the server side: `ipc` resolves to the upstream CUDA\n`IPCWeightTransferEngine`, which calls `torch.cuda` and crashes on\nAscend. Upstream relaxed `WeightTransferConfig.backend` to `Literal[...]\n| str`, so `npu_ipc` can be addressed directly and the factory creates\n`NPUIPCWeightTransferEngine` (matching the trainer-side\n`NPUIPCTrainerInitInfo`) |\n\n### Does this PR introduce _any_ user-facing change?\n\nNo\n\n### How was this patch tested?\n\nCI verification only\n\n---\n\n- vLLM version: v0.26.0\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/58d3918e3ea0a544ffedadad2ba84559e9c51d8f\n\n---------\n\nSigned-off-by: liaoqidan <1107297340@qq.com>"
+    },
+    {
+      "sha": "351879064cfbd219ac6301b016c7ffecdde15c44",
+      "comment": "CI 后处理脚本日志修复：upload_to_openlibing.py 使用 logging 写 stderr，旧逻辑只在失败时打印 stderr，成功时吞掉日志，导致上传成功/失败难以排查。现在无论成功失败都转发 stdout/stderr，非零退出码仍打印 Warning 且保持 best-effort 不阻断测试。另外 merge_postprocess_payload 增加 test_env[\"yaml_name\"]。纯 CI/脚本变更，风险极低。",
+      "tags": [
+        "ci",
+        "bugfix",
+        "low-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "仅修改 nightly 后处理脚本的日志转发行为，不影响测试判定逻辑；可在 nightly 运行中观察上传日志确认。",
+        "suggested_test_areas": []
+      },
+      "message": "[BugFix][CI] Forward upload script stderr in nightly result postprocess (#14051)\n\n### What this PR does / why we need it?\n\n`upload_to_openlibing.py` uses Python `logging`, which writes to stderr.\n`_run_postprocess_script` captured both streams but only printed stdout\non success, and only printed stderr when the exit code was non-zero.\n\nAs a result, after `OPENLIBING_SECRET` was configured and upload\nsucceeded, CI only showed `Postprocess JSON written to ...` with no\nupload success/failure details, which made debugging difficult.\n\nThis PR always forwards stdout/stderr from the upload subprocess, and\nstill prints a Warning when the exit code is non-zero. Upload failure\ncontinues to be best-effort and does not fail the benchmark test case.\n\n### Does this PR introduce _any_ user-facing change?\n\nNo. CI-only logging improvement for nightly/weekly postprocess upload.\n\n### How was this patch tested?\n\n- Verified locally that success/failure logs from\n`upload_to_openlibing.py` are printed by `_run_postprocess_script`.\n- Nightly debug runs for `qwen3-32b-int8` (e.g. Nightly-A2:\nhttps://github.com/vllm-project/vllm-ascend/actions/runs/31553200411)\nobserved that without this fix, upload produced no logs after JSON\nwrite; this change addresses that.\n\nhttps://github.com/vllm-project/vllm-ascend/actions/runs/31561503582/job/94005553056\n\n\n- vLLM version: v0.26.0\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/58d3918e3ea0a544ffedadad2ba84559e9c51d8f\n\n---------\n\nSigned-off-by: jiangyunfan1 <jiangyunfan1@h-partners.com>"
+    },
+    {
+      "sha": "8f89feb9dbf157fe16ae0421d47a1f52ce5ff966",
+      "comment": "修复 RL 场景 + ACL Graph 模式下 W8A8 MXFP8 权重重载后图重放读脏数据的问题。原实现每次 process_weights_after_loading 都重新 .contiguous()，导致 layer.weight.data 与 weight_scale.data 的 data_ptr 在每次 reload 后变化；ACL graph 捕获的是首次地址，reload 后地址指向已释放/陈旧内存，图重放产生乱码输出。修复后首次调用分配并缓存 _mxfp8_weight_buf/_mxfp8_scale_buf，后续 reload 通过 copy_ 原地写入并重新指向缓存 buffer，保证 data_ptr 与 contiguity 跨 reload 稳定；同时统一了 scale 奇偶维度的 reshape/pad 处理。新增 UT 覆盖 3 轮 reload 的地址稳定性。属于典型的\"graph 地址稳定性\"修复，对 RL+graph 组合场景至关重要。",
+      "tags": [
+        "bugfix",
+        "quantization",
+        "medium-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "已新增 test_transform_buffer_data_ptr_stable_across_reloads 覆盖 data_ptr 稳定与 contiguity；建议进一步补充 RL 权重恢复后 graph 重放输出与 eager 一致的数值正确性用例。",
+        "suggested_test_areas": [
+          "tests/ut/quantization/methods/test_w8a8_mxfp8.py"
+        ]
+      },
+      "message": "[BugFix] [w8a8_mxfp8] Reuse weight address in graph and RL scenario (#13902)\n\n### What this PR does / why we need it?\n\nIn RL workflows (e.g. verl), rollout weights are reloaded into the model\nrepeatedly, and after each reload\n`AscendW8A8MXFP8DynamicLinearMethod.process_weights_after_loading` is\ninvoked again to transform the weight (transpose) and scale (reshape +\ntranspose) into the layout consumed by ACL.\n\nBefore this fix, every call re-allocated the transformed tensors via\n`.contiguous()`, so `layer.weight.data` / `layer.weight_scale.data` got\na new `data_ptr` on each reload. When ACL graph mode is enabled, the\ngraph captures the buffer addresses on the first capture and replays\nagainst them; after a reload the captured addresses point to freed/stale\nmemory, so graph replay reads garbage and produces garbled output.\n\n  This PR makes the transformed buffer stable across reloads:\n- On the first `process_weights_after_loading`, allocate the contiguous\ntransformed buffers once and cache them on the layer as\n`_mxfp8_weight_buf` / `_mxfp8_scale_buf`.\n- On subsequent calls (the RL reload path), copy the reloaded\noriginal-shape data in place into the cached buffers via `copy_()`, then\npoint `layer.weight.data` / `layer.weight_scale.data` back at the cached\nbuffers.\n\nAs a result the buffer `data_ptr` and contiguity never change across\nreloads, so ACL graph replay always reads the live, contiguous weights\nand produces correct output.\n\n  ### Does this PR introduce _any_ user-facing change?\n\nNo API/interface change. Behaviorally this fixes the garbled output that\noccurred in RL + ACL graph mode scenarios after a weight reload; non-RL\nand non-graph-mode paths are unaffected.\n\n  ### How was this patch tested?\n\nAdded\n`TestAscendW8A8MXFP8LinearMethod.test_transform_buffer_data_ptr_stable_across_reloads`,\nwhich:\n- Transforms once and records the `data_ptr` of `_mxfp8_weight_buf` /\n`_mxfp8_scale_buf`.\n- Loops 3 times over: `restore_weights_for_rl_loading` -> simulate\n`model.load_weights()` writing new data via `copy_()` ->\n`process_weights_after_loading`.\n- Asserts the buffer `data_ptr` and `layer.weight.data` /\n`layer.weight_scale.data` `data_ptr` stay stable, and that all four\ntensors remain contiguous, both after the first transform and after\nevery reload.\n\n  Run on an NPU machine:\n\n  ```bash\npytest\ntests/ut/quantization/methods/test_w8a8_mxfp8.py::TestAscendW8A8MXFP8LinearMethod::test_transform_buffer_data_ptr_stable_across_reloads\n-v\n```\n  Existing tests in the same file continue to pass.\n- vLLM version: v0.26.0\n- vLLM main: https://github.com/vllm-project/vllm/commit/0351e9aa1fdf1a51329d1906881528dfe61fc88e\n\n---------\n\nSigned-off-by: kyle-zhangchi <chiiiiiizhang@gmail.com>"
+    },
+    {
+      "sha": "c04eb05cbbc04f90ca0bb863e5704b923cc2d080",
+      "comment": "因 PR #13874 与 #13995 冲突，临时跳过四卡 DeepSeek V4 e2e 测试。仅增加 @pytest.mark.skip 标记，属于临时 CI 保护措施。需要注意冲突解决后及时移除 skip，避免该用例长时间失去看护。风险极低。",
+      "tags": [
+        "ci",
+        "test",
+        "low-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "跳过一个四卡 e2e 用例会暂时降低 DeepSeek V4 的回归看护；应在冲突合并后移除 skip 并恢复运行。",
+        "suggested_test_areas": [
+          "tests/e2e/pull_request/four_card/model_runner_v2/test_deepseek_v4.py"
+        ]
+      },
+      "message": "[CI] Temporarily skip DeepSeek V4 test due to PR conflicts (#14189)\n\n### What this PR does / why we need it?\n\nTemporarily skip the DeepSeek V4 test due to conflicts between #13874\nand #13995.\n### Does this PR introduce _any_ user-facing change?\n\nN/A\n### How was this patch tested?\nN/A\n\n- vLLM version: v0.26.0\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/58d3918e3ea0a544ffedadad2ba84559e9c51d8f\n\nSigned-off-by: jiajinzhu2 <jiajinzhu@huawei.com>"
+    },
+    {
+      "sha": "26a68272cd4de2f81c920b5d383cfe65bec96f64",
+      "comment": "自动化文档翻译提交：新增/更新 14 个 zh_CN locale PO 文件，覆盖 SFA Remote D2H Connector 设计文档、DyntraLB、分层与稀疏 KV 缓存卸载、流水线并行等新文档的翻译，以及安装/快速开始/支持矩阵等既有文档的增量翻译。纯文档变更，无代码影响。需关注 CI 自动翻译与源文档的同步一致性（如 supported_models 的支持状态改动）。",
+      "tags": [
+        "docs",
+        "low-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "纯文档/翻译变更，不涉及测试逻辑。",
+        "suggested_test_areas": []
+      },
+      "message": "[Doc] Translated Doc files 2026-08-13 (#14155)\n\n## Auto-Translation Summary\n\nTranslated **14** file(s):\n\n-\n<code>/home/runner/_work/vllm-ascend/vllm-ascend/docs/source/locale/zh_CN/LC_MESSAGES/developer_guide/Design_Documents/sfa_remote_d2h_connector.po</code>\n-\n<code>/home/runner/_work/vllm-ascend/vllm-ascend/docs/source/locale/zh_CN/LC_MESSAGES/developer_guide/performance_and_debug/msprobe_guide.po</code>\n-\n<code>/home/runner/_work/vllm-ascend/vllm-ascend/docs/source/locale/zh_CN/LC_MESSAGES/installation.po</code>\n-\n<code>/home/runner/_work/vllm-ascend/vllm-ascend/docs/source/locale/zh_CN/LC_MESSAGES/quick_start.po</code>\n-\n<code>/home/runner/_work/vllm-ascend/vllm-ascend/docs/source/locale/zh_CN/LC_MESSAGES/tutorials/models/DeepSeek-V4-Flash.po</code>\n-\n<code>/home/runner/_work/vllm-ascend/vllm-ascend/docs/source/locale/zh_CN/LC_MESSAGES/tutorials/models/GLM5.2.po</code>\n-\n<code>/home/runner/_work/vllm-ascend/vllm-ascend/docs/source/locale/zh_CN/LC_MESSAGES/user_guide/configuration/additional_config.po</code>\n-\n<code>/home/runner/_work/vllm-ascend/vllm-ascend/docs/source/locale/zh_CN/LC_MESSAGES/user_guide/feature_guide/dyntra_lb.po</code>\n-\n<code>/home/runner/_work/vllm-ascend/vllm-ascend/docs/source/locale/zh_CN/LC_MESSAGES/user_guide/feature_guide/index.po</code>\n-\n<code>/home/runner/_work/vllm-ascend/vllm-ascend/docs/source/locale/zh_CN/LC_MESSAGES/user_guide/feature_guide/layerwise_and_sparse_kv_cache_offloading.po</code>\n-\n<code>/home/runner/_work/vllm-ascend/vllm-ascend/docs/source/locale/zh_CN/LC_MESSAGES/user_guide/feature_guide/layerwise_kv_pool.po</code>\n-\n<code>/home/runner/_work/vllm-ascend/vllm-ascend/docs/source/locale/zh_CN/LC_MESSAGES/user_guide/feature_guide/pipeline_parallel.po</code>\n-\n<code>/home/runner/_work/vllm-ascend/vllm-ascend/docs/source/locale/zh_CN/LC_MESSAGES/user_guide/support_matrix/supported_features.po</code>\n-\n<code>/home/runner/_work/vllm-ascend/vllm-ascend/docs/source/locale/zh_CN/LC_MESSAGES/user_guide/support_matrix/supported_models.po</code>\n\n---\n\n[Workflow\nrun](https://github.com/vllm-project/vllm-ascend/actions/runs/31661254282)\n- vLLM version: v0.26.0\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/58d3918e3ea0a544ffedadad2ba84559e9c51d8f\n\nSigned-off-by: wangxiyuan <wangxiyuan@users.noreply.github.com>\nCo-authored-by: wangxiyuan <wangxiyuan@users.noreply.github.com>"
+    },
+    {
+      "sha": "747c33ac73866f80dc85c09b530a2d3196622f54",
+      "comment": "新增周级 e2e 测试配置：Qwen3.6-27B-W8A8-310P-300I-DUO（310P 2 卡），并注册到 weekly_config.yaml；同时新增 Qwen3.6-35B-A3B-W8A8-310P-300I-DUO 配置文件。注意 Qwen3.6-35B 的 yaml 中 `2threshold: 0.97` 疑似笔误（应为 threshold），会导致 perf 阈值未生效或配置解析异常，建议修复。",
+      "tags": [
+        "ci",
+        "test",
+        "low-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "新增两个周级 e2e 配置，需验证配置可被测试框架正确解析；其中 35B 配置存在 `2threshold` 键名笔误需要修正，27B 配置末尾缺少换行符也应规范化。",
+        "suggested_test_areas": [
+          "tests/e2e/weekly/single_node/configs/Qwen3.6-27B-W8A8-310P-300I-DUO.yaml",
+          "tests/e2e/weekly/single_node/configs/Qwen3.6-35B-W8A8-310P-300I-DUO.yaml"
+        ]
+      },
+      "message": "[CI]add qwen3.6-27B-W8A8-310P-300I-DUO (#14073)\n\n### What this PR does / why we need it?\nwe add qwen3.6-27B-W8A8-310P-300I-DUO\n\n### Does this PR introduce _any_ user-facing change?\nno\n\n### How was this patch tested?\nrun case weekly\n\n- vLLM version: v0.26.0\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/58d3918e3ea0a544ffedadad2ba84559e9c51d8f\n\n---------\n\nSigned-off-by: wanglei727 <naie.wanglei@h-partners.com>"
+    },
+    {
+      "sha": "5435305b7a28fa8b7600d96a2d587d13a7843b6f",
+      "comment": "移除已废弃环境变量 VLLM_ASCEND_ENABLE_CONTEXT_PARALLEL 的文档记录与 nightly 特性提取映射（#9668 之后该 env 不再使用）。文档与测试脚本的同步清理，无产品代码变更，风险低。",
+      "tags": [
+        "docs",
+        "refactor",
+        "low-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "仅删除文档条目和 utils.py 中一个 env→feature 映射，不影响测试执行；需确认 nightly 报告没有其他位置引用该 feature 名。",
+        "suggested_test_areas": []
+      },
+      "message": "[doc] remove VLLM_ASCEND_ENABLE_CONTEXT_PARALLEL (#14167)\n\n### What this PR does / why we need it?\n\nRemove unused env var `VLLM_ASCEND_ENABLE_CONTEXT_PARALLEL` following\n#9668.\n\n### Does this PR introduce _any_ user-facing change?\n\nNo.\n\n### How was this patch tested?\n\n- vLLM version: v0.26.0\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/58d3918e3ea0a544ffedadad2ba84559e9c51d8f\n\nSigned-off-by: QiuChunshuo <qiuchunshuo@huawei.com>"
+    },
+    {
+      "sha": "11f3669b5d2e24dce78b9ce9bb371115d5cb357b",
+      "comment": "将 auto_bisect 的 11 个参数（good/bad commit、fail-confirm-retries、trial/barrier timeout、no-verify-good/bad、force-initial-build、config-base-path 等）从 /nightly PR 命令透传到 CI workflows → E2E 模板 → K8s Pod → 脚本 → auto_bisect.py 全链路。新增 bisect_args.sh 统一构造 BISECT_EXTRA_ARGS；pr_nightly_command.yml 增加参数解析与校验（SHA 格式、超时正数、选项顺序、--aop_enabled 前后依赖）；single-node 工作流在显式提供 good commit 时跳过 good_table 年龄门禁。默认值保持原行为。这是一个较大的 CI 编排改动，涉及多份 workflow/jinja2/脚本的一致性，需要仔细回归。",
+      "tags": [
+        "ci",
+        "feature",
+        "medium-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "AOP 单/多节点脚本新增/调整了位置参数（aop_process.sh 的 14-21 号参数）与 BISECT_EXTRA_ARGS 拼装逻辑，调用方必须严格一致；建议至少做一次带显式 bisect 参数的 nightly 试运行，并验证未传参时行为完全不变。",
+        "suggested_test_areas": [
+          "tests/e2e/nightly/scripts/bisect_args.sh",
+          "tests/e2e/nightly/scripts/aop_process.sh",
+          "tests/e2e/nightly/multi_node/scripts/run.sh"
+        ]
+      },
+      "message": "[CI] Extend bisect parameters through AOP workflows (#13167)\n\n… chain\n\nAdd 11 new bisect parameters controllable via /nightly PR command:\n- --good-commit, --bad-commit\n- --fail-confirm-retries, --trial-timeout, --barrier-timeout\n- --no-verify-good, --no-verify-bad\n- --force-initial-build, --no-assume-built-head\n- --native-check, --config-base-path\n\nParameters flow from /nightly -> CI workflows -> E2E templates -> K8s\npods -> shell scripts -> auto_bisect.py.\nAll defaults preserved; no behavior change when params are omitted.\n\n### What this PR does / why we need it?\n\n### Does this PR introduce _any_ user-facing change?\n\n### How was this patch tested?\n\n- vLLM version: v0.26.0\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/58d3918e3ea0a544ffedadad2ba84559e9c51d8f\n\n---------\n\nSigned-off-by: chenzeyu <2978509328@qq.com>"
+    },
+    {
+      "sha": "6af9257e449ca139ccd228f0d71ca7d2c09909c9",
+      "comment": "将 DFlash 与 DSpark 的动态推测解码统一到 DynamicSpecScheduler（vllm_ascend/spec_decode/utils.py）：统一流水线为 token 置信度 → 接受概率 → 累积存活概率 (cumprod) → 全局验证预算 → 每请求验证长度。DFlash 无 confidence head，使用 argmax token 的 softmax 概率作为置信度；DSpark 继续使用 confidence head 的 sigmoid 输出。从 dspark_proposer 中删除原有预算计算/分配逻辑，改为共享 scheduler；dflash_proposer 在 method==\"dflash\" 时初始化 scheduler；llm_base_proposer 分别传 model/last_hidden_states/draft_token_ids（DSpark）或 logits（DFlash）。同时调整默认超参（budget_update_interval 50→16，budget_threshold 0.7→0.3，新增 min_verify_tokens=1），model_runner_v1.take_draft_token_ids 改为读取 drafter.dynamic_spec.num_verify_tokens，qwen3_dspark 的 enable_confidence_head 判定简化。潜在问题：dspark_proposer 中 _compute_confidence_logits 可能成为死代码；DynamicSpecScheduler 对 DSpark 重新实现了 confidence 计算，需确认与旧实现语义一致；默认超参变化会影响既有动态解码行为。",
+      "tags": [
+        "feature",
+        "spec_decode",
+        "performance",
+        "model-runner",
+        "medium-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "e2e test_dynamic.py 已参数化 dspark/dflash 两个动态方法并更新 baseline（dflash_dynamic）；但 DynamicSpecScheduler 的统一调度逻辑（cumprod、top-k 分配、min_k 下限、预算奇偶修正）缺少独立 UT，建议补充；同时回归 dspark 原有动态用例确认默认超参变化不破坏验收。",
+        "suggested_test_areas": [
+          "tests/e2e/pull_request/one_card/spec_decode/test_dynamic.py",
+          "tests/ut/spec_decode/test_dspark_proposer.py",
+          "tests/ut/spec_decode/（新增 test_dynamic_spec_scheduler.py）"
+        ]
+      },
+      "message": "[Feature] Support dynamic speculative decoding with DFlash and Unified dynamic selection logic (#13819)\n\n## Summary\nFollow up from https://github.com/vllm-project/vllm-ascend/pull/13216\nThis PR unifies the dynamic speculative decoding logic for **DFlash**\nand **DSpark**.\n\nBoth methods now use the same dynamic verification pipeline:\n\n```text\ntoken confidence\n    -> token acceptance probabilities\n    -> cumulative survival probabilities\n    -> shared verify budget\n    -> per-request verify lengths\n```\n\nThe shared scheduler handles:\n\n- `budget_threshold`\n- `budget_update_interval`\n- `initial_verify_budget_per_req`\n- cumulative survival computation\n- global verification-budget update\n- per-request budget allocation\n- dynamic-spec buffers and state\n\nThe only method-specific part is how token confidence is computed.\n\n## DFlash confidence\n\nDFlash does not have a dedicated confidence head, so the softmax\nprobability of the selected greedy token is used as its confidence\nestimate.\n\nFor logits `z_i`:\n\n```text\nt_i = argmax_j z_{i,j}\n```\n\nand the confidence of the selected token is:\n\n```text\np_i = exp(z_{i,t_i}) / sum_j exp(z_{i,j})\n```\n\nThis is computed directly with the fused max-softmax kernel without\nmaterializing the full softmax tensor.\n\n## DSpark confidence\n\nDSpark uses its learned confidence head:\n\n```text\np_i = sigmoid(c_i)\n```\n\nwhere `c_i` is the confidence-head output for speculative position `i`.\n\n## Unified survival-based scheduling\n\nAfter obtaining per-token probabilities, both DFlash and DSpark use\nexactly the same logic.\n\nPrefix survival probability is estimated as:\n\n```text\nS_k = product_{i=1..k} p_i\n```\n\nIn code:\n\n```python\nsurvival = torch.cumprod(\n    token_probs,\n    dim=1,\n)\n```\n\nThe survival probabilities are then used both to update the shared\nverification budget and to distribute that budget across requests.\n\nRequests with higher predicted prefix survival receive longer\nverification lengths, while lower-confidence requests receive shorter\nones.\n## Tests\n**Target model**: Qwen/Qwen3-8B\n**DFlash**: z-lab/Qwen3-8B-DFlash-b16\n**DSpark**: deepseek-ai/dspark_qwen3_8b_block7\n**Confidence scores computation**: DFlash - the softmax probability of\nthe selected greedy, DSpark - confidence head prediction\n\n**NB:** current threshold is not optimized for the specific draft model\nand was set as **budget_threshold = 0.3** for both DFlash and DSpark.\nLower threshold will reduce verification budget and pressure but will\nalso reduce the acceptance length, so for the better performance this\nparameter should be optimized for corresponding target/draft model and\ndata-flow, the logic values for this is into [0.2-0.4]\n**All tests are conducted on bs = 128**\n\nMethod | Draft | EAGER tok/s OFF → ON | Δ | FULL tok/s OFF → ON | Δ |\nAcceptance OFF → ON | Δ\n-- | -- | -- | -- | -- | -- | -- | --\nTarget | — | 1517 | — | 2454 | — | — | —\nDFlash | 9 | 2475 → 2904 | +17.33% | 2649 → 3213 | +21.29% | 3.46 → 3.25\n| -0.21\n  | 7 | 2612 → 2920 | +11.79% | 2788 → 3165 | +13.52% | 3.32 → 3.17 |\n-0.15\n  | 5 | 2804 → 2871 | +2.39% | 3051 → 3182 | +4.29% | 3.04 → 2.94 |\n-0.10\nDSpark | 9 | 2812 → 3189 | +13.41% | 3133 → 3551 | +13.34% | 4.27 → 4.09\n| -0.18\n  | 7 | 3022 → 3238 | +7.15% | 3428 → 3704 | +8.05% | 4.16 → 4.06 |\n-0.10\n  | 5 | 3149 → 3092 | -1.81% | 3639 → 3593 | -1.26% | 3.70 → 3.66 |\n-0.04\n\nUsing the average over K = 5, 7, 9, and normalizing each graph mode to\nits own Target throughput:\n\nGraph mode | Target | DFlash | + Dynamic | DSpark | + Dynamic\n-- | -- | -- | -- | -- | --\nEAGER | ×1.000 | ×1.734 | ×1.911 **(x1.10)** | ×1.974 | ×2.092\n**(x1.06)**\nFULL | ×1.000 | ×1.153 | ×1.299 **(x1.13)** | ×1.385 | ×1.474\n**(x1.06)**\n\nExtreme Case for Dflash\nGraph mode | DFlash (15) | Dynamic DFlash (15)\n-- | -- | -- \nFULL| 1991 tok/sec | 3063 tok/sec (x1.54)\n## Refactoring\n\nDynamic-spec state and buffers are moved from the individual proposer\nimplementations into a shared scheduler.\n\nAs a result, proposer-specific code is reduced to confidence\ncomputation, while budget calculation and token allocation are shared\nbetween DFlash and DSpark.\n\n\n- vLLM version: v0.26.0\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/58d3918e3ea0a544ffedadad2ba84559e9c51d8f\n\nSigned-off-by: chenaoxuan <cax1165@163.com>\nSigned-off-by: StanislavII <StasIlyushin@main.ru>\nCo-authored-by: chenaoxuan <cax1165@163.com>"
+    },
+    {
+      "sha": "13cc8ce27a92d3cec2ef9a64328f0830759ed584",
+      "comment": "修复 Mooncake KV 传输在 PP + 推测解码场景下的 MTP/Eagle 层路由错误。旧逻辑仅凭合成层索引 >= index_cache_plane_base 判断 index-cache 平面，而 MTP/Eagle draft 层的合成索引也可能落在该范围，被误判为 index-cache 索引并转换回 transformer 层索引，错误路由到第一个 prefill PP rank；但本地 drafter 及其 KV cache 在最后一个 PP stage。修复改为根据 group_spec 的 layer_names 中是否包含 \".index_cache\" 判断，只有真正的 index-cache group 才做索引变换。逻辑更精确，风险中等，需确保所有 index-cache group 的 layer_names 命名规范一致。",
+      "tags": [
+        "bugfix",
+        "distributed",
+        "medium-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "现有 test_mooncake_connector.py 覆盖基础路由，但缺少 MTP/Eagle 与 index-cache 混合场景的用例；建议新增针对 draft layer 合成索引不被误路由的 UT。",
+        "suggested_test_areas": [
+          "tests/ut/kv_offload/test_mooncake_connector.py"
+        ]
+      },
+      "message": "[Bugfix][P/D] Fix MTP PP layer routing in Mooncake (#13778)\n\n### What this PR does / why we need it?\n\nMooncake currently identifies index-cache metadata based solely on\nwhether a synthetic layer index is greater than or equal to the target\nmodel's total number of layers.\n\nMTP/Eagle draft layers may also use synthetic indices in this range. As\na result, their indices can be misidentified as index-cache indices,\ntranslated back to parent transformer-layer indices, and incorrectly\nrouted to the first prefill pipeline-parallel rank. However, the local\ndrafter and its KV cache reside on the final PP stage.\n\nThis change identifies index-cache groups using their cache-layer names.\nMetadata indices are translated back to parent transformer-layer indices\nonly for groups containing `.index_cache`. MTP/Eagle indices remain\nunchanged, ensuring that their KV-cache metadata is routed to the final\nprefill PP rank.\n\n### Does this PR introduce any user-facing change?\n\nNo. This change fixes Mooncake KV-cache transfer routing for\npipeline-parallel deployments that use speculative decoding together\nwith index-cache metadata.\n\n### How was this patch tested?\n\n- `ruff check\nvllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py`\n- `ruff format --check\nvllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py`\n- `bash format.sh ci`\n- `pytest -sv tests/ut/kv_offload/test_mooncake_connector.py`\n\n- vLLM version: v0.26.0\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/58d3918e3ea0a544ffedadad2ba84559e9c51d8f\n\n---------\n\nSigned-off-by: xyy59516 <xyy59516@gmail.com>"
+    },
+    {
+      "sha": "abeb73b546f7e4cc482da8fcf092b9d2680ac183",
+      "comment": "为 Gemma4/Gemma4Unified 多模态模型增加 EAGLE3 草稿加载时的 image token 映射支持。将原先内联在 load_model 里的多模态 image_token_index 选择逻辑抽取为静态方法 _get_multimodal_image_token_index，加入 Gemma4 系列（使用 config.image_token_id），Pixtral 与 Kimi 特殊分支保持不变，默认回退 image_token_index。新增 UT 参数化覆盖所有已知模型。方法抽取行为等价，风险低。",
+      "tags": [
+        "feature",
+        "spec_decode",
+        "multimodal",
+        "low-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "已新增 TestMultimodalImageTokenIndex 参数化单测覆盖 Gemma4 新路径及原有模型特殊分支，测试随代码一起提交，无需额外补充。",
+        "suggested_test_areas": [
+          "tests/ut/spec_decode/test_llm_base_proposer.py"
+        ]
+      },
+      "message": "[Feature][SpecDecode] Support Gemma4 image token mapping (#12948)\n\n### What this PR does / why we need it?\n\nAdds `Gemma4ForConditionalGeneration` and\n`Gemma4UnifiedForConditionalGeneration` to the multimodal image token\nmapping used by `AscendSpecDecodeBaseProposer.load_model`.\n\nGemma4 VL configs use `image_token_id`, so Gemma4 EAGLE3 draft loading\nshould follow the same mapping path as Qwen VL and Step3p7. This also\naligns vLLM Ascend with upstream vLLM's Gemma4 handling.\n\nFixes #12947\n\n### Does this PR introduce _any_ user-facing change?\n\nNo API or CLI change. This only enables the existing EAGLE3 speculative\ndecoding path to load Gemma4 draft models correctly.\n\n### How was this patch tested?\n\n- Added unit tests in `tests/ut/spec_decode/test_llm_base_proposer.py`\nfor multimodal image token mapping, including both Gemma4 architectures.\n- `python -m ruff check vllm_ascend/spec_decode/llm_base_proposer.py\ntests/ut/spec_decode/test_llm_base_proposer.py`\n- `python -m ruff format --check\nvllm_ascend/spec_decode/llm_base_proposer.py\ntests/ut/spec_decode/test_llm_base_proposer.py`\n- `git diff --check`\n\n`pytest tests/ut/spec_decode/test_llm_base_proposer.py` was not run\nlocally because this Windows environment does not have vLLM/torch\ninstalled.\n\n\n- vLLM version: v0.26.0\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/0351e9aa1fdf1a51329d1906881528dfe61fc88e\n\nSigned-off-by: XUE TONGYAO <Alex-stack-hub@users.noreply.github.com>\nCo-authored-by: XUE TONGYAO <Alex-stack-hub@users.noreply.github.com>"
+    },
+    {
+      "sha": "80e71da7710d597aace43a88dcfb6ff818a6b358",
+      "comment": "修复因上游 send_image_request API 变更（#13751）导致的测试失败：test_disaggregated_encoder.py 原来传裸 model 字符串，现在构造 SingleNodeConfig（包含与旧硬编码等价的 image chat-completion 请求）再传入 send_image_request。纯测试修复，风险低。",
+      "tags": [
+        "test",
+        "bugfix",
+        "low-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "该提交本身就是测试修复；需在 CI 中验证 two_card 的 disaggregated encoder 用例恢复通过，无进一步测试变更需求。",
+        "suggested_test_areas": [
+          "tests/e2e/pull_request/two_card/test_disaggregated_encoder.py"
+        ]
+      },
+      "message": "[BugFix][Test] Fix disaggregated encoder test after send_image_request API change (#14128)\n\n### What this PR does / why we need it?\n\nUpstream #13751 changed `send_image_request`'s signature from `(model,\nserver)` to `(config: SingleNodeConfig, server)` but left\n`test_disaggregated_encoder.py` passing a bare model string, breaking\n`test_disaggregated_encoder` with `AttributeError: 'str' object has no\nattribute 'mm_request'`.\n\nBuild a `SingleNodeConfig` carrying the same image chat-completion\npayload the old hardcoded request sent and pass it to\n`send_image_request`.\n\n### Does this PR introduce _any_ user-facing change?\n\nNo\n\n### How was this patch tested?\n\nCI verification only\n- vLLM version: v0.26.0\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/58d3918e3ea0a544ffedadad2ba84559e9c51d8f\n\nSigned-off-by: liaoqidan <1107297340@qq.com>"
+    }
+  ],
+  "architecture_based_on_sha": "e04f251a5895969d1c1f4ac9a3807177a0c4769c",
+  "architecture_generated_at": "2026-08-01T20:25:03.693997+08:00"
+}

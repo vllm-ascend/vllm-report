@@ -1,0 +1,500 @@
+{
+  "date": "2026-08-15",
+  "repo": "vllm-project/vllm",
+  "generated_at": "2026-08-16T02:28:11.357526+08:00",
+  "daily_summary": "当日变更覆盖多个方向：构建系统（CUDA PTX 全局架构请求告警、ROCm Docker 清理）、DSV4 稀疏 MLA 端到端修复（decode/MTP/DSpark，含 workspace lane 机制与 topk kernel 负长度防护）、流式 Parser Engine 的 reasoning token 计数支持、ModelScope 环境变量与仓库文件列举修复、ROCm CI 无 GPU 任务的 CPU 平台选择、GPU<->CPU 同步检测基础设施（VLLM_GPU_SYNC_CHECK 并包裹大量有意的 D2H 同步点）、DeepSeek V3.2 MTP 尾部 all-reduce 融合与 local-argmax draft、MRV2 attention-free 模型支持、ROCm MXFP4 MoE 的 SiTU 特例移除、Rust gRPC Control 服务新增 RL 生命周期控制、多模态编码器减少 GPU<->CPU 同步、ROCm 16-token 块稀疏索引支持以及 flashinfer.comm 导入保护放宽。整体以 bugfix、性能优化和 CI/可观测性建设为主。",
+  "ascend_impact_summary": "对 vllm-ascend 影响较大的有三处：(1) DSV4 稀疏 MLA 修复中 DeepseekSparseSWAMetadata 新增 decode_swa_width 字段、WorkspaceManager 引入 num_lanes 多通道机制并要求 GPUModelRunner/GPUWorker 侧同步初始化，Ascend 的 DSA/MLA 元数据构建器与 NPUWorker 需同步适配；(2) GPU<->CPU 同步检测基础设施在共享的 V2 GPUModelRunner、Sampler、FlashInfer/注意力 wrapper 与大量多模态模型中包裹 gpu_sync_allowed()，Ascend 若启用 VLLM_GPU_SYNC_CHECK 需确保自身 worker/model runner 的有意 D2H 同步同样被标记；(3) WorkerBase 新增 supports_draft_weight_updates() 默认方法且 EngineCoreReadyResponse 增加 RL 握手字段，属向后兼容的增量。另有 vllm/platforms/__init__.py 的 CPU 平台提前短路逻辑与 GPUModelRunner.release() 清理 cudagraph_manager 的小幅行为变化，均不破坏现有 Ascend 路径。",
+  "commits": [
+    {
+      "sha": "d4801990a45792c7081652f8ebea4ee56ceb67f9",
+      "comment": "构建系统改进：将 clear_cuda_arches 宏重命名为 clear_cuda_gencode_flags，并新增 warn_if_ptx_arch_requested 函数，在用户通过全局 TORCH_CUDA_ARCH_LIST 请求 +PTX 时发出警告，说明 vLLM 会按源文件重新生成 gencode 标志、不保留全局 PTX 请求。同时更新了 CUDA 安装文档并增强 tests/test_cmake_utils.py（自动探测 cmake 可执行文件路径、新增宏功能测试）。纯 CUDA 构建/CI/文档变更，无运行时影响。",
+      "tags": [
+        "ci",
+        "build",
+        "docs",
+        "low-risk",
+        "cuda-build"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[CI/Build] Add warning for unsupported global PTX architecture requests in...  (#51901)"
+    },
+    {
+      "sha": "97388c44f9c608f83318e0c9540a536cd7de3e0d",
+      "comment": "DSV4 稀疏 MLA 的大型端到端修复。核心变更：(1) cooperative_topk/persistent_topk CUDA kernel 对负数 seq_len 做 clamp，避免 uint32 回绕成 ~4e9 导致越界读；(2) DeepseekSparseSWAMetadata 新增 decode_swa_width 字段，区分 DSpark 非因果填充后的索引宽度与逻辑 window_size；(3) 新增 get_dspark_swa_index_width() 统一 64 对齐宽度计算；(4) build_flashinfer_mixed_sparse_indices kernel 改用 SWA_INDEX_WIDTH 布局；(5) DFlash speculator 对拒绝后缀做 PAD 处理并禁止写入 null block (block 0)；(6) WorkspaceManager 引入 num_lanes 多通道，保证 DSpark target 与 draft CUDA graph 同时持有 workspace 视图；(7) SM120 FlashInfer 能力检查改为精确匹配 dispatch 表。风险点：decode_swa_width 默认值为 0，所有构造 DeepseekSparseSWAMetadata 的 builder 必须显式填充；workspace lane 未初始化时 get_simultaneous 会抛 RuntimeError。",
+      "tags": [
+        "bugfix",
+        "performance",
+        "medium-risk",
+        "attention",
+        "model-runner",
+        "spec-decode",
+        "workspace"
+      ],
+      "ascend_impact": {
+        "ascend_affected": true,
+        "functionality": "命中 vllm/v1/worker/gpu/model_runner.py（NPUModelRunner 继承的 GPUModelRunner）与注意力后端共享模块。DeepseekSparseSWAMetadata 新增 decode_swa_width 字段（默认 0），vllm-ascend 的 AscendMLA/DSA 等基于该元数据类的后端必须按本 commit 中 ROCm 后端的修复模式填充 decode_swa_width（非因果 DSpark 时使用 get_dspark_swa_index_width），否则非因果宽度计算错误；WorkspaceManager/init_workspace_manager 新增 num_lanes 参数，NPUWorker 若复用共享 WorkspaceManager 并在 DSpark 场景下调用 use_workspace_lane(1)，必须按 _num_workspace_lanes 逻辑初始化 2 条 lane，否则 get_simultaneous 抛 RuntimeError；indexer.py 的 seq_len clamp 修复为共享正确性修复，Ascend 一并受益。",
+        "testing": "vllm-ascend 应验证其 MLA/DSA 元数据构建在 decode_swa_width 缺失时不会静默产生错误形状，以及 DSpark 场景下 workspace lane 初始化与 model runner 行为。",
+        "needs_test_update": true,
+        "suggested_test_areas": [
+          "vllm_ascend/attention/（AscendMLA/DSA 元数据构建器 decode_swa_width 填充）",
+          "vllm_ascend/worker/（NPUWorker workspace lane 初始化与 DSpark 集成）"
+        ]
+      },
+      "message": "[Bugfix] Make DSV4 sparse MLA work end-to-end for plain decode, MTP, and DSpark (#51538)",
+      "deep_analysis": {
+        "ascend_affected_confirmed": true,
+        "affected_interfaces": [
+          "NPUWorker.init_device (vllm_ascend/worker/worker.py) — calls init_workspace_manager(self.device, num_ubatches) without the new num_lanes parameter; upstream GPUWorker now configures 2 workspace lanes for DSpark+v2",
+          "XliteWorker.init_device (vllm_ascend/xlite/xlite_worker.py) — same init_workspace_manager call without num_lanes",
+          "AscendDFlashSpeculator / _prepare_dflash_inputs_kernel_ascend (vllm_ascend/worker/v2/spec_decode/dflash/speculator.py) — Ascend-maintained fork of the upstream triton kernel, patched via vllm_ascend/patch/worker/patch_v2/patch_triton.py; lacks the new rejected-suffix and null-block fixes",
+          "AscendDSparkSpeculator (vllm_ascend/worker/v2/spec_decode/dspark/speculator.py) — inherits DSparkSpeculator whose propose/capture/load_model now execute inside use_workspace_lane(1) in inherited GPUModelRunner code",
+          "AscendDSAMetadataBuilder / build_dspark_swa_indices / _aligned_dspark_index_width (vllm_ascend/attention/dsa_v1.py) — DSpark SWA index-width alignment (128) now diverges from upstream get_dspark_swa_index_width (64)",
+          "NPUModelRunner v2 (vllm_ascend/worker/v2/model_runner.py) — inherits GPUModelRunner.load_model/_dummy_run/capture/execute_model which now wrap speculator calls in use_workspace_lane(self._draft_workspace_lane)"
+        ],
+        "adaptation_effort": "medium",
+        "adaptation_guide": "1) Workspace lanes: In NPUWorker.init_device (vllm_ascend/worker/worker.py:463) and XliteWorker.init_device (vllm_ascend/xlite/xlite_worker.py:29), mirror GPUWorker's new logic and pass num_lanes = 2 when use_v2_model_runner and speculative_config.use_dspark() (else 1): init_workspace_manager(self.device, num_ubatches, num_lanes). Without this, DSpark target/draft ops run inside use_workspace_lane(1) while the manager has only 1 lane — currently harmless only because Ascend attention backends never call get_simultaneous(), but it silently drops the DSpark workspace-aliasing fix and risks a RuntimeError('Workspace lane 1 is not configured') the moment any draft-path code touches the workspace manager. 2) DFlash kernel sync: Update _prepare_dflash_inputs_kernel_ascend in vllm_ascend/worker/v2/spec_decode/dflash/speculator.py to match the new upstream semantics: (a) clamp context loads/stores to [0, valid_ctx_end - ctx_start) so rejected-suffix rows write position 0 + PAD_SLOT_ID instead of real draft KV (contamination bug fixed upstream), and (b) force rows whose ctx_block_id or q_block_id == 0 (null/physical block 0) to PAD_SLOT_ID so draft KV never writes the null block. Verify DFlashCudaGraphManager/DFlashAclGraphManager capture paths (vllm_ascend/worker/v2/spec_decode/dflash/aclgraph.py) tolerate the -1 sample_idx_mapping initialization inherited from DFlashSpeculator.__init__. 3) Optionally align dsa_v1.py's _aligned_dspark_index_width alignment (currently 128) with upstream get_dspark_swa_index_width (alignment 64) to keep DSpark SWA index widths consistent with upstream metadata; not a hard break since Ascend uses its own AscendDSAMetadataBuilder. 4) No action needed for the flashinfer/cuda/AMD/NVIDIA/FlashInfer-CUTLASS MoE/csrc changes — those paths are not used by Ascend.",
+        "risk": "medium. If the workspace-lane configuration is not added, DSpark v2 speculative decoding on NPU either silently misses the upstream workspace-aliasing fix or raises a RuntimeError if any workspace get_simultaneous call is introduced on the draft lane. If the Ascend DFlash kernel is not synced, DSpark/DFlash DSV4 sparse MLA decode can still write rejected-suffix rows and null-block (physical block 0) slots into draft KV, producing corrupted K/V and incorrect generations — the exact bugs this commit fixes on GPU. The SWA width alignment divergence (128 vs 64) is lower risk since Ascend builds its own metadata, but should be kept consistent to avoid future shape mismatches when DSpark draft and target metadata are combined."
+      }
+    },
+    {
+      "sha": "ac2ae8798c7ef59c1924d5c0447a4279fa645770",
+      "comment": "流式 Parser Engine 增加 reasoning token 计数。Parser/DelegatingParser 新增 count_reasoning_tokens 默认方法；SemanticEvent/LexToken/TextChunk 携带 token_count，IncrementalLexer 通过 _char_token_counts 将 token 数按字符归属到增量文本与延迟终端；ParserEngine.count_reasoning_tokens 改为返回引擎累计计数而非重新扫描 token 序列；ParserManager 将基于同一 parser engine 的 reasoning+tool adapter 折叠为共享 engine 类；OpenAI chat/responses serving 在 usage 中输出 completion_tokens_details.reasoning_tokens。非流式路径通过创建 counting engine 单遍解析兜底。整体为前端协议与解析器增强，不涉及推理内核。",
+      "tags": [
+        "feature",
+        "low-risk",
+        "parser",
+        "frontend",
+        "openai-api"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Frontend]  Support count_reasoning_tokens in the Streaming Parser Engine (#45802)\n\nSigned-off-by: chaunceyjiang <chaunceyjiang@gmail.com>\nCo-authored-by: mergify[bot] <37929162+mergify[bot]@users.noreply.github.com>"
+    },
+    {
+      "sha": "5cecfc01375052698823fc401e31518fb32a981e",
+      "comment": "修复 ModelScope 使用：VLLM_USE_MODELSCOPE 环境变量从仅接受 'true' 扩展为接受 '1'/'true'（大小写不敏感、自动 strip），并移除 modelscope_list_repo_files 中对 Type == 'blob' 的过滤（实际文件字段为 Path）。同时更新了环境变量注释。小而实用的兼容性修复。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "config",
+        "modelscope"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Bugfix] Fix modelscope usage (#52431)\n\nSigned-off-by: DarkLight1337 <tlleungac@connect.ust.hk>"
+    },
+    {
+      "sha": "42156466db66f6d54cbea6075af82304cdfdaa6a",
+      "message": "[Rust Frontend][gRPC] Preserve skip_special_tokens decoding option (#52384)\n\nSigned-off-by: Biswa Panda <biswa.panda@gmail.com>",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "chore"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "44fc57d7b72eafaaefdcb0983451e08648be4d49",
+      "comment": "ROCm CI 变更：无 GPU 的原生任务复用 ROCm wheel 时显式设置 VLLM_TARGET_DEVICE=cpu；vllm/platforms/__init__.py 中 resolve_current_platform_cls_qualname 在检测到该环境变量时直接短路返回 CpuPlatform，cpu_platform_plugin 也优先以环境变量判断 CPU 平台，避免在装有加速卡的主机上同时激活 CPU 与宿主加速器平台。新增测试验证非 CPU wheel 上下文中的平台选择。",
+      "tags": [
+        "ci",
+        "refactor",
+        "low-risk",
+        "platform"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "命中 vllm/platforms/__init__.py（OOT 平台注册入口）。该 commit 在平台解析最前面增加 VLLM_TARGET_DEVICE == 'cpu' 的短路逻辑，并将 cpu_platform_plugin 的判定顺序改为环境变量优先。对 vllm-ascend 的 NPUPlatform 注册与自动检测流程无破坏：只要环境变量不被误设为 'cpu'，OOT 平台探测顺序保持不变；若用户在 NPU 环境中显式设置 VLLM_TARGET_DEVICE=cpu，将按设计改用 CpuPlatform。",
+        "testing": "无需新增测试；建议在 ascend CI 中顺带确认平台解析仍返回 NPUPlatform。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[ROCm][CI] Select CPU platform for native no-GPU jobs (#49515)\n\nSigned-off-by: Andreas Karatzas <Andreas.Karatzas@amd.com>",
+      "deep_analysis": {
+        "ascend_affected_confirmed": false,
+        "affected_interfaces": [],
+        "adaptation_effort": "low",
+        "adaptation_guide": "",
+        "risk": ""
+      }
+    },
+    {
+      "sha": "acb0f1dcdb668d90bbbf50e57552d2f6f0987c87",
+      "comment": "DSpark 推测解码小修复：当 speculative_config.attention_backend 为 None 时，draft 模型配置改为继承 vllm_config.attention_config.backend，避免 draft 侧重新执行 auto-selection 而选出与 target 不同的 attention 类。单文件、单行逻辑修复，行为更可预期。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "spec-decode",
+        "dspark"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Bugfix][Spec Decode] DSpark: inherit the target's attention backend when the speculative config names none (#52288)"
+    },
+    {
+      "sha": "615d4cfadeb3d5ea1df248eb59aa128af5dbd441",
+      "comment": "为 CI 引入 GPU<->CPU 同步检测：Docker 镜像设置 VLLM_GPU_SYNC_CHECK=error，并将代码库中『有意为之』的设备到主机同步点用新引入的 gpu_sync_allowed() 上下文管理器显式标记。覆盖范围极广：EPLB 通信/状态提交、LoRA worker 管理、Mamba 状态拷贝、一批多模态编码器（ernie45/idefics/gemma4/minicpmv/qwen 系列/siglip/ultravox 等）、FlashInfer 元数据构建、VIT attention wrapper、TopK/TopP Triton 表初始化、Sampler 的 mark_unbacked、V2 GPUModelRunner 的 sample 处理、EncoderCudaGraphManager、KV connector/NIXL 传输等。gpu_sync_allowed 在未设置环境变量时为空操作，生产行为不变；bitsandbytes 插件测试步骤显式 unset 该变量。该机制用于在 CI 中捕获热路径上的意外同步。",
+      "tags": [
+        "ci",
+        "refactor",
+        "test",
+        "medium-risk",
+        "model-runner",
+        "sampler",
+        "multimodal",
+        "distributed",
+        "lora",
+        "observability"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "命中 vllm/v1/worker/gpu_model_runner.py（NPUModelRunnerV2 继承的 V2 GPUModelRunner）与 vllm/v1/sample/sampler.py（共享 Sampler）。变更本质是行为透明的：gpu_sync_allowed() 在未设置 VLLM_GPU_SYNC_CHECK 时为空操作，Ascend 运行时不受影响；但 vllm-ascend 若在自己的 CI 或镜像中启用该环境变量，其 NPUWorker/NPUModelRunner 自有的 .item()/.tolist()/.cpu() 等有意同步点若未包裹 gpu_sync_allowed() 会被判定为错误。另外 vllm/model_executor/models/ 下大量共享多模态模型（qwen2_5_vl、phi4mm、siglip、ultravox 等）的同步点包裹对 Ascend 同样生效，属于正确的降同步改造。",
+        "testing": "vllm-ascend 若引入 VLLM_GPU_SYNC_CHECK 需要遍历自身 worker/model runner/attention 后端的 D2H 同步点；现有 Ascend 测试不受影响。",
+        "needs_test_update": true,
+        "suggested_test_areas": [
+          "vllm_ascend/worker/（NPUWorker/NPUModelRunner 同步点标记）",
+          "vllm_ascend/attention/（注意力后端元数据构建中的 D2H）",
+          "vllm_ascend CI 镜像的 VLLM_GPU_SYNC_CHECK 策略"
+        ]
+      },
+      "message": "[Core] Check for GPU<->CPU syncs during CI (#43107)\n\nSigned-off-by: Nick Hill <nickhill123@gmail.com>\nCo-authored-by: Claude Opus 4.8 (1M context) <noreply@anthropic.com>",
+      "deep_analysis": {
+        "ascend_affected_confirmed": false,
+        "affected_interfaces": [],
+        "adaptation_effort": "low",
+        "adaptation_guide": "",
+        "risk": ""
+      }
+    },
+    {
+      "sha": "7b544ecb524b6a5847465b671db2df9b8560ad93",
+      "comment": "DeepSeek V3.2 MTP 性能优化：非序列并行路径下，将原先独立的 tensor_model_parallel_all_reduce 融合进最终 RMSNorm（fused_allreduce_rms_norm），与主模型层边界的融合做法一致；同时新增 get_top_tokens()，通过每个 rank 在 vocab 分片上的局部 argmax 直接产生贪心 draft token，避免 compute_logits 的全 vocab all-gather。仅修改 NVIDIA DeepSeek V3.2 MTP 实现。",
+      "tags": [
+        "performance",
+        "feature",
+        "low-risk",
+        "spec-decode",
+        "mtp",
+        "model"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Spec Decode][Perf] Fuse the MTP trailing all-reduce; local-argmax draft tokens (#49793)\n\nSigned-off-by: Peiyuan Zhou <peiyuanzhou1994@gmail.com>\nCo-authored-by: Claude <noreply@anthropic.com>\nCo-authored-by: mergify[bot] <37929162+mergify[bot]@users.noreply.github.com>"
+    },
+    {
+      "sha": "d6f17f3d530efbd83a730d3d73e9f483726dfde1",
+      "comment": "MRV2 支持 attention-free 模型：init_model_state 现在对 is_attention_free 模型同样路由到 MambaHybridModelState；GPUModelRunner.release() 增加 self.cudagraph_manager = None 以便释放 CUDA graph 引用、支持同进程内存回收；日志文案微调；V1 mamba prefix cache 测试通过 VLLM_USE_V2_MODEL_RUNNER=0 显式固定 V1 路径，因为 MoE/hybrid 模型已默认走 V2 runner。",
+      "tags": [
+        "feature",
+        "refactor",
+        "low-risk",
+        "model-runner",
+        "mamba",
+        "attention-free"
+      ],
+      "ascend_impact": {
+        "ascend_affected": true,
+        "functionality": "命中 vllm/v1/worker/gpu/model_runner.py（NPUModelRunner 直接继承的 GPUModelRunner）与 vllm/v1/worker/gpu/model_states/__init__.py。release() 现在将 self.cudagraph_manager 置 None，NPUModelRunner 族自动继承该行为，对于使用 ACL graph manager 的 Ascend 路径同样有助于同进程内存回收；model_states 将 attention-free 模型路由到 MambaHybridModelState 的改动对 Ascend 上运行 attention-free/hybrid 模型（如 Mamba 系）同样生效，行为一致。",
+        "testing": "无强制测试需求；若 vllm-ascend 支持 attention-free 模型，建议补充 MRV2 下冒烟验证。",
+        "needs_test_update": false,
+        "suggested_test_areas": [
+          "vllm_ascend 的 attention-free 模型 e2e 测试（MRV2 路径）"
+        ]
+      },
+      "message": "[MRV2] Support attention-free models (#52374)\n\nSigned-off-by: Nick Hill <nickhill123@gmail.com>",
+      "deep_analysis": {
+        "ascend_affected_confirmed": true,
+        "affected_interfaces": [
+          "vllm_ascend/worker/v2/model_states/__init__.py::init_asecnd_model_state",
+          "vllm_ascend/worker/v2/model_states/mamba_hybrid.py::AscendMambaHybridModelState",
+          "vllm_ascend/worker/v2/model_runner.py::NPUModelRunnerV2 (inherits GPUModelRunner.shutdown)"
+        ],
+        "adaptation_effort": "low",
+        "adaptation_guide": "1. Mirror the upstream init_model_state change in vllm_ascend/worker/v2/model_states/__init__.py:init_asecnd_model_state (line 37): change the condition from `if vllm_config.model_config.is_hybrid:` to `if vllm_config.model_config.is_hybrid or vllm_config.model_config.is_attention_free:` so that attention-free models (pure Mamba/SSM with no attention layers) are routed to AscendMambaHybridModelState instead of AscendModelState. 2. Verify AscendMambaHybridModelState (vllm_ascend/worker/v2/model_states/mamba_hybrid.py:36, which inherits upstream MambaHybridModelState + AscendModelState) correctly handles attention-free models on NPU: it inherits MambaHybridAttnMetadata construction (num_accepted_tokens, num_decode_draft_tokens_cpu used by Mamba2AttentionMetadataBuilder/GDNAttentionMetadataBuilder) and the align-mode state pre/postprocessing; confirm the triton kernels used (preprocess_mamba_align_fused_kernel, _scatter/_fill_num_accepted_kernel in vllm/v1/worker/gpu/model_states/mamba_hybrid.py) and MambaSpecDecodeGPUContext already run on NPU for pure-mamba models as they do for hybrid mamba models. 3. Optionally add an e2e test for an attention-free model under VLLM_USE_V2_MODEL_RUNNER=1 on NPU. 4. The GPUModelRunner.shutdown() addition of `self.cudagraph_manager = None` is inherited by NPUModelRunnerV2 (no override); this plain attribute assignment is safe, but confirm no NPU code later dereferences cudagraph_manager after shutdown in multi-model/RL sleep-wake scenarios.",
+        "risk": "Low risk. The main risk is that without the one-line condition change in init_asecnd_model_state, attention-free models silently fall back to AscendModelState and either crash or produce incorrect output (missing mamba state migration, missing num_accepted_tokens/num_decode_draft_tokens_cpu metadata for the mamba attention backend). This only affects MRV2 with attention-free models; hybrid models (Qwen3-Next etc.) are unaffected. A secondary consideration: if NPU lacks support for the align-mode triton kernels used by MambaHybridModelState, attention-free model runs on NPU would fail, so hardware verification of the mamba kernels is required before enabling."
+      }
+    },
+    {
+      "sha": "9df9b0b0a1816b6d0d0f6ecd0da563cc37fd72f5",
+      "comment": "ROCm Docker 构建依赖清理：从 uv pip install 列表中移除 pybind11，避免与 torch 自带的 pybind11 版本不匹配。纯镜像构建变更，无业务影响。",
+      "tags": [
+        "ci",
+        "build",
+        "low-risk",
+        "rocm",
+        "docker"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[ROCm]: Drop pybind11 from Dockerfile.rocm to prevent version mismatch (#52400)\n\nSigned-off-by: Rohan138 <rohanpotdar138@gmail.com>"
+    },
+    {
+      "sha": "bb4b448f9896cf3f5607bd5ed4b35b29cd866a6b",
+      "message": "[CI] Shard Humming H100 eval (#52326)\n\nSigned-off-by: Kevin Luu <51931015+khluu@users.noreply.github.com>",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "chore"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "81e81dac1f3654564c3c48000edce1cdbe248ab9",
+      "message": "[CI] Shard MoE refactor B200 eval (#52327)\n\nSigned-off-by: Kevin Luu <51931015+khluu@users.noreply.github.com>",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "refactor",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "694db075f8af1ccb026720782bc0e2400a3f5c61",
+      "message": "[CI] Shard multimodal extended generation 2 (#52323)\n\nSigned-off-by: Kevin Luu <51931015+khluu@users.noreply.github.com>",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "chore"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "549cef0b0b2c8924d302686c613cb4c39fc24dcd",
+      "message": "[CI] Shard extended pooling model tests (#52322)\n\nSigned-off-by: Kevin Luu <51931015+khluu@users.noreply.github.com>\nSigned-off-by: khluu <khluu000@gmail.com>",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "chore"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "d87ef456abe54565cef476637df5e585bfddfb37",
+      "message": "[CI] Shard Quantization job into 4 parallel shards (≤30 min target) (#52328)",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "chore"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "925ea7e60f727bbb3fe3fcdb1c02b01a5bfb2749",
+      "message": "[CI][Test] Seed the DeepEP v2 MoE workers, not just the parent (#50589)\n\nSigned-off-by: Guanxin Li <guanxinl@nvidia.com>\nCo-authored-by: Claude Opus 5 (1M context) <noreply@anthropic.com>",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "chore"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "c794754062d49a8fdb63ab3c5215b488b865030c",
+      "comment": "ROCm MXFP4 MoE 重构：移除 Kimi-K3 SiTU 的模型级特判分支，将 SiTU 统一收编到通用 AITER 权重转换路径中。具体包括：AiterExperts 支持 SiTU 激活；convert_weight_to_mxfp4_moe_kernel_format 新增 activation 参数并在 SiTU 时走 shuffle_weight_a16w4/e8m0_shuffle 的专用转换；MXFP4 形状断言对 SiTU 跳过（其 kernel 处理非 256 对齐的原生中间维度）；mxfp4_round_up_hidden_size_and_intermediate_size 将 128 对齐特例限定在 ROCm AITER SiTU/SiLU 组合；GptOssMxfp4MoEMethod 补充默认 SwiGLU clamp 参数（alpha=1.702, beta=1.0, limit=7.0）并在未配置时不再于 forward 中断言。仅影响 ROCm/AITER 路径。",
+      "tags": [
+        "refactor",
+        "performance",
+        "low-risk",
+        "moe",
+        "quantization",
+        "rocm"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[ROCm]Remove special-case SiTU support model-specific gating (#50597)\n\nSigned-off-by: Stacy Roberts <sroberts@amd.com>\nSigned-off-by: Stacy Roberts <robers23@utexas.edu>\nCo-authored-by: Stacy Roberts <robers23@utexas.edu>"
+    },
+    {
+      "sha": "f473870ecf7a5a83958dbc116468663224f45b05",
+      "comment": "Rust gRPC Control 服务新增 RL 生命周期控制：在 control.proto 中新增 PauseGeneration/ResumeGeneration/IsPaused、Sleep/WakeUp/IsSleeping、InitWeightTransferEngine/StartWeightUpdate/StartDraftWeightUpdate/UpdateWeights/FinishWeightUpdate/UpdateWeightVersion/GetWeightVersion 等 RPC，ServerInfo 增加 RlCapabilities。Python 侧 EngineCoreReadyResponse 新增 weight_transfer_backend/enable_sleep_mode/supports_draft_weight_updates 字段；WorkerBase 新增 supports_draft_weight_updates() 默认返回 False，GPUWorker 根据 weight_transfer_engine 与 draft model 是否存在实现该能力；Executor 通过 collective_rpc 聚合 worker 能力；EngineCoreProc 在握手响应中填充新字段；gRPC service 以 Mutex 串行化 RL 生命周期调用，并校验 sleep mode/weight transfer 配置与 JSON payload。整体为向后兼容的增量接口扩展。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "grpc",
+        "engine",
+        "worker",
+        "rl-lifecycle"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "命中 vllm/v1/worker/worker_base.py（NPUWorker 继承的 WorkerBase，新增 supports_draft_weight_updates() 默认方法，不破坏编译）与 vllm/v1/executor/abstract.py（Executor 新增默认实现）。EngineCoreReadyResponse 新增字段均有默认值，握手协议向后兼容；NPUWorker 未覆写 supports_draft_weight_updates 时默认返回 False，行为安全。vllm-ascend 的 sleep mode（CaMem）能力来自 model_config.enable_sleep_mode，握手字段会自动反映；若未来 Ascend 支持 draft 权重更新，需在 NPUWorker 中覆写 supports_draft_weight_updates 并与 weight_transfer_engine 对接。",
+        "testing": "无强制测试需求；Ascend 的 sleep/wakeup 与握手字段可通过现有 engine 测试覆盖。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Rust Frontend][gRPC] Add RL lifecycle control (#51316)\n\nSigned-off-by: Connor Carpenter <connorc@nvidia.com>\nCo-authored-by: Nick Hill <nickhill123@gmail.com>",
+      "deep_analysis": {
+        "ascend_affected_confirmed": false,
+        "affected_interfaces": [],
+        "adaptation_effort": "low",
+        "adaptation_guide": "",
+        "risk": ""
+      }
+    },
+    {
+      "sha": "3e3ceb1961d44252ff4a4f8e22364186d70c54f7",
+      "comment": "多模态编码器降 GPU<->CPU 同步优化：将一批 host 构造的数据改用 async_tensor_h2d/non_blocking 传输（ernie45_vl、keye、paddleocr_vl、GLM-4V），用 host 已知尺寸替代设备端 .max()/.tolist()（keye、paddleocr_vl 的 max_grid_size、siglip 的翻转索引），对仅 host 消费的字段使用 MultiModalFieldConfig keep_on_cpu=True（interns1、phi4mm、ultravox），将 GLM-4V 的逐图拼接改为 numpy 批量扩展，linear attention chunk 索引改 non_blocking 传输。行为保持等价，消除模型前向热路径中的隐式同步。",
+      "tags": [
+        "performance",
+        "refactor",
+        "low-risk",
+        "multimodal",
+        "model"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Perf] Avoid more GPU<->CPU syncs in multimodal encoders (#52369)\n\nSigned-off-by: Nick Hill <nickhill123@gmail.com>"
+    },
+    {
+      "sha": "9b0ab5dd53583ee25066b8d937e8bd3235daa6e2",
+      "comment": "ROCm 稀疏 MLA 启用 16-token 块：DeepseekV32IndexerBackend 与 ROCMAiterMLASparseBackend 的 get_supported_kernel_block_sizes 在 ROCm 平台由 [1, 64] 改为 [1, MultipleOf(16)]，配合 preshuffled 稀疏索引支持 16-token block；测试验证 select_common_block_size 可接受该尺寸。AMD 平台特性，CUDA 路径不变。",
+      "tags": [
+        "feature",
+        "performance",
+        "low-risk",
+        "attention",
+        "rocm",
+        "sparse-mla"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[ROCm][AMD] Enable preshuffled sparse indexing for 16-token blocks (#51216)\n\nSigned-off-by: jamesETsmith <james.smith9113@gmail.com>\nCo-authored-by: Andreas Karatzas <akaratza@amd.com>"
+    },
+    {
+      "sha": "83ded8d839f60d97f5b020b598001cd9081150f6",
+      "message": "[Test][LoRA] Speed up the LoRA test job (#52331)\n\nSigned-off-by: Stefan Koncarevic <stefan.koncarevic@amd.com>",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "performance",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "e078a2238a1e4b53d49a7cc15e09716ed61abf3b",
+      "comment": "将 allreduce_rms_fusion.py 中 flashinfer.comm 的 import 保护从 except ImportError 放宽为 except Exception 并输出 debug 日志，避免 flashinfer 部分初始化（如共享库缺失）导致的异常直接中断引擎启动。防御性小修复，编译 pass 的融合逻辑不受影响。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "compilation",
+        "flashinfer"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Bugfix] Widen flashinfer.comm import guard so a failed import doesn't abort engine startup (#52241)\n\nSigned-off-by: shanjiaz <zsjwpianpian@gmail.com>"
+    },
+    {
+      "sha": "03a8d0b1ede68efc20b8bbfc14ee4681a62f8d75",
+      "comment": "该 commit 为 Kimi K3 模型在 AttnRes（attention residual）路径下新增可选的 DFlash 辅助状态捕获方式。默认行为不变，仍由 prefix_sum + hidden_states 得到 aux hidden state；设置 VLLM_KIMI_K3_AUX_ATTN_RES_STREAM=1 后，_capture_aux_hidden_stream() 会调用 attn_res kernel 计算 pre-norm AttnRes mixture（不写 delta、不写 block、不做 output norm）作为 drafter 的输入。实现上根据 layer_idx+1 < end_layer 选择下一层或输出侧 norm/proj 权重，非最后 rank 的最后层则安全回退为 prefix。测试覆盖了开关关闭、权重选择、last rank 回退和 forward 参数映射。风险较低：功能默认关闭，仅影响 Kimi K3 NVIDIA 专用模型与 spec decode 路径；但开启后 drafter 看到的新数值可能影响输出质量，需要实际评估。",
+      "tags": [
+        "feature",
+        "spec-decode",
+        "model",
+        "test",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。变更集中在 vllm/models/kimi_k3/nvidia/ 的 NVIDIA 专有模型实现和 Kimi K3 相关 env，未触碰 vLLM 平台抽象、Worker、AttentionBackend、KVCacheSpec、DeviceCommunicator 等 Ascend 依赖的接口；vllm-ascend 当前不包含 Kimi K3 模型实现，也不会导入该 NVIDIA 专属路径。",
+        "testing": "无影响。新增/修改的测试均属于 Kimi K3 NVIDIA 模型单测，不涉及 vllm-ascend 测试体系。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Model][Spec Decode] Tap the pre-norm AttnRes mixture as the Kimi K3 DFlash aux state (#50487)\n\nSigned-off-by: Rahul Chalamala <22563365+rchalamala@users.noreply.github.com>\nCo-authored-by: Janelle Cai <janelle.cai@modal.com>"
+    }
+  ],
+  "architecture_based_on_sha": "7154856f3dcb1d3fdd5a136f7d2c5987f22244f5",
+  "architecture_generated_at": "2026-08-01T20:25:03.691327+08:00"
+}

@@ -1,0 +1,350 @@
+{
+  "date": "2026-08-16",
+  "repo": "vllm-project/vllm",
+  "generated_at": "2026-08-17T02:30:18.441741+08:00",
+  "daily_summary": "当日变更覆盖多个方向：(1) DeepSeek V4 性能优化：global top-k index Triton kernel 的多个参数改为编译期常量，combine kernel 的 worker 数从 128 调到 256；(2) 内存管理：CuMem/XpuMem Allocator 新增按 tag 选择性释放显存的 discard()，并在 MemAllocator Protocol 中补充该接口，同时为 sleep/wake_up 增加 is_asleep 状态跟踪与策略冲突告警；(3) 错误处理：结构化输出各后端 validator 统一改抛 VLLMValidationError，Anthropic 端点对客户端错误返回 4xx 而非 500；(4) Spec Decode 修复：DSpark 零 draft budget 下 grammar bitmask 映射修复、Model Runner V2 bad_words 前缀匹配 off-by-one 修复、EAGLE partial-hash-hit 缓存注册修复、thinking-budget 非对称 SWAP 状态清除修复；(5) DeepSeek V4 的 MRV1+PIECEWISE cudagraph 硬校验被移除，改为 attention 按 model runner 选择 eager capture region，ROCm 默认将 DSV4 保留在 MRV1；(6) 多模态：Gemma4 视频帧数改为 keep_on_cpu；(7) EC Connector 新增 worker metadata 聚合回传机制，贯穿 Executor/GPUModelRunner/Outputs；(8) 若干 NVIDIA 专有模型（Kimi-K3）参数命名修正。",
+  "ascend_impact_summary": "当日对 vllm-ascend 有实际影响的变更集中在五处：(1) MemAllocator Protocol 新增 discard()，CaMemAllocator 需要补齐该接口以维持与 CuMemAllocator 的接口对等；(2) GPUModelRunner 中 StructuredOutputsWorker 构造函数新增必传参数 num_bonus_tokens，DSpark 零预算 grammar bitmask 映射规则变化，NPUModelRunner 若覆写相关路径需同步；(3) 结构化输出 validator 错误类型从 ValueError 改为 VLLMValidationError（VLLMClientError 子类），错误处理契约发生变化；(4) DSV4 的 MRV1+PIECEWISE 硬校验被移除并由 attention 按 model runner 选择 eager region，vllm-ascend 的 DSV4 attention 实现需确认等价逻辑；(5) EC Connector 功能为 Executor/GPUModelRunner 基类带来新增字段与参数（ExecuteModelState.ec_connector_output、collective_rpc 的 ec_output_aggregator、EngineCore 访问 scheduler.ec_connector），对 vllm-ascend 为 additive 变更，但覆写这些路径时需要同步。其余变更（DeepSeek V4 Triton kernel 调优、ROCm MLA、GPU sampling、Anthropic API、Gemma4、Kimi-K3）不直接影响 vllm-ascend。",
+  "commits": [
+    {
+      "sha": "83f591d7f694a3ca3ae3bf22d646e818a1421872",
+      "comment": "将 DSV4 的 global top-k index Triton kernel（_compute_global_topk_indices_and_lens_kernel）中的运行时参数（global_topk_indices_stride、topk_indices_stride、topk、block_table_stride、block_size）标记为 tl.constexpr，使 Triton 编译器在编译期特化这些值，减少每次 launch 时对步长/边界等不变量的重复计算。属于纯性能优化，不改变 kernel 语义、输出形状或调用约定。低风险，但 constexpr 特化会按参数组合增加编译出的 kernel 变体数量。位于 vllm/models/deepseek_v4/，属于 vllm-ascend 维护自有 DeepseekV4 实现的无关路径。",
+      "tags": [
+        "performance",
+        "low-risk",
+        "deepseek-v4",
+        "triton-kernel",
+        "model"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Perf][DSV4] Optimize global top-k index kernel with compile-time constants (#51967)\n\nSigned-off-by: chaunceyjiang <chaunceyjiang@gmail.com>\nCo-authored-by: mergify[bot] <37929162+mergify[bot]@users.noreply.github.com>"
+    },
+    {
+      "sha": "9409f59e0963a033a87a6847d6cafef54a64a79c",
+      "comment": "为 CuMemAllocator 和 XpuMemAllocator 新增 discard(tags) 方法：按 tag 直接 unmap 并释放已映射的 GPU 内存，不保留 CPU backup，用于 RL 等场景下选择性释放显存；同时在 MemAllocator Protocol 中补充 discard() 抽象方法。sleep() 逻辑被强化：对已 asleep 的分配不再静默改变 offload 策略，而是记录 has_policy_conflict 并告警；XpuMemAllocator 补齐了 is_asleep 状态跟踪，wake_up() 现在跳过非 asleep 分配（CuMem 也加了同样 guard）。潜在风险：wake_up 跳过非 asleep 分配意味着状态标记必须准确，否则活跃分配可能不会被恢复映射；discard 后内容不保留，调用方需明确其与 sleep 的语义差异。",
+      "tags": [
+        "feature",
+        "low-risk",
+        "device-allocator",
+        "memory"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "vllm/device_allocator/__init__.py 的 MemAllocator Protocol 新增 discard(tags) 抽象方法。vllm-ascend 的 CaMemAllocator（对标 CuMemAllocator 的 NPU 分配器，实现同类的 use_memory_pool/sleep/wake_up 接口）未实现 discard()。当前 vLLM 生产代码尚无 discard() 调用点，因此不会立即产生运行时错误，但接口契约已变化：CaMemAllocator 应同步实现 discard() 以支持按 tag 直接释放 NPU 内存（不带 CPU backup），并与 CuMemAllocator/XpuMemAllocator 的 sleep/wake_up 新语义（跳过非 asleep 分配、策略冲突告警）保持一致。",
+        "testing": "无现有 vllm-ascend 测试被破坏；若 CaMemAllocator 补实现 discard()，需自行补充对应单测。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Core] Add CuMemAllocator.discard() for tag-selective GPU memory release (#52514)\n\nSigned-off-by: AlanFokCo <alanfok2868@gmail.com>\nSigned-off-by: Dakai An <dakaian108@gmail.com>\nCo-authored-by: AlanFokCo <alanfok2868@gmail.com>\nCo-authored-by: OpenAI Codex <codex@openai.com>",
+      "deep_analysis": {
+        "ascend_affected_confirmed": false,
+        "affected_interfaces": [],
+        "adaptation_effort": "low",
+        "adaptation_guide": "",
+        "risk": ""
+      }
+    },
+    {
+      "sha": "fe1c317157d4478fdc0e02096447e61305b871e9",
+      "comment": "ROCm AITER MLA 后端的 FP8 prefill PS-metadata 构建在 chunked-context 批次下被跳过。原条件为 _fp8_prefill_enabled 且 prefill 非空即构建，但 chunked context 的 prefill 布局与普通 prefill 不同，构建 PS 元数据会得到无效结果。修复后仅对非 chunked 的 prefill 构建。ROCm 专属路径，不影响其他平台。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "attention",
+        "mla",
+        "rocm"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Bugfix][ROCm] Skip FP8 MLA prefill PS-metadata build for chunked-context batches (#52356)\n\nSigned-off-by: Shantipriya Parida <shantipriya.parida@amd.com>"
+    },
+    {
+      "sha": "836aac92ffdaa337083934181cb6d00b64b2a1a6",
+      "comment": "将 DSV4 sparse top-k combine kernel 使用的 _COMBINE_TOPK_SWA_NUM_WORKERS 从 128 提升到 256，增加 Triton kernel 的并行 worker 数以提升 prefill 吞吐。纯参数调优，无语义变化，风险极低。",
+      "tags": [
+        "performance",
+        "low-risk",
+        "deepseek-v4",
+        "triton-kernel",
+        "model"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Perf][DSV4] Optimize sparse top-k metadata kernels for higher prefill throughput (#52084)\n\nSigned-off-by: chaunceyjiang <chaunceyjiang@gmail.com>"
+    },
+    {
+      "sha": "4d2a68d64d9e05921ed5c4099146e768a92d71d5",
+      "comment": "修复 DSpark 推测解码 + 结构化输出在 draft budget 为零时的 grammar bitmask 映射错误。adaptive verification 会把压缩后的 CPU logit offsets 重写为仅 bonus token，若从这些重写后的 offsets 反推 bitmask→logits 映射，行数会减少并触发 num_masks == len(mapping) 断言失败。修复方式：新增 _build_grammar_mapping()，映射改按调度时的布局（num_draft_tokens_per_req + num_bonus_tokens）生成，与 bitmask 行布局一致；StructuredOutputsWorker 构造函数新增必传参数 num_bonus_tokens，GPUModelRunner 传入 model_state.num_new_sampled_tokens_per_step。该构造参数为破坏性签名变更，任何直接构造 StructuredOutputsWorker 的代码需同步更新；测试覆盖零预算下每请求保留一行 grammar row 的场景。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "spec-decode",
+        "structured-output",
+        "model-runner"
+      ],
+      "ascend_impact": {
+        "ascend_affected": true,
+        "functionality": "vllm/v1/worker/gpu/model_runner.py（GPUModelRunner，NPUModelRunner 的父类，属必然影响路径）中 StructuredOutputsWorker 构造函数新增必传参数 num_bonus_tokens，DSpark 零 draft budget 场景的 grammar bitmask 映射改为按 num_draft_tokens_per_req + num_bonus_tokens 推导。vllm-ascend 的 NPUModelRunner 若直接继承 GPUModelRunner 的 structured output 路径，自动获得该修复；若 vllm-ascend 覆写 structured output worker 的构造或自行实现 DSpark grammar bitmask 逻辑，则必须同步传入 num_bonus_tokens 并应用新的映射规则，否则零预算场景下会触发断言失败或错误掩码。",
+        "testing": "无现有 vllm-ascend 测试被破坏；vllm-ascend 的 DSpark + 结构化输出集成可参考上游新增的 test_zero_budget_keeps_one_grammar_row_per_scheduled_draft 验证零预算场景。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Bugfix][Spec Decode][Structured Output] DSpark: fix the grammar bitmask mapping when the draft budget is zero (#52436)\n\nSigned-off-by: oops-oom <73481342@qq.com>\nCo-authored-by: oops-oom <73481342@qq.com>\nCo-authored-by: Claude Opus 4.8 <noreply@anthropic.com>",
+      "deep_analysis": {
+        "ascend_affected_confirmed": true,
+        "affected_interfaces": [
+          "vllm_ascend/worker/v2/structured_outputs.py::_apply_grammar_bitmask_kernel",
+          "vllm_ascend/patch/worker/patch_v2/patch_triton.py",
+          "vllm_ascend/worker/v2/model_runner.py (inherited StructuredOutputsWorker usage via GPUModelRunner)"
+        ],
+        "adaptation_effort": "medium",
+        "adaptation_guide": "The commit changes the grammar bitmask→logits mapping semantics in vllm/v1/worker/gpu/structured_outputs.py: (1) StructuredOutputsWorker.__init__ now requires a `num_bonus_tokens` param; (2) apply_grammar_bitmask derives the mapping from input_batch.num_draft_tokens_per_req + num_bonus_tokens (scheduled layout) instead of compacted cu_num_logits offsets, so mapping rows can exceed the compacted device layout and must be guarded by `position_is_active` in the kernel. vllm-ascend's MRV2 path inherits StructuredOutputsWorker construction from GPUModelRunner.load_model (no direct construction, so the new param flows in automatically), but vllm-ascend swaps in its own NPU kernel via patch/worker/patch_v2/patch_triton.py which currently treats logits_indices as absolute indices and lacks the cu_num_logits/MASK_STRIDE resolution and the position guard. Required changes: (a) update vllm_ascend/worker/v2/structured_outputs.py::_apply_grammar_bitmask_kernel to match the current upstream call signature (logits, stride, logits_indices, input_batch.cu_num_logits, bitmask, bitmask.stride(0), vocab_size, MASK_STRIDE, BLOCK_SIZE), decode mapping_idx into req_idx = mapping_idx // MASK_STRIDE and position_idx = mapping_idx % MASK_STRIDE, resolve logits_idx = cu_num_logits[req_idx] + position_idx, and add the `position_is_active = position_idx < cu_num_logits[req_idx+1] - cu_num_logits[req_idx]` guard (keep the existing BLOCK_SIZE_SUB tiling); (b) keep patch/worker/patch_v2/patch_triton.py's module-level swap consistent; (c) verify AscendInputBatch populates num_draft_tokens_per_req and cu_num_logits_np (already inherited from vllm InputBatch and set in NPUModelRunner.prepare_inputs), and that StructuredOutputsWorker gets num_bonus_tokens via the inherited load_model; (d) add a regression test mirroring upstream test_zero_budget_keeps_one_grammar_row_per_scheduled_draft for the NPU path (tests/ut or tests/e2e/pull_request/one_card/test_guided_decoding.py).",
+        "risk": "If the NPU kernel is not updated, DSpark with a zero draft budget combined with structured output (xgrammar) on Ascend will either trip the `num_masks == len(mapping)` assertion in apply_grammar_bitmask or, if the patched kernel writes through unguarded positions, misapply grammar masks / write out-of-bounds in the logits tensor. The risk is contained to the MRV2 + spec-decode (DSpark/DFlash) + structured-output combination and requires NPU hardware verification. Note that part of the kernel-signature drift (MASK_STRIDE/cu_num_logits) predates this commit (introduced by DSpark confidence-scheduled verification #47808), so this commit is the one that makes correct guard handling mandatory for the zero-budget case."
+      }
+    },
+    {
+      "sha": "84530eb235dc3d866fa7d4588217f2fb53f43e76",
+      "comment": "修复 Gemma 4 多模态处理中 video_frame_counts 被错误搬移到 GPU 的问题：改为 keep_on_cpu=True，与相邻的 video_num_soft_tokens 保持一致，避免 CPU 端 multi-modal field 处理时出现设备不匹配。测试侧为 vit_cudagraph 测试的 Gemma4 配置增加 encoder_cudagraph_token_budgets=[1120]，限定最小的 CUDA graph bucket，降低捕获期的内存压力。低风险的共享模型处理 bugfix。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "multimodal",
+        "model"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Bugfix][Multimodal] Keep Gemma 4 video frame counts on CPU (#52441)\n\nSigned-off-by: chaunceyjiang <chaunceyjiang@gmail.com>"
+    },
+    {
+      "sha": "1b079c40ff9d2598d837f4ed1fc08342fca4fd6e",
+      "comment": "修复 Model Runner V2 中 bad words Triton kernel 的 draft token 前缀匹配 off-by-one。在 spec decode 采样路径中，input_ids 按 logits_indices 收集，local position 0 是最后一个已提交 token，draft tokens 从 position 1 开始；kernel 原先在 from_spec_input 分支读取 cur_req_first_pos + spec_offset，缺少 +1 偏移，导致跨 committed/draft 边界的前缀匹配错位一个位置。修复为 spec_offset + 1，并新增四个针对性单测（draft 内前缀、跨边界前缀、无虚假匹配、纯 committed 前缀）。低风险。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "spec-decode",
+        "sampling",
+        "model-runner"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Bugfix][Model Runner V2][Spec Decode] Fix off-by-one in bad_words draft-prefix matching (#52311)\n\nSigned-off-by: jyan <r_02213@sjtu.edu.cn>\nCo-authored-by: jyan <r_02213@sjtu.edu.cn>\nCo-authored-by: Claude Fable 5 <noreply@anthropic.com>\nCo-authored-by: mergify[bot] <37929162+mergify[bot]@users.noreply.github.com>"
+    },
+    {
+      "sha": "70aaec832bde70ada17cbad2061105bbd07541dc",
+      "comment": "修复 Anthropic /v1/messages 与 /v1/messages/count_tokens 的错误码映射：原来任何异常都统一返回 500 internal_error，现在改用 create_error_response(e) 生成标准错误响应，使客户端引发的问题（pydantic ValidationError、VLLMValidationError 等）正确映射为 400 BadRequestError，服务端内部错误仍保持 500。同时将 anthropic.api_router 从 sanitize 模块测试列表中移除（该模块不再直接使用 sanitize_message）。配套测试覆盖 400/500 两类路径。低风险，属于 API 边界错误语义修正。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "api",
+        "error-handling",
+        "anthropic"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Bugfix][Anthropic] Return 4xx for client-caused errors in /v1/messages (#52246)\n\nSigned-off-by: Do_it_now_! <lizhengcheng233@gmail.com>"
+    },
+    {
+      "sha": "41f12a0daf193c80f2e748f6a65f0735623be3a5",
+      "comment": "将结构化输出各后端 validator（xgrammar、outlines、lm-format-enforcer、guidance）的失败异常从 ValueError 统一改为 VLLMValidationError。VLLMValidationError 是 VLLMClientError 子类且不是 ValueError 子类，因此错误传播契约改变：在 AsyncLLM.generate 路径中 VLLMClientError 会被原样透出并映射为 4xx，而 ValueError 会被包装成 EngineGenerateError 导致 500。auto 后端的回退逻辑改为捕获 VLLMValidationError；openai protocol 的 structural_tag 校验 except 元组补上 VLLMValidationError；sampling_params 中 JSON 解析失败也包装为 VLLMValidationError。潜在风险：任何依赖 except ValueError 捕获结构化输出错误的下游代码需要更新为 VLLMValidationError。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "structured-output",
+        "error-handling"
+      ],
+      "ascend_impact": {
+        "ascend_affected": true,
+        "functionality": "vllm/v1/structured_output/（可能影响路径）下四个 validator 的错误类型从 ValueError 统一改为 VLLMValidationError（VLLMClientError 子类）。vllm-ascend 的采样/结构化输出集成中，凡通过 except ValueError 识别非法 grammar/schema/regex 的代码路径需要改为捕获 VLLMValidationError；API 层现在会将这类错误映射为 4xx 而非 500。若 vllm-ascend 扩展了 SamplingParams 结构化输出校验或自定义 validator，也应保持抛出 VLLMValidationError 以对齐错误契约。",
+        "testing": "如果 vllm-ascend 存在断言结构化输出校验抛 ValueError 的测试，需要改为断言 VLLMValidationError；否则无测试影响。",
+        "needs_test_update": true,
+        "suggested_test_areas": [
+          "vllm_ascend 结构化输出/采样参数校验错误类型相关测试"
+        ]
+      },
+      "message": "[Bugfix] Raise `VLLMValidationError` from structured output validators (#52394)\n\nSigned-off-by: Jeffrey Wang <jeffreywang@anyscale.com>\nCo-authored-by: Claude Opus 5 (1M context) <noreply@anthropic.com>",
+      "deep_analysis": {
+        "ascend_affected_confirmed": true,
+        "affected_interfaces": [
+          {
+            "interface": "SamplingParams._validate_structured_outputs (vllm/sampling_params.py)",
+            "ascend_impl": "vllm_ascend/patch/platform/patch_structured_output.py::_patch_sampling_params_validation (monkey-patch wrapper)",
+            "impact": "The upstream method now raises VLLMValidationError (not ValueError) from all backend validators and its `auto` fallback catches only `except VLLMValidationError:` (was `except ValueError:`). A plain ValueError from any validator now propagates uncaught and no fallback occurs. The ascend wrapper's post-validation backend-consistency check (`self.structured_outputs._backend` vs the recorded config backend) is orthogonal and still works, but the exception contract its tests rely on has changed."
+          },
+          {
+            "interface": "Structured output backend validators: validate_xgrammar_grammar, validate_structured_output_request_outlines, validate_guidance_grammar, validate_structured_output_request_lm_format_enforcer (vllm/v1/structured_output/backend_*.py)",
+            "ascend_impl": "tests/ut/patch/platform/test_patch_structured_output.py monkeypatches these validators (lines 75, 85, 109, 125, 135)",
+            "impact": "Upstream validators now raise VLLMValidationError instead of ValueError. Since VLLMValidationError is NOT a subclass of ValueError, any code/test matching `ValueError` around these validators silently misses the new error type, and monkeypatched fakes raising ValueError no longer trigger the `auto` fallback."
+          },
+          {
+            "interface": "vllm_ascend/patch/platform/__init__.py (platform patch loader) and vllm_ascend/patch/__init__.py (patch catalog doc entry #19)",
+            "ascend_impl": "patch_structured_output.py is loaded at vllm_ascend/patch/platform/__init__.py:32",
+            "impact": "The upstream issue (#43920 / PR #44401) that this patch works around is not fixed by this commit, so the patch must be kept; only its tests and verification need updating."
+          }
+        ],
+        "adaptation_effort": "low",
+        "adaptation_guide": "The patch logic in vllm_ascend/patch/platform/patch_structured_output.py is signature-flexible and backend-tracking based (reads `_backend` only after `original_validate` succeeds), so it does NOT need to change. Required work is confined to vllm-ascend tests:\n\n1. tests/ut/patch/platform/test_patch_structured_output.py:\n   - test_sampling_params_rejects_mixed_structured_output_backends: change the fake `validate_xgrammar_grammar` (line 71) to raise `vllm.exceptions.VLLMValidationError(\"xgrammar unsupported\")` instead of `ValueError`; otherwise the new `except VLLMValidationError:` fallback never triggers, `_backend` stays \"auto\", and `_raise_mixed_backend(\"xgrammar\", \"auto\")` raises a message that no longer matches `\"already using 'xgrammar'.*'guidance'\"`.\n   - test_failed_first_validation_does_not_lock_config: change the fake validators (lines 126 and 136) to raise `VLLMValidationError` (so the fallback chain reaches guidance), and change `pytest.raises(ValueError, match=\"guidance error\")` to `pytest.raises(VLLMValidationError, match=\"guidance error\")`. As-is, the fake xgrammar `ValueError` is no longer caught by the fallback, so the raised error becomes `\"xgrammar error\"` and the match fails. (`assert not hasattr(config, _BACKEND_ATTR)` still holds because the exception propagates before the wrapper's post-check.)\n   - test_sampling_params_allows_consistent_guidance_backend and the grammar_init/manager tests are unaffected.\n2. tests/e2e/pull_request/one_card/test_guided_decoding.py::test_guided_auto_rejects_mixed_structured_output_backends should still pass (multipleOf triggers xgrammar's VLLMValidationError -> caught by the new fallback -> guidance -> wrapper raises VLLMValidationError matching \"already using 'xgrammar'.*'guidance'\"), but should be re-run on NPU to confirm.\n3. No production code in vllm_ascend catches ValueError around structured-output validation (verified by grep), so no runtime catch-site changes are needed; the patch's own `_raise_mixed_backend` already raises VLLMValidationError (a VLLMClientError -> HTTP 400), consistent with the new upstream contract.",
+        "risk": "Low. The upstream `auto` fallback no longer swallows plain `ValueError`, and VLLMValidationError is not a ValueError subclass: (a) vllm-ascend's UT file would fail CI if left unchanged (two tests described above); (b) any future vllm-ascend code catching `ValueError` around structured-output validation would miss the new exception and could surface as HTTP 500 instead of 400 — currently none exist; (c) the core mixed-backend guard behavior of patch_structured_output.py is preserved, so NPU runtime behavior is unchanged. Residual risk is limited to stale tests and the possibility that upstream later removes this fallback in favor of a different backend-consistency mechanism (the patch's stated future plan)."
+      }
+    },
+    {
+      "sha": "8efa13b700f1836657699cae2503dc2feab27fa0",
+      "comment": "调整 DeepSeek V4 的 model runner 与 CUDA graph 组合策略。(1) 删除 MRV1 + PIECEWISE cudagraph 对 DeepSeek V4 的硬校验（此前直接抛 ValueError），改为运行时行为：DeepseekV4Attention 按 use_v2_model_runner 选择 eager capture region——MRV1 必须使用宽 eager region（_prepare_and_attn 整体 eager），因为 MRV1 的 piecewise capture 只容忍宽 eager 区域，窄区域会把 attention 输入准备留在捕获图中产生错误结果（#51430）。(2) default_v2_model_runner_architectures() 改为平台相关函数并加 lru_cache：ROCm 上 DSV4 仍默认 MRV1（性能原因），其他平台默认集不变。风险点：平台判断发生在首次调用时，运行时修改平台属性需要清理 lru_cache（测试已示范该模式）。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "config",
+        "cudagraph",
+        "deepseek-v4",
+        "model-runner"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "vllm/config/vllm.py（可能影响路径）删除了 DeepSeek V4 + MRV1 + PIECEWISE cudagraph 的硬校验，并将 default_v2_model_runner_architectures() 改为平台相关：ROCm 排除 DeepseekV4ForCausalLM；Ascend 上 is_rocm()=False，默认集不变（DSV4 仍默认 V2）。对 vllm-ascend 的实际影响：使用 MRV1 + PIECEWISE ACL Graph + DSV4 的配置不再报错，而是依赖 attention 层的 eager region 选择；vllm-ascend 的 DeepSeek V4 attention 实现若支持该配置，需要同步按 model runner 选择宽/窄 eager region 的逻辑，否则可能静默产出错误结果。另外 lru_cache 意味着 vllm-ascend 若在运行时改变平台属性需清理该缓存。",
+        "testing": "无现有 vllm-ascend 测试被直接破坏；若 vllm-ascend 维护 DSV4 + MRV1 + piecewise 场景的测试，需要验证 eager region 行为。上游测试已示范 monkeypatch is_rocm 并清理 default_v2_model_runner_architectures 缓存的模式。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Bugfix] Pick the DeepSeek V4 eager cudagraph region per model runner (#52401)",
+      "deep_analysis": {
+        "ascend_affected_confirmed": false,
+        "affected_interfaces": [],
+        "adaptation_effort": "low",
+        "adaptation_guide": "",
+        "risk": ""
+      }
+    },
+    {
+      "sha": "6593754e61a45b27a93e40fa0479568945d38661",
+      "comment": "修复 HybridKVCacheCoordinator 在 partial-hash-hit 路径下 EAGLE 组缓存注册不完整的问题。原 cache_blocks 实现总是把可缓存 token 数向下取整到 scheduler_block_size 的倍数；当启用细粒度 partial hash hits 时不应做任何取整，否则上次对齐边界到尾部之间的 token 会被漏注册。新增 _align_cacheable() 封装：enable_partial_hash_hits 时原样返回，否则 round_down 到 scheduler_block_size；EAGLE 组的 finalize 边界计算也复用该函数。测试构造了 eagle block_size < scheduler_block_size 的几何关系，验证所有 group 都按原始 token 数注册。低风险的共享 KV cache 逻辑修复。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "kv-cache",
+        "prefix-cache",
+        "spec-decode"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Bugfix][Spec Decode] Keep EAGLE cache registration on the partial-hash-hit path (#52419)"
+    },
+    {
+      "sha": "edd4c8176cfd98ece8a29beda574378c42971967",
+      "comment": "回退 DSV4 C128A sparse MLA 的 adaptive top-k metadata packing 优化。原实现按 max_seq_len 动态计算 active_topk_width（pow2 对齐并 clamp），再通过 view(-1) 切出可变宽度的 buffer 视图，虽节省显存但破坏了 CUDA graph 的地址稳定性。回退后 build_c128a_topk_metadata 直接使用预分配 buffer 的前缀切片，kernel 改为通过显式 stride 参数（global_decode_buffer.stride(0) 等）寻址，CUDA graph 下地址固定。对应删除动态 packing 的测试。属于对之前优化的 bugfix 式回退，恢复稳定行为。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "deepseek-v4",
+        "attention",
+        "revert"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Bugfix][DSv4] Revert adaptive C128A metadata packing (#51318)\n\nSigned-off-by: tobymao <toby.mao@gmail.com>\nSigned-off-by: Yongye Zhu <zyy1102000@gmail.com>\nCo-authored-by: Claude <noreply@anthropic.com>\nCo-authored-by: Roger Wang <hey@rogerw.io>\nCo-authored-by: Yongye Zhu <zyy1102000@gmail.com>\nCo-authored-by: OpenAI Codex <codex@openai.com>"
+    },
+    {
+      "sha": "fa9d67f7828e9bc105912ddf41dc384105732b1e",
+      "comment": "为 EC Connector（Encoder Cache 传输）新增 worker→scheduler 的元数据回传机制：(1) 新增 ECConnectorWorkerMetadata 抽象类（aggregate() 合并）与 ECOutputAggregator（镜像 KVOutputAggregator，将各 rank 的 finished_sending/finished_recving/worker_meta 合并到 output_rank 的 ModelRunnerOutput 上）；(2) ECConnectorBase 新增 build_connector_worker_meta()，worker 侧 ActiveECConnector.maybe_get_output 退出时上报 worker meta，no_forward 路径也支持 EC 收发；(3) 贯穿 Executor：abstract.py 新增 ec_output_aggregator 属性与 init_ec_output_aggregator()，MultiprocExecutor.collective_rpc 新增 ec_output_aggregator 参数并链式聚合 KV/EC 输出；(4) ModelRunnerOutput 新增 with_ec_conn_output/with_ec_conn_output_only 及对共享 EMPTY_MODEL_RUNNER_OUTPUT 的 copy-on-write 保护；(5) EngineCore 在 scheduler.ec_connector 存在时初始化聚合器；legacy Ray executor 对 EC connector + world_size>1 抛 NotImplementedError。风险点：ExecuteModelState NamedTuple 新增必填字段 ec_connector_output，GPUModelRunner 内所有构造点已更新，但下游覆写者需同步；EngineCore 新增对 scheduler.ec_connector 的属性访问，自定义 Scheduler 若不设置该属性会 AttributeError。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "ec-connector",
+        "distributed",
+        "executor",
+        "model-runner"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "涉及 vllm/v1/executor/abstract.py（必然影响）与 vllm/v1/worker/gpu/model_runner.py（必然影响）：(1) Executor 基类新增 ec_output_aggregator 属性与 init_ec_output_aggregator() 方法，MultiprocExecutor.collective_rpc 新增 ec_output_aggregator 参数并链式聚合 KV/EC 输出——vllm-ascend 若覆写 collective_rpc 或自定义 Executor，需要同步该参数；(2) GPUModelRunner 的 ExecuteModelState NamedTuple 新增必填字段 ec_connector_output，execute_model 各分支通过 ModelRunnerOutput.with_ec_conn_output 传递 EC 输出——vllm-ascend 的 NPUModelRunner 若覆写 execute_model 或自行构造 ExecuteModelState，需要携带新字段；(3) ModelRunnerOutput 新增 EC 相关字段与方法（带默认值，序列化向后兼容）；(4) EngineCore 现在访问 scheduler.ec_connector——vllm-ascend 的自定义 Scheduler（BalanceScheduler 等）若直接实现 SchedulerInterface 而非继承 vLLM Scheduler，需确保存在 ec_connector 属性，否则 EngineCore 初始化会 AttributeError。EC transfer 本身被 vllm-ascend 视为无关路径，该功能对 Ascend 无直接收益，但基类变更需要同步。",
+        "testing": "无现有 vllm-ascend 测试被破坏；如 vllm-ascend 有自定义 executor 或 ExecuteModelState 构造相关测试，需覆盖新字段/参数。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[EC Connector] Added Build Connector Worker Meta for EC Connector (#49585)\n\nSigned-off-by: yewentao256 <zhyanwentao@126.com>\nSigned-off-by: omerpaz95 <omerpaz95@gmail.com>\nSigned-off-by: omerpaz95 <73347585+omerpaz95@users.noreply.github.com>\nCo-authored-by: yewentao256 <zhyanwentao@126.com>\nCo-authored-by: Wentao Ye <44945378+yewentao256@users.noreply.github.com>",
+      "deep_analysis": {
+        "ascend_affected_confirmed": false,
+        "affected_interfaces": [],
+        "adaptation_effort": "low",
+        "adaptation_guide": "",
+        "risk": ""
+      }
+    },
+    {
+      "sha": "c94cdd0ae03865c00b694ca6f13b2d2bc4360fcd",
+      "comment": "修复 ThinkingBudgetStateHolder 在非对称 SWAP 时不清空空侧状态的问题。原实现用 get() 读取两侧状态，当从一个有 budget 的 index 换到无 budget 的空 index 时，空侧没有 pop 掉，导致两个 index 共享同一份状态或残留脏数据。改为 pop() 后状态原子迁移，空侧被清除；对称 SWAP（两侧均有状态）行为保持不变。新增两个单测覆盖非对称与对称 SWAP。低风险。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "sampling"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Bugfix][Sampling] Clear empty side on thinking-budget asymmetric SWAP (#49613)\n\nSigned-off-by: Henry Su <henrysu4707@gmail.com>"
+    },
+    {
+      "sha": "ed0f4750f8766c2cc3984be4f1ba073a6915d4ed",
+      "comment": "修复 Kimi-K3 MegaMoE 调用 fp8_fp4_mega_moe kernel 时的参数名错误：activation_beta/activation_linear_beta 实际对应 kernel 的 situ_beta/situ_linear_beta 参数。改名后 situ activation 的 beta 参数才真正传入 kernel，否则会被静默丢弃，导致 MoE 专家计算中 situ activation 行为不正确。NVIDIA 专有模型路径，低风险。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "model",
+        "moe",
+        "kimi-k3"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Bugfix][Model] Kimi-K3 MegaMoE: pass situ_beta/situ_linear_beta to fp8_fp4_mega_moe (#52445)\n\nSigned-off-by: UranusSeven <109661872+UranusSeven@users.noreply.github.com>\nCo-authored-by: Claude <noreply@anthropic.com>"
+    }
+  ],
+  "architecture_based_on_sha": "7154856f3dcb1d3fdd5a136f7d2c5987f22244f5",
+  "architecture_generated_at": "2026-08-01T20:25:03.691327+08:00"
+}

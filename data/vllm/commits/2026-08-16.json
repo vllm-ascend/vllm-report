@@ -1,0 +1,649 @@
+{
+  "date": "2026-08-16",
+  "repo": "vllm-project/vllm",
+  "branch": "main",
+  "commits": [
+    {
+      "sha": "83f591d7f694a3ca3ae3bf22d646e818a1421872",
+      "author": {
+        "name": "Chauncey",
+        "email": "chaunceyjiang@gmail.com"
+      },
+      "date": "2026-08-16T23:24:14+08:00",
+      "message": "[Perf][DSV4] Optimize global top-k index kernel with compile-time constants (#51967)\n\nSigned-off-by: chaunceyjiang <chaunceyjiang@gmail.com>\nCo-authored-by: mergify[bot] <37929162+mergify[bot]@users.noreply.github.com>",
+      "parents": [
+        "9409f59e0963a033a87a6847d6cafef54a64a79c"
+      ],
+      "stats": {
+        "total_additions": 5,
+        "total_deletions": 5,
+        "files_changed": 1
+      },
+      "files": [
+        {
+          "filename": "vllm/models/deepseek_v4/common/ops/cache_utils.py",
+          "status": "modified",
+          "additions": 5,
+          "deletions": 5,
+          "patch": "@@ -477,15 +477,15 @@ def compute_global_topk_indices_and_lens(\n @triton.jit\n def _compute_global_topk_indices_and_lens_kernel(\n     global_topk_indices_ptr,\n-    global_topk_indices_stride,\n+    global_topk_indices_stride: tl.constexpr,\n     topk_lens_ptr,\n     topk_indices_ptr,\n-    topk_indices_stride,\n-    topk,\n+    topk_indices_stride: tl.constexpr,\n+    topk: tl.constexpr,\n     token_to_req_indices_ptr,\n     block_table_ptr,\n-    block_table_stride,\n-    block_size,\n+    block_table_stride: tl.constexpr,\n+    block_size: tl.constexpr,\n     is_valid_token_ptr,\n     TRITON_BLOCK_SIZE: tl.constexpr,\n ):\n"
+        }
+      ]
+    },
+    {
+      "sha": "9409f59e0963a033a87a6847d6cafef54a64a79c",
+      "author": {
+        "name": "Dakai An",
+        "email": "77474977+andakai@users.noreply.github.com"
+      },
+      "date": "2026-08-16T23:15:14+08:00",
+      "message": "[Core] Add CuMemAllocator.discard() for tag-selective GPU memory release (#52514)\n\nSigned-off-by: AlanFokCo <alanfok2868@gmail.com>\nSigned-off-by: Dakai An <dakaian108@gmail.com>\nCo-authored-by: AlanFokCo <alanfok2868@gmail.com>\nCo-authored-by: OpenAI Codex <codex@openai.com>",
+      "parents": [
+        "fe1c317157d4478fdc0e02096447e61305b871e9"
+      ],
+      "stats": {
+        "total_additions": 132,
+        "total_deletions": 0,
+        "files_changed": 4
+      },
+      "files": [
+        {
+          "filename": "tests/basic_correctness/test_mem.py",
+          "status": "modified",
+          "additions": 35,
+          "deletions": 0,
+          "patch": "@@ -75,6 +75,41 @@ def test_basic_cumem():\n     assert torch.allclose(output, torch.ones_like(output) * 3)\n \n \n+@create_new_process_for_each_test(\"fork\" if current_platform.is_cuda() else \"spawn\")\n+def test_discard_tags():\n+    \"\"\"Test that discard(tags) selectively frees GPU memory for specific\n+    tags while keeping other tags mapped and usable.\"\"\"\n+    allocator = get_mem_allocator_instance()\n+\n+    with allocator.use_memory_pool(\"weights\"):\n+        weights = torch.ones(1024, 1024, device=DEVICE_TYPE)\n+\n+    with allocator.use_memory_pool(\"kv_cache\"):\n+        kv = torch.ones(512, 512, device=DEVICE_TYPE)\n+\n+    free_bytes = torch.accelerator.get_memory_info()[0]\n+\n+    # Discard kv_cache only — weights should remain valid\n+    allocator.discard(\"kv_cache\")\n+\n+    free_bytes_after_discard = torch.accelerator.get_memory_info()[0]\n+    assert free_bytes_after_discard > free_bytes\n+\n+    # Weights are still usable\n+    assert torch.allclose(weights, torch.ones_like(weights))\n+\n+    # Wake up and verify kv_cache is remapped (zeroed content)\n+    allocator.wake_up()\n+    # After wake_up the VA is remapped; content is not preserved\n+    # but the allocation is valid\n+    assert kv.shape == (512, 512)\n+\n+    # Full sleep/wake cycle still works after discard\n+    allocator.sleep(offload_tags=\"weights\")\n+    allocator.wake_up()\n+    assert torch.allclose(weights, torch.ones_like(weights))\n+\n+\n @create_new_process_for_each_test(\"fork\" if current_platform.is_cuda() else \"spawn\")\n @pytest.mark.skipif(current_platform.is_xpu(), reason=\"CUDA graph not supported on XPU\")\n def test_cumem_with_cudagraph():"
+        },
+        {
+          "filename": "vllm/device_allocator/__init__.py",
+          "status": "modified",
+          "additions": 2,
+          "deletions": 0,
+          "patch": "@@ -27,6 +27,8 @@ class MemAllocator(Protocol):\n \n     def sleep(self, offload_tags: tuple[str, ...] | str | None = None) -> None: ...\n \n+    def discard(self, tags: tuple[str, ...] | str) -> None: ...\n+\n     def wake_up(self, tags: list[str] | None = None) -> None: ...\n \n     def get_current_usage(self) -> int: ..."
+        },
+        {
+          "filename": "vllm/device_allocator/cumem.py",
+          "status": "modified",
+          "additions": 46,
+          "deletions": 0,
+          "patch": "@@ -247,8 +247,15 @@ class CuMemAllocator:\n \n         total_bytes = 0\n         backup_bytes = 0\n+        has_policy_conflict = False\n \n         for ptr, data in self.pointer_to_data.items():\n+            if data.is_asleep:\n+                requests_offload = data.tag in offload_tags\n+                was_offloaded = data.cpu_backup_tensor is not None\n+                if requests_offload != was_offloaded:\n+                    has_policy_conflict = True\n+                continue\n             handle = data.handle\n             total_bytes += handle[1]\n             if data.tag in offload_tags:\n@@ -277,9 +284,46 @@ class CuMemAllocator:\n             (total_bytes - backup_bytes) / 1024**3,\n         )\n \n+        if has_policy_conflict:\n+            logger.warning(\n+                \"CuMemAllocator: sleep cannot change the policy of \"\n+                \"already-asleep allocations; the existing policy was kept.\"\n+            )\n+\n         gc.collect()\n         torch.cuda.empty_cache()\n \n+    def discard(self, tags: tuple[str, ...] | str) -> None:\n+        \"\"\"Discard mapped allocations with the given tags without CPU backup.\"\"\"\n+        if isinstance(tags, str):\n+            tags = (tags,)\n+\n+        discarded_bytes = 0\n+        has_policy_conflict = False\n+        for data in self.pointer_to_data.values():\n+            if data.tag not in tags:\n+                continue\n+            if data.is_asleep:\n+                if data.cpu_backup_tensor is not None:\n+                    has_policy_conflict = True\n+                continue\n+            torch.accelerator.synchronize(data.handle[0])\n+            unmap_and_release(data.handle)\n+            data.is_asleep = True\n+            discarded_bytes += data.handle[1]\n+\n+        logger.info(\n+            \"CuMemAllocator: discarded %.2f GiB for tags %s.\",\n+            discarded_bytes / 1024**3,\n+            tags,\n+        )\n+\n+        if has_policy_conflict:\n+            logger.warning(\n+                \"CuMemAllocator: discard cannot change the policy of \"\n+                \"already-asleep allocations; the existing policy was kept.\"\n+            )\n+\n     def wake_up(self, tags: list[str] | None = None) -> None:\n         \"\"\"\n         Wake up the allocator from sleep mode.\n@@ -295,6 +339,8 @@ class CuMemAllocator:\n         torch.accelerator.empty_cache()\n \n         for ptr, data in self.pointer_to_data.items():\n+            if not data.is_asleep:\n+                continue\n             if tags is None or data.tag in tags:\n                 handle = data.handle\n                 create_and_map(handle)"
+        },
+        {
+          "filename": "vllm/device_allocator/xpumem.py",
+          "status": "modified",
+          "additions": 49,
+          "deletions": 0,
+          "patch": "@@ -174,12 +174,20 @@ class XpuMemAllocator:\n \n         total_bytes = 0\n         backup_bytes = 0\n+        has_policy_conflict = False\n \n         for ptr, data in self.pointer_to_data.items():\n+            if data.is_asleep:\n+                requests_offload = data.tag in offload_tags\n+                was_offloaded = data.cpu_backup_tensor is not None\n+                if requests_offload != was_offloaded:\n+                    has_policy_conflict = True\n+                continue\n             size_in_bytes = data.handle[1]\n             total_bytes += size_in_bytes\n             if data.tag not in offload_tags:\n                 unmap_and_release(data.handle)\n+                data.is_asleep = True\n                 continue\n \n             backup_bytes += size_in_bytes\n@@ -201,6 +209,7 @@ class XpuMemAllocator:\n             data.cpu_backup_tensor = cpu_backup_tensor\n \n             unmap_and_release(data.handle)\n+            data.is_asleep = True\n \n         logger.info(\n             \"XpuMemAllocator: sleep freed %.2f GiB memory in total, of which \"\n@@ -211,16 +220,56 @@ class XpuMemAllocator:\n             (total_bytes - backup_bytes) / 1024**3,\n         )\n \n+        if has_policy_conflict:\n+            logger.warning(\n+                \"XpuMemAllocator: sleep cannot change the policy of \"\n+                \"already-asleep allocations; the existing policy was kept.\"\n+            )\n+\n         gc.collect()\n         xpu_empty_cache = getattr(torch.xpu, \"empty_cache\", None)\n         if callable(xpu_empty_cache):\n             xpu_empty_cache()\n \n+    def discard(self, tags: tuple[str, ...] | str) -> None:\n+        \"\"\"Discard mapped allocations with the given tags without CPU backup.\"\"\"\n+        if isinstance(tags, str):\n+            tags = (tags,)\n+\n+        discarded_bytes = 0\n+        has_policy_conflict = False\n+        for data in self.pointer_to_data.values():\n+            if data.tag not in tags:\n+                continue\n+            if data.is_asleep:\n+                if data.cpu_backup_tensor is not None:\n+                    has_policy_conflict = True\n+                continue\n+            torch.accelerator.synchronize(data.handle[0])\n+            unmap_and_release(data.handle)\n+            data.is_asleep = True\n+            discarded_bytes += data.handle[1]\n+\n+        logger.info(\n+            \"XpuMemAllocator: discarded %.2f GiB for tags %s.\",\n+            discarded_bytes / 1024**3,\n+            tags,\n+        )\n+\n+        if has_policy_conflict:\n+            logger.warning(\n+                \"XpuMemAllocator: discard cannot change the policy of \"\n+                \"already-asleep allocations; the existing policy was kept.\"\n+            )\n+\n     def wake_up(self, tags: list[str] | None = None) -> None:\n         for ptr, data in self.pointer_to_data.items():\n+            if not data.is_asleep:\n+                continue\n             if tags is not None and data.tag not in tags:\n                 continue\n             create_and_allocate(data.handle)\n+            data.is_asleep = False\n \n             cpu_backup_tensor = data.cpu_backup_tensor\n             if cpu_backup_tensor is None:\n"
+        }
+      ]
+    },
+    {
+      "sha": "fe1c317157d4478fdc0e02096447e61305b871e9",
+      "author": {
+        "name": "Shantipriya Parida",
+        "email": "shantipriya.parida@amd.com"
+      },
+      "date": "2026-08-16T21:21:31+08:00",
+      "message": "[Bugfix][ROCm] Skip FP8 MLA prefill PS-metadata build for chunked-context batches (#52356)\n\nSigned-off-by: Shantipriya Parida <shantipriya.parida@amd.com>",
+      "parents": [
+        "836aac92ffdaa337083934181cb6d00b64b2a1a6"
+      ],
+      "stats": {
+        "total_additions": 5,
+        "total_deletions": 1,
+        "files_changed": 1
+      },
+      "files": [
+        {
+          "filename": "vllm/v1/attention/backends/mla/rocm_aiter_mla.py",
+          "status": "modified",
+          "additions": 5,
+          "deletions": 1,
+          "patch": "@@ -777,7 +777,11 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):\n             attn_metadata.reduce_indptr = self._mla_reduce_indptr\n             attn_metadata.reduce_final_map = self._mla_reduce_final_map\n             attn_metadata.reduce_partial_map = self._mla_reduce_partial_map\n-        if self._fp8_prefill_enabled and attn_metadata.prefill is not None:\n+        if (\n+            self._fp8_prefill_enabled\n+            and attn_metadata.prefill is not None\n+            and attn_metadata.prefill.chunked_context is None\n+        ):\n             self._build_fp8_prefill_ps_metadata(attn_metadata, common_attn_metadata)\n         return attn_metadata\n \n"
+        }
+      ]
+    },
+    {
+      "sha": "836aac92ffdaa337083934181cb6d00b64b2a1a6",
+      "author": {
+        "name": "Chauncey",
+        "email": "chaunceyjiang@gmail.com"
+      },
+      "date": "2026-08-16T21:15:47+08:00",
+      "message": "[Perf][DSV4] Optimize sparse top-k metadata kernels for higher prefill throughput (#52084)\n\nSigned-off-by: chaunceyjiang <chaunceyjiang@gmail.com>",
+      "parents": [
+        "4d2a68d64d9e05921ed5c4099146e768a92d71d5"
+      ],
+      "stats": {
+        "total_additions": 1,
+        "total_deletions": 1,
+        "files_changed": 1
+      },
+      "files": [
+        {
+          "filename": "vllm/models/deepseek_v4/common/ops/cache_utils.py",
+          "status": "modified",
+          "additions": 1,
+          "deletions": 1,
+          "patch": "@@ -580,7 +580,7 @@ def combine_topk_swa_indices(\n     return combined_indices, combined_lens\n \n \n-_COMBINE_TOPK_SWA_NUM_WORKERS = 128\n+_COMBINE_TOPK_SWA_NUM_WORKERS = 256\n \n \n # Representative pointer alignment variants for Triton pointer specialization.\n"
+        }
+      ]
+    },
+    {
+      "sha": "4d2a68d64d9e05921ed5c4099146e768a92d71d5",
+      "author": {
+        "name": "oops-oom",
+        "email": "liubin8905@vip.qq.com"
+      },
+      "date": "2026-08-16T19:09:23+08:00",
+      "message": "[Bugfix][Spec Decode][Structured Output] DSpark: fix the grammar bitmask mapping when the draft budget is zero (#52436)\n\nSigned-off-by: oops-oom <73481342@qq.com>\nCo-authored-by: oops-oom <73481342@qq.com>\nCo-authored-by: Claude Opus 4.8 <noreply@anthropic.com>",
+      "parents": [
+        "84530eb235dc3d866fa7d4588217f2fb53f43e76"
+      ],
+      "stats": {
+        "total_additions": 89,
+        "total_deletions": 15,
+        "files_changed": 3
+      },
+      "files": [
+        {
+          "filename": "tests/v1/spec_decode/test_adaptive_verification.py",
+          "status": "modified",
+          "additions": 49,
+          "deletions": 0,
+          "patch": "@@ -9,6 +9,7 @@ from vllm.v1.worker.gpu.async_utils import StepTimingSample\n from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (\n     AdaptiveVerificationManager,\n )\n+from vllm.v1.worker.gpu.structured_outputs import _build_grammar_mapping\n \n \n def make_manager(\n@@ -168,3 +169,51 @@ def test_zero_budget_rebuilds_cpu_cu_num_logits():\n     assert cu_num_logits_np.dtype == scheduled_cu_num_logits.dtype\n     # The prefill keeps its scheduled tokens; only drafts are dropped.\n     assert np.array_equal(compacted, np.array([1, 1, 40], dtype=np.int32))\n+\n+\n+def test_zero_budget_keeps_one_grammar_row_per_scheduled_draft():\n+    # The scheduler sizes the grammar bitmask from the *scheduled* drafts\n+    # (len(drafts) + 1 rows per request), but a zero budget rewrites\n+    # cu_num_logits_np to bonus-only. Deriving the bitmask -> logits mapping\n+    # from those rewritten offsets drops rows and trips the\n+    # `num_masks == len(mapping)` assert in apply_grammar_bitmask.\n+    manager = make_manager(\n+        np.array([[0.9, 0.9], [0.9, 0.9], [1.0, 1.0]], dtype=np.float32),\n+        np.ones(64),\n+    )\n+    manager.req_states.req_id_to_index[\"prefill\"] = 2\n+    manager.req_states.num_computed_tokens_np = np.zeros(3, dtype=np.int32)\n+    manager.req_states.prefill_len.np = np.array([0, 0, 60], dtype=np.int32)\n+    manager._max_total_logits = 2  # < 3 requests * 1 bonus token\n+\n+    scheduled_spec_decode_tokens = {\"low\": [1, 2], \"high\": [3, 4]}\n+    manager.get_num_tokens(\n+        {\"low\": 3, \"high\": 3, \"prefill\": 40}, scheduled_spec_decode_tokens\n+    )\n+    assert manager._batch_budget[2] == 0\n+\n+    req_ids = [\"low\", \"high\", \"prefill\"]\n+    num_draft_tokens_per_req = np.array([2, 2, 0], dtype=np.int32)\n+    _, cu_num_logits_np = manager.compact_batch(\n+        num_draft_tokens_per_req,\n+        np.array([3, 3, 40], dtype=np.int32),\n+        np.array([0, 3, 6, 7], dtype=np.int32),\n+    )\n+\n+    mask_stride = manager.num_speculative_steps + manager.num_bonus_tokens\n+    mapping = _build_grammar_mapping(\n+        req_ids,\n+        req_ids,\n+        cu_num_logits_np,\n+        num_draft_tokens_per_req,\n+        manager.num_bonus_tokens,\n+        mask_stride,\n+    )\n+\n+    num_bitmask_rows = sum(\n+        len(scheduled_spec_decode_tokens.get(req_id, ())) + 1 for req_id in req_ids\n+    )\n+    assert len(mapping) == num_bitmask_rows\n+    # (request, position) keys, so the kernel can mask rows the compacted\n+    # device layout no longer has room for.\n+    assert mapping == [0, 1, 2, 3, 4, 5, 6]"
+        },
+        {
+          "filename": "vllm/v1/worker/gpu/model_runner.py",
+          "status": "modified",
+          "additions": 1,
+          "deletions": 0,
+          "patch": "@@ -425,6 +425,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):\n                 vocab_size=self.vocab_size,\n                 device=self.device,\n                 mask_stride=self.decode_query_len,\n+                num_bonus_tokens=self.model_state.num_new_sampled_tokens_per_step,\n             )\n \n         if self.is_pooling_model and self.is_last_pp_rank:"
+        },
+        {
+          "filename": "vllm/v1/worker/gpu/structured_outputs.py",
+          "status": "modified",
+          "additions": 39,
+          "deletions": 15,
+          "patch": "@@ -10,6 +10,32 @@ from vllm.v1.worker.gpu.buffer_utils import async_copy_to_gpu\n from vllm.v1.worker.gpu.input_batch import InputBatch\n \n \n+def _build_grammar_mapping(\n+    req_ids: list[str],\n+    grammar_req_ids: list[str],\n+    cu_num_logits_np: np.ndarray,\n+    num_draft_tokens_per_req: np.ndarray | None,\n+    num_bonus_tokens: int,\n+    mask_stride: int,\n+) -> list[int]:\n+    mapping: list[int] = []\n+    req_id_to_idx = {req_id: i for i, req_id in enumerate(req_ids)}\n+    for grammar_req_id in grammar_req_ids:\n+        req_idx = req_id_to_idx[grammar_req_id]\n+        if num_draft_tokens_per_req is None:\n+            num_positions = int(\n+                cu_num_logits_np[req_idx + 1] - cu_num_logits_np[req_idx]\n+            )\n+        else:\n+            # Grammar masks follow the scheduled layout even when adaptive\n+            # verification compacts the actual CPU logit offsets to bonus-only.\n+            num_positions = int(num_draft_tokens_per_req[req_idx]) + num_bonus_tokens\n+        mapping.extend(\n+            req_idx * mask_stride + position for position in range(num_positions)\n+        )\n+    return mapping\n+\n+\n class StructuredOutputsWorker:\n     def __init__(\n         self,\n@@ -17,6 +43,7 @@ class StructuredOutputsWorker:\n         vocab_size: int,\n         device: torch.device,\n         mask_stride: int,\n+        num_bonus_tokens: int,\n     ):\n         self.logits_indices = torch.zeros(\n             max_num_logits, dtype=torch.int32, device=device\n@@ -27,6 +54,7 @@ class StructuredOutputsWorker:\n         self.device = device\n         self.copy_stream = torch.cuda.Stream()\n         self.mask_stride = mask_stride\n+        self.num_bonus_tokens = num_bonus_tokens\n \n     def apply_grammar_bitmask(\n         self,\n@@ -45,21 +73,17 @@ class StructuredOutputsWorker:\n             )\n \n         # Construct bitmask -> logits mapping\n-        mapping: list[int] = []\n-        req_ids = input_batch.req_ids\n-        cu_num_logits = input_batch.cu_num_logits_np.tolist()\n-        req_id_to_idx = {req_id: i for i, req_id in enumerate(req_ids)}\n-        for grammar_req_id in grammar_req_ids:\n-            req_idx = req_id_to_idx[grammar_req_id]\n-            logits_start_idx = cu_num_logits[req_idx]\n-            logits_end_idx = cu_num_logits[req_idx + 1]\n-            # Key by (request, position) rather than absolute logit index:\n-            # adaptive verification finalizes per-request logit offsets on\n-            # device, so the kernel resolves them from the GPU cu_num_logits.\n-            mapping.extend(\n-                req_idx * self.mask_stride + position\n-                for position in range(logits_end_idx - logits_start_idx)\n-            )\n+        # Key by (request, position) rather than absolute logit index:\n+        # adaptive verification finalizes per-request logit offsets on\n+        # device, so the kernel resolves them from the GPU cu_num_logits.\n+        mapping = _build_grammar_mapping(\n+            input_batch.req_ids,\n+            grammar_req_ids,\n+            input_batch.cu_num_logits_np,\n+            input_batch.num_draft_tokens_per_req,\n+            self.num_bonus_tokens,\n+            self.mask_stride,\n+        )\n \n         # Asynchronously copy the mapping to GPU.\n         with torch.cuda.stream(self.copy_stream):\n"
+        }
+      ]
+    },
+    {
+      "sha": "84530eb235dc3d866fa7d4588217f2fb53f43e76",
+      "author": {
+        "name": "Chauncey",
+        "email": "chaunceyjiang@gmail.com"
+      },
+      "date": "2026-08-16T17:17:04+08:00",
+      "message": "[Bugfix][Multimodal] Keep Gemma 4 video frame counts on CPU (#52441)\n\nSigned-off-by: chaunceyjiang <chaunceyjiang@gmail.com>",
+      "parents": [
+        "1b079c40ff9d2598d837f4ed1fc08342fca4fd6e"
+      ],
+      "stats": {
+        "total_additions": 7,
+        "total_deletions": 1,
+        "files_changed": 2
+      },
+      "files": [
+        {
+          "filename": "tests/models/multimodal/generation/test_vit_cudagraph.py",
+          "status": "modified",
+          "additions": 6,
+          "deletions": 0,
+          "patch": "@@ -286,6 +286,12 @@ MODEL_CONFIGS: dict[str, VitCudagraphTestConfig] = {\n             \"<bos><start_of_turn>user\\n<|video|>\\nDescribe this video in one sentence.\"\n             \"<end_of_turn>\\n<start_of_turn>model\\n\"\n         ),\n+        # The 16-frame test video produces 1056 vision tokens. Capture only\n+        # the smallest supported bucket that covers it instead of all default\n+        # buckets through max_model_len, which adds unrelated memory pressure.\n+        compilation_config_overrides={\n+            \"encoder_cudagraph_token_budgets\": [1120],\n+        },\n         needs_video_metadata=True,\n         marks=[pytest.mark.core_model],\n     ),"
+        },
+        {
+          "filename": "vllm/model_executor/models/gemma4_mm.py",
+          "status": "modified",
+          "additions": 1,
+          "deletions": 1,
+          "patch": "@@ -801,7 +801,7 @@ class Gemma4MultiModalProcessor(BaseMultiModalProcessor[Gemma4ProcessingInfo]):\n                     MultiModalFieldConfig.flat_from_sizes(\"video\", vfc)\n                 ),\n                 video_frame_counts=MultiModalFieldConfig.batched(\n-                    \"video\",\n+                    \"video\", keep_on_cpu=True\n                 ),\n                 video_num_soft_tokens=MultiModalFieldConfig.batched(\n                     \"video\", keep_on_cpu=True\n"
+        }
+      ]
+    },
+    {
+      "sha": "1b079c40ff9d2598d837f4ed1fc08342fca4fd6e",
+      "author": {
+        "name": "Jyan-R",
+        "email": "87905051+jyan-R@users.noreply.github.com"
+      },
+      "date": "2026-08-16T17:02:20+08:00",
+      "message": "[Bugfix][Model Runner V2][Spec Decode] Fix off-by-one in bad_words draft-prefix matching (#52311)\n\nSigned-off-by: jyan <r_02213@sjtu.edu.cn>\nCo-authored-by: jyan <r_02213@sjtu.edu.cn>\nCo-authored-by: Claude Fable 5 <noreply@anthropic.com>\nCo-authored-by: mergify[bot] <37929162+mergify[bot]@users.noreply.github.com>",
+      "parents": [
+        "70aaec832bde70ada17cbad2061105bbd07541dc"
+      ],
+      "stats": {
+        "total_additions": 108,
+        "total_deletions": 1,
+        "files_changed": 2
+      },
+      "files": [
+        {
+          "filename": "tests/v1/worker/test_gpu_bad_words.py",
+          "status": "added",
+          "additions": 105,
+          "deletions": 0,
+          "patch": "new file mode 100644\n@@ -0,0 +1,105 @@\n+# SPDX-License-Identifier: Apache-2.0\n+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project\n+\n+import numpy as np\n+import pytest\n+import torch\n+\n+pytest.importorskip(\"triton\")\n+if not torch.cuda.is_available():\n+    pytest.skip(\n+        \"CUDA required for Model Runner V2 bad words tests\",\n+        allow_module_level=True,\n+    )\n+\n+from vllm.sampling_params import SamplingParams\n+from vllm.v1.worker.gpu.sample.bad_words import BadWordsState\n+from vllm.v1.worker.gpu.states import RequestState\n+\n+DEVICE = torch.device(\"cuda\")\n+VOCAB_SIZE = 128\n+\n+# Committed tokens: prompt [5], output [10, 11]. Draft tokens: [12, 13].\n+# The sampler passes input_ids gathered at logits_indices, so local position 0\n+# holds the last committed token (11) and draft tokens start at position 1.\n+PROMPT_LEN = 1\n+COMMITTED = [5, 10, 11]\n+INPUT_IDS = [11, 12, 13]\n+LOCAL_POS = [0, 1, 2]\n+\n+\n+def _make_state(bad_words_token_ids: list[list[int]]) -> tuple[BadWordsState, int]:\n+    req_states = RequestState(\n+        max_num_reqs=4,\n+        max_model_len=64,\n+        max_num_batched_tokens=16,\n+        num_speculative_steps=4,\n+        vocab_size=VOCAB_SIZE,\n+        device=DEVICE,\n+    )\n+    req_states.add_request(\n+        req_id=\"req\",\n+        prompt_len=PROMPT_LEN,\n+        all_token_ids=COMMITTED,\n+        num_computed_tokens=len(COMMITTED),\n+        max_tokens=32,\n+    )\n+    req_states.apply_staged_writes()\n+\n+    req_idx = req_states.req_id_to_index[\"req\"]\n+    state = BadWordsState(req_states)\n+    state.add_request(req_idx, SamplingParams(_bad_words_token_ids=bad_words_token_ids))\n+    state.apply_staged_writes()\n+    return state, req_idx\n+\n+\n+def _apply(bad_words_token_ids: list[list[int]]) -> torch.Tensor:\n+    state, req_idx = _make_state(bad_words_token_ids)\n+    num_logits = len(INPUT_IDS)\n+    logits = torch.zeros((num_logits, VOCAB_SIZE), device=DEVICE)\n+    idx_mapping_np = np.array([req_idx], dtype=np.intp)\n+    expanded_idx_mapping = torch.tensor(\n+        [req_idx] * num_logits, dtype=torch.int32, device=DEVICE\n+    )\n+    state.apply_bad_words(\n+        logits,\n+        expanded_idx_mapping,\n+        idx_mapping_np,\n+        torch.tensor(INPUT_IDS, dtype=torch.int32, device=DEVICE),\n+        torch.tensor(LOCAL_POS, dtype=torch.int32, device=DEVICE),\n+    )\n+    return logits.cpu()\n+\n+\n+def test_v2_bad_words_prefix_inside_draft_tokens():\n+    \"\"\"A prefix matching entirely within the draft tokens must mask the bad\n+    word's last token at the draft position that completes the prefix.\"\"\"\n+    out = _apply([[12, 13, 40]])\n+    expected = torch.zeros_like(out)\n+    expected[2, 40] = -float(\"inf\")\n+    torch.testing.assert_close(out, expected)\n+\n+\n+def test_v2_bad_words_prefix_spanning_committed_and_draft_tokens():\n+    \"\"\"A prefix spanning the committed/draft boundary must mask at the row\n+    where the prefix completes, not one draft position later.\"\"\"\n+    out = _apply([[11, 12, 30]])\n+    expected = torch.zeros_like(out)\n+    expected[1, 30] = -float(\"inf\")\n+    torch.testing.assert_close(out, expected)\n+\n+\n+def test_v2_bad_words_no_spurious_match_from_last_committed_token():\n+    \"\"\"The last committed token must not be double-counted as the first draft\n+    token; [11, 11] never occurs in output [10, 11] + drafts [12, 13].\"\"\"\n+    out = _apply([[11, 11, 50]])\n+    expected = torch.zeros_like(out)\n+    torch.testing.assert_close(out, expected)\n+\n+\n+def test_v2_bad_words_committed_prefix():\n+    \"\"\"Baseline: a fully committed prefix masks at the first row.\"\"\"\n+    out = _apply([[10, 11, 60]])\n+    expected = torch.zeros_like(out)\n+    expected[0, 60] = -float(\"inf\")\n+    torch.testing.assert_close(out, expected)"
+        },
+        {
+          "filename": "vllm/v1/worker/gpu/sample/bad_words.py",
+          "status": "modified",
+          "additions": 3,
+          "deletions": 1,
+          "patch": "@@ -153,8 +153,10 @@ def _bad_words_kernel(\n \n         from_spec_input = actual_pos >= output_len\n         if from_spec_input:\n+            # input_ids at local position 0 is the last committed token;\n+            # draft tokens start at local position 1.\n             spec_offset = actual_pos - output_len\n-            actual = tl.load(input_ids_ptr + cur_req_first_pos + spec_offset)\n+            actual = tl.load(input_ids_ptr + cur_req_first_pos + spec_offset + 1)\n         else:\n             actual = tl.load(output_base + actual_pos)\n \n"
+        }
+      ]
+    },
+    {
+      "sha": "70aaec832bde70ada17cbad2061105bbd07541dc",
+      "author": {
+        "name": "Do_it_now_!",
+        "email": "lizhengcheng233@gmail.com"
+      },
+      "date": "2026-08-16T16:05:17+08:00",
+      "message": "[Bugfix][Anthropic] Return 4xx for client-caused errors in /v1/messages (#52246)\n\nSigned-off-by: Do_it_now_! <lizhengcheng233@gmail.com>",
+      "parents": [
+        "41f12a0daf193c80f2e748f6a65f0735623be3a5"
+      ],
+      "stats": {
+        "total_additions": 100,
+        "total_deletions": 20,
+        "files_changed": 3
+      },
+      "files": [
+        {
+          "filename": "tests/entrypoints/anthropic/test_anthropic_messages_conversion.py",
+          "status": "modified",
+          "additions": 95,
+          "deletions": 0,
+          "patch": "@@ -15,12 +15,14 @@ Also covers cache usage computation in ``_build_anthropic_usage``.\n import json\n from argparse import Namespace\n from http import HTTPStatus\n+from typing import Annotated\n from unittest.mock import MagicMock\n \n import pytest\n from fastapi import FastAPI\n from fastapi.exceptions import RequestValidationError\n from fastapi.testclient import TestClient\n+from pydantic import BaseModel, Field, ValidationError\n \n from vllm.entrypoints.anthropic.api_router import attach_router\n from vllm.entrypoints.anthropic.protocol import (\n@@ -47,6 +49,7 @@ from vllm.entrypoints.openai.engine.protocol import (\n from vllm.entrypoints.serve.exception_handling.handlers.validation import (\n     validation_exception_handler,\n )\n+from vllm.exceptions import VLLMValidationError\n \n _convert = AnthropicServingMessages._convert_anthropic_to_openai_request\n _img_url = AnthropicServingMessages._convert_image_source_to_url\n@@ -1458,3 +1461,95 @@ class TestCacheSalt:\n \n         assert response.status_code == HTTPStatus.BAD_REQUEST\n         handler.create_messages.assert_not_awaited()\n+\n+\n+# ======================================================================\n+# Client-caused errors are 4xx, not 500 (Issue #52088)\n+# ======================================================================\n+\n+\n+class TestClientErrorResponses:\n+    @staticmethod\n+    def _make_api_app(handler: MagicMock):\n+        app = FastAPI()\n+        attach_router(app)\n+        app.state.args = Namespace(log_error_stack=False)\n+        app.exception_handler(RequestValidationError)(validation_exception_handler)\n+        app.state.anthropic_serving_messages = handler\n+        return app\n+\n+    @staticmethod\n+    def _request_body() -> dict:\n+        return {\n+            \"model\": \"test-model\",\n+            \"max_tokens\": 1,\n+            \"messages\": [{\"role\": \"user\", \"content\": \"Hello\"}],\n+        }\n+\n+    @staticmethod\n+    def _conversion_error() -> ValidationError:\n+        \"\"\"A real pydantic ValidationError like the one ChatCompletionRequest\n+        construction raises when Anthropic input violates the OpenAI schema.\"\"\"\n+\n+        class _StubRequest(BaseModel):\n+            stop: Annotated[list[str], Field(max_length=4)] | None = None\n+\n+        with pytest.raises(ValidationError) as exc_info:\n+            _StubRequest(stop=[\"a\"] * 6)\n+        return exc_info.value\n+\n+    def test_validation_error_returns_bad_request(self):\n+        \"\"\"A pydantic ValidationError during Anthropic->OpenAI conversion is\n+        surfaced as a 400 BadRequestError, not a 500.\"\"\"\n+        handler = MagicMock(spec=AnthropicServingMessages)\n+        handler.create_messages.side_effect = self._conversion_error()\n+\n+        app = self._make_api_app(handler)\n+        with TestClient(app, raise_server_exceptions=False) as client:\n+            response = client.post(\"/v1/messages\", json=self._request_body())\n+\n+        assert response.status_code == HTTPStatus.BAD_REQUEST\n+        body = response.json()\n+        assert body[\"type\"] == \"error\"\n+        assert body[\"error\"][\"type\"] == \"BadRequestError\"\n+        assert \"at most 4 items\" in body[\"error\"][\"message\"]\n+\n+    def test_vllm_client_error_returns_bad_request(self):\n+        \"\"\"VLLMClientError raised by the serving layer maps to 400.\"\"\"\n+        handler = MagicMock(spec=AnthropicServingMessages)\n+        handler.create_messages.side_effect = VLLMValidationError(\n+            \"Invalid value for stop\", parameter=\"stop\"\n+        )\n+\n+        app = self._make_api_app(handler)\n+        with TestClient(app, raise_server_exceptions=False) as client:\n+            response = client.post(\"/v1/messages\", json=self._request_body())\n+\n+        assert response.status_code == HTTPStatus.BAD_REQUEST\n+        assert response.json()[\"error\"][\"type\"] == \"BadRequestError\"\n+\n+    def test_generic_error_still_returns_internal_server_error(self):\n+        \"\"\"Non-client errors keep the existing 500 behaviour.\"\"\"\n+        handler = MagicMock(spec=AnthropicServingMessages)\n+        handler.create_messages.side_effect = RuntimeError(\"boom\")\n+\n+        app = self._make_api_app(handler)\n+        with TestClient(app, raise_server_exceptions=False) as client:\n+            response = client.post(\"/v1/messages\", json=self._request_body())\n+\n+        assert response.status_code == HTTPStatus.INTERNAL_SERVER_ERROR\n+        assert response.json()[\"error\"][\"type\"] == \"InternalServerError\"\n+\n+    def test_count_tokens_validation_error_returns_bad_request(self):\n+        \"\"\"The count_tokens route maps conversion errors to 400 as well.\"\"\"\n+        handler = MagicMock(spec=AnthropicServingMessages)\n+        handler.count_tokens.side_effect = self._conversion_error()\n+\n+        app = self._make_api_app(handler)\n+        with TestClient(app, raise_server_exceptions=False) as client:\n+            response = client.post(\n+                \"/v1/messages/count_tokens\", json=self._request_body()\n+            )\n+\n+        assert response.status_code == HTTPStatus.BAD_REQUEST\n+        assert response.json()[\"error\"][\"type\"] == \"BadRequestError\""
+        },
+        {
+          "filename": "tests/entrypoints/serve/exception_handling/test_error_sanitization.py",
+          "status": "modified",
+          "additions": 0,
+          "deletions": 1,
+          "patch": "@@ -116,7 +116,6 @@ class TestAffectedModulesUseSanitize:\n     @pytest.mark.parametrize(\n         \"module\",\n         [\n-            \"vllm.entrypoints.anthropic.api_router\",\n             \"vllm.entrypoints.anthropic.serving\",\n             \"vllm.entrypoints.speech_to_text.realtime.connection\",\n         ],"
+        },
+        {
+          "filename": "vllm/entrypoints/anthropic/api_router.py",
+          "status": "modified",
+          "additions": 5,
+          "deletions": 19,
+          "patch": "@@ -17,7 +17,9 @@ from vllm.entrypoints.anthropic.protocol import (\n )\n from vllm.entrypoints.anthropic.serving import AnthropicServingMessages\n from vllm.entrypoints.openai.engine.protocol import ErrorResponse\n-from vllm.entrypoints.serve.exception_handling.utils import sanitize_message\n+from vllm.entrypoints.serve.exception_handling.error_response import (\n+    create_error_response,\n+)\n from vllm.entrypoints.serve.utils.api_utils import (\n     load_aware_call,\n     validate_json_request,\n@@ -71,15 +73,7 @@ async def create_messages(request: AnthropicMessagesRequest, raw_request: Reques\n         generator = await handler.create_messages(request, raw_request)\n     except Exception as e:\n         logger.exception(\"Error in create_messages: %s\", e)\n-        return JSONResponse(\n-            status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,\n-            content=AnthropicErrorResponse(\n-                error=AnthropicError(\n-                    type=\"internal_error\",\n-                    message=sanitize_message(str(e)),\n-                )\n-            ).model_dump(),\n-        )\n+        return translate_error_response(create_error_response(e))\n \n     if isinstance(generator, ErrorResponse):\n         return translate_error_response(generator)\n@@ -117,15 +111,7 @@ async def count_tokens(request: AnthropicCountTokensRequest, raw_request: Reques\n         response = await handler.count_tokens(request, raw_request)\n     except Exception as e:\n         logger.exception(\"Error in count_tokens: %s\", e)\n-        return JSONResponse(\n-            status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,\n-            content=AnthropicErrorResponse(\n-                error=AnthropicError(\n-                    type=\"internal_error\",\n-                    message=sanitize_message(str(e)),\n-                )\n-            ).model_dump(),\n-        )\n+        return translate_error_response(create_error_response(e))\n \n     if isinstance(response, ErrorResponse):\n         return translate_error_response(response)\n"
+        }
+      ]
+    },
+    {
+      "sha": "41f12a0daf193c80f2e748f6a65f0735623be3a5",
+      "author": {
+        "name": "Jeffrey Wang",
+        "email": "jeffreywang@anyscale.com"
+      },
+      "date": "2026-08-16T16:04:51+08:00",
+      "message": "[Bugfix] Raise `VLLMValidationError` from structured output validators (#52394)\n\nSigned-off-by: Jeffrey Wang <jeffreywang@anyscale.com>\nCo-authored-by: Claude Opus 5 (1M context) <noreply@anthropic.com>",
+      "parents": [
+        "8efa13b700f1836657699cae2503dc2feab27fa0"
+      ],
+      "stats": {
+        "total_additions": 109,
+        "total_deletions": 30,
+        "files_changed": 8
+      },
+      "files": [
+        {
+          "filename": "tests/entrypoints/llm/test_struct_output_generate.py",
+          "status": "modified",
+          "additions": 5,
+          "deletions": 2,
+          "patch": "@@ -13,6 +13,7 @@ from pydantic import BaseModel\n \n from tests.reasoning.utils import run_reasoning_extraction\n from vllm.config import StructuredOutputsConfig\n+from vllm.exceptions import VLLMValidationError\n from vllm.outputs import RequestOutput\n from vllm.platforms import current_platform\n from vllm.reasoning.abs_reasoning_parsers import ReasoningParserManager\n@@ -326,7 +327,7 @@ def test_structured_output(\n         )\n         if backend.startswith(\"xgrammar\"):\n             with pytest.raises(\n-                ValueError,\n+                VLLMValidationError,\n                 match=\"The provided JSON schema contains features \"\n                 \"not supported by xgrammar.\",\n             ):\n@@ -453,7 +454,9 @@ def test_structured_output(\n                 max_tokens=1000,\n                 structured_outputs=StructuredOutputsParams(grammar=\"not a grammar\"),\n             )\n-            with pytest.raises(ValueError, match=\"Failed to convert the grammar \"):\n+            with pytest.raises(\n+                VLLMValidationError, match=\"Failed to convert the grammar \"\n+            ):\n                 runner.llm.generate(\n                     (\n                         \"Generate a sql statement that selects col_1 from \""
+        },
+        {
+          "filename": "tests/v1/structured_output/test_validation.py",
+          "status": "modified",
+          "additions": 58,
+          "deletions": 1,
+          "patch": "@@ -5,7 +5,7 @@\n import pytest\n \n from vllm.config import StructuredOutputsConfig\n-from vllm.exceptions import VLLMValidationError\n+from vllm.exceptions import VLLMClientError, VLLMValidationError\n from vllm.sampling_params import SamplingParams, StructuredOutputsParams\n \n pytestmark = pytest.mark.cpu_test\n@@ -103,3 +103,60 @@ def test_regex_with_nul_byte_rejected(regex):\n \n     with pytest.raises(ValueError, match=\"NUL\"):\n         validate_xgrammar_grammar(params)\n+\n+\n+INVALID_JSON_SCHEMA = {\"type\": \"object\", \"properties\": {\"name\": {\"type\": \"str\"}}}\n+\n+\n+@pytest.mark.parametrize(\n+    \"backend, structured_outputs\",\n+    [\n+        (\"xgrammar\", StructuredOutputsParams(json=INVALID_JSON_SCHEMA)),\n+        (\"outlines\", StructuredOutputsParams(json=INVALID_JSON_SCHEMA)),\n+        (\"auto\", StructuredOutputsParams(json=INVALID_JSON_SCHEMA)),\n+        (\"auto\", StructuredOutputsParams(json='{\"type\": ')),\n+        (\"xgrammar\", StructuredOutputsParams(grammar=\"not a grammar\")),\n+        (\"guidance\", StructuredOutputsParams(grammar=\"not a grammar\")),\n+        (\"lm-format-enforcer\", StructuredOutputsParams(grammar=\"not a grammar\")),\n+        (\"outlines\", StructuredOutputsParams(regex=\"(\")),\n+        (\"guidance\", StructuredOutputsParams(structural_tag='{\"nope\": 1}')),\n+    ],\n+)\n+def test_unsupported_grammar_is_a_client_error(backend, structured_outputs):\n+    \"\"\"Only `VLLMClientError` survives `AsyncLLM.generate` untouched; anything else\n+    is wrapped in `EngineGenerateError` and served as a 500 instead of a 400.\"\"\"\n+    params = SamplingParams(structured_outputs=structured_outputs)\n+    with pytest.raises(VLLMClientError):\n+        params._validate_structured_outputs(\n+            _StubModelConfig(is_diffusion=False),\n+            StructuredOutputsConfig(backend=backend),\n+            tokenizer=object(),\n+        )\n+\n+\n+@pytest.mark.parametrize(\n+    \"schema, expected_backend\",\n+    [\n+        # multipleOf is unsupported by xgrammar, patternProperties also by guidance.\n+        (\n+            {\n+                \"type\": \"object\",\n+                \"properties\": {\"n\": {\"type\": \"integer\", \"multipleOf\": 2}},\n+            },\n+            \"guidance\",\n+        ),\n+        (\n+            {\"type\": \"object\", \"patternProperties\": {\"^a\": {\"type\": \"string\"}}},\n+            \"outlines\",\n+        ),\n+    ],\n+)\n+def test_auto_backend_falls_back_on_unsupported_schema(schema, expected_backend):\n+    \"\"\"`auto` falls back on rejection, so it must catch what the validators raise.\"\"\"\n+    params = SamplingParams(structured_outputs=StructuredOutputsParams(json=schema))\n+    params._validate_structured_outputs(\n+        _StubModelConfig(is_diffusion=False),\n+        StructuredOutputsConfig(backend=\"auto\"),\n+        tokenizer=object(),\n+    )\n+    assert params.structured_outputs._backend == expected_backend"
+        },
+        {
+          "filename": "vllm/entrypoints/openai/engine/protocol.py",
+          "status": "modified",
+          "additions": 1,
+          "deletions": 1,
+          "patch": "@@ -266,7 +266,7 @@ def validate_structural_tag_payload(payload: Any, *, parameter: str) -> None:\n                 structured_outputs=StructuredOutputsParams(structural_tag=payload)\n             )\n         )\n-    except (TypeError, ValueError) as exc:\n+    except (TypeError, ValueError, VLLMValidationError) as exc:\n         raise VLLMValidationError(\n             f\"Invalid {parameter} structural_tag specification.\",\n             parameter=parameter,"
+        },
+        {
+          "filename": "vllm/sampling_params.py",
+          "status": "modified",
+          "additions": 7,
+          "deletions": 2,
+          "patch": "@@ -1092,7 +1092,7 @@ class SamplingParams(\n             try:\n                 validate_xgrammar_grammar(self)\n                 self.structured_outputs._backend = \"xgrammar\"\n-            except ValueError:\n+            except VLLMValidationError:\n                 # The request either failed validation\n                 # or includes some jsonschema feature(s) that\n                 # are not supported in xgrammar.\n@@ -1103,7 +1103,12 @@ class SamplingParams(\n                 so_params = self.structured_outputs\n                 if not skip_guidance and so_params.json:\n                     if isinstance(so_params.json, str):\n-                        schema = json_mod.loads(so_params.json)\n+                        try:\n+                            schema = json_mod.loads(so_params.json)\n+                        except json_mod.JSONDecodeError as e:\n+                            raise VLLMValidationError(\n+                                \"Invalid JSON grammar specification.\"\n+                            ) from e\n                     else:\n                         schema = so_params.json\n                     skip_guidance = has_guidance_unsupported_json_features(schema)"
+        },
+        {
+          "filename": "vllm/v1/structured_output/backend_guidance.py",
+          "status": "modified",
+          "additions": 10,
+          "deletions": 4,
+          "patch": "@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any\n import torch\n from transformers import MistralCommonBackend\n \n+from vllm.exceptions import VLLMValidationError\n from vllm.logger import init_logger\n from vllm.sampling_params import SamplingParams\n from vllm.utils.import_utils import LazyLoader\n@@ -269,7 +270,7 @@ def serialize_guidance_grammar(\n                 begin: str = s[\"begin\"]\n                 trig = next((t for t in triggers if begin.startswith(t)), None)\n                 if trig is None:\n-                    raise ValueError(\n+                    raise VLLMValidationError(\n                         f\"Trigger {begin} not found in triggers {triggers}\"\n                     )\n                 tags.append(\n@@ -281,7 +282,9 @@ def serialize_guidance_grammar(\n                     )\n                 )\n             if not tags:\n-                raise ValueError(\"No structural tags found in the grammar spec.\")\n+                raise VLLMValidationError(\n+                    \"No structural tags found in the grammar spec.\"\n+                )\n             return llguidance.StructTag.to_grammar(tags)\n         else:\n             logger.error(\n@@ -300,7 +303,10 @@ def validate_guidance_grammar(\n     if sampling_params.structured_outputs is None:\n         return\n     tp, grm = get_structured_output_key(sampling_params.structured_outputs)\n-    guidance_grm = serialize_guidance_grammar(tp, grm)\n+    try:\n+        guidance_grm = serialize_guidance_grammar(tp, grm)\n+    except (ValueError, KeyError, TypeError) as e:\n+        raise VLLMValidationError(f\"Invalid grammar specification: {e}\") from e\n     err = llguidance.LLMatcher.validate_grammar(guidance_grm, tokenizer)\n     if err:\n-        raise ValueError(f\"Grammar error: {err}\")\n+        raise VLLMValidationError(f\"Grammar error: {err}\")"
+        },
+        {
+          "filename": "vllm/v1/structured_output/backend_lm_format_enforcer.py",
+          "status": "modified",
+          "additions": 5,
+          "deletions": 4,
+          "patch": "@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING\n import torch\n from transformers import PreTrainedTokenizerBase\n \n+from vllm.exceptions import VLLMValidationError\n from vllm.sampling_params import SamplingParams\n from vllm.utils.import_utils import LazyLoader\n from vllm.utils.torch_utils import PIN_MEMORY\n@@ -166,7 +167,7 @@ def validate_structured_output_request_lm_format_enforcer(params: SamplingParams\n                 so_params.regex,\n             )\n         except Exception as err:\n-            raise ValueError(\n+            raise VLLMValidationError(\n                 f\"Failed to compile regex for lm-format-enforcer: {err}\"\n             ) from err\n         return\n@@ -176,19 +177,19 @@ def validate_structured_output_request_lm_format_enforcer(params: SamplingParams\n                 # make sure schema is valid json\n                 json.loads(so_params.json)\n             except json.JSONDecodeError as e:\n-                raise ValueError(\"Invalid JSON grammar specification.\") from e\n+                raise VLLMValidationError(\"Invalid JSON grammar specification.\") from e\n         else:\n             try:\n                 json.dumps(so_params.json)\n             except Exception as e:\n-                raise ValueError(\n+                raise VLLMValidationError(\n                     f\"Error serializing structured outputs jsonschema: {e}\"\n                 ) from e\n         return\n     elif so_params.choice:\n         return\n     elif so_params.grammar:\n-        raise ValueError(\n+        raise VLLMValidationError(\n             \"LM Format Enforcer structured outputs backend \"\n             \"does not support grammar specifications\"\n         )"
+        },
+        {
+          "filename": "vllm/v1/structured_output/backend_outlines.py",
+          "status": "modified",
+          "additions": 13,
+          "deletions": 7,
+          "patch": "@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING\n import torch\n from regex import escape as regex_escape\n \n+from vllm.exceptions import VLLMValidationError\n from vllm.sampling_params import SamplingParams\n from vllm.utils.import_utils import LazyLoader\n from vllm.utils.torch_utils import PIN_MEMORY\n@@ -186,22 +187,27 @@ def validate_structured_output_request_outlines(params: SamplingParams):\n                 json.loads(so_params.json)\n                 schema = so_params.json\n             except json.JSONDecodeError as e:\n-                raise ValueError(\"Invalid JSON grammar specification.\") from e\n+                raise VLLMValidationError(\"Invalid JSON grammar specification.\") from e\n         else:\n             try:\n                 schema = json.dumps(so_params.json)\n             except Exception as e:\n-                raise ValueError(\n+                raise VLLMValidationError(\n                     f\"Error serializing structured outputs jsonschema: {e}\"\n                 ) from e\n-        pattern = json_schema.build_regex_from_schema(schema)\n+        try:\n+            pattern = json_schema.build_regex_from_schema(schema)\n+        except Exception as e:\n+            raise VLLMValidationError(\n+                f\"Failed to transform json schema into a regex: {e}\"\n+            ) from e\n         validate_regex_is_buildable(pattern)\n     elif so_params.choice:\n         choices = [regex_escape(str(choice)) for choice in so_params.choice]\n         regex = \"(\" + \"|\".join(choices) + \")\"\n         validate_regex_is_buildable(regex)\n     elif so_params.grammar:\n-        raise ValueError(\n+        raise VLLMValidationError(\n             \"Outlines structured outputs backend \"\n             \"does not support grammar specifications\"\n         )\n@@ -315,19 +321,19 @@ def validate_regex_is_buildable(pattern: str) -> None:\n         parsed = sre_parse.parse(pattern)\n \n     except sre_constants.error as e:\n-        raise ValueError(f\"Error parsing regex: {e}\") from e\n+        raise VLLMValidationError(f\"Error parsing regex: {e}\") from e\n \n     try:\n         _check_unsupported(parsed)\n     except ValueError as e:\n-        raise ValueError(\n+        raise VLLMValidationError(\n             f\"Regex uses unsupported feature for structured outputs: {e}. \"\n             \"Only basic matching constructs are supported—lookarounds, \"\n             \"backreferences, and unicode boundaries are not.\"\n         ) from e\n \n     if _prefix_needs_context(parsed):\n-        raise ValueError(\n+        raise VLLMValidationError(\n             \"Regex does not have a anchored universal start state\"\n             \"This means that the Regex uses anchors (^) or look-arounds \"\n             \"in a way which requires context before any token is matched.\""
+        },
+        {
+          "filename": "vllm/v1/structured_output/backend_xgrammar.py",
+          "status": "modified",
+          "additions": 10,
+          "deletions": 9,
+          "patch": "@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any\n import torch\n \n import vllm.envs\n+from vllm.exceptions import VLLMValidationError\n from vllm.logger import init_logger\n from vllm.sampling_params import SamplingParams\n from vllm.utils.import_utils import LazyLoader\n@@ -276,7 +277,7 @@ def has_xgrammar_unsupported_json_features(schema: dict[str, Any]) -> bool:\n def validate_xgrammar_grammar(sampling_params: SamplingParams) -> None:\n     \"\"\"Validate that the request is supported by structured output.\n \n-    Raises ValueError if the request is not supported.\n+    Raises VLLMValidationError if the request is not supported.\n     \"\"\"\n     if sampling_params.structured_outputs is None:\n         return\n@@ -298,7 +299,7 @@ def validate_xgrammar_grammar(sampling_params: SamplingParams) -> None:\n                 so_params.regex,\n             )\n         except Exception as err:\n-            raise ValueError(\n+            raise VLLMValidationError(\n                 f\"Failed to transform regex into a grammar: {err}\"\n             ) from err\n \n@@ -307,7 +308,7 @@ def validate_xgrammar_grammar(sampling_params: SamplingParams) -> None:\n         try:\n             xgr.Grammar.from_ebnf(choice_grammar)\n         except Exception as err:\n-            raise ValueError(\n+            raise VLLMValidationError(\n                 f\"Failed to transform choices into a grammar: {err}\"\n             ) from err\n         so_params.choice = None\n@@ -319,19 +320,19 @@ def validate_xgrammar_grammar(sampling_params: SamplingParams) -> None:\n             try:\n                 schema = json.loads(so_params.json)\n             except json.JSONDecodeError as e:\n-                raise ValueError(\"Invalid JSON grammar specification.\") from e\n+                raise VLLMValidationError(\"Invalid JSON grammar specification.\") from e\n         else:\n             schema = so_params.json\n \n         if has_xgrammar_unsupported_json_features(schema):\n-            raise ValueError(\n+            raise VLLMValidationError(\n                 \"The provided JSON schema contains features not supported by xgrammar.\"\n             )\n \n         try:\n             xgr.Grammar.from_json_schema(schema)\n         except Exception as err:\n-            raise ValueError(\n+            raise VLLMValidationError(\n                 f\"Failed to transform json schema into a grammar: {err}\"\n             ) from err\n         return\n@@ -342,7 +343,7 @@ def validate_xgrammar_grammar(sampling_params: SamplingParams) -> None:\n             try:\n                 so_params.grammar = convert_lark_to_ebnf(so_params.grammar)\n             except ValueError as e:\n-                raise ValueError(\n+                raise VLLMValidationError(\n                     \"Failed to convert the grammar from Lark to EBNF. \"\n                 ) from e\n \n@@ -351,7 +352,7 @@ def validate_xgrammar_grammar(sampling_params: SamplingParams) -> None:\n             # parse the grammar, but we aren't compiling it.\n             xgr.Grammar.from_ebnf(so_params.grammar)\n         except Exception as e:\n-            raise ValueError(\"Invalid grammar specification.\") from e\n+            raise VLLMValidationError(\"Invalid grammar specification.\") from e\n         return\n \n     if so_params.structural_tag:\n@@ -372,4 +373,4 @@ def validate_xgrammar_grammar(sampling_params: SamplingParams) -> None:\n             else:\n                 xgr.Grammar.from_structural_tag(so_params.structural_tag)\n         except Exception as e:\n-            raise ValueError(\"Invalid structural tag specification.\") from e\n+            raise VLLMValidationError(\"Invalid structural tag specification.\") from e\n"
+        }
+      ]
+    },
+    {
+      "sha": "8efa13b700f1836657699cae2503dc2feab27fa0",
+      "author": {
+        "name": "Nick Hill",
+        "email": "nickhill123@gmail.com"
+      },
+      "date": "2026-08-16T12:04:08+08:00",
+      "message": "[Bugfix] Pick the DeepSeek V4 eager cudagraph region per model runner (#52401)",
+      "parents": [
+        "6593754e61a45b27a93e40fa0479568945d38661"
+      ],
+      "stats": {
+        "total_additions": 96,
+        "total_deletions": 66,
+        "files_changed": 3
+      },
+      "files": [
+        {
+          "filename": "tests/test_config.py",
+          "status": "modified",
+          "additions": 24,
+          "deletions": 37,
+          "patch": "@@ -66,41 +66,18 @@ def test_v2_model_runner_env_tri_state(monkeypatch, env_value, expected):\n     assert envs.VLLM_USE_V2_MODEL_RUNNER is expected\n \n \n-@pytest.mark.parametrize(\n-    \"cudagraph_mode\",\n-    [CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL_AND_PIECEWISE],\n-)\n-def test_deepseek_v4_rejects_mrv1_piecewise_cudagraph(cudagraph_mode):\n-    config = SimpleNamespace(\n-        use_v2_model_runner=False,\n-        model_config=SimpleNamespace(architectures=[\"DeepseekV4ForCausalLM\"]),\n-        compilation_config=SimpleNamespace(cudagraph_mode=cudagraph_mode),\n-    )\n-\n-    with pytest.raises(ValueError, match=\"DeepSeek V4 does not support PIECEWISE\"):\n-        VllmConfig._validate_mrv1_piecewise_cudagraph(config)\n-\n-\n-@pytest.mark.parametrize(\n-    (\"use_v2_model_runner\", \"architecture\", \"cudagraph_mode\"),\n-    [\n-        (True, \"DeepseekV4ForCausalLM\", CUDAGraphMode.PIECEWISE),\n-        (False, \"DeepseekV4ForCausalLM\", CUDAGraphMode.NONE),\n-        (False, \"DeepseekV4ForCausalLM\", CUDAGraphMode.FULL),\n-        (False, \"DeepseekV4ForCausalLM\", CUDAGraphMode.FULL_DECODE_ONLY),\n-        (False, \"LlamaForCausalLM\", CUDAGraphMode.PIECEWISE),\n-    ],\n-)\n-def test_mrv1_piecewise_cudagraph_allowed(\n-    use_v2_model_runner, architecture, cudagraph_mode\n-):\n-    config = SimpleNamespace(\n-        use_v2_model_runner=use_v2_model_runner,\n-        model_config=SimpleNamespace(architectures=[architecture]),\n-        compilation_config=SimpleNamespace(cudagraph_mode=cudagraph_mode),\n-    )\n-\n-    VllmConfig._validate_mrv1_piecewise_cudagraph(config)\n+def test_rocm_defaults_deepseek_v4_to_mrv1(monkeypatch):\n+    \"\"\"ROCm keeps DeepSeek V4 on MRV1, which is still faster there.\"\"\"\n+    from vllm.config.vllm import default_v2_model_runner_architectures\n+    from vllm.platforms import current_platform\n+\n+    monkeypatch.setattr(current_platform, \"is_rocm\", lambda: True)\n+    # The lookup is lru_cached against a fixed platform.\n+    default_v2_model_runner_architectures.cache_clear()\n+    try:\n+        assert \"DeepseekV4ForCausalLM\" not in default_v2_model_runner_architectures()\n+    finally:\n+        default_v2_model_runner_architectures.cache_clear()\n \n \n @pytest.mark.parametrize(\n@@ -330,10 +307,20 @@ def test_resolve_cudagraph_mode_adjusts_spec_decode_sizes_only_for_v1(\n         ),\n     ],\n )\n-def test_is_default_v2_model_runner_model(model_config, expected):\n+def test_is_default_v2_model_runner_model(model_config, expected, monkeypatch):\n+    from vllm.config.vllm import default_v2_model_runner_architectures\n+    from vllm.platforms import current_platform\n+\n+    # The expectations below are the platform-independent defaults; ROCm's\n+    # DeepSeek V4 carve-out is covered by test_rocm_defaults_deepseek_v4_to_mrv1.\n+    monkeypatch.setattr(current_platform, \"is_rocm\", lambda: False)\n+    default_v2_model_runner_architectures.cache_clear()\n     config = SimpleNamespace(model_config=model_config)\n \n-    assert VllmConfig._is_default_v2_model_runner_model(config) is expected\n+    try:\n+        assert VllmConfig._is_default_v2_model_runner_model(config) is expected\n+    finally:\n+        default_v2_model_runner_architectures.cache_clear()\n \n \n @pytest.mark.skip_global_cleanup"
+        },
+        {
+          "filename": "vllm/config/vllm.py",
+          "status": "modified",
+          "additions": 7,
+          "deletions": 25,
+          "patch": "@@ -66,10 +66,6 @@ else:\n \n logger = init_logger(__name__)\n \n-MRV1_UNSUPPORTED_PIECEWISE_CUDAGRAPH_ARCHITECTURES = frozenset(\n-    {\"DeepseekV4ForCausalLM\"}\n-)\n-\n DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES = frozenset(\n     {\n         \"DeepseekV2ForCausalLM\",\n@@ -87,6 +83,13 @@ DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES = frozenset(\n @lru_cache\n def default_v2_model_runner_architectures() -> frozenset[str]:\n     \"\"\"Architectures defaulting to the V2 model runner on this platform.\"\"\"\n+    from vllm.platforms import current_platform\n+\n+    if current_platform.is_rocm():\n+        # TODO(rocm): DeepSeek V4 is still faster on MRV1 on ROCm. The\n+        # attention layer picks the eager cudagraph region MRV1 needs, so\n+        # this is a perf default only; drop it once MRV2 catches up.\n+        return DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES - {\"DeepseekV4ForCausalLM\"}\n     return DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES\n \n \n@@ -691,25 +694,6 @@ class VllmConfig:\n             return False\n         return is_default_v2_architecture or not model_config.is_moe\n \n-    def _validate_mrv1_piecewise_cudagraph(self) -> None:\n-        if self.use_v2_model_runner:\n-            return\n-        model_config = self.model_config\n-        if model_config is None:\n-            return\n-        if not self.compilation_config.cudagraph_mode.has_piecewise_cudagraphs():\n-            return\n-        architectures = getattr(model_config, \"architectures\", [])\n-        if any(\n-            arch in MRV1_UNSUPPORTED_PIECEWISE_CUDAGRAPH_ARCHITECTURES\n-            for arch in architectures\n-        ):\n-            raise ValueError(\n-                \"DeepSeek V4 does not support PIECEWISE CUDA graphs with \"\n-                \"Model Runner V1. Use Model Runner V2 or disable PIECEWISE \"\n-                \"CUDA graphs.\"\n-            )\n-\n     @property\n     def needs_dp_coordinator(self) -> bool:\n         \"\"\"\n@@ -1644,8 +1628,6 @@ class VllmConfig:\n                         \"pipeline parallelism\",\n                     )\n \n-        self._validate_mrv1_piecewise_cudagraph()\n-\n         # final check of cudagraph mode after all possible updates\n         if current_platform.is_cuda_alike():\n             if ("
+        },
+        {
+          "filename": "vllm/models/deepseek_v4/attention.py",
+          "status": "modified",
+          "additions": 65,
+          "deletions": 4,
+          "patch": "@@ -298,6 +298,13 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):\n                 eager_scratch_pool=eager_scratch_pool,\n             )\n \n+        self._prepare_and_attn_fn = self._prepare_and_attn\n+        if not vllm_config.use_v2_model_runner:\n+            # MRV1's piecewise capture only tolerates the wide eager region: with\n+            # the narrow one the attention input preparation stays in the captured\n+            # graph and MRV1 produces garbage (#51430).\n+            self._prepare_and_attn_fn = self._prepare_and_attn_eager\n+\n         # Will be None on ROCm for now.\n         self.aux_stream_list = aux_stream_list\n         # [0]: GEMM start / post-GEMM event0. [1..3]: GEMM done events;\n@@ -379,6 +386,64 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):\n             self.eps,\n         )\n \n+        self._prepare_and_attn_fn(\n+            hidden_states,\n+            qr,\n+            kv,\n+            kv_score,\n+            indexer_kv_score,\n+            indexer_weights,\n+            positions,\n+            o_padded,\n+        )\n+        o = o_padded[:, : self.n_local_heads, :]\n+\n+        # Inverse-RoPE + wo_a + wo_b output projection (platform-specific).\n+        return self._o_proj(o, positions)\n+\n+    @eager_break_during_capture\n+    def _prepare_and_attn_eager(\n+        self,\n+        hidden_states: torch.Tensor,\n+        qr: torch.Tensor,\n+        kv: torch.Tensor,\n+        kv_score: torch.Tensor,\n+        indexer_kv_score: torch.Tensor,\n+        indexer_weights: torch.Tensor,\n+        positions: torch.Tensor,\n+        o_padded: torch.Tensor,\n+    ) -> None:\n+        \"\"\"Wide eager region: the whole of ``_prepare_and_attn`` runs eagerly.\n+\n+        The nested ``_sparse_indexer_and_attn`` break runs inline, since\n+        ``add_eager`` clears ``_capturing`` before invoking this.\n+        \"\"\"\n+        self._prepare_and_attn(\n+            hidden_states,\n+            qr,\n+            kv,\n+            kv_score,\n+            indexer_kv_score,\n+            indexer_weights,\n+            positions,\n+            o_padded,\n+        )\n+\n+    def _prepare_and_attn(\n+        self,\n+        hidden_states: torch.Tensor,\n+        qr: torch.Tensor,\n+        kv: torch.Tensor,\n+        kv_score: torch.Tensor,\n+        indexer_kv_score: torch.Tensor,\n+        indexer_weights: torch.Tensor,\n+        positions: torch.Tensor,\n+        o_padded: torch.Tensor,\n+    ) -> None:\n+        \"\"\"Attention input preparation followed by the sparse indexer and MLA.\n+\n+        Only the latter runs in the eager break.\n+        \"\"\"\n         attn_metadata = get_forward_context().attn_metadata\n         indexer = self.indexer\n         compressor = self.compressor\n@@ -438,10 +503,6 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):\n             positions,\n             o_padded,\n         )\n-        o = o_padded[:, : self.n_local_heads, :]\n-\n-        # Inverse-RoPE + wo_a + wo_b output projection (platform-specific).\n-        return self._o_proj(o, positions)\n \n     def _fused_wqa_wkv_gemm(self, hidden_states: torch.Tensor) -> torch.Tensor:\n         # Override point: the ROCm layer preshuffles this weight in place, so\n"
+        }
+      ]
+    },
+    {
+      "sha": "6593754e61a45b27a93e40fa0479568945d38661",
+      "author": {
+        "name": "mispa-ms",
+        "email": "81828223+mispa-ms@users.noreply.github.com"
+      },
+      "date": "2026-08-16T12:03:53+08:00",
+      "message": "[Bugfix][Spec Decode] Keep EAGLE cache registration on the partial-hash-hit path (#52419)",
+      "parents": [
+        "edd4c8176cfd98ece8a29beda574378c42971967"
+      ],
+      "stats": {
+        "total_additions": 92,
+        "total_deletions": 20,
+        "files_changed": 2
+      },
+      "files": [
+        {
+          "filename": "tests/v1/core/prefix_cache/test_partial_prefix_cache_hits.py",
+          "status": "modified",
+          "additions": 74,
+          "deletions": 0,
+          "patch": "@@ -261,6 +261,80 @@ def test_hybrid_mamba_align_partial_hash_hit():\n     assert manager.get_blocks(\"1\").blocks[1][1].block_hash_num_tokens == 8\n \n \n+def test_eagle_group_registers_unaligned_tail_under_partial_hash_hits():\n+    \"\"\"An EAGLE group must not re-floor what partial hash hits leaves un-floored.\n+\n+    ``cache_blocks`` decides once how far a request may be registered, and with\n+    fine-grained partial hash hits that bound is the raw token count. The EAGLE\n+    branch then re-derives its own bound for the lookahead block; if it rounds\n+    down to ``scheduler_block_size`` again, everything between the last aligned\n+    boundary and the tail stops being registered -- ``(n % scheduler_block_size)\n+    - manager.block_size`` tokens per call, which is most of a segment whenever\n+    the group's own block is much smaller than the scheduler block.\n+    \"\"\"\n+    hash_block_size = 2\n+    mamba_block_size = 4 * hash_block_size\n+    kv_cache_config = KVCacheConfig(\n+        num_blocks=40,\n+        kv_cache_tensors=[],\n+        kv_cache_groups=[\n+            KVCacheGroupSpec(\n+                [\"full\"],\n+                FullAttentionSpec(\n+                    block_size=hash_block_size,\n+                    num_kv_heads=1,\n+                    head_size=1,\n+                    dtype=torch.float32,\n+                ),\n+            ),\n+            KVCacheGroupSpec(\n+                [\"mamba\"],\n+                MambaSpec(\n+                    block_size=mamba_block_size,\n+                    shapes=(1, 1),\n+                    dtypes=(torch.float32,),\n+                    mamba_cache_mode=\"align\",\n+                ),\n+            ),\n+        ],\n+    )\n+    manager = make_kv_cache_manager(\n+        kv_cache_config=kv_cache_config,\n+        max_model_len=8192,\n+        enable_caching=True,\n+        hash_block_size=hash_block_size,\n+    )\n+    coordinator = manager.coordinator\n+    assert coordinator.enable_partial_hash_hits\n+    # The full-attention group is the EAGLE one, and its block is smaller than\n+    # the scheduler block -- the geometry where re-flooring loses tokens.\n+    eagle_manager = coordinator.single_type_managers[0]\n+    eagle_manager.use_eagle = True\n+    assert eagle_manager.block_size < coordinator.scheduler_block_size\n+\n+    # Deliberately not a multiple of the scheduler block, so the two bounds\n+    # differ: floor(22/8)*8 + 2 = 18 against 22.\n+    num_tokens = coordinator.scheduler_block_size * 2 + hash_block_size * 3\n+    req = make_request(\"0\", list(range(num_tokens)), hash_block_size, sha256)\n+\n+    recorded: list[int] = []\n+    for single_type_manager in coordinator.single_type_managers:\n+        original = single_type_manager.cache_blocks\n+\n+        def spy(request, num_tokens_to_cache, *args, _orig=original, **kwargs):\n+            recorded.append(num_tokens_to_cache)\n+            return _orig(request, num_tokens_to_cache, *args, **kwargs)\n+\n+        single_type_manager.cache_blocks = spy\n+\n+    # allocate_slots caches on the way out, so this exercises the real path.\n+    computed_blocks, num_computed, _ = manager.get_computed_blocks(req)\n+    assert manager.allocate_slots(req, num_tokens, num_computed, computed_blocks)\n+\n+    # Every group, EAGLE or not, may register the whole unaligned tail.\n+    assert recorded == [num_tokens] * len(coordinator.single_type_managers)\n+\n+\n def test_hybrid_mamba_partial_tail_owner_uses_cow_on_continue():\n     hash_block_size = 2\n     block_size = 2 * hash_block_size"
+        },
+        {
+          "filename": "vllm/v1/core/kv_cache_coordinator.py",
+          "status": "modified",
+          "additions": 18,
+          "deletions": 20,
+          "patch": "@@ -6,7 +6,7 @@ from typing import NamedTuple\n \n from vllm import envs\n from vllm.logger import init_logger\n-from vllm.utils.math_utils import cdiv\n+from vllm.utils.math_utils import cdiv, round_down\n from vllm.v1.core.block_pool import BlockPool\n from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector\n from vllm.v1.core.kv_cache_utils import (\n@@ -704,39 +704,37 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):\n                 for gid in group.group_ids:\n                     self.single_type_managers[gid].use_eagle = True\n \n-    def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:\n+    def _align_cacheable(self, num_tokens: int) -> int:\n+        \"\"\"Largest prefix of ``num_tokens`` a future cache hit could match.\n+\n+        Hits are ``scheduler_block_size``-aligned (see\n+        ``find_longest_cache_hit``) unless fine-grained partial hash hits are\n+        enabled, in which case no rounding applies -- rounding even to\n+        ``hash_block_size`` would re-register a privatized Mamba tail.\n+        \"\"\"\n         if self.enable_partial_hash_hits:\n-            aligned_num_computed_tokens = num_computed_tokens\n-        else:\n-            # Cache hits in this coordinator are always a multiple of\n-            # ``scheduler_block_size`` tokens (see ``find_longest_cache_hit``).\n-            # Within an aligned region, SWA groups may only consult a subset of\n-            # blocks per ``scheduler_block_size``-segment so the unused blocks\n-            # also stay out of the prefix-cache hash map.\n-            aligned_num_computed_tokens = (\n-                num_computed_tokens\n-                // self.scheduler_block_size\n-                * self.scheduler_block_size\n-            )\n+            return num_tokens\n+        return round_down(num_tokens, self.scheduler_block_size)\n+\n+    def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:\n+        cached_num_computed_tokens = self._align_cacheable(num_computed_tokens)\n         for manager in self.single_type_managers:\n-            num_tokens_to_cache = aligned_num_computed_tokens\n+            num_tokens_to_cache = cached_num_computed_tokens\n             # EAGLE groups match one block past each aligned boundary and drop\n             # it, so make that lookahead block eligible to be cached.\n-            if manager.use_eagle and aligned_num_computed_tokens > 0:\n+            if manager.use_eagle and cached_num_computed_tokens > 0:\n                 # Only cache tokens with finalized KV. The last\n                 # num_reprefillable_tokens tokens can be re-prefilled during\n                 # multi-module MTP.\n                 num_finalized_computed_tokens = max(\n                     0, num_computed_tokens - self.num_reprefillable_tokens\n                 )\n-                aligned_num_finalized_computed_tokens = (\n+                cached_num_finalized_computed_tokens = self._align_cacheable(\n                     num_finalized_computed_tokens\n-                    // self.scheduler_block_size\n-                    * self.scheduler_block_size\n                 )\n                 num_tokens_to_cache = min(\n                     num_finalized_computed_tokens,\n-                    aligned_num_finalized_computed_tokens + manager.block_size,\n+                    cached_num_finalized_computed_tokens + manager.block_size,\n                 )\n             # The manager already knows the fine hit granularity\n             # (``scheduler_block_size``); retention is passed separately so it\n"
+        }
+      ]
+    },
+    {
+      "sha": "edd4c8176cfd98ece8a29beda574378c42971967",
+      "author": {
+        "name": "Toby Mao",
+        "email": "toby.mao@gmail.com"
+      },
+      "date": "2026-08-16T09:39:23+08:00",
+      "message": "[Bugfix][DSv4] Revert adaptive C128A metadata packing (#51318)\n\nSigned-off-by: tobymao <toby.mao@gmail.com>\nSigned-off-by: Yongye Zhu <zyy1102000@gmail.com>\nCo-authored-by: Claude <noreply@anthropic.com>\nCo-authored-by: Roger Wang <hey@rogerw.io>\nCo-authored-by: Yongye Zhu <zyy1102000@gmail.com>\nCo-authored-by: OpenAI Codex <codex@openai.com>",
+      "parents": [
+        "fa9d67f7828e9bc105912ddf41dc384105732b1e"
+      ],
+      "stats": {
+        "total_additions": 7,
+        "total_deletions": 56,
+        "files_changed": 2
+      },
+      "files": [
+        {
+          "filename": "tests/kernels/attention/test_flashmla_sparse.py",
+          "status": "modified",
+          "additions": 0,
+          "deletions": 37,
+          "patch": "@@ -4,43 +4,6 @@ import pytest\n import torch\n \n \n-def test_deepseek_v4_c128a_dynamic_topk_packed_buffers():\n-    from vllm.models.deepseek_v4.sparse_mla import build_c128a_topk_metadata\n-\n-    device = torch.device(\"cuda\")\n-    capacity_width = 256\n-    active_width = 128\n-    global_decode_buffer = torch.empty(\n-        (2, capacity_width), dtype=torch.int32, device=device\n-    )\n-    decode_lens_buffer = torch.empty(2, dtype=torch.int32, device=device)\n-    prefill_buffer = torch.empty((2, capacity_width), dtype=torch.int32, device=device)\n-\n-    global_decode, decode_lens, prefill_local = build_c128a_topk_metadata(\n-        positions=torch.tensor([255, 511], dtype=torch.int64, device=device),\n-        compress_ratio=128,\n-        num_decode_tokens=1,\n-        token_to_req_indices=torch.tensor([0, 0], dtype=torch.int32, device=device),\n-        block_table=torch.tensor([[3]], dtype=torch.int32, device=device),\n-        block_size=capacity_width,\n-        slot_mapping=torch.tensor([0, 1], dtype=torch.int64, device=device),\n-        global_decode_buffer=global_decode_buffer,\n-        decode_lens_buffer=decode_lens_buffer,\n-        prefill_buffer=prefill_buffer,\n-        max_compressed_tokens=active_width,\n-    )\n-\n-    assert global_decode.shape == (1, active_width)\n-    assert prefill_local.shape == (1, active_width)\n-    assert global_decode.stride() == (active_width, 1)\n-    assert prefill_local.stride() == (active_width, 1)\n-    assert global_decode[0, :2].cpu().tolist() == [768, 769]\n-    assert decode_lens.cpu().tolist() == [2]\n-    assert prefill_local[0, :4].cpu().tolist() == list(range(4))\n-    assert torch.all(global_decode[0, 2:] == -1)\n-    assert torch.all(prefill_local[0, 4:] == -1)\n-\n-\n def test_sparse_flashmla_metadata_smoke():\n     import vllm.v1.attention.ops.flashmla as fm\n "
+        },
+        {
+          "filename": "vllm/models/deepseek_v4/sparse_mla.py",
+          "status": "modified",
+          "additions": 7,
+          "deletions": 19,
+          "patch": "@@ -257,13 +257,6 @@ class DeepseekV4SparseMLAMetadataBuilder(\n         assert cm.positions is not None, (\n             \"positions is required for C128A metadata build\"\n         )\n-        active_topk_width = min(\n-            max(\n-                triton.next_power_of_2(max(cm.max_seq_len // self.compress_ratio, 1)),\n-                _C128A_TOPK_ALIGNMENT,\n-            ),\n-            self.c128a_max_compressed,\n-        )\n         block_size = self.kv_cache_spec.block_size // self.compress_ratio\n         global_decode, decode_lens, prefill_local = build_c128a_topk_metadata(\n             cm.positions[:num_total],\n@@ -276,7 +269,7 @@ class DeepseekV4SparseMLAMetadataBuilder(\n             self.c128a_global_decode_buffer,\n             self.c128a_decode_lens_buffer,\n             self.c128a_prefill_buffer,\n-            max_compressed_tokens=active_topk_width,\n+            max_compressed_tokens=self.c128a_max_compressed,\n         )\n \n         result: dict[str, torch.Tensor | None] = {}\n@@ -322,30 +315,25 @@ def build_c128a_topk_metadata(\n     Decode tokens: position → block_table lookup → global slot ids + topk_lens.\n     Prefill tokens: position → local indices [0, ..., n-1, -1, ...].\n \n-    Writes into packed views of pre-allocated buffers for CUDA graph stability.\n+    Writes into pre-allocated buffers for CUDA graph address stability.\n+    Returns slices of the buffers.\n     \"\"\"\n     num_tokens = positions.shape[0]\n     num_prefill_tokens = num_tokens - num_decode_tokens\n \n-    # view(-1) as 1-d array and then expanded to\n-    # [num_decode_tokens, max_compressed_tokens]\n-    global_decode = global_decode_buffer.view(-1)[\n-        : num_decode_tokens * max_compressed_tokens\n-    ].view(num_decode_tokens, max_compressed_tokens)\n+    global_decode = global_decode_buffer[:num_decode_tokens]\n     decode_lens = decode_lens_buffer[:num_decode_tokens]\n-    prefill_local = prefill_buffer.view(-1)[\n-        : num_prefill_tokens * max_compressed_tokens\n-    ].view(num_prefill_tokens, max_compressed_tokens)\n+    prefill_local = prefill_buffer[:num_prefill_tokens]\n \n     if num_tokens == 0:\n         return global_decode, decode_lens, prefill_local\n \n     _build_c128a_topk_metadata_kernel[(num_tokens,)](\n         global_decode_buffer,\n-        max_compressed_tokens,\n+        global_decode_buffer.stride(0),\n         decode_lens_buffer,\n         prefill_buffer,\n-        max_compressed_tokens,\n+        prefill_buffer.stride(0),\n         positions,\n         compress_ratio,\n         max_compressed_tokens,\n"
+        }
+      ]
+    },
+    {
+      "sha": "fa9d67f7828e9bc105912ddf41dc384105732b1e",
+      "author": {
+        "name": "omerpaz95",
+        "email": "73347585+omerpaz95@users.noreply.github.com"
+      },
+      "date": "2026-08-16T06:40:38+08:00",
+      "message": "[EC Connector] Added Build Connector Worker Meta for EC Connector (#49585)\n\nSigned-off-by: yewentao256 <zhyanwentao@126.com>\nSigned-off-by: omerpaz95 <omerpaz95@gmail.com>\nSigned-off-by: omerpaz95 <73347585+omerpaz95@users.noreply.github.com>\nCo-authored-by: yewentao256 <zhyanwentao@126.com>\nCo-authored-by: Wentao Ye <44945378+yewentao256@users.noreply.github.com>",
+      "parents": [
+        "c94cdd0ae03865c00b694ca6f13b2d2bc4360fcd"
+      ],
+      "stats": {
+        "total_additions": 430,
+        "total_deletions": 16,
+        "files_changed": 16
+      },
+      "files": [
+        {
+          "filename": ".buildkite/test_areas/misc.yaml",
+          "status": "modified",
+          "additions": 1,
+          "deletions": 0,
+          "patch": "@@ -127,6 +127,7 @@ steps:\n     - pytest -v -s v1/test_kv_cache_spec_registry.py\n     - pytest -v -s v1/cudagraph/test_cudagraph_manager.py\n     - pytest -v -s -m 'cpu_test' v1/kv_connector/unit\n+    - pytest -v -s -m 'cpu_test' v1/ec_connector/unit\n     - pytest -v -s -m 'cpu_test' v1/metrics\n \n - label: Extract Hidden States Integration"
+        },
+        {
+          "filename": "tests/v1/ec_connector/unit/test_ec_output_aggregator.py",
+          "status": "added",
+          "additions": 115,
+          "deletions": 0,
+          "patch": "new file mode 100644\n@@ -0,0 +1,115 @@\n+# SPDX-License-Identifier: Apache-2.0\n+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project\n+\"\"\"Unit tests for ECOutputAggregator.\"\"\"\n+\n+import pytest\n+\n+from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorWorkerMetadata\n+from vllm.distributed.ec_transfer.ec_connector.utils import ECOutputAggregator\n+from vllm.distributed.kv_transfer.kv_connector.utils import KVOutputAggregator\n+from vllm.v1.outputs import (\n+    EMPTY_MODEL_RUNNER_OUTPUT,\n+    ECConnectorOutput,\n+    KVConnectorOutput,\n+    ModelRunnerOutput,\n+)\n+\n+pytestmark = pytest.mark.cpu_test\n+\n+\n+class FakeWorkerMeta(ECConnectorWorkerMetadata):\n+    \"\"\"Records merge order. `aggregate` returns a new object, as the base class\n+    declares: an aggregator discarding the return value would lose the merge.\n+    \"\"\"\n+\n+    def __init__(self, saves: list[str]):\n+        self.saves = saves\n+\n+    def aggregate(self, other: \"FakeWorkerMeta\") -> \"FakeWorkerMeta\":\n+        return FakeWorkerMeta(self.saves + other.saves)\n+\n+\n+def _worker_output(ec_output: ECConnectorOutput | None) -> ModelRunnerOutput:\n+    return ModelRunnerOutput(\n+        req_ids=[], req_id_to_index={}, ec_connector_output=ec_output\n+    )\n+\n+\n+def test_aggregate_folds_every_rank_onto_output_rank():\n+    \"\"\"EC work done on any rank reaches the scheduler via output_rank's output.\n+\n+    The middle rank reports no worker metadata: it must neither seed nor clobber\n+    the accumulator.\n+    \"\"\"\n+    outputs = [\n+        _worker_output(\n+            ECConnectorOutput(\n+                finished_sending={\"mm0\"},\n+                ec_connector_worker_meta=FakeWorkerMeta([\"mm0\"]),\n+            )\n+        ),\n+        _worker_output(ECConnectorOutput(finished_recving={\"mm1\"})),\n+        _worker_output(\n+            ECConnectorOutput(ec_connector_worker_meta=FakeWorkerMeta([\"mm2\"]))\n+        ),\n+    ]\n+\n+    result = ECOutputAggregator().aggregate(outputs, output_rank=2)\n+\n+    assert result is outputs[2]\n+    assert result.ec_connector_output.finished_sending == {\"mm0\"}\n+    assert result.ec_connector_output.finished_recving == {\"mm1\"}\n+    assert result.ec_connector_output.ec_connector_worker_meta.saves == [\"mm0\", \"mm2\"]\n+\n+\n+def test_aggregate_leaves_no_ec_output_when_no_worker_reported():\n+    \"\"\"Empty per-worker reports must not reach the scheduler as an empty object.\"\"\"\n+    outputs = [_worker_output(ECConnectorOutput()), _worker_output(ECConnectorOutput())]\n+\n+    result = ECOutputAggregator().aggregate(outputs, output_rank=0)\n+\n+    assert result is outputs[0]\n+    assert result.ec_connector_output is None\n+    assert ECOutputAggregator().aggregate([None], output_rank=0) is None\n+\n+\n+def test_aggregate_does_not_write_through_the_shared_empty_output():\n+    \"\"\"A rank with nothing to report yields the shared empty output singleton.\n+\n+    Folding another rank's metadata onto it must not write through to the\n+    module-level object, which every later step would then carry.\n+    \"\"\"\n+    outputs = [\n+        _worker_output(\n+            ECConnectorOutput(ec_connector_worker_meta=FakeWorkerMeta([\"mm0\"]))\n+        ),\n+        EMPTY_MODEL_RUNNER_OUTPUT,\n+    ]\n+\n+    result = ECOutputAggregator().aggregate(outputs, output_rank=1)\n+\n+    assert EMPTY_MODEL_RUNNER_OUTPUT.ec_connector_output is None\n+    assert result is not EMPTY_MODEL_RUNNER_OUTPUT\n+    assert result.ec_connector_output.ec_connector_worker_meta.saves == [\"mm0\"]\n+\n+\n+def test_chaining_with_kv_aggregator_preserves_both_outputs():\n+    \"\"\"MultiprocExecutor chains both aggregators and keeps only the last result,\n+    so each must merge onto the same output_rank output rather than replace it.\n+    \"\"\"\n+    outputs = [\n+        _worker_output(ECConnectorOutput(finished_sending={\"mm0\"})),\n+        _worker_output(None),\n+    ]\n+    outputs[1].kv_connector_output = KVConnectorOutput(invalid_block_ids={7})\n+\n+    result = None\n+    for aggregator in (\n+        KVOutputAggregator(expected_finished_count=1),\n+        ECOutputAggregator(),\n+    ):\n+        result = aggregator.aggregate(outputs, output_rank=1)\n+\n+    assert result is outputs[1]\n+    assert result.kv_connector_output.invalid_block_ids == {7}\n+    assert result.ec_connector_output.finished_sending == {\"mm0\"}"
+        },
+        {
+          "filename": "tests/v1/ec_connector/unit/test_worker_ec_connector.py",
+          "status": "added",
+          "additions": 77,
+          "deletions": 0,
+          "patch": "new file mode 100644\n@@ -0,0 +1,77 @@\n+# SPDX-License-Identifier: Apache-2.0\n+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project\n+\"\"\"Unit tests for the V2 GPU model runner's EC connector wrapper.\"\"\"\n+\n+from types import SimpleNamespace\n+from unittest.mock import MagicMock, patch\n+\n+import pytest\n+\n+from vllm.distributed.ec_transfer.ec_connector.base import (\n+    ECConnectorBase,\n+    ECConnectorMetadata,\n+)\n+from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT\n+from vllm.v1.worker.gpu.ec_connector import NO_OP_EC_CONNECTOR, ActiveECConnector\n+\n+pytestmark = pytest.mark.cpu_test\n+\n+WORKER_META = object()\n+\n+\n+def _scheduler_output() -> SimpleNamespace:\n+    return SimpleNamespace(\n+        ec_connector_metadata=ECConnectorMetadata(), finished_req_ids=frozenset()\n+    )\n+\n+\n+def _connector(\n+    encoder_cache: dict | None = None,\n+    is_producer: bool = True,\n+    is_consumer: bool = False,\n+) -> tuple[ActiveECConnector, MagicMock]:\n+    fake = MagicMock(spec=ECConnectorBase)\n+    fake.is_producer = is_producer\n+    fake.is_consumer = is_consumer\n+    fake.get_finished.return_value = (None, None)\n+    fake.build_connector_worker_meta.return_value = WORKER_META\n+    with patch(\"vllm.v1.worker.gpu.ec_connector.get_ec_transfer\", return_value=fake):\n+        return ActiveECConnector(SimpleNamespace(), encoder_cache or {}), fake\n+\n+\n+@pytest.mark.parametrize(\n+    (\"is_producer\", \"is_consumer\"), [(True, False), (True, True), (False, True)]\n+)\n+def test_saves_newly_added_caches_for_every_producer(is_producer, is_consumer):\n+    \"\"\"An ec_both node is also a producer: it must offload what it just computed.\"\"\"\n+    encoder_cache = {\"mm_old\": None}\n+    connector, fake = _connector(encoder_cache, is_producer, is_consumer)\n+\n+    with connector.maybe_get_output(_scheduler_output()):\n+        encoder_cache[\"mm_new\"] = None\n+\n+    saved = [call.kwargs[\"mm_hash\"] for call in fake.save_caches.call_args_list]\n+    assert saved == ([\"mm_new\"] if is_producer else [])\n+    assert fake.start_load_caches.called == is_consumer\n+\n+\n+def test_worker_meta_is_reported_on_context_exit():\n+    \"\"\"Reported in the finally block, so is_empty() sees it only after the exit.\"\"\"\n+    connector, fake = _connector()\n+\n+    with connector.maybe_get_output(_scheduler_output()) as output:\n+        assert output.ec_connector_worker_meta is None\n+\n+    assert output.ec_connector_worker_meta is WORKER_META\n+    assert fake.clear_connector_metadata.called\n+\n+\n+def test_no_forward_reports_without_running_the_model():\n+    connector, _ = _connector()\n+\n+    output = connector.no_forward(_scheduler_output())\n+\n+    assert output.ec_connector_output.ec_connector_worker_meta is WORKER_META\n+\n+    empty = NO_OP_EC_CONNECTOR.no_forward(_scheduler_output())\n+    assert empty is EMPTY_MODEL_RUNNER_OUTPUT"
+        },
+        {
+          "filename": "tests/v1/executor/test_executor.py",
+          "status": "modified",
+          "additions": 3,
+          "deletions": 0,
+          "patch": "@@ -9,6 +9,7 @@ from typing import Any\n \n import pytest\n \n+from vllm.distributed.ec_transfer.ec_connector.utils import ECOutputAggregator\n from vllm.distributed.kv_transfer.kv_connector.utils import KVOutputAggregator\n from vllm.engine.arg_utils import AsyncEngineArgs, EngineArgs\n from vllm.sampling_params import SamplingParams\n@@ -98,6 +99,7 @@ class CustomMultiprocExecutor(MultiprocExecutor):\n         non_block: bool = False,\n         unique_reply_rank: int | None = None,\n         kv_output_aggregator: KVOutputAggregator = None,\n+        ec_output_aggregator: ECOutputAggregator | None = None,\n     ) -> Any | list[Any] | Future[Any | list[Any]]:\n         # Drop marker to show that this was run\n         with open(\".marker\", \"w\"):\n@@ -110,6 +112,7 @@ class CustomMultiprocExecutor(MultiprocExecutor):\n             non_block,\n             unique_reply_rank,\n             kv_output_aggregator,\n+            ec_output_aggregator,\n         )\n \n "
+        },
+        {
+          "filename": "tests/v1/kv_connector/unit/test_handshake_pp_aggregation.py",
+          "status": "modified",
+          "additions": 1,
+          "deletions": 0,
+          "patch": "@@ -55,6 +55,7 @@ def _run_engine_core_handshake(\n     class _FakeScheduler:\n         def __init__(self, **kwargs: Any) -> None:\n             self.connector = connector\n+            self.ec_connector = None\n \n         def get_kv_connector(self) -> KVConnectorBase_V1:\n             return connector"
+        },
+        {
+          "filename": "tests/v1/test_outputs.py",
+          "status": "modified",
+          "additions": 18,
+          "deletions": 1,
+          "patch": "@@ -6,7 +6,13 @@ import numpy as np\n import torch\n \n from vllm.platforms import current_platform\n-from vllm.v1.outputs import LogprobsLists, LogprobsTensors\n+from vllm.v1.outputs import (\n+    EMPTY_MODEL_RUNNER_OUTPUT,\n+    ECConnectorOutput,\n+    LogprobsLists,\n+    LogprobsTensors,\n+    ModelRunnerOutput,\n+)\n from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p\n from vllm.v1.worker.gpu.sample.output import SamplingMaskTensors\n \n@@ -200,3 +206,14 @@ class TestLogprobsLists(TestCase):\n         assert len(sliced.logprob_token_ids) == 9  # All tokens\n         assert sliced.logprob_token_ids == self.logprobsLists.logprob_token_ids\n         assert sliced.cu_num_generated_tokens is None\n+\n+\n+def test_with_ec_conn_output_copies_shared_empty_output():\n+    \"\"\"The shared empty output is copied, never written to.\"\"\"\n+    ec_output = ECConnectorOutput(finished_sending={\"mm_hash\"})\n+\n+    result = ModelRunnerOutput.with_ec_conn_output(EMPTY_MODEL_RUNNER_OUTPUT, ec_output)\n+\n+    assert result is not EMPTY_MODEL_RUNNER_OUTPUT\n+    assert result.ec_connector_output is ec_output\n+    assert EMPTY_MODEL_RUNNER_OUTPUT.ec_connector_output is None"
+        },
+        {
+          "filename": "tests/v1/worker/test_gpu_model_runner_v2_eplb.py",
+          "status": "modified",
+          "additions": 1,
+          "deletions": 0,
+          "patch": "@@ -180,6 +180,7 @@ def test_v2_sample_tokens_runs_eplb_on_non_last_pp_rank(monkeypatch):\n         hidden_states=None,\n         aux_hidden_states=None,\n         finished_req_ids=set(),\n+        ec_connector_output=None,\n         routed_experts=None,\n         num_tokens_across_dp=None,\n     )"
+        },
+        {
+          "filename": "vllm/distributed/ec_transfer/ec_connector/base.py",
+          "status": "modified",
+          "additions": 33,
+          "deletions": 0,
+          "patch": "@@ -20,6 +20,8 @@ The class provides the following primitives:\n \n         get_finished() - called with ids of finished requests, returns\n             ids of requests that have completed async sending/recving.\n+        build_connector_worker_meta() - builds metadata to be sent\n+            back to the scheduler-side connector\n \"\"\"\n \n import enum\n@@ -56,6 +58,27 @@ class ECConnectorMetadata(ABC):  # noqa: B024\n     pass\n \n \n+class ECConnectorWorkerMetadata(ABC):\n+    \"\"\"\n+    Abstract Metadata used to communicate back\n+    Worker ECConnector -> Scheduler ECConnector.\n+\n+    Each worker can output its own metadata.\n+    For a single engine step, all metadata objects returned by workers\n+    will be aggregated using the `aggregate` method below, before\n+    being passed to the Scheduler ECConnector.\n+    \"\"\"\n+\n+    @abstractmethod\n+    def aggregate(\n+        self, other: \"ECConnectorWorkerMetadata\"\n+    ) -> \"ECConnectorWorkerMetadata\":\n+        \"\"\"\n+        Aggregate metadata with another `ECConnectorWorkerMetadata` object.\n+        \"\"\"\n+        pass\n+\n+\n class ECConnectorBase(ABC):\n     def __init__(self, vllm_config: \"VllmConfig\", role: ECConnectorRole):\n         self._connector_metadata: ECConnectorMetadata | None = None\n@@ -190,6 +213,16 @@ class ECConnectorBase(ABC):\n         \"\"\"\n         return None, None\n \n+    def build_connector_worker_meta(self) -> ECConnectorWorkerMetadata | None:\n+        \"\"\"\n+        Build the ECConnector worker metadata for this engine step.\n+\n+        Returns:\n+            ECConnectorWorkerMetadata: the worker metadata.\n+            None if no worker metadata is available.\n+        \"\"\"\n+        return None\n+\n     # ==============================\n     # Scheduler-side methods\n     # =============================="
+        },
+        {
+          "filename": "vllm/distributed/ec_transfer/ec_connector/utils.py",
+          "status": "added",
+          "additions": 51,
+          "deletions": 0,
+          "patch": "new file mode 100644\n@@ -0,0 +1,51 @@\n+# SPDX-License-Identifier: Apache-2.0\n+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project\n+\"\"\"EC connector helper utilities.\"\"\"\n+\n+from vllm.v1.outputs import ECConnectorOutput, ModelRunnerOutput\n+\n+\n+class ECOutputAggregator:\n+    \"\"\"Merge every worker's EC connector output onto the single\n+    ModelRunnerOutput that reaches the scheduler.\n+\n+    Mirrors KVOutputAggregator: only `output_rank`'s output is returned to the\n+    scheduler, but the EC connector may have run on any rank.\n+    \"\"\"\n+\n+    def aggregate(\n+        self, outputs: list[ModelRunnerOutput | None], output_rank: int = 0\n+    ) -> ModelRunnerOutput | None:\n+        output = outputs[output_rank]\n+        if not output:\n+            return None\n+\n+        finished_sending = set[str]()\n+        finished_recving = set[str]()\n+        worker_meta = None\n+        for model_runner_output in outputs:\n+            assert model_runner_output is not None\n+            ec_output = model_runner_output.ec_connector_output\n+            if not ec_output:\n+                continue\n+\n+            finished_sending |= ec_output.finished_sending or set()\n+            finished_recving |= ec_output.finished_recving or set()\n+\n+            if meta := ec_output.ec_connector_worker_meta:\n+                worker_meta = (\n+                    meta if worker_meta is None else worker_meta.aggregate(meta)\n+                )\n+\n+        aggregated = ECConnectorOutput(\n+            finished_sending=finished_sending or None,\n+            finished_recving=finished_recving or None,\n+            ec_connector_worker_meta=worker_meta,\n+        )\n+        if aggregated.is_empty():\n+            output.ec_connector_output = None\n+            return output\n+\n+        # `output` is the shared empty output whenever `output_rank` had no work,\n+        # so attach through the copy-on-write helper.\n+        return ModelRunnerOutput.with_ec_conn_output(output, aggregated)"
+        },
+        {
+          "filename": "vllm/v1/engine/core.py",
+          "status": "modified",
+          "additions": 2,
+          "deletions": 0,
+          "patch": "@@ -173,6 +173,8 @@ class EngineCore:\n         )\n         if self.scheduler.connector is not None:  # type: ignore\n             self.model_executor.init_kv_output_aggregator(self.scheduler.connector)  # type: ignore\n+        if self.scheduler.ec_connector is not None:  # type: ignore\n+            self.model_executor.init_ec_output_aggregator()\n \n         mm_registry = MULTIMODAL_REGISTRY\n         self.mm_receiver_cache = mm_registry.engine_receiver_cache_from_config("
+        },
+        {
+          "filename": "vllm/v1/executor/abstract.py",
+          "status": "modified",
+          "additions": 5,
+          "deletions": 0,
+          "patch": "@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Literal, TypeVar, overload\n \n import vllm.envs as envs\n from vllm.config import VllmConfig\n+from vllm.distributed.ec_transfer.ec_connector.utils import ECOutputAggregator\n from vllm.distributed.kv_transfer.kv_connector.utils import KVOutputAggregator\n from vllm.distributed.kv_transfer.kv_connector.v1.base import (\n     KVConnectorHandshakeMetadata,\n@@ -110,6 +111,7 @@ class Executor(ABC):\n         self.is_sleeping = False\n         self.sleeping_tags: set[str] = set()\n         self.kv_output_aggregator: KVOutputAggregator | None = None\n+        self.ec_output_aggregator: ECOutputAggregator | None = None\n \n     @abstractmethod\n     def _init_executor(self) -> None:\n@@ -283,6 +285,9 @@ class Executor(ABC):\n             connector, self.parallel_config.world_size\n         )\n \n+    def init_ec_output_aggregator(self) -> None:\n+        self.ec_output_aggregator = ECOutputAggregator()\n+\n     @cached_property  # Avoid unnecessary RPC calls\n     def supported_tasks(self) -> tuple[SupportedTask, ...]:\n         output: list[tuple[SupportedTask, ...]]"
+        },
+        {
+          "filename": "vllm/v1/executor/multiproc_executor.py",
+          "status": "modified",
+          "additions": 20,
+          "deletions": 6,
+          "patch": "@@ -29,6 +29,7 @@ import vllm.envs as envs\n from vllm.config import VllmConfig\n from vllm.distributed import destroy_distributed_environment, destroy_model_parallel\n from vllm.distributed.device_communicators.shm_broadcast import Handle, MessageQueue\n+from vllm.distributed.ec_transfer.ec_connector.utils import ECOutputAggregator\n from vllm.distributed.kv_transfer.kv_connector.utils import KVOutputAggregator\n from vllm.distributed.parallel_state import (\n     get_dcp_group,\n@@ -343,6 +344,7 @@ class MultiprocExecutor(Executor):\n             non_block=non_block,\n             timeout=envs.VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS,\n             kv_output_aggregator=self.kv_output_aggregator,\n+            ec_output_aggregator=self.ec_output_aggregator,\n         )\n \n     def sample_tokens(  # type: ignore[override]\n@@ -355,6 +357,7 @@ class MultiprocExecutor(Executor):\n             non_block=non_block,\n             timeout=envs.VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS,\n             kv_output_aggregator=self.kv_output_aggregator,\n+            ec_output_aggregator=self.ec_output_aggregator,\n         )\n \n     def execute_dummy_batch(self) -> None:\n@@ -375,9 +378,10 @@ class MultiprocExecutor(Executor):\n         non_block: bool = False,\n         unique_reply_rank: int | None = None,\n         kv_output_aggregator: KVOutputAggregator | None = None,\n+        ec_output_aggregator: ECOutputAggregator | None = None,\n     ) -> Any:\n-        \"\"\"Returns single result if unique_reply_rank and/or kv_output_aggregator\n-        is provided, otherwise list.\"\"\"\n+        \"\"\"Returns single result if unique_reply_rank and/or an output\n+        aggregator is provided, otherwise list.\"\"\"\n         assert self.rpc_broadcast_mq is not None, (\n             \"collective_rpc should not be called on follower node\"\n         )\n@@ -387,11 +391,21 @@ class MultiprocExecutor(Executor):\n         deadline = None if timeout is None else time.monotonic() + timeout\n         kwargs = kwargs or {}\n \n-        if kv_output_aggregator is not None:\n+        aggregators = [a for a in (kv_output_aggregator, ec_output_aggregator) if a]\n+        aggregate: Callable[[Any], Any]\n+        if aggregators:\n             output_rank = None\n-            aggregate: Callable[[Any], Any] = partial(\n-                kv_output_aggregator.aggregate, output_rank=unique_reply_rank or 0\n-            )\n+\n+            def _aggregate(outputs: Any) -> Any:\n+                # Each aggregator merges its own connector's output onto\n+                # outputs[output_rank] in place and returns it, so chaining is safe.\n+                rank = unique_reply_rank or 0\n+                result = outputs[rank]\n+                for a in aggregators:\n+                    result = a.aggregate(outputs, output_rank=rank)\n+                return result\n+\n+            aggregate = _aggregate\n         else:\n             output_rank = unique_reply_rank\n             aggregate = lambda x: x"
+        },
+        {
+          "filename": "vllm/v1/executor/ray_executor.py",
+          "status": "modified",
+          "additions": 13,
+          "deletions": 0,
+          "patch": "@@ -89,6 +89,19 @@ class RayDistributedExecutor(Executor):\n         # KV connector setup\n         self.has_connector = self.vllm_config.kv_transfer_config is not None\n \n+        if (\n+            self.vllm_config.ec_transfer_config is not None\n+            and self.parallel_config.world_size > 1\n+        ):\n+            raise NotImplementedError(\n+                \"EC connector worker metadata is not supported with the \"\n+                \"legacy Ray executor when world_size > 1: only the output \"\n+                \"of a single worker is fetched, silently dropping the \"\n+                \"other workers' EC connector state. Set \"\n+                \"VLLM_USE_RAY_V2_EXECUTOR_BACKEND=1 to use RayExecutorV2, \"\n+                \"or use the multiprocessing executor instead.\"\n+            )\n+\n         self.uses_sampler = self.vllm_config.model_config.runner_type != \"pooling\" and (\n             self.vllm_config.ec_transfer_config is None\n             or self.vllm_config.ec_transfer_config.is_ec_consumer"
+        },
+        {
+          "filename": "vllm/v1/outputs.py",
+          "status": "modified",
+          "additions": 36,
+          "deletions": 0,
+          "patch": "@@ -14,6 +14,7 @@ from vllm.compilation.cuda_graph import CUDAGraphStat\n from vllm.v1.core.sched.output import SchedulerOutput\n \n if TYPE_CHECKING:\n+    from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorWorkerMetadata\n     from vllm.distributed.kv_events import KVConnectorKVEvents\n     from vllm.distributed.kv_transfer.kv_connector.v1.base import (\n         KVConnectorWorkerMetadata,\n@@ -23,6 +24,7 @@ else:\n     KVConnectorStats = object\n     KVConnectorWorkerMetadata = object\n     KVConnectorKVEvents = object\n+    ECConnectorWorkerMetadata = object\n \n \n class LogprobsLists(NamedTuple):\n@@ -292,6 +294,14 @@ class ECConnectorOutput:\n     # [mm_hash]\n     finished_sending: set[str] | None = None\n     finished_recving: set[str] | None = None\n+    ec_connector_worker_meta: ECConnectorWorkerMetadata | None = None\n+\n+    def is_empty(self):\n+        return (\n+            not self.finished_sending\n+            and not self.finished_recving\n+            and not self.ec_connector_worker_meta\n+        )\n \n \n # ModelRunnerOutput is serialized and sent to the scheduler process.\n@@ -362,6 +372,32 @@ class ModelRunnerOutput:\n         output.kv_connector_output = kv_connector_output\n         return output\n \n+    @staticmethod\n+    def with_ec_conn_output_only(\n+        ec_connector_output: ECConnectorOutput | None,\n+    ) -> \"ModelRunnerOutput\":\n+        \"\"\"Return an otherwise-empty output carrying `ec_connector_output`.\"\"\"\n+        return ModelRunnerOutput.with_ec_conn_output(\n+            EMPTY_MODEL_RUNNER_OUTPUT, ec_connector_output\n+        )\n+\n+    @staticmethod\n+    def with_ec_conn_output(\n+        output: \"ModelRunnerOutput\",\n+        ec_connector_output: ECConnectorOutput | None,\n+    ) -> \"ModelRunnerOutput\":\n+        \"\"\"Return `output` carrying `ec_connector_output`.\n+\n+        The shared empty output is copied rather than written to, so callers\n+        must use the return value.\n+        \"\"\"\n+        if ec_connector_output is None or ec_connector_output.is_empty():\n+            return output\n+        if output is EMPTY_MODEL_RUNNER_OUTPUT:\n+            output = copy(EMPTY_MODEL_RUNNER_OUTPUT)\n+        output.ec_connector_output = ec_connector_output\n+        return output\n+\n \n # ModelRunnerOutput wrapper for async scheduling.\n class AsyncModelRunnerOutput(ABC):"
+        },
+        {
+          "filename": "vllm/v1/worker/gpu/ec_connector.py",
+          "status": "modified",
+          "additions": 25,
+          "deletions": 2,
+          "patch": "@@ -9,7 +9,11 @@ import torch\n from vllm.config import VllmConfig\n from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer\n from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorBase\n-from vllm.v1.outputs import ECConnectorOutput\n+from vllm.v1.outputs import (\n+    EMPTY_MODEL_RUNNER_OUTPUT,\n+    ECConnectorOutput,\n+    ModelRunnerOutput,\n+)\n \n if TYPE_CHECKING:\n     from vllm.v1.core.sched.output import SchedulerOutput\n@@ -25,6 +29,12 @@ class ECConnector:\n     ) -> Generator[ECConnectorOutput | None, None, None]:\n         yield None\n \n+    def no_forward(\n+        self,\n+        scheduler_output: \"SchedulerOutput\",\n+    ) -> ModelRunnerOutput:\n+        return EMPTY_MODEL_RUNNER_OUTPUT\n+\n \n class ActiveECConnector(ECConnector):\n     def __init__(\n@@ -33,9 +43,11 @@ class ActiveECConnector(ECConnector):\n         encoder_cache: dict[str, torch.Tensor],\n     ) -> None:\n         self.encoder_cache = encoder_cache\n-        self.save_new_caches = vllm_config.is_ec_producer_only\n         self.ec_connector = get_ec_transfer()\n         assert isinstance(self.ec_connector, ECConnectorBase)\n+        # Every producer offloads freshly computed encoder outputs, including\n+        # an ec_both node that also reloads them.\n+        self.save_new_caches = self.ec_connector.is_producer\n \n     @contextmanager\n     def maybe_get_output(\n@@ -65,8 +77,19 @@ class ActiveECConnector(ECConnector):\n             output.finished_sending, output.finished_recving = (\n                 ec_connector.get_finished(scheduler_output.finished_req_ids)\n             )\n+            output.ec_connector_worker_meta = ec_connector.build_connector_worker_meta()\n             ec_connector.clear_connector_metadata()\n \n+    def no_forward(\n+        self,\n+        scheduler_output: \"SchedulerOutput\",\n+    ) -> ModelRunnerOutput:\n+        # EC send/recv even if no work to do.\n+        with self.maybe_get_output(scheduler_output) as ec_connector_output:\n+            pass\n+\n+        return ModelRunnerOutput.with_ec_conn_output_only(ec_connector_output)\n+\n \n NO_OP_EC_CONNECTOR = ECConnector()\n "
+        },
+        {
+          "filename": "vllm/v1/worker/gpu/model_runner.py",
+          "status": "modified",
+          "additions": 29,
+          "deletions": 7,
+          "patch": "@@ -65,6 +65,7 @@ from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput\n from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec\n from vllm.v1.outputs import (\n     DraftTokenIds,\n+    ECConnectorOutput,\n     ModelRunnerOutput,\n     RoutedExpertsTensors,\n     make_empty_encoder_model_runner_output,\n@@ -1393,6 +1394,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):\n             idx_mapping, num_sampled, self.req_states.num_computed_tokens.gpu\n         )\n \n+    def _merge_ec_connector_no_forward(\n+        self, scheduler_output: SchedulerOutput, output: ModelRunnerOutput\n+    ) -> ModelRunnerOutput:\n+        \"\"\"Let the EC connector send/recv on a step with no work to run.\"\"\"\n+        return ModelRunnerOutput.with_ec_conn_output(\n+            output,\n+            self.ec_connector.no_forward(scheduler_output).ec_connector_output,\n+        )\n+\n     @torch.inference_mode()\n     def execute_model(\n         self,\n@@ -1414,7 +1424,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):\n             if scheduler_output.total_num_scheduled_tokens == 0:\n                 # No need to run the model.\n                 empty_output = self.kv_connector.no_forward(scheduler_output)\n-                return empty_output\n+                return self._merge_ec_connector_no_forward(\n+                    scheduler_output, empty_output\n+                )\n \n         # Get batch descriptor and sync across DP ranks.\n         num_reqs = len(scheduler_output.num_scheduled_tokens)\n@@ -1455,7 +1467,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):\n         if batch_desc.num_tokens == 0:\n             # All DP ranks have zero tokens to run.\n             empty_output = self.kv_connector.no_forward(scheduler_output)\n-            return empty_output\n+            return self._merge_ec_connector_no_forward(scheduler_output, empty_output)\n \n         if not dummy_run:\n             # Common case.\n@@ -1572,9 +1584,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):\n                 input_ids = None\n \n         if self.is_encoder_only:\n-            output = make_empty_encoder_model_runner_output(scheduler_output)\n-            output.ec_connector_output = ec_connector_output\n-            return output\n+            return ModelRunnerOutput.with_ec_conn_output(\n+                make_empty_encoder_model_runner_output(scheduler_output),\n+                ec_connector_output,\n+            )\n \n         model_inputs = {\n             \"input_ids\": input_ids,\n@@ -1679,6 +1692,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):\n             hidden_states=hidden_states,\n             aux_hidden_states=aux_hidden_states,\n             finished_req_ids=finished_req_ids,\n+            ec_connector_output=ec_connector_output,\n             routed_experts=routed_experts,\n         )\n \n@@ -1702,6 +1716,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):\n         hidden_states = self.execute_model_state.hidden_states\n         aux_hidden_states = self.execute_model_state.aux_hidden_states\n         finished_req_ids = self.execute_model_state.finished_req_ids\n+        ec_connector_output = self.execute_model_state.ec_connector_output\n         routed_experts = self.execute_model_state.routed_experts\n         self.execute_model_state = None\n \n@@ -1721,7 +1736,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):\n \n             # Post-step KV connector related operations.\n             kv_connector_output = self.kv_connector.post_forward(finished_req_ids)\n-            return ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)\n+            # The first PP rank holds the encoder cache, so pass its EC output on.\n+            output = ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)\n+            return ModelRunnerOutput.with_ec_conn_output(output, ec_connector_output)\n \n         # Last rank: sample tokens\n         hidden_states, input_batch = pcp.maybe_restore_pcp_for_sampling(\n@@ -1838,6 +1855,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):\n         # Post-step KV connector related operations.\n         kv_connector_output = self.kv_connector.post_forward(finished_req_ids)\n         model_runner_output.kv_connector_output = kv_connector_output\n+        model_runner_output.ec_connector_output = ec_connector_output\n \n         return async_output\n \n@@ -1854,6 +1872,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):\n         input_batch = self.execute_model_state.input_batch\n         hidden_states = self.execute_model_state.hidden_states\n         finished_req_ids = self.execute_model_state.finished_req_ids\n+        ec_connector_output = self.execute_model_state.ec_connector_output\n         self.execute_model_state = None\n \n         # Post-step KV connector related operations.\n@@ -1861,7 +1880,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):\n \n         if not self.is_last_pp_rank:\n             self.postprocess_num_computed_tokens(input_batch)\n-            return ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)\n+            output = ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)\n+            return ModelRunnerOutput.with_ec_conn_output(output, ec_connector_output)\n \n         assert self.pooling_runner is not None\n         pooler_output, finished_mask = self.pooling_runner.pool(\n@@ -1873,6 +1893,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):\n             req_ids=input_batch.req_ids,\n             req_id_to_index={req_id: i for i, req_id in enumerate(input_batch.req_ids)},\n             kv_connector_output=kv_connector_output,\n+            ec_connector_output=ec_connector_output,\n         )\n         async_output = AsyncPoolingOutput(\n             model_runner_output=model_runner_output,\n@@ -1962,6 +1983,7 @@ class ExecuteModelState(NamedTuple):\n     hidden_states: torch.Tensor | None\n     aux_hidden_states: list[torch.Tensor] | None\n     finished_req_ids: set[str]\n+    ec_connector_output: ECConnectorOutput | None\n     routed_experts: RoutedExpertsTensors | None\n \n \n"
+        }
+      ]
+    },
+    {
+      "sha": "c94cdd0ae03865c00b694ca6f13b2d2bc4360fcd",
+      "author": {
+        "name": "Henry Su",
+        "email": "henrysu4707@gmail.com"
+      },
+      "date": "2026-08-16T05:13:02+08:00",
+      "message": "[Bugfix][Sampling] Clear empty side on thinking-budget asymmetric SWAP (#49613)\n\nSigned-off-by: Henry Su <henrysu4707@gmail.com>",
+      "parents": [
+        "ed0f4750f8766c2cc3984be4f1ba073a6915d4ed"
+      ],
+      "stats": {
+        "total_additions": 97,
+        "total_deletions": 2,
+        "files_changed": 2
+      },
+      "files": [
+        {
+          "filename": "tests/v1/sample/test_thinking_budget_state.py",
+          "status": "added",
+          "additions": 95,
+          "deletions": 0,
+          "patch": "new file mode 100644\n@@ -0,0 +1,95 @@\n+# SPDX-License-Identifier: Apache-2.0\n+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project\n+\"\"\"Unit tests for ThinkingBudgetStateHolder batch index moves.\"\"\"\n+\n+import torch\n+\n+from vllm.sampling_params import SamplingParams\n+from vllm.v1.sample.logits_processor.interface import (\n+    BatchUpdate,\n+    MoveDirectionality,\n+)\n+from vllm.v1.sample.thinking_budget_state import ThinkingBudgetStateHolder\n+\n+\n+class _MockReasoningConfig:\n+    reasoning_start_token_ids = [151667]\n+    reasoning_end_token_ids = [151668]\n+\n+\n+def _make_holder() -> ThinkingBudgetStateHolder:\n+    return ThinkingBudgetStateHolder(\n+        _MockReasoningConfig(),\n+        8,\n+        0,\n+        torch.device(\"cpu\"),\n+        False,\n+    )\n+\n+\n+def test_swap_budgeted_with_unbudgeted_clears_empty_side():\n+    \"\"\"Asymmetric SWAP must not leave the empty index sharing state.\"\"\"\n+    h = _make_holder()\n+    h.sync_batch(\n+        BatchUpdate(\n+            batch_size=2,\n+            removed=(),\n+            added=[\n+                (0, SamplingParams(thinking_token_budget=5), None, []),\n+                (1, SamplingParams(), None, []),\n+            ],\n+            moved=(),\n+        )\n+    )\n+    assert list(h._state.keys()) == [0]\n+    budget_state = h._state[0]\n+\n+    h.sync_batch(\n+        BatchUpdate(\n+            batch_size=2,\n+            removed=(),\n+            added=(),\n+            moved=[(0, 1, MoveDirectionality.SWAP)],\n+        )\n+    )\n+    assert list(h._state.keys()) == [1]\n+    assert h._state[1] is budget_state\n+    assert h._state[1][\"thinking_token_budget\"] == 5\n+\n+    h.sync_batch(\n+        BatchUpdate(\n+            batch_size=2,\n+            removed=(),\n+            added=(),\n+            moved=[(0, 1, MoveDirectionality.SWAP)],\n+        )\n+    )\n+    assert list(h._state.keys()) == [0]\n+    assert h._state[0] is budget_state\n+\n+\n+def test_swap_exchanges_two_budgeted_states():\n+    h = _make_holder()\n+    h.sync_batch(\n+        BatchUpdate(\n+            batch_size=2,\n+            removed=(),\n+            added=[\n+                (0, SamplingParams(thinking_token_budget=3), None, []),\n+                (1, SamplingParams(thinking_token_budget=7), None, []),\n+            ],\n+            moved=(),\n+        )\n+    )\n+    b0 = h._state[0][\"thinking_token_budget\"]\n+    b1 = h._state[1][\"thinking_token_budget\"]\n+    h.sync_batch(\n+        BatchUpdate(\n+            batch_size=2,\n+            removed=(),\n+            added=(),\n+            moved=[(0, 1, MoveDirectionality.SWAP)],\n+        )\n+    )\n+    assert h._state[0][\"thinking_token_budget\"] == b1\n+    assert h._state[1][\"thinking_token_budget\"] == b0"
+        },
+        {
+          "filename": "vllm/v1/sample/thinking_budget_state.py",
+          "status": "modified",
+          "additions": 2,
+          "deletions": 2,
+          "patch": "@@ -100,8 +100,8 @@ class ThinkingBudgetStateHolder:\n \n         for i1, i2, direction in batch_update.moved:\n             if direction == MoveDirectionality.SWAP:\n-                state1 = self._state.get(i1)\n-                state2 = self._state.get(i2)\n+                state1 = self._state.pop(i1, None)\n+                state2 = self._state.pop(i2, None)\n                 if state1 is not None:\n                     self._state[i2] = state1\n                 if state2 is not None:\n"
+        }
+      ]
+    },
+    {
+      "sha": "ed0f4750f8766c2cc3984be4f1ba073a6915d4ed",
+      "author": {
+        "name": "Uranus",
+        "email": "109661872+UranusSeven@users.noreply.github.com"
+      },
+      "date": "2026-08-16T02:59:22+08:00",
+      "message": "[Bugfix][Model] Kimi-K3 MegaMoE: pass situ_beta/situ_linear_beta to fp8_fp4_mega_moe (#52445)\n\nSigned-off-by: UranusSeven <109661872+UranusSeven@users.noreply.github.com>\nCo-authored-by: Claude <noreply@anthropic.com>",
+      "parents": [
+        "d4801990a45792c7081652f8ebea4ee56ceb67f9"
+      ],
+      "stats": {
+        "total_additions": 2,
+        "total_deletions": 2,
+        "files_changed": 1
+      },
+      "files": [
+        {
+          "filename": "vllm/models/kimi_k3/nvidia/model.py",
+          "status": "modified",
+          "additions": 2,
+          "deletions": 2,
+          "patch": "@@ -486,8 +486,8 @@ class KimiK3MegaMoEExperts(DeepseekV4MegaMoEExperts):\n             symm_buffer,\n             activation_clamp=activation_clamp,\n             activation=self.activation,\n-            activation_beta=self.activation_beta,\n-            activation_linear_beta=self.activation_linear_beta,\n+            situ_beta=self.activation_beta,\n+            situ_linear_beta=self.activation_linear_beta,\n             fast_math=fast_math,\n         )\n         return y\n"
+        }
+      ]
+    }
+  ]
+}

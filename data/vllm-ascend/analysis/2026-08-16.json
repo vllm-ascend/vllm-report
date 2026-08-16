@@ -1,0 +1,66 @@
+{
+  "date": "2026-08-16",
+  "repo": "vllm-project/vllm-ascend",
+  "generated_at": "2026-08-17T02:47:42.745964+08:00",
+  "daily_summary": "当日 3 个提交均围绕 vLLM v0.27.1 适配的稳定性修复：一是 Mooncake KV transfer 接收线程中 KV cache reformat 的执行时序调整，解决 TP rank 间数据不一致问题；二是 MRV2 DSA attention 后端在 prefill/decode 与 MTP speculative decoding 场景下的 is_prefilling 元数据传递修复，并同步对齐 DSA get_kv_cache_shape 接口签名；三是 CI weekly 测试补充 OPENLIBING_SECRET 环境变量。总体以分布式 KV 传输和注意力元数据正确性为主，附带 CI 可用性修复。",
+  "test_impact_summary": "当日变更对测试看护有一定增量要求：Mooncake reformat 时序修复未附带测试，需要新增覆盖多 TP pull 任务完成顺序与 reformat 执行顺序的并发回归测试；DSA 元数据修复虽已更新 test_attn_utils_v2.py 覆盖默认 runner 与 MRV2 eager/FULL graph 路径，但 MTP spec decode 的 build_draft_attn_metadata_factory 签名变化以及 DSA 跳过 seq_lens 更新的分支仍缺少直接测试，建议补充；CI secret 变更为 workflow 级配置，不影响单元测试。整体看护策略应在分布式 KV transfer 和 DSA spec decode 两条路径上加强回归。",
+  "commits": [
+    {
+      "sha": "1db6265104ebd620215e9430a425c146a823eb37",
+      "comment": "该提交修复 Mooncake PD 分离场景下 KV cache reformat 执行时序错误导致的 TP 间精度不一致。修改前，_preprocess_attention_group_reformat 可能在某个 shard 的 TP pull 任务尚未全部完成时立即执行 reformat，导致各 TP rank 的 KV cache 重排结果不一致。修复方式是在 KVCacheRecvingThread 中新增 pending_reformat（request_id -> shard_idx -> reformat 组）暂存 ready 的 reformat 组，并在 finally 中通过 _mark_request_task_done 判断该 request 的所有 pull 任务完成后，按 shard_idx 排序统一调用 _apply_kv_cache_reformat；失败路径会清理 pending 状态并标记失败。同时通过 shard_idx=pcp_dcp_rank 将 shard 索引透传到元数据中。实现上使用锁保护 pending_reformat，排序保证跨 shard 的确定性。潜在风险是如果请求始终未触发 all_task_done，pending_reformat 可能滞留，但现有 task_tracker 机制应能兜底；另外部分 shard 已 reformat 后若后续 shard 失败，可能留下部分重排状态。建议补充并发/时序回归测试。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "distributed",
+        "kv-transfer"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "该修复涉及多线程时序和 TP 一致性，但提交未新增直接测试；需要针对所有 TP pull 完成后才按 shard 顺序 reformat 的逻辑增加回归测试，防止后续重排时序回退。",
+        "suggested_test_areas": [
+          "tests/ut/distributed/test_mooncake_connector.py",
+          "vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py"
+        ]
+      },
+      "message": "[BugFix]Fix precision issues caused by incorrect reordering timing leading to TP inequality (#12359)\n\n### What this PR does / why we need it?\nFix precision issues caused by incorrect reordering timing leading to TP\ninequality\n\n### Does this PR introduce _any_ user-facing change?\nNo\n\n### How was this patch tested?\nBy ci\n\n- vLLM version: v0.27.1\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/58d3918e3ea0a544ffedadad2ba84559e9c51d8f\n\nSigned-off-by: wangxiaoteng <wangxiaoteng@huawei.com>"
+    },
+    {
+      "sha": "dd6805d846bdac9474f3a4d59fdadb99beda8aca",
+      "comment": "该提交修复 MRV2 下 DSA 注意力后端 prefill/decode 状态未正确传递的问题。核心改动包括：从 AscendInputBatch 的 is_prefilling_np 构造 torch tensor 并传入 build_attn_metadata；build_attn_metadata 新增 is_prefilling 可选参数并放入公共 attention metadata；DSA get_kv_cache_shape 参数名由 cache_type 改为 cache_dtype_str，与当前后端接口对齐；MTP speculative decoding 的 draft attention metadata 通过 build_draft_attn_metadata_factory 传递同一 is_prefilling；同时 DSA 跳过 _ascend_update_seq_lens 的通用 seq_lens+1 逻辑，避免与 DSA metadata builder 自身维护的序列长度状态冲突。整体改动集中在 v2 model runner 的 attention metadata 链路，is_prefilling 默认 None，对默认后端无行为影响。风险点包括 build_draft_attn_metadata_factory 签名变化，若存在其他调用方需同步；以及 DSA 跳过通用 seq_lens 更新后，后续若出现其他自维护 seq_lens 的后端可能需要类似分支。已有 UT 覆盖默认/MRV2 eager/FULL graph 路径，但 MTP spec decode 路径建议补充回归。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "attention",
+        "model-runner",
+        "spec_decode"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "提交已更新 test_attn_utils_v2.py 覆盖 DSA is_prefilling 元数据传播，但 build_draft_attn_metadata_factory 签名变化和 DSA 下跳过 _ascend_update_seq_lens 的分支未被直接测试，建议补充 MTP/DSA spec decode 相关回归测试。",
+        "suggested_test_areas": [
+          "tests/ut/worker/test_attn_utils_v2.py",
+          "tests/ut/spec_decode/test_dsa_mtp_metadata.py",
+          "vllm_ascend/worker/v2/spec_decode/autoregressive/speculator.py"
+        ]
+      },
+      "message": "[BugFix][MRV2] Fix DSA prefill metadata propagation (#14211)\n\n### What this PR does / why we need it?\n\nFix DSA attention metadata handling in ModelRunner V2:\n\n- Propagate each request's `is_prefilling` state from `AscendInputBatch`\ninto common DSA attention metadata.\n- Apply the same propagation when building draft attention metadata for\nMTP speculative decoding.\n- Keep DSA sequence-length state under the DSA metadata builder instead\nof applying the generic speculative-decoding update.\n- Align the DSA KV-cache shape method signature with the current backend\ninterface.\n- Add regression coverage for the default runner and MRV2 eager/FULL\ngraph metadata paths.\n\n### Does this PR introduce _any_ user-facing change?\n\nNo public API change. This fixes DSA MRV2 runtime correctness for\nprefill/decode state handling, including MTP speculative decoding.\n\n### How was this patch tested?\n\n- `pytest -sv tests/ut/worker/test_attn_utils_v2.py` — 5 passed with\nvLLM v0.27.1.\n- `git diff --check origin/main..HEAD` — passed.\n\n- vLLM version: v0.27.1\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/58d3918e3ea0a544ffedadad2ba84559e9c51d8f\n\nSigned-off-by: leolee <yihao.li@huawei.com>"
+    },
+    {
+      "sha": "9a276026c6e68faa6ea35f85a538f719bb508767",
+      "comment": "该提交是 CI 配置修复：在 schedule_weekly_test_a3.yaml 的 weekly job 环境中补充 OPENLIBING_SECRET secret 传递，避免依赖该 secret 的 A3 测试因缺少环境变量而失败。纯 workflow 变更，不涉及 Python 运行时代码，风险极低。",
+      "tags": [
+        "ci",
+        "chore",
+        "low-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "该提交仅新增 CI workflow 的环境变量透传，不改变 vllm-ascend 运行时或测试逻辑，不需要新增单元测试。",
+        "suggested_test_areas": []
+      },
+      "message": "[CI] Fix weekly test for missing OPENLIBING_SECRET (#14366)\n\n### What this PR does / why we need it?\n\nFix weekly test for missing OPENLIBING_SECRET\n\n### Does this PR introduce _any_ user-facing change?\n\n### How was this patch tested?\n\n- vLLM version: v0.27.1\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/58d3918e3ea0a544ffedadad2ba84559e9c51d8f\n\nSigned-off-by: hfadzxy <starmoon_zhang@163.com>"
+    }
+  ],
+  "architecture_based_on_sha": "e04f251a5895969d1c1f4ac9a3807177a0c4769c",
+  "architecture_generated_at": "2026-08-01T20:25:03.693997+08:00"
+}

@@ -1,0 +1,113 @@
+{
+  "date": "2026-08-16",
+  "repo": "vllm-project/vllm-ascend",
+  "branch": "main",
+  "commits": [
+    {
+      "sha": "1db6265104ebd620215e9430a425c146a823eb37",
+      "author": {
+        "name": "wangxiaoteng888",
+        "email": "56506195+wangxiaoteng888@users.noreply.github.com"
+      },
+      "date": "2026-08-16T18:45:45+08:00",
+      "message": "[BugFix]Fix precision issues caused by incorrect reordering timing leading to TP inequality (#12359)\n\n### What this PR does / why we need it?\nFix precision issues caused by incorrect reordering timing leading to TP\ninequality\n\n### Does this PR introduce _any_ user-facing change?\nNo\n\n### How was this patch tested?\nBy ci\n\n- vLLM version: v0.27.1\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/58d3918e3ea0a544ffedadad2ba84559e9c51d8f\n\nSigned-off-by: wangxiaoteng <wangxiaoteng@huawei.com>",
+      "parents": [
+        "dd6805d846bdac9474f3a4d59fdadb99beda8aca"
+      ],
+      "stats": {
+        "total_additions": 59,
+        "total_deletions": 1,
+        "files_changed": 1
+      },
+      "files": [
+        {
+          "filename": "vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py",
+          "status": "modified",
+          "additions": 59,
+          "deletions": 1,
+          "patch": "@@ -466,6 +466,12 @@ class KVCacheRecvingThread(threading.Thread):\n         self.remote_block_stride_per_addr: dict[str, dict[int, list[list[int]]]] = SizedDict()\n         self.remote_kv_group2layeridx: dict[str, dict[int, dict[int, tuple[dict[str, Any], list[int]]]]] = SizedDict()\n         self.remote_metadata_lock = threading.Lock()\n+        # Reformat metadata keyed by request_id then CP shard index. Populated by the\n+        # last TP-offset pull task for each shard; applied once all pull tasks finish.\n+        self.pending_reformat: defaultdict[str, dict[int, list[tuple[int, list[list[int]], int, list[int]]]]] = (\n+            defaultdict(dict)\n+        )\n+        self.pending_reformat_lock = threading.Lock()\n \n         self.request_queue: queue.Queue[Any] = queue.Queue()\n         first_kv_cache = next(iter(self.kv_caches.values()))\n@@ -559,6 +565,7 @@ class KVCacheRecvingThread(threading.Thread):\n         remote_port_send_num: dict[int, RemotePortInfo] | None = None,\n         num_computed_tokens: int = 0,\n         all_task_done: bool = False,\n+        shard_idx: int = 0,\n         local_block_ids_replicate_k: BlockIds | None = None,\n         remote_block_ids_replicate_k: BlockIds | None = None,\n     ):\n@@ -579,6 +586,7 @@ class KVCacheRecvingThread(threading.Thread):\n             \"num_computed_tokens\": num_computed_tokens,\n             \"remote_port_send_num\": remote_port_send_num,\n             \"all_task_done\": all_task_done,\n+            \"shard_idx\": shard_idx,\n             \"remote_block_size\": remote_block_size,\n         }\n         logger.debug(\"Adding request %s to the queue.Trans info:%s\", request_id, trans_info)\n@@ -718,7 +726,24 @@ class KVCacheRecvingThread(threading.Thread):\n                     self._mark_failed_recv_request(request_id, req_meta[\"local_block_ids\"])\n                     logger.exception(\"Failed to transfer KV cache for request %s: %s\", remote_request_id, e)\n         finally:\n-            if self._mark_request_task_done(request_id, all_task_done):\n+            all_tasks_done = self._mark_request_task_done(request_id, all_task_done)\n+            if all_tasks_done:\n+                if transfer_failed or self._is_failed_recv_request(request_id):\n+                    with self.pending_reformat_lock:\n+                        self.pending_reformat.pop(request_id, None)\n+                else:\n+                    try:\n+                        self._reformat_pending_kv_caches(request_id)\n+                    except Exception as e:\n+                        transfer_failed = True\n+                        self._mark_failed_recv_request(request_id, req_meta[\"local_block_ids\"])\n+                        with self.pending_reformat_lock:\n+                            self.pending_reformat.pop(request_id, None)\n+                        logger.exception(\n+                            \"Failed to reformat KV cache after all pulls for request %s: %s\",\n+                            remote_request_id,\n+                            e,\n+                        )\n                 self.task_tracker.update_done_task_count(request_id)\n                 with self.proc_not_transfer_request_lock:\n                     self.proc_not_transfer_request.pop(remote_request_id, None)\n@@ -1006,6 +1031,38 @@ class KVCacheRecvingThread(threading.Thread):\n         for reformat_group, is_group_transfer_end in attention_group_reformat_block_ids:\n             if is_group_transfer_end:\n                 ready_attention_group_reformat_block_ids.append(reformat_group)\n+        if ready_attention_group_reformat_block_ids:\n+            shard_idx = int(req_meta.get(\"shard_idx\", 0))\n+            self._stash_pending_reformat(\n+                req_meta[\"request_id\"],\n+                shard_idx,\n+                ready_attention_group_reformat_block_ids,\n+            )\n+\n+    def _stash_pending_reformat(\n+        self,\n+        request_id: str,\n+        shard_idx: int,\n+        ready_attention_group_reformat_block_ids: list[tuple[int, list[list[int]], int, list[int]]],\n+    ) -> None:\n+        with self.pending_reformat_lock:\n+            self.pending_reformat[request_id][shard_idx] = ready_attention_group_reformat_block_ids\n+\n+    def _reformat_pending_kv_caches(self, request_id: str) -> None:\n+        with self.pending_reformat_lock:\n+            shard_reformats = self.pending_reformat.pop(request_id, {})\n+        for shard_idx in sorted(shard_reformats):\n+            logger.debug(\n+                \"Reformatting KV cache after all pulls completed. request_id=%s shard_idx=%s\",\n+                request_id,\n+                shard_idx,\n+            )\n+            self._apply_kv_cache_reformat(shard_reformats[shard_idx])\n+\n+    def _apply_kv_cache_reformat(\n+        self,\n+        ready_attention_group_reformat_block_ids: list[tuple[int, list[list[int]], int, list[int]]],\n+    ) -> None:\n         if not ready_attention_group_reformat_block_ids:\n             return\n \n@@ -3550,6 +3607,7 @@ class MooncakeConnectorWorker:\n                             pcp_dcp_rank == len(remote_handshake_port_list) - 1\n                             and remote_tp_offset == len(remote_ports) - 1\n                         ),\n+                        shard_idx=pcp_dcp_rank,\n                         remote_block_size=meta.remote_block_size,\n                         local_block_ids_replicate_k=local_block_ids_replicate_k_for_port,\n                         remote_block_ids_replicate_k=remote_block_ids_replicate_k_for_port,\n"
+        }
+      ]
+    },
+    {
+      "sha": "dd6805d846bdac9474f3a4d59fdadb99beda8aca",
+      "author": {
+        "name": "leolee",
+        "email": "83689697+li1how@users.noreply.github.com"
+      },
+      "date": "2026-08-16T16:20:02+08:00",
+      "message": "[BugFix][MRV2] Fix DSA prefill metadata propagation (#14211)\n\n### What this PR does / why we need it?\n\nFix DSA attention metadata handling in ModelRunner V2:\n\n- Propagate each request's `is_prefilling` state from `AscendInputBatch`\ninto common DSA attention metadata.\n- Apply the same propagation when building draft attention metadata for\nMTP speculative decoding.\n- Keep DSA sequence-length state under the DSA metadata builder instead\nof applying the generic speculative-decoding update.\n- Align the DSA KV-cache shape method signature with the current backend\ninterface.\n- Add regression coverage for the default runner and MRV2 eager/FULL\ngraph metadata paths.\n\n### Does this PR introduce _any_ user-facing change?\n\nNo public API change. This fixes DSA MRV2 runtime correctness for\nprefill/decode state handling, including MTP speculative decoding.\n\n### How was this patch tested?\n\n- `pytest -sv tests/ut/worker/test_attn_utils_v2.py` — 5 passed with\nvLLM v0.27.1.\n- `git diff --check origin/main..HEAD` — passed.\n\n- vLLM version: v0.27.1\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/58d3918e3ea0a544ffedadad2ba84559e9c51d8f\n\nSigned-off-by: leolee <yihao.li@huawei.com>",
+      "parents": [
+        "9a276026c6e68faa6ea35f85a538f719bb508767"
+      ],
+      "stats": {
+        "total_additions": 21,
+        "total_deletions": 3,
+        "files_changed": 5
+      },
+      "files": [
+        {
+          "filename": "tests/ut/worker/test_attn_utils_v2.py",
+          "status": "modified",
+          "additions": 6,
+          "deletions": 0,
+          "patch": "@@ -268,6 +268,7 @@ def test_mrv2_builds_shared_dsa_metadata_for_each_execution_mode(\n             num_scheduled_tokens=torch.tensor([2, 3, 0, 0], dtype=torch.int32),\n             seq_lens=torch.tensor([2, 3, 0, 0], dtype=torch.int32),\n             seq_lens_np=np.array([2, 3, 0, 0], dtype=np.int32),\n+            is_prefilling_np=np.array([True, True, False, False]),\n             dcp_local_seq_lens=None,\n             positions=torch.arange(8, dtype=torch.int32),\n             attn_state=None,\n@@ -288,6 +289,11 @@ def test_mrv2_builds_shared_dsa_metadata_for_each_execution_mode(\n         common_metadata = call[\"common_attn_metadata\"]\n         assert common_metadata.num_actual_tokens == 5\n         assert common_metadata.num_input_tokens == expected_input_tokens\n+        if caller != \"default\":\n+            assert torch.equal(\n+                common_metadata.is_prefilling,\n+                torch.tensor([True, True, False, False]),\n+            )\n     cache_name = \"common_ratio_to_sas_metadata\"\n     assert calls[0][cache_name] is calls[1][cache_name]\n     assert calls[1][cache_name][\"first_group\"] is True"
+        },
+        {
+          "filename": "vllm_ascend/attention/dsa_v1.py",
+          "status": "modified",
+          "additions": 1,
+          "deletions": 1,
+          "patch": "@@ -154,7 +154,7 @@ class AscendDSABackend(AttentionBackend):\n         block_size: int,\n         num_kv_heads: int,\n         head_size: int,\n-        cache_type: str = \"\",\n+        cache_dtype_str: str = \"\",\n     ) -> tuple[int, ...]:\n         return num_blocks, block_size, num_kv_heads, head_size\n "
+        },
+        {
+          "filename": "vllm_ascend/worker/v2/attn_utils.py",
+          "status": "modified",
+          "additions": 2,
+          "deletions": 0,
+          "patch": "@@ -180,6 +180,7 @@ def build_attn_metadata(\n     graph_pad_size: int = -1,\n     num_actual_tokens: int | None = None,\n     num_input_tokens: int | None = None,\n+    is_prefilling: torch.Tensor | None = None,\n     model_specific_attn_metadata: ModelSpecificAttnMetadata | None = None,\n     for_cudagraph_capture: bool = False,\n     causal: bool | Mapping[int, bool] = True,\n@@ -234,6 +235,7 @@ def build_attn_metadata(\n             attn_state=attn_state,\n             graph_pad_size=graph_pad_size,\n             num_input_tokens=num_input_tokens,\n+            is_prefilling=is_prefilling,\n             max_seq_len=max_seq_len,\n             causal=group_causal,\n             **common_attn_metadata_extra_kwargs,"
+        },
+        {
+          "filename": "vllm_ascend/worker/v2/model_states/default.py",
+          "status": "modified",
+          "additions": 2,
+          "deletions": 0,
+          "patch": "@@ -54,6 +54,7 @@ class AscendModelState(DefaultModelState):\n \n         num_actual_tokens = input_batch.num_tokens\n         query_start_loc_cpu = torch.from_numpy(input_batch.query_start_loc_np)\n+        is_prefilling = torch.from_numpy(input_batch.is_prefilling_np)\n         max_query_len = input_batch.num_scheduled_tokens.max().item()\n         # attn_metadata is needed when update_full_graph_params, but no way can get it now.\n         # Temporarily store it in model_state.\n@@ -63,6 +64,7 @@ class AscendModelState(DefaultModelState):\n             num_tokens=num_input_tokens,\n             num_actual_tokens=num_actual_tokens,\n             num_input_tokens=num_input_tokens,\n+            is_prefilling=is_prefilling,\n             query_start_loc_gpu=input_batch.query_start_loc,\n             query_start_loc_cpu=query_start_loc_cpu,\n             max_query_len=max_query_len,"
+        },
+        {
+          "filename": "vllm_ascend/worker/v2/spec_decode/autoregressive/speculator.py",
+          "status": "modified",
+          "additions": 10,
+          "deletions": 2,
+          "patch": "@@ -45,7 +45,7 @@ logger = logging.getLogger(__name__)\n \n \n @contextmanager\n-def build_draft_attn_metadata_factory(positions, pad):\n+def build_draft_attn_metadata_factory(positions, pad, is_prefilling):\n     \"\"\"Wrap build_attn_metadata to forward MLA rotary positions for the block.\n \n     MLA reads positions inside build_decode_metadata for cos/sin; the flat\n@@ -56,6 +56,7 @@ def build_draft_attn_metadata_factory(positions, pad):\n \n     def build_attn_metadata(*args, **kwargs):\n         kwargs[\"positions\"] = positions[:pad]\n+        kwargs[\"is_prefilling\"] = is_prefilling\n         return raw(*args, **kwargs)\n \n     try:\n@@ -335,7 +336,12 @@ class AscendAutoRegressiveSpeculator(AutoRegressiveSpeculator):\n         num_query_per_req: int = 1,\n         causal: bool = True,\n     ) -> dict[str, Any] | None:\n-        with build_draft_attn_metadata_factory(self.input_buffers.positions, num_tokens_padded):\n+        assert self.input_batch is not None\n+        with build_draft_attn_metadata_factory(\n+            self.input_buffers.positions,\n+            num_tokens_padded,\n+            torch.from_numpy(self.input_batch.is_prefilling_np),\n+        ):\n             attn_metadata = super()._build_draft_attn_metadata(\n                 num_reqs,\n                 num_reqs_padded,\n@@ -371,6 +377,8 @@ class AscendAutoRegressiveSpeculator(AutoRegressiveSpeculator):\n         return draft_attn_metadatas\n \n     def _ascend_update_seq_lens(self, attn_metadata: dict[str, Any] | None) -> None:\n+        if self.attn_architecture == \"DSA\":\n+            return\n         if attn_metadata is not None:\n             for attn_meta in attn_metadata.values():\n                 attn_meta.seq_lens = attn_meta.seq_lens + 1\n"
+        }
+      ]
+    },
+    {
+      "sha": "9a276026c6e68faa6ea35f85a538f719bb508767",
+      "author": {
+        "name": "zhangxinyuehfad",
+        "email": "59153331+zhangxinyuehfad@users.noreply.github.com"
+      },
+      "date": "2026-08-16T11:12:00+08:00",
+      "message": "[CI] Fix weekly test for missing OPENLIBING_SECRET (#14366)\n\n### What this PR does / why we need it?\n\nFix weekly test for missing OPENLIBING_SECRET\n\n### Does this PR introduce _any_ user-facing change?\n\n### How was this patch tested?\n\n- vLLM version: v0.27.1\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/58d3918e3ea0a544ffedadad2ba84559e9c51d8f\n\nSigned-off-by: hfadzxy <starmoon_zhang@163.com>",
+      "parents": [
+        "d5e9816065ede613327d93908f87fee9f5c47128"
+      ],
+      "stats": {
+        "total_additions": 1,
+        "total_deletions": 0,
+        "files_changed": 1
+      },
+      "files": [
+        {
+          "filename": ".github/workflows/schedule_weekly_test_a3.yaml",
+          "status": "modified",
+          "additions": 1,
+          "deletions": 0,
+          "patch": "@@ -253,6 +253,7 @@ jobs:\n       KUBECONFIG_B64: ${{ secrets.KUBECONFIG_B64 }}\n       OBS_ACCESS_KEY_ID: ${{ secrets.OBS_ACCESS_KEY_ID }}\n       OBS_SECRET_ACCESS_KEY: ${{ secrets.OBS_SECRET_ACCESS_KEY }}\n+      OPENLIBING_SECRET: ${{ secrets.OPENLIBING_SECRET }}\n \n   double-node-tests:\n     name: double-node\n"
+        }
+      ]
+    }
+  ]
+}

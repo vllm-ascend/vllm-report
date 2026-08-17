@@ -1,0 +1,610 @@
+{
+  "date": "2026-08-17",
+  "repo": "vllm-project/vllm",
+  "generated_at": "2026-08-18T02:39:28.053699+08:00",
+  "daily_summary": "当日 vLLM 变更覆盖范围较广：核心运行时方面，将 prefix_cache_retention_interval 从环境变量提升为 CLI 参数并将默认值改为 0（SWA/Mamba 前缀缓存默认变为稀疏留存）；Kimi-K3 新增 RecoverSSM 推测解码大特性（含配置校验、Mamba 状态扩展、RecoverSSM 元数据与 worker 状态机）；Mamba state copy 重叠拷贝竞态修复；MRV2 Sampler 增加 logits-processing 请求状态缓存并顺带修复 greedy+thinking budget 场景。硬件适配方面，包含 ROCm Triton W4A16 transpose 判定修复、CPU attention group head count 修复、XPU KDA 测试开启、NVIDIA GB10 fused-MoE FP8 tuning 配置、DSv4 可断图 indexer scoring 修复、FlashKDA 版本更新。前端方面，整合 entrypoint 中间件、补齐请求体非对象 JSON 校验守卫、BGE-M3 combined pooling task 权限校验。另修复 Mooncake 异步 store job 的 GPU block 引用生命周期并改用 store_job_id 台账。",
+  "ascend_impact_summary": "当日对 vllm-ascend 有实质影响的变更集中在三处：(1) prefix_cache_retention_interval 默认值从 None 改为 0 并下沉到 KVCacheConfig，Ascend 上含 sliding-window/Mamba cache group 的模型将默认启用稀疏 checkpoint 留存，影响前缀缓存命中率与显存占用，且 VLLM_PREFIX_CACHE_RETENTION_INTERVAL 环境变量被移除；(2) Kimi-K3 RecoverSSM 引入的 VllmConfig/CacheConfig 新校验逻辑与 MambaSpecDecodeGPUContext 行为调整（按 copy_func 遍历、要求状态张量数量足够），对使用 vLLM 通用 Mamba 路径的平台可见；(3) AttentionConfig.indexer_kv_dtype 默认值改为 auto 并废弃 use_fp4_indexer_cache，Ascend 配置路径需改用 resolve_indexer_kv_dtype 解析。其余变更集中在 CPU/XPU/ROCm/NVIDIA 特定代码、前端 entrypoint、纯配置/测试/构建，不影响 vllm-ascend。",
+  "commits": [
+    {
+      "sha": "017e9f4448b700e85ee16023287b025693c72b9e",
+      "comment": "将 prefix_cache_retention_interval 从环境变量 VLLM_PREFIX_CACHE_RETENTION_INTERVAL 提升为 EngineArgs/CacheConfig 正式参数，默认值由 None（dense 留存）改为 0（仅保留最新 replay 边界与 shared-prefix junction）。变更贯穿配置层（cache.py/arg_utils.py）、KV cache 协调层（kv_cache_coordinator.py 改为从 KVCacheConfig 读取）、Mooncake worker（改读 config 值）以及 simple_kv_offload（改用 dataclasses.replace 保留新字段）。同时将 retention interval 加入 CacheConfig.compute_hash 忽略列表，表明其不参与编译图哈希。潜在风险：默认行为从 dense 变为稀疏，SWA/Mamba 模型的前缀缓存命中率与内存占用会发生变化；KVCacheConfig 为 dataclass 且新字段加在类体前部，若任何调用方以位置参数构造 KVCacheConfig 会被破坏（vLLM 内部均已改用关键字参数）。",
+      "tags": [
+        "refactor",
+        "config",
+        "kv-cache",
+        "medium-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": true,
+        "functionality": "vllm/v1/kv_cache_interface.py 的 KVCacheConfig 新增 prefix_cache_retention_interval 字段，KVCacheCoordinator 改为从 kv_cache_config 读取该值而非环境变量；CacheConfig 默认值由 None（dense 留存）改为 0（稀疏留存）。Ascend 的 KV cache 管理器/调度器路径复用 vLLM 的 KVCacheManager/KVCacheCoordinator，因此对含 sliding-window 或 Mamba cache group 的模型，Ascend 默认行为从'每个 block 边界都保留 checkpoint'变为'仅保留最新 replay 边界和 shared-prefix junction'，影响前缀缓存命中率与显存占用。VLLM_PREFIX_CACHE_RETENTION_INTERVAL 环境变量已从 vllm/envs.py 移除，Ascend 侧若依赖该 env 需要迁移到新的 config 字段。",
+        "testing": "需要在 Ascend 上验证 SWA/Mamba 模型在新默认值（interval=0）下的前缀缓存命中与 KV cache 分配/回收行为。",
+        "needs_test_update": true,
+        "suggested_test_areas": [
+          "vllm_ascend 前缀缓存/KV cache 分配与回收测试",
+          "SWA/Mamba 模型 prefix caching 回归测试"
+        ]
+      },
+      "message": "Promote `prefix_cache_retention_interval` to an argument and change the default to 0 (#52216)\n\nSigned-off-by: Tyler Michael Smith <tlrmchlsmth@gmail.com>\nCo-authored-by: OpenAI Codex <codex@openai.com>",
+      "deep_analysis": {
+        "ascend_affected_confirmed": true,
+        "affected_interfaces": [
+          {
+            "file": "vllm_ascend/patch/platform/patch_kv_cache_coordinator.py",
+            "class": "AscendHybridKVCacheCoordinator",
+            "method": "__init__",
+            "line": 106,
+            "impact": "Reads `envs_vllm.VLLM_PREFIX_CACHE_RETENTION_INTERVAL` via getattr with default None. This commit removes the variable from vllm/envs.py (exposed through the module `__getattr__` over the `environment_variables` dict), so after this commit the read always yields None. `self.retention_interval` is consumed by the inherited `HybridKVCacheCoordinator.cache_blocks` and forwarded to `manager.cache_blocks(retention_interval=...)`, so the sparse-retention feature is silently disabled on Ascend and diverges from the new upstream default of 0. Must instead read `kv_cache_config.prefix_cache_retention_interval` (the new field populated on KVCacheConfig by vllm/v1/core/kv_cache_utils.py:get_kv_cache_config_from_groups). The `_validate_prefix_cache_retention_interval` getattr at lines 107-114 remains safe (function signature unchanged upstream)."
+          },
+          {
+            "file": "vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_scheduler.py",
+            "class": "AscendStorePoolScheduler",
+            "method": "__init__",
+            "line": 101,
+            "impact": "Reads `envs.VLLM_PREFIX_CACHE_RETENTION_INTERVAL` via getattr with default None; after this commit it is always None, disabling retention-based checkpoint pruning in the AscendStore KV-transfer pool. Should read `vllm_config.cache_config.prefix_cache_retention_interval` instead (vllm_config is already in scope)."
+          },
+          {
+            "file": "vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py",
+            "class": "AscendStoreWorker (AscendStorePoolWorker)",
+            "method": "_build_cache_coordinator",
+            "line": 586,
+            "impact": "Reads `envs.VLLM_PREFIX_CACHE_RETENTION_INTERVAL` via getattr and forwards it to `AscendStoreCoordinator(retention_interval=...)`. After this commit it is always None, so the external-DP/P-D AscendStore coordinator always uses dense retention regardless of config. Should read `vllm_config.cache_config.prefix_cache_retention_interval` instead (vllm_config is already in scope)."
+          }
+        ],
+        "adaptation_effort": "low",
+        "adaptation_guide": "The upstream commit removes `VLLM_PREFIX_CACHE_RETENTION_INTERVAL` from vllm/envs.py, promotes `prefix_cache_retention_interval` to a `CacheConfig` field (default 0) plus the `--prefix-cache-retention-interval` CLI arg, adds the resolved value as `KVCacheConfig.prefix_cache_retention_interval` (vllm/v1/kv_cache_interface.py, populated in kv_cache_utils.py), and switches KVCacheCoordinator + Mooncake store worker to consume it. vllm-ascend has 3 sites that read the removed env var and must switch to the config value:\n\n1. vllm_ascend/patch/platform/patch_kv_cache_coordinator.py:106 — replace `self.retention_interval = getattr(envs_vllm, \"VLLM_PREFIX_CACHE_RETENTION_INTERVAL\", None)` with `self.retention_interval = kv_cache_config.prefix_cache_retention_interval` (kv_cache_config is the __init__ parameter; keep the subsequent validation call, it is signature-compatible).\n2. vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_scheduler.py:101-102 — replace the getattr with `retention_interval = vllm_config.cache_config.prefix_cache_retention_interval` (keep the isinstance normalization).\n3. vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py:586-588 — in `_build_cache_coordinator`, replace the getattr with `retention_interval = vllm_config.cache_config.prefix_cache_retention_interval`.\n\nNo signature change is needed on the `get_kv_cache_coordinator` patch wrapper (retention now flows through kv_cache_config). Update/verify the e2e configs under tests/e2e/nightly and tests/e2e/weekly/multi_node/external_dp/config/ that set `VLLM_PREFIX_CACHE_RETENTION_INTERVAL=4096`: the env var still works upstream via the deprecated get_from_deprecated_env_if_set path, but after this change it is preferred to pass `--prefix-cache-retention-interval` or CacheConfig so Ascend behavior matches upstream. Add/extend a unit test in tests/ut/patch/platform/test_prefix_cache_cp_patches.py asserting the coordinator reads the interval from KVCacheConfig.",
+        "risk": "No compile/runtime crash: the removed env var is only read via getattr(..., None) in vllm-ascend and envs.py exposes variables through a module-level __getattr__, so the reads degrade to None rather than raising. The real risk is silent behavioral divergence: (a) upstream default changes from None (dense) to 0 (sparse retention), while Ascend silently keeps None; (b) on DeepSeek-V4 hybrid models with sliding-window/Mamba groups, prefix-cache checkpoint retention and hit behavior on Ascend will differ from upstream and from the configured value (users setting --prefix-cache-retention-interval get no effect); (c) the deprecated env var is still honored on CUDA/ROCm but silently ignored on Ascend until adapted. Without the fix, prefix-cache hit rates / KV memory profile on Ascend diverge from upstream."
+      }
+    },
+    {
+      "sha": "1d3a8b9e220f1edc77c190c3370cf0f76dfdd2fd",
+      "comment": "修复 ROCm 上 Triton W4A16 对 GPTQ/AutoGPTQ 权重的 transpose 判定。原逻辑仅按 tensor shape 判断 qzeros 是否已处于 kernel 布局，AutoGPTQ 的 qzeros 已满足 [K//G, N//8] 时因 shape 判据与 compressed-tensors 的转置布局存在歧义而被错误转置。新逻辑优先读取 zp.output_dim：output_dim==1 时不转置，output_dim==0 时转置；缺失时退回 shape 推断（方形 shape 默认转置）。同时将 symmetric(uint4b8) 分支中 qzeros 置 None 的逻辑改为显式判断 weight_type.has_bias()。风险低，仅影响 ROCm/GPTQ 路径。",
+      "tags": [
+        "bugfix",
+        "quantization",
+        "rocm",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[ROCm][Bugfix] Fix Triton W4A16 bug in determining if transpose is required for GPTQ/AutoGPTQ  (#48998)\n\nSigned-off-by: Qiang Li <qiang.li2@amd.com>"
+    },
+    {
+      "sha": "70afdedc1081d28c3eaae53bece8292298484c86",
+      "comment": "为 Kimi-K3 KDA 增加 RecoverSSM 推测解码支持（NVIDIA 分支），属大特性变更。核心新增 vllm/models/kimi_k3/nvidia/ops/recoverssm.py（Triton verify/commit kernel 与 KDARecoverSSMCommitContext）和 vllm/v1/attention/backends/recoverssm_metadata.py 抽象接口；KimiK3KDAMetadataBuilder 扩展出 RecoverSSM 元数据、align 模式 postprocess 与 CUDA graph 阶段逻辑；MambaHybridModelState 集成 RecoverSSMState 协调采样后提交。通用侧影响：CacheConfig 新增 use_kda_recoverssm（init=False）；VllmConfig.validate_mamba_cached_kernel 重写 --use-replayssm 校验（spec 解码时要求 Kimi 架构、mamba_cache_mode∈{none,align}、PP=1、禁止 stochastic rounding）；MambaBase 在 RecoverSSM 下不预留 spec 状态槽；MambaSpecDecodeGPUContext 忽略辅助 cache 张量并按 copy_func 数量遍历。特性主体是 NVIDIA 专有，但配置校验与公共 Mamba 工具函数语义变化对所有平台可见。",
+      "tags": [
+        "feature",
+        "kimi-k3",
+        "mamba",
+        "model-runner",
+        "config",
+        "high-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "VllmConfig.validate_mamba_cached_kernel 重写：--use-replayssm 开启且 num_speculative_tokens>0 时自动置 CacheConfig.use_kda_recoverssm，并新增架构（仅 Kimi-K3）、mamba_cache_mode（none/align）、pipeline_parallel_size=1、禁止 stochastic rounding 的校验，对包括 Ascend 在内的所有平台生效。vllm/model_executor/layers/mamba/abstract.py 在 use_kda_recoverssm 时 num_speculative_blocks 置 0；vllm/v1/worker/mamba_utils.py 的 MambaSpecDecodeGPUContext.initialize_from_forward_context 改为按 copy_func 遍历并校验 len(kv_caches) >= num_state_types，辅助张量被忽略。若 vllm-ascend 复用 vLLM 的 Mamba 层或 MambaSpecDecodeGPUContext，需保证传入状态张量数量满足新要求；RecoverSSM 主体（Kimi-K3 nvidia ops/metadata）为 NVIDIA 专有，不影响 Ascend 默认路径。",
+        "testing": "无强制新增要求；若 vllm-ascend 使用 MambaSpecDecodeGPUContext，建议补充含辅助 cache 张量的兼容性验证。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[K3] support recoverssm for K3 (#51855)\n\nSigned-off-by: zjy0516 <riverclouds.zhu@qq.com>\nSigned-off-by: Benjamin Chislett <bchislett@nvidia.com>\nCo-authored-by: OpenAI Codex <codex@openai.com>\nCo-authored-by: Benjamin Chislett <bchislett@nvidia.com>\nCo-authored-by: mergify[bot] <37929162+mergify[bot]@users.noreply.github.com>",
+      "deep_analysis": {
+        "ascend_affected_confirmed": false,
+        "affected_interfaces": [],
+        "adaptation_effort": "low",
+        "adaptation_guide": "",
+        "risk": ""
+      }
+    },
+    {
+      "sha": "f27ae25473af7520dde3f8b9e0705041940be0c9",
+      "comment": "CPU attention 后端修复：AttentionMetadataBuilder 的 num_heads 从 model_config 全局 head count 改为从本 attention group 的 layers 获取（新增 get_num_attention_heads_from_layers 兜底），并在 __init__ 中提前解析 window_size。修复 Laguna 这类按层变化 head count 的模型因 scratchpad 按全局 head count 分配而过小导致的越界问题。仅影响 CPU backend，附新增单元测试并接入 CPU CI。",
+      "tags": [
+        "bugfix",
+        "attention",
+        "cpu",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Bugfix][CPU] Take an attention group's query head count from its layers (#51852)\n\nSigned-off-by: Ganesh R <Ganesh.R@amd.com>\nSigned-off-by: R <Ganesh.R@amd.com>\nCo-authored-by: Cursor <cursoragent@cursor.com>\nCo-authored-by: Li, Jiang <jiang1.li@intel.com>"
+    },
+    {
+      "sha": "95901ce70a625cd152e465d1b15441fd199bde24",
+      "comment": "为 BGE-M3 的 'embed&token_classify' 组合 pooling task 增加所有权校验：未加载 IO processor plugin 时注册 UnsupportedCombinedTaskIOProcessor，请求时抛出可操作错误，引导用户通过 plugin 的 'data' 字段或选择具体 task；加载 plugin 时注册 'plugin' task 走 PluginWithIOProcessorPlugins。同步完善文档，说明 dense/sparse/colbert 三种模式与 plugin 用法。仅影响 pooling 入口层。",
+      "tags": [
+        "bugfix",
+        "frontend",
+        "pooling",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "fix(pooling): validate BGE-M3 combined task ownership (#51823)\n\nSigned-off-by: Zhe Li <2843409461@qq.com>\nCo-authored-by: OpenAI Codex <noreply@openai.com>"
+    },
+    {
+      "sha": "cc7cf71fc819df579664adc2e944438d464dbc30",
+      "comment": "将 Kimi-K3 KDA 内核测试的 DEVICE 从硬编码 'cuda' 改为 current_platform.device_type，并放开 skip 条件到 CUDA-alike/XPU；同时放宽 gather_initial_states 中 state.is_cuda 断言为 is_cuda or is_xpu。属于测试平台扩展与小范围内核断言修改，不影响 Ascend。",
+      "tags": [
+        "test",
+        "xpu",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[XPU] Enable Kimi K3 KDA kernel tests on XPU (#51809)\n\nSigned-off-by: pmanczak <pawel.manczak@intel.com>"
+    },
+    {
+      "sha": "bb233626caa31602728f7ee4625f3d2a4d1a3ad5",
+      "message": "[CI] Shard Humming A100 eval (#52325)\n\nSigned-off-by: Kevin Luu <51931015+khluu@users.noreply.github.com>",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "chore"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "c05d923f186842d4ac35bfddafdd5aa01b6cbaf8",
+      "message": "[Doc] [ROCm] Update installation documentation (#52303)\n\nSigned-off-by: tjtanaa <tunjian.tan@embeddedllm.com>",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "chore"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "0ff370b51c58a3072b85e68fa5686b77b5034965",
+      "message": "docs: fix incorrect --custom-skip-chat-template flag reference (#52588)",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "bugfix",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "5fd7a888386cff800f32de6b5a33d1dd3ca1e397",
+      "message": "[CI/Build] Fix accident pre-commit breakage due to concurrent merge (#52578)\n\nSigned-off-by: Isotr0py <Isotr0py@outlook.com>",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "bugfix",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "a02cfccbc6187344325e364f09f6d8c33c4b253b",
+      "comment": "修复 Mamba state copy 中重叠内存拷贝的竞态（memmove 语义缺失）。_copy_mamba_state_block：DS 布局的行循环改为 token 循环（同一 token 行的源/目区域在 lane 维度上不重叠）；SD 同 block 左移改为 token 从低到高逐段拷贝（每段源/目不相交），不同 block 或 token_bias==0 保留 u64 向量化；batch_memcpy_kernel 对 left-overlap 增加 debug_barrier。测试改为基于未修改快照独立验证 Python 与 GPU 路径，避免共享 bug 被掩盖。该修复位于通用 GPU worker 工具，不改变接口签名，风险中等。",
+      "tags": [
+        "bugfix",
+        "mamba",
+        "worker",
+        "medium-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Bugfix][Mamba] Fix overlapping state copy race (#50729)\n\nSigned-off-by: Andreas Karatzas <akaratza@amd.com>\nCo-authored-by: OpenAI Codex <codex@openai.com>"
+    },
+    {
+      "sha": "93550cc4cd7e97bebe47b9b57333b60921c0d662",
+      "comment": "将 OpenAI API server 的中间件设置与 router 注册逻辑从 vllm/entrypoints/openai/api_server.py 抽取到 vllm/entrypoints/serve/middleware/（authenticate/x_request_id/log_response/register）与 vllm/entrypoints/launchers/api_server/routers.py，统一由 register_api_routers/init_entrypoints_middleware 编排。行为微调：AuthenticationMiddleware 移到新模块；ScalingMiddleware 仅在 generate task 时挂载；log_response 的 streaming 日志解析器独立成 SSEDecoder。属前端重构，便于非 OpenAI 启动入口复用；新增中间件自动化路由测试。",
+      "tags": [
+        "refactor",
+        "frontend",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Frontend] Consolidate entrypoint middleware (#52309)\n\nSigned-off-by: wang.yuqi <yuqi.wang@daocloud.io>"
+    },
+    {
+      "sha": "53e211d2923192ea1f7442de93d59cfbb150e089",
+      "message": "[CI/Build] Reduce more duplicate runner startup in tests (#52570)\n\nSigned-off-by: Isotr0py <Isotr0py@outlook.com>",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "chore"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "311b3513af33bc29b4acb2fde2e9313e5e9966a0",
+      "message": "[ROCm][CI] Avoid forcing FlashAttention in the ColPali pooling test (#52565)\n\nSigned-off-by: Andreas Karatzas <Andreas.Karatzas@amd.com>",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "chore"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "71b578b9cc37c262aeeb23815e6c478112c97d8b",
+      "message": "[ROCm][CI] Use the same-build wheel in Python-only CI (#49514)\n\nSigned-off-by: Andreas Karatzas <akaratza@amd.com>\nSigned-off-by: Andreas Karatzas <Andreas.Karatzas@amd.com>",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "chore"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "7ea4b40954084bbafa595faab6b322a5eb124ec0",
+      "comment": "为 NVIDIA GB10 增加 E=256 与 E=512 的 fused-MoE FP8(W8A8) Triton tuning 配置 JSON，覆盖常见 M 档位。纯配置数据，无代码逻辑变更，仅影响对应硬件上的 MoE kernel 自动调优选择。",
+      "tags": [
+        "performance",
+        "config",
+        "fused-moe",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Hardware][NVIDIA] Add GB10 fused-MoE fp8 tuning configs (E=256, E=512) (#52502)"
+    },
+    {
+      "sha": "292187dd8ca1b1bfa195f25b2886262527269999",
+      "comment": "修复 DeepSeek V4 在可断 CUDA graph（breakable graph）下 indexer scoring 被跳过的问题：当 max_seq_len//compress_ratio <= topk_tokens 时仍保留 compressor 路径，除非当前正在进行 stream capture（此时由 graph 捕获路径处理）。一行条件修复，仅影响 DSv4 的 CUDA graph 捕获行为。",
+      "tags": [
+        "bugfix",
+        "model",
+        "cuda-graph",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Bugfix][DSv4] Keep indexer scoring in breakable graphs (#52492)\n\nSigned-off-by: Lucas Wilkinson <lwilkins@redhat.com>\nCo-authored-by: OpenAI Codex <codex@openai.com>\nCo-authored-by: Yongye Zhu <zyy1102000@gmail.com>"
+    },
+    {
+      "sha": "6664d397bf091cb9371cba481d4efb8233436fe6",
+      "comment": "性能优化：MRV2 Sampler 在 add_request 时即计算并缓存每个请求的 needs_logits_processing 布尔值，替代每步执行的 _requires_logits_processing 全量数组扫描。缓存同时纳入 thinking_budget 判定，顺带修复 greedy（temperature=0）+ thinking_token_budget 请求未走 logits processing 的 bug（新增对应测试）。缓存由 add_request 重算，slot 复用时会被正确覆盖。",
+      "tags": [
+        "performance",
+        "bugfix",
+        "sampler",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Performance][MRV2] Cache logits-processing request state (#52329)\n\nSigned-off-by: Rui Rui4 Cheng <chengrui4@lenovo.com>\nCo-authored-by: Rui Rui4 Cheng <chengrui4@lenovo.com>"
+    },
+    {
+      "sha": "502af5ed007da93c2a7747b31d0dc0e6110e17a3",
+      "message": "[Doc] Add MatrixHub as a model loading source (#50492)\n\nSigned-off-by: yiting.jiang <yiting.jiang@daocloud.io>",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "feature",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "a6a2a93f9b9f3b2c155b50c8c6f2badf41cbfd66",
+      "comment": "为其余 entrypoint 请求模型（Completion/Responses/Embedding/Classification/Pooling/Tokenize/Transcription/Translation）的 mode='before' validator 补上 isinstance(data, dict) 守卫，避免非对象 JSON body（字符串/数组/标量/null）触发 AttributeError 变成 HTTP 500，统一返回 pydantic ValidationError。纯前端健壮性修复，不影响后端执行。",
+      "tags": [
+        "bugfix",
+        "frontend",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Bugfix][Frontend] Guard remaining before-validators against non-object JSON bodies (#52528)\n\nSigned-off-by: Kaif <kaifkohari10@gmail.com>"
+    },
+    {
+      "sha": "967e104fad12758e1fc4f16b7f9fdebfc3b6b1bb",
+      "comment": "统一 sparse-attention indexer KV cache 的 dtype 配置：AttentionConfig.indexer_kv_dtype 默认值从 'bf16' 改为 'auto'（按模型解析），新增 resolve_indexer_kv_dtype()；废弃 use_fp4_indexer_cache（True→mxfp4，False 为 no-op，带 deprecation warning）；compute_hash 将废弃字段折叠进 indexer_kv_dtype。DSV4 侧新增 dsa_indexer_uses_fp4 统一校验（mxfp4 要求 Blackwell 数据中心 GPU，sm_120 及更早不支持）。E2E 配置同步迁移。配置语义变化对所有平台可见，但 mxfp4 能力校验是 NVIDIA 特定的。",
+      "tags": [
+        "refactor",
+        "config",
+        "attention",
+        "medium-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "AttentionConfig.indexer_kv_dtype 默认值从 'bf16' 改为 'auto'，新增 resolve_indexer_kv_dtype() 解析方法；use_fp4_indexer_cache 废弃并映射到 mxfp4（True），compute_hash 忽略该字段。vllm-ascend 的配置路径（AscendConfig/NPUPlatform.check_and_update_config）若直接读取 indexer_kv_dtype 或设置 use_fp4_indexer_cache，需要改用 resolve_indexer_kv_dtype 并按 'auto' 解析；DeepSeek V4/MiniMax M3 的索引器实现由 vllm-ascend 自有模型目录覆盖，vLLM 侧 NVIDIA 实现的 dsa_indexer_uses_fp4 校验不影响 Ascend 运行时路径。",
+        "testing": "无必需新增测试；建议确认 vllm-ascend 配置测试未对 use_fp4_indexer_cache 的旧语义做断言。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Config] Unify indexer cache dtype under attention_config.indexer_kv_dtype (#52550)\n\nSigned-off-by: Yongye Zhu <zyy1102000@gmail.com>\nCo-authored-by: Claude Opus 5 (1M context) <noreply@anthropic.com>",
+      "deep_analysis": {
+        "ascend_affected_confirmed": false,
+        "affected_interfaces": [],
+        "adaptation_effort": "low",
+        "adaptation_guide": "",
+        "risk": ""
+      }
+    },
+    {
+      "sha": "0ad04cff1b10267a2642becbf31f62c91018cad5",
+      "message": "[ROCm][CI] Enable ViT CUDA graph tests on AMD gfx950 GPUs (#52256)\n\nSigned-off-by: Shanshan Shen <87969357+shen-shanshan@users.noreply.github.com>\nCo-authored-by: Andreas Karatzas <akaratza@amd.com>",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "chore"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "a18c9b56ff9feb617d8f7c2eeca9263b328cc9c1",
+      "comment": "更新 FlashKDA 外部项目 GIT_TAG，获取 automatic K2 V-split 的 kernel 优化。纯构建依赖升级，仅影响 NVIDIA Kimi-K3 的 FlashKDA 内核编译。",
+      "tags": [
+        "chore",
+        "build",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Kimi-K3][Perf] Update FlashKDA for automatic K2 V-split (#52458)"
+    },
+    {
+      "sha": "dc9ae4b8ac2331991ad7091812ef82ece4f8fdc2",
+      "comment": "Mooncake store 异步保存的 GPU block 生命周期修复：ReqMeta 新增全局唯一 store_job_id；scheduler 在发出 store job 时通过 BlockPool.touch 对 job 读取的 GPU blocks 加引用（含 partial-tail CoW block），并在所有 rank 上报完成（MooncakeStoreWorkerMetadata.completed_saves 聚合）后释放；connector.request_finished 不再延迟释放块；worker 端 stored_requests 改为 req_id->set(store_job_id)，避免 preemption 后 req_id 复用导致旧 job 误伤新 generation；新增 has_pending_push_work 保证引擎在有 in-flight 引用时持续步进。属于 KV connector 内部一致性修复。",
+      "tags": [
+        "bugfix",
+        "kv-transfer",
+        "medium-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Bugfix][Mooncake] Reference GPU blocks for in-flight store jobs and key the store ledger by store_job_id (#52372)\n\nSigned-off-by: Guanyi Chen <939416532@qq.com>"
+    },
+    {
+      "sha": "eee538d5daa0c8c969f20d0c48c972155a6f1859",
+      "comment": "修复 v1 多模态 encoder cache 的一个竞态 bug：在单次调度 pass 内，某个 mm_hash 先因 eviction 被放入 freed 列表，随后同一 pass 内该 hash 又被重新分配并进入 cached 字典。原实现直接返回 freed 列表，导致 EngineCore 收到 stale 的 freed hash 并错误地删除 worker 侧仍被使用的 encoder tensor。修复方式是在 get_freed_mm_hashes() 中过滤掉已存在于 self.cached 中的 hash。变更集中在 vllm/v1/core/encoder_cache_manager.py，属于平台无关的多模态缓存内部逻辑，不涉及任何公共接口，风险低。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "multimodal",
+        "v1-core"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Bugfix][V1][Multimodal] Ignore stale same-step encoder cache evictions (#52482)\n\nSigned-off-by: Tianyu Guo <guoty@inferact.ai>"
+    },
+    {
+      "sha": "e3c1cb54fcafe796bc2a0354bb0962edbb4abbb8",
+      "message": "[CI/Build] Avoid duplicate runner startup for multimodal test (#52417)\n\nSigned-off-by: Isotr0py <Isotr0py@outlook.com>",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "chore"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "6b0b850a8b1764a66d7ffbb023c0b0e0bbdb900b",
+      "message": "[CI] Fit small KV-offload evals within shared memory (#52496)\n\nSigned-off-by: Taneem Ibrahim <taneem.ibrahim@gmail.com>",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "chore"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "fdab2b10bcac00a16c406f8b17a75a1c3f729e59",
+      "comment": "为 v2 ModelRunner 增加对 Transformers pooling（encoder-only）模型的支持。核心变更在 vllm/v1/worker/gpu/model_states/__init__.py：将原先通过 isinstance(model.modules(), EncoderOnlyAttention) 判断 encoder-only 模型的方式，改为通过 get_layers_from_vllm_config() 遍历 Attention 层并检查 attn_type == AttentionType.ENCODER_ONLY。新方式更精确且不依赖模型模块树的直接类型匹配，可以覆盖通过配置注册的 attention 层。测试侧新增 VLLM_USE_V2_MODEL_RUNNER 参数化，确保 v1/v2 两条路径都覆盖 pooling 模型。由于 vllm/v1/worker/gpu/model_states 是 GPUModelRunner 的组成部分，而 vllm-ascend 的 NPUModelRunnerV2 直接继承 GPUModelRunner，该变更会传导至 Ascend v2 路径；但不改变任何接口签名，属于功能增强。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "model-runner",
+        "v2-model-runner"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "vllm/v1/worker/gpu/model_states/__init__.py 的 init_model_state() 逻辑变更：EncoderOnly 模型判定从 isinstance(EncoderOnlyAttention) 改为检查 Attention 层 attn_type == ENCODER_ONLY。vllm-ascend 的 NPUModelRunnerV2 继承 GPUModelRunner，若 Ascend 在 v2 路径下加载 TransformersEmbeddingModel/TransformersForSequenceClassification 等 encoder-only 模型，模型状态将走新的构建分支；此变更不修改任何公共接口签名，不破坏现有继承关系。",
+        "testing": "上游测试新增 v2 model runner 参数化（VLLM_USE_V2_MODEL_RUNNER=1）覆盖 pooling 模型。vllm-ascend 需要确认 v2 model runner 在 NPU 上对 encoder-only 模型的支持不受影响。",
+        "needs_test_update": true,
+        "suggested_test_areas": [
+          "vllm-ascend v2 model runner 的 encoder-only/Transformers pooling 模型加载测试",
+          "Ascend 多模态/embedding 模型在 VLLM_USE_V2_MODEL_RUNNER=1 下的回归测试"
+        ]
+      },
+      "message": "[ModelRunner v2] Support Transformers pooling model  (#52425)\n\nSigned-off-by: Taneem Ibrahim <taneem.ibrahim@gmail.com>",
+      "deep_analysis": {
+        "ascend_affected_confirmed": false,
+        "affected_interfaces": [],
+        "adaptation_effort": "low",
+        "adaptation_guide": "",
+        "risk": ""
+      }
+    },
+    {
+      "sha": "ef43e3101b8fda8cd2b52de150c76b4fc177fad2",
+      "comment": "ROCm gfx950 上 DeepSeek V4 sparse-MLA decode 的 Triton kernel 大规模性能优化。主要变更：新增 gfx950 专用 partial kernel（_sparse_attn_decode_gfx950_partial_kernel），优化 FP8 cache 读取（按 128 维 chunk 精确加载、E8M0 scale 解码、tail 处理）；引入 adaptive splits 机制，根据 wave 占用和 iter 数动态调整 split 数量；对 fp8_ds_mla compressed cache 写入增加 NaN 清洗（SANITIZE_CACHE_NANS），将非有限值规范化为 0，避免 decode 时产生 NaN；增加 TRUST_EXTRA_CACHE_NAN_FREE 门控，仅当 gfx950 + fp8_ds_mla + 无 KV transfer 时跳过解码侧 NaN scrub；同时支持 CUDA graph 重放场景下 ragged index buffer 的稳定性。测试大量补充 gfx950 专属用例。变更全部位于 ROCm/DeepSeek V4 专属代码路径，不影响其他平台。",
+      "tags": [
+        "performance",
+        "high-risk",
+        "attention",
+        "rocm",
+        "deepseek-v4"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[ROCm][DSV4][Perf] Optimize Triton sparse-MLA decode on gfx950 (#52212)\n\nSigned-off-by: Fangzhou Ai <fangzhou.ai@amd.com>\nSigned-off-by: fai <fangzhouai@gmail.com>\nCo-authored-by: Nick Hill <nickhill123@gmail.com>\nCo-authored-by: Cursor Grok 4.6 <cursoragent@cursor.com>"
+    },
+    {
+      "sha": "1f0e0bf61210346a6bef4ad75172e62554d1b86c",
+      "comment": "临时禁用 Blackwell（SM100）上 FlashAttention 4 的 head_size=256 路径。此前只在 requires_local_attention（sliding window）时禁用，现在改为只要 head_size==256 就回退到 FA2，原因是上游 FA4 对 head_dim=256 的本地 attention 支持不完整。同时从 get_flash_attn_version() 签名中移除 requires_local_attention 参数，并更新 FlashAttentionImpl 调用点。ColPali 多模态 pooling 测试显式指定 FLASH_ATTN 后端并断言 v2 model runner 启用，以避免 FA4 路径触发。变更仅涉及 FlashAttention CUDA 后端的版本选择逻辑，不影响其他 attention 后端。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "attention",
+        "flash-attention"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Bugfix][Attention] Temporarily disable FA4 head-dim 256 (#52050)\n\nSigned-off-by: Taneem Ibrahim <taneem.ibrahim@gmail.com>\nCo-authored-by: Wentao Ye <44945378+yewentao256@users.noreply.github.com>"
+    },
+    {
+      "sha": "7d7b6f26f4120b5db10d0a697a878ad605f09579",
+      "comment": "清理量化模块中的 dead code，共删除约 395 行。涉及：MMLinearKernel 体系中的 Int8Params 数据类及文档引用；int8_utils 中从 sglang 移植的 w8a8_block_int8_matmul Triton kernel 及配套 config 加载逻辑（per_token_group_quant_int8 等仍保留）；AutoAWQ 的 is_awq_marlin_compatible（Marlin 兼容性检查已不再使用）；fused_moe/oracle/mxfp4.py 中未用的 AITER_BACKENDS；compressed_tensors W4A8 scheme 中未使用的 W4A8_SUPPORTED_BITS；humming.py 的 prepare_padded_shape/may_pad_loaded_weight；INC 的 MXFP8_SUPPORTED_ACT_DTYPES 和 INCXPUW4A16LinearScheme；modelopt 的 KV_CACHE_QUANT_ALGOS；torchao 的 get_scaled_act_names；mxfp4_utils 的 CK_MXFP4_MOE_DIM_ALIGNMENT；ocp_mx_utils 的 SUPPORTED_OCP_MX_DTYPES 等。纯内部清理，无行为变更。",
+      "tags": [
+        "refactor",
+        "low-risk",
+        "quantization"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Refactor] Remove dead code for quantization (#52221)\n\nSigned-off-by: yewentao256 <zhyanwentao@126.com>"
+    },
+    {
+      "sha": "6914d60b1e1a2594f0066fe81e3684574413fbe7",
+      "comment": "ROCm gfx942 性能优化：将 fp8 MQA logits 计算从 vLLM 内 vendored 的临时 workaround（triton_fp8_mqa_logits.fp8_mqa_logits_gfx942）切换到上游 AITER 的 FlyDSL 实现（aiter.ops.flydsl.flydsl_fp8_mqa_logits），使 gfx942 直接使用 ROCm/aiter#3913 合入的优化 kernel。变更极其聚焦，仅修改 rocm_aiter_mla_sparse.py 中的函数引用，删除 TODO 注释。纯 ROCm/AITER 路径，不影响其他平台。",
+      "tags": [
+        "performance",
+        "low-risk",
+        "attention",
+        "rocm"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[ROCm][Perf] gfx942: use FlyDSL fp8 MQA logits kernel (ROCm/aiter#3913) (#49544)\n\nSigned-off-by: Aakif Nawaz <aakif.nawaz@amd.com>"
+    }
+  ],
+  "architecture_based_on_sha": "7154856f3dcb1d3fdd5a136f7d2c5987f22244f5",
+  "architecture_generated_at": "2026-08-01T20:25:03.691327+08:00"
+}

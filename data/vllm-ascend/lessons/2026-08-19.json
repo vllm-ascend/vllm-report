@@ -1,0 +1,71 @@
+{
+  "date": "2026-08-19",
+  "lessons": [
+    {
+      "id": "L20260819-001",
+      "title": "shared-expert multistream stream-sync refactor breaks Ascend ms-ON path — 'forward is overridden' is a false no-op",
+      "keywords": [
+        "Test1",
+        "multistream_overlap_shared_expert",
+        "shared_experts",
+        "AssertionError",
+        "maybe_forward_async",
+        "stale-buffer",
+        "located"
+      ],
+      "symptom": "runs 31811865858/31889914421/31952700363/32101793062 (8/14-8/18): test_multistream_overlap_shared_expert[32-vllm-ascend/DeepSeek-V2-Lite-W8A8] failed 9+ consecutive e2e rounds with AssertionError: Test1: — ms-ON vs ms-OFF first-token deterministic flip (' located!!!' vs ' that!!!') at temperature=0, 15+ retries bit-identical.",
+      "root_cause": "upstream 47ececb58e ([Perf][ROCm] Dual-stream decode with hipgraphs #48223) restructured the shared-expert overlap machinery: moe_runner.py replaced _maybe_sync_shared_experts_stream + SharedExpertsOrder.MULTI_STREAM_OVERLAPPED with self._shared_experts.maybe_forward_async() before dispatch and wait() after routed experts, and shared_experts.py added torch.cuda.Event() pairs + _should_enable_stream_overlap_heuristic. vllm-ascend's ms-ON path (AscendSharedExperts.forward in vllm_ascend/ops/fused_moe/shared_experts.py, unchanged since 8/1) runs gate_up/down on a dedicated stream synchronized by events around the routed-experts dispatch — precisely the lifecycle this commit restructured, so the sync surface changed and a cross-stream race read stale buffers. The adapter dismissed it as no-op ('AscendMoERunner._forward_impl fully overrides the upstream flow') because the refactor touched wrapped-module control flow (streams/events/ordering), not any overridden method. Upstream reverted 47ececb58e via #52024 (landed 8/13); syncing past the revert restores the test.",
+      "fix_guidance": [
+        "When an e2e failure is a first-token deterministic divergence between an OPTIONAL feature path (ms-ON) and the baseline, suspect async/stream/event sync changes in the WRAPPED upstream module, not the overridden forward.",
+        "Diff-check the wrapped module's control flow in the upstream patch: stream sync, Event creation/recording/wait, call ORDER of maybe_forward_async/wait vs dispatch/combine, heuristic gating (_should_enable_stream_overlap_heuristic).",
+        "'forward is overridden' is not evidence of no-op: AscendSharedExperts wraps the upstream SharedExperts module whose async lifecycle executes on the wrapper's behalf.",
+        "Reference: upstream vllm/model_executor/layers/fused_moe/moe_runner.py + shared_experts.py at the target commit; vllm-ascend vllm_ascend/ops/fused_moe/shared_experts.py (AscendSharedExperts.forward).",
+        "If the break is a known upstream refactor already reverted (e.g. #52024), the correct adaptation is to advance the verified commit past the revert, not to patch the Ascend side."
+      ],
+      "tags": [
+        "diagnosis-guard",
+        "shared-experts",
+        "multistream",
+        "moe",
+        "no-op-trap",
+        "stream-sync"
+      ],
+      "example": "run https://github.com/vllm-project/vllm-ascend/actions/runs/31889914421 AssertionError: Test1: vllm_eager_outputs: ' located!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!' vllm_moe_ms_eager_outputs: ' that!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!'. File: tests/e2e/model_utils.py:53 check_outputs_equal.",
+      "created_at": "2026-08-19T10:30:00+08:00",
+      "hits": 0
+    },
+    {
+      "id": "L20260819-002",
+      "title": "upstream deleted the is_internal_router gate branch — NPU MoE receives hidden_states as router_logits (bias assert + EP lora splits)",
+      "keywords": [
+        "bias first dim",
+        "moe_gating_top_k",
+        "is_internal_router",
+        "Split sizes doesn't match",
+        "test_mtp_spec_decoding",
+        "qwen3moe_lora",
+        "too many values"
+      ],
+      "symptom": "PR #14376 CI (run 31989107166, main lane only; v0.27.1 control passed): (1) test_mtp_spec_decoding[full_decode_only-False-32-wemaster/deepseek_mtp_main_random_bf16] failed during profile_run with 'RuntimeError: The bias first dim should be same as x second dim' (TORCH_CHECK(bias_size[0]==expert_num) in csrc/moe/moe_gating_top_k/moe_gating_top_k_torch_adpt.h:47, via AscendFusedTopKRouter._compute_routing -> DeviceOperator.moe_gating_top_k); (2) test_qwen3moe_lora_multi_id_ep failed with 'RuntimeError: Split sizes doesn't match total dim 0 size' in dist.all_to_all_single (vllm_ascend/ops/fused_moe/token_dispatcher.py:540 EP path), then HCCL AlltoAllV deadlock (507001) -> EngineDeadError.",
+      "root_cause": "upstream fd04edef3e ([Refactor] Delete dead code in models #51838, 8/11, never reverted) deleted the is_internal_router branch in DeepseekV2MoE.forward (model no longer computes gate itself — always passes router_logits=hidden_states, relying on the runner to apply the gate) and removed the is_internal_router properties from FusedMoEWithLoRA/MoERunner plus ep_rank/physical_expert_start/physical_expert_end from Qwen3MoeSparseMoeBlock. Dead-code cleanup on CUDA (runner applies gate internally) but LIVE on NPU: AscendMoERunner._forward_impl (vllm_ascend/ops/fused_moe/fused_moe.py) only recomputes logits when is_internal_router (gate.weight_fp32 present, DSv4-only), so bf16 models (MTP: n_routed_experts=72, topk_method=noaux_tc, scoring_func=sigmoid) feed hidden_states [T,2560] into moe_gating_top_k expecting [T,72] -> bias assert. Same commit's qwen3_moe.py/lora fused_moe rewrites changed the contract the Ascend EP+lora assembly (AscendFusedMoEWithLoRA + prepare_lora_indices -1 padding) absorbs -> out-of-range topk_ids in mixed-lora EP batches -> histc(splits) sum != numel -> all_to_all split mismatch. UNRESOLVED on vllm-ascend side (both tests blocked in main2main per-step e2e).",
+      "fix_guidance": [
+        "NPU-side fix must make the runner apply the gate for ALL MoE models (not only is_internal_router), matching upstream's new 'runner applies gate' contract; guard against double-application for DSv4 (is_internal_router still true there) and MiniMax-M2's model-side gate patch.",
+        "Check e_score_correction_bias flow: upstream deepseek_v2.py builds nn.Parameter(config.n_routed_experts) 1D; the op contract (1D, len==router_logits.shape[1]) is correct — the bug is WHAT is passed as router_logits, not the bias shape.",
+        "For EP+lora: the old all_to_all_single token_dispatcher is frozen legacy (upstream moved to all2all_manager); verify topk_ids stay in [0, num_experts) in mixed-lora batches (-1 padding from prepare_lora_indices interacts with the dispatch) or re-architect onto upstream's new EP path.",
+        "Unrelated symptom pairing: 'too many values to unpack (expected 20)' at npu_fx_compiler is a separate torch_npu compile bug (L20260810-era, qwen3_5_0_8b) — do not conflate."
+      ],
+      "tags": [
+        "diagnosis-guard",
+        "moe",
+        "gate",
+        "is_internal_router",
+        "known-gap",
+        "ep-lora",
+        "mtp"
+      ],
+      "example": "run https://github.com/vllm-project/vllm-ascend/actions/runs/31989107166 job a2-1: 'RuntimeError: The bias first dim should be same as x second dim' — stack: deepseek_v2.py forward -> moe_runner._moe_forward_shared -> fused_topk_router.py:147 -> device_op.py:148 -> torch/_ops.py:1209.",
+      "created_at": "2026-08-19T10:30:00+08:00",
+      "hits": 0
+    }
+  ]
+}

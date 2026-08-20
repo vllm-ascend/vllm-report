@@ -547,7 +547,7 @@ def build_prompt(repo, date, commits_data, data_dir, local_repo=None, commit_sub
     return prompt
 
 
-DEFAULT_API_BASE = "https://api.deepseek.com"
+DEFAULT_API_BASE = "https://ark.cn-beijing.volces.com/api/coding/v3"
 
 
 def call_llm(prompt):

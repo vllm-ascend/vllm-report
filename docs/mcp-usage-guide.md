@@ -370,20 +370,23 @@ Ascend attention 测试：
 
 > 以下为 vllm-report MCP Server 提供的全部工具，按类别组织。
 
-### 架构分析（10 个）
+### 架构分析（13 个）
 
 | 工具 | 渐进式 | 说明 |
 |------|--------|------|
 | `get_architecture_overview` | ✅ | 概览 + 模块列表（轻量级，首选） |
+| `get_module_info` | ✅ | 单个模块详情（支持模糊匹配） |
+| `get_interface_surface` | ✅ | 可继承接口 + not_used_by_ascend 路径 |
+| `get_key_abstractions` | ✅ | 关键抽象类 + 继承关系 + ascend 实现 |
+| `get_implementation_principles` | ✅ | 核心工作流详解 |
+| `get_hardware_abstraction` | ✅ | 平台无关 vs 平台特定代码划分 |
+| `get_development_workflows` | ✅ | 开发工作流模板 |
+| `get_testing_guide` | ✅ | 测试命令和环境配置 |
 | `get_architecture_context` | ❌ | 完整架构数据（量大，可能截断，按需使用） |
 | `get_architecture_at_commit` | ❌ | 指定 commit 时的架构快照 |
 | `get_architecture_diff` | ❌ | 两 commit 间架构差异 |
 | `get_architecture_freshness` | ❌ | 架构数据是否过时 |
-| `get_module_info` | ✅ | 单个模块详情（支持模糊匹配） |
-| `get_module_history` | ❌ | 模块近期变更历史（可指定天数） |
-| `get_key_abstractions` | ✅ | 关键抽象类 + 继承关系 + ascend 实现 |
-| `get_hardware_abstraction` | ✅ | 平台无关 vs 平台特定代码划分 |
-| `get_implementation_principles` | ✅ | 核心工作流详解 |
+| `get_commit_arch_delta` | ❌ | 单个 commit 对架构的增量影响 |
 
 ### 适配管理（5 个）
 
@@ -395,25 +398,23 @@ Ascend attention 测试：
 | `get_adaptation_guide` | 单个 commit 的详细适配指南（含影响分析、测试命令） |
 | `get_adaptation_roadmap` | 从 SHA_from 到 SHA_to 的完整适配路线 |
 
-### 变更分析（5 个）
+### 变更分析（6 个）
 
 | 工具 | 说明 |
 |------|------|
-| `get_commit_diff` | 获取 commit 全量 diff（本地优先，GitHub API 回退） |
-| `get_commit_arch_delta` | 单个 commit 对架构的增量影响 |
 | `get_ascend_impact_summary` | 日期范围内影响 ascend 的 commit 摘要 |
+| `get_commit_diff` | 获取 commit 全量 diff（本地优先，GitHub API 回退） |
+| `get_commit_impact_batch` | 批量查询一批 vllm commit 的 ascend 影响分析（结构化 JSON） |
 | `search_analysis` | 跨日期关键词/标签搜索 |
 | `get_daily_analysis` | 指定日期的分析数据 |
+| `get_module_history` | 模块近期变更历史（可指定天数） |
 
-### 工程支持（5 个）
+### 工程支持（2 个）
 
 | 工具 | 渐进式 | 说明 |
 |------|--------|------|
-| `get_interface_surface` | ✅ | vllm 可继承接口 + ascend 实现映射 + 影响规则 |
 | `get_cross_project_mapping` | ❌ | vllm ↔ vllm-ascend 跨项目映射 |
-| `get_development_workflows` | ✅ | 开发工作流模板 |
-| `get_testing_guide` | ✅ | 测试命令和环境配置 |
-| `get_patch_catalog` | ❌ | vllm-ascend 所有 patch 的完整目录 |
+| `get_patch_catalog` | ❌ | vllm-ascend 所有 patch 的完整目录（可分类筛选） |
 
 ### 经验沉淀（2 个）
 
@@ -463,9 +464,9 @@ Ascend attention 测试：
 | 工具 | 角色 | 说明 |
 |------|------|------|
 | **Web Dashboard**（site/） | 人工浏览 | 不变，继续使用 |
-| **MCP Server**（src/mcp_server_app.py） | Agent 查询入口 | 22 个 tools，知识库核心接口 |
-| **track_adaptation.py** | 适配进度管理 | CLI 工具，init/update/status/list |
+| **MCP Server**（src/mcp_server_app.py） | Agent 查询入口 | 28 个 tools，知识库核心接口 |
+| **track_adaptation.py** | 适配进度管理 | CLI 工具，init/status/list/backfill-messages |
 | **build_index.py** | 检索索引 | 每日更新，加速跨日期搜索 |
 | **index.json + commits-index.json** | 两层检索索引 | index.json 存 SHA 列表映射，commits-index.json 存 SHA→基本信息 |
-| **architecture.json** | 架构知识库（11 维度） | 含 overview、modules、key_abstractions、implementation_principles、interface_surface、cross_project_relationship、knowledge_base |
+| **architecture.json** | 架构知识库（12 维度） | 含 overview、modules、key_abstractions、implementation_principles、interface_surface、cross_project_relationship、knowledge_base、architecture_history |
 | **vllm-knowledge** | 手写知识库 | **已废弃**，内容已合并到 architecture.json |

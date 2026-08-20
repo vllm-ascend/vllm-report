@@ -8,6 +8,7 @@ data/
 ├── vllm/
 │   ├── commits/{date}.json              # 原始 commit 数据（含 diff/patch）
 │   ├── analysis/{date}.json             # Phase 1 DeepSeek 分析结果
+│   ├── _deep_analysis_cache/            # Phase 2 深分析的源码上下文缓存（AST 提取）
 │   ├── context/
 │   │   ├── architecture.json            # vllm 架构基线知识库
 │   │   └── arch_deltas.json             # 自基线以来的架构增量变更
@@ -16,8 +17,10 @@ data/
 └── vllm-ascend/
     ├── commits/{date}.json
     ├── analysis/{date}.json
+    ├── lessons/{date}.json              # 适配经验沉淀（main2main 实战）
     ├── context/
-    │   └── architecture.json            # vllm-ascend 架构知识（基于最新代码）
+    │   ├── architecture.json            # vllm-ascend 架构知识（基于最新代码）
+    │   └── arch_deltas.json
     ├── index.json
     ├── commits-index.json
     └── adaptation-status.json           # 适配状态跟踪
@@ -369,6 +372,10 @@ print(f'deltas 已清空: {len(d[\"deltas\"])}')  # 应该为 0
 | `deep_analyze_commits.py` | Phase 2: opencode 深度分析 ascend_affected commit | 每日（仅当有 ascend_affected 时） | checkout 到父 commit 再恢复 |
 | `generate_context.py` | 生成/刷新架构知识库 + 交叉引用 | 初始化时 / 用户主动刷新 | pull（--checkout 时）+ checkout 再恢复 |
 | `build_index.py` | 构建检索索引 | 每次数据更新后 | 无 |
-| `track_adaptation.py` | 管理适配状态跟踪（仅 init/status/list） | 每次数据更新后 | 无 |
+| `track_adaptation.py` | 管理适配状态跟踪（init/status/list/backfill-messages） | 每次数据更新后 | 无 |
 | `mcp_server_app.py` | MCP 服务（供 agent 查询知识库，运行 `python -m src.mcp_server_app`） | 常驻 | 无 |
 | `clean_stale_data.py` | 清理过期数据（CI 专用） | 每日（CI 中） | 无 |
+
+> `track_adaptation.py` 另有一个 `backfill-messages` 子命令，用于从 `commits-index.json` 回填适配跟踪中缺失的 commit message。
+>
+> 也可用根目录 `daily_refresh.sh` 一次跑完整个每日流水线（对应 `daily-commit.yml`），可用 `--repo/--date/--skip-*` 等参数控制步骤。

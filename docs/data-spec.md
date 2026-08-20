@@ -17,18 +17,21 @@ data/
 │   ├── commits/                     # 原始 commit 数据（按日期）
 │   │   ├── 2026-07-30.json
 │   │   └── ...
+│   ├── _deep_analysis_cache/        # Phase 2 深分析的源码上下文缓存（AST 提取，按文件）
+│   │   └── source_context/*.json
 │   ├── context/
-│   │   └── architecture.json        # 项目架构知识摘要（用户主动刷新，锚定一个 commit）
-│   ├── arch_deltas.json             # 架构增量变化链（自基线以来的每个 commit 的架构影响）
+│   │   ├── architecture.json        # 项目架构知识摘要（用户主动刷新，锚定一个 commit）
+│   │   └── arch_deltas.json         # 架构增量变化链（自基线以来的每个 commit 的架构影响）
 │   ├── index.json                   # 检索索引（标签/模块/关键词 → SHA 列表）
 │   ├── commits-index.json           # SHA → {date, message} 查找表（配合 index.json 使用）
 │   └── meta.json                    # 仓库元数据
 ├── vllm-ascend/                     # vllm-ascend 项目数据
 │   ├── analysis/
 │   ├── commits/
+│   ├── lessons/                     # 适配经验（main2main 实战沉淀，按日期）
 │   ├── context/
-│   │   └── architecture.json
-│   ├── arch_deltas.json
+│   │   ├── architecture.json
+│   │   └── arch_deltas.json
 │   ├── index.json
 │   ├── commits-index.json
 │   ├── adaptation-status.json       # 适配状态跟踪（仅 vllm-ascend）
@@ -59,7 +62,7 @@ data/
 
 ### 2. `data/{repo}/context/architecture.json`
 
-**作用：** 项目的架构知识摘要，由 LLM 每周生成。包含核心模块、关键抽象、接口面、跨项目关系。
+**作用：** 项目的架构知识摘要，由 opencode Agent 按需生成（`refresh-context.yml` 工作流或本地 `generate_context.py`）。包含核心模块、关键抽象、接口面、跨项目关系。
 
 **关键字段：**
 
@@ -78,12 +81,14 @@ data/
 | `test_structure` | object | 测试结构 |
 | `cross_project_relationship` | object | 跨项目关系（vllm ↔ vllm-ascend） |
 | `knowledge_base` | object (可选) | 知识库（patch_catalog、development_workflows、testing_guide） |
+| `architecture_history` | object[] (可选) | 历史架构快照列表（`commit_sha` + `generated_at`），累积用于计算增量 |
 
 **兼容性：**
 - `modules`、`key_abstractions`、`interface_surface`：稳定
-  - `interface_surface.not_used_by_ascend` 由 opencode 每周自动更新，反映当前代码库状态
+  - `interface_surface.not_used_by_ascend` 由 opencode 在每次架构刷新时自动更新，反映当前代码库状态
 - `cross_project_relationship`：稳定
 - `knowledge_base`：稳定（新增字段，向后兼容）
+- `architecture_history`：实验性（聚合历史快照）
 
 ---
 
@@ -142,6 +147,7 @@ data/
 | `adaptation_effort` | string | 适配工作量评估：low / medium / high |
 | `adaptation_guide` | string | 适配指南（具体需要修改哪些文件） |
 | `risk` | string | 风险评估 |
+| `ascend_affected_confirmed` | boolean (可选) | 深度分析是否确认了 ascend 影响 |
 
 **兼容性：** 稳定。`architecture_based_on_sha`、`architecture_impact`、`deep_analysis` 为新增字段，不影响旧数据。
 
@@ -162,6 +168,8 @@ data/
 | `date_range` | string[] | 日期范围 [最早, 最晚] |
 | `analysis_dates` | string[] | 所有有分析数据的日期列表（替代已废弃的 `dates.json` 和 `analysis-dates.json`） |
 | `available_data` | object | 该 repo 有哪些数据可用 |
+| `architecture_version` | object | 架构版本引用（`commit_sha` + `generated_at`，指向架构缓存的版本） |
+| `architecture_deltas` | object | 架构增量链引用（`baseline_sha`、`delta_count`、`affected_commits`） |
 | `tags_index` | object | 按 tag 索引（tag → SHA 列表），每个 commit 只存 SHA 不存完整对象 |
 | `modules_index` | object | 按模块 tag 索引（模块名 → SHA 列表） |
 | `architecture_impact_index` | object | 架构影响索引 |
@@ -252,6 +260,7 @@ data/
 | `ascend_impact_summary` | string | 影响概述 |
 | `adaptation_notes` | string | 适配备注 |
 | `adapted_at` | string (nullable) | 适配完成时间 |
+| `adapted_by` | string (nullable) | 适配执行者（机器人/人） |
 
 **stats 字段：**
 
@@ -313,4 +322,4 @@ data/
 | **实验性** | 字段可能在未来版本中修改或移除，会提前在文档中标注 |
 | **不保证** | 临时数据，不对外提供兼容性 |
 
-所有当前文档中列出的字段均为 **稳定** 级别。
+所有当前文档中列出的字段均为 **稳定** 级别，除已单独标注为 **实验性** 的字段（如 `architecture_history`）外。

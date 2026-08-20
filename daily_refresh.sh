@@ -58,8 +58,6 @@ usage() {
 
 环境变量:
   LLM_API_KEY               DeepSeek API Key（Phase 1 必需）
-  OPENCODE_MODEL            opencode 使用的 provider/model 选择器（如 deepseek/deepseek-v4-flash，Phase 2 可选）
-  OPENCODE_BASE_URL         OpenAI 兼容 API Base URL（仅当 opencode 配置未内置时使用）
   OPENCODE_AUTH_TOKEN       OpenAI 兼容 API Key（仅当 opencode 配置未内置时使用）
 
 示例:

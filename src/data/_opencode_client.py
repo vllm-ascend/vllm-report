@@ -9,7 +9,6 @@ provider/model configured in the opencode config (opencode.json).
 Environment variables (mirror the old CLAUDE_* but prefixed OPENCODE_):
   OPENCODE_BIN               path to the `opencode` binary (default: discover via PATH)
   OPENCODE_MODEL             provider/model selector for `-m`, e.g. "volcengine-plan/ark-code-latest"
-  OPENCODE_BASE_URL          OpenAI-compatible base URL (used by CI's generated opencode.json)
   OPENCODE_AUTH_TOKEN        API key for the provider (used by CI's generated opencode.json)
   OPENCODE_SMALL_FAST_MODEL  (optional) small/fast model name, informational
   OPENCODE_TIMEOUT           per-call timeout in seconds (default 600)

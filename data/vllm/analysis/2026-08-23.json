@@ -1,0 +1,364 @@
+{
+  "date": "2026-08-23",
+  "repo": "vllm-project/vllm",
+  "generated_at": "2026-08-24T02:25:36.998062+08:00",
+  "daily_summary": "当日变更涵盖多个方向：多模态处理 API 大型重构（PromptSeq 统一为 list[int]，随后移除 renderer_applies_updates 标志）、Qwen3-Omni DSpark 推测解码支持、Mamba 前缀缓存 internal prefill checkpoint 性能优化（TTFT 提升 9%~25%）、GPT-OSS routed expert 流式加载、RL 稀疏 checkpoint 权重更新支持、Mistral3 图像占位符 grid 修复、死代码清理（use_prefill_decode_attention）、e/f 开头模型文件的 mypy 类型修复，以及若干 CI/构建修复（arm64 Cython 固定、ROCm profiler SDK）。",
+  "ascend_impact_summary": "当日对 vllm-ascend 影响最大的变更集中在多模态处理链路：PromptUpdate API 改为纯 token 序列（字符串 target 不再被接受、is_embed 回调签名简化）以及 _maybe_apply_prompt_updates 方法签名移除 is_update_applied 参数，vllm-ascend 的自定义多模态处理器需同步适配。MambaSpec 新增 num_prefill_checkpoint_blocks 字段并伴随 Scheduler/MambaManager 的 checkpoint 分配逻辑变更，影响 Ascend 上 Mamba 模型的 KV cache 管理与自定义调度器。Qwen3-Omni DSpark 支持涉及 spec_decode 工具函数和模型注册，vllm-ascend 的 DSpark proposer 需关注。model_loader 的 meta.py 修复与新增 checkpoint_weight_patch 模块为增量变更，对 Ascend 向后兼容。",
+  "commits": [
+    {
+      "sha": "39eba6ac368133ab4e69a0589fcd53c481dddc44",
+      "comment": "将离线推理输入验证中的 ValueError 替换为 VLLMValidationError，统一异常类型。变更涉及 vllm/entrypoints/offline_utils.py 中 _params_to_seq、_lora_request_to_seq、_priority_to_seq 三个方法，以及对应测试更新。VLLMValidationError 是 vLLM 自定义的验证异常，通常继承自 ValueError，因此对现有调用方向后兼容。新增 tests/entrypoints/test_offline_utils.py 专门测试 OfflineInferenceMixin 的输入验证逻辑。风险低。",
+      "tags": [
+        "refactor",
+        "low-risk",
+        "offline-inference",
+        "exceptions"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Misc] Use VLLMValidationError in offline inference input validation (#53432)\n\nSigned-off-by: Jensen Chen <a1043904820@gmail.com>\nCo-authored-by: Claude Opus 5 <noreply@anthropic.com>"
+    },
+    {
+      "sha": "b26039b09fc97aa00f095a99eda503b7dad594ec",
+      "comment": "为 GPT-OSS 模型添加 routed expert 流式加载支持。新增 GptOssRoutedExperts 类，继承 RoutedExperts，实现逐 expert 加载（streamed per-expert loading），避免组装全局 expert 堆叠。同时修复 vllm/model_executor/model_loader/reload/meta.py 中 restore_layer_on_meta 在层属性被替换为非 Parameter 张量时的处理逻辑（先删除再恢复为 meta Parameter）。测试覆盖 TP 切片、量化布局（MXFP4/NVFP4）、bias 归属等场景。meta.py 的修复影响所有平台的 layerwise reload 生命周期。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "model-loader",
+        "gpt-oss",
+        "weight-loading"
+      ],
+      "ascend_impact": {
+        "ascend_affected": true,
+        "functionality": "meta.py 的 restore_layer_on_meta 修复影响 vllm-ascend 的 NPUWorker 权重重载生命周期。该修复使 restore 阶段能正确处理被替换为普通张量的层属性（先删除再恢复为 meta Parameter），对 Ascend 的 sleep/wakeup 和权重更新流程更健壮。GptOssRoutedExperts 是模型特定实现，不影响 Ascend 接口。",
+        "testing": "无直接影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "Add routed expert loading for gpt-oss (#52209)\n\nSigned-off-by: Wyett <wyettzeng@gmail.com>\nSigned-off-by: wyett <wyettzeng@gmail.com>",
+      "deep_analysis": {
+        "ascend_affected_confirmed": true,
+        "affected_interfaces": [
+          "vllm_ascend/ops/fused_moe/routed_experts.py — AscendRoutedExperts (RoutedExperts OOT pluggable-layer replacement)",
+          "vllm_ascend/ops/fused_moe/fused_moe.py — AscendMoERunner (depends on routed_experts.quant_type / .forward_impl / EPLB & expert-map state)",
+          "vllm_ascend/utils.py — REGISTERED_ASCEND_OPS / CustomOp.register_oot registration for RoutedExperts and MoERunner",
+          "vllm_ascend/_310p/fused_moe/fused_moe.py — AscendRoutedExperts310 (310P variant)",
+          "vllm_ascend/distributed/weight_transfer/hccl_engine.py — uses upstream layerwise reload (initialize/finalize_layerwise_reload) affected by the reload/meta.py change (low risk)"
+        ],
+        "adaptation_effort": "medium",
+        "adaptation_guide": "Root cause: the commit makes gpt-oss pass `routed_experts_cls=GptOssRoutedExperts` to FusedMoEFactory (vllm/model_executor/models/gpt_oss.py MLPBlock). GptOssRoutedExperts subclasses RoutedExperts, and vLLM's PluggableLayer.__new__ substitutes the OOT class ONLY by exact class name against op_registry_oot (vllm/model_executor/custom_op.py:47-66). vllm-ascend registers \"RoutedExperts\"→AscendRoutedExperts and \"MoERunner\"→AscendMoERunner, but NOT \"GptOssRoutedExperts\", so on NPU the plain upstream class is instantiated and AscendRoutedExperts is bypassed. AscendMoERunner then accesses routed_experts.quant_type (fused_moe.py:70) and calls routed_experts.forward_impl(...) (fused_moe.py:218/239/272/297); the plain upstream RoutedExperts/GptOssRoutedExperts defines neither (verified: no forward_impl, no quant_type), so gpt-oss on Ascend fails with AttributeError at model construction/forward. Adaptation required: (1) add an Ascend subclass of GptOssRoutedExperts (e.g. AscendGptOssRoutedExperts in vllm_ascend/ops/fused_moe/routed_experts.py) that re-implements the same overrides as AscendRoutedExperts (__init__ installing AscendUnquantizedFusedMoEMethod, _get_quant_method with tid2eid, forward_impl returning routed_out(+FusedMoEEvents), update_expert_map, quant_type, EPLB/expert-map/ascend_expert_map plumbing); (2) register it in REGISTERED_ASCEND_OPS in vllm_ascend/utils.py as \"GptOssRoutedExperts\" (and \"GptOssRoutedExperts310\" in the _310p block for 310P); (3) validate the new streamed per-expert weight loading path (GptOssModel._try_load_streamed_expert/_get_streamed_expert_info and GptOssRoutedExperts.weight_loader, including _map_global_expert_id_to_local_expert_id and EPLB global→local mapping) on NPU, since gpt-oss weight loading now goes through GptOssRoutedExperts.weight_loader instead of the Ascend layer; (4) run the existing gpt-oss e2e (tests/e2e/pull_request/two_card/test_gpt_oss_distributed.py, unsloth/gpt-oss-20b-BF16, TP2) to confirm. The reload/meta.py restore_layer_on_meta change (union of tensor names + hasattr guard) is backwards-compatible and used via the upstream layerwise reload that vllm-ascend's HCCL weight transfer relies on; no interface change needed there, but it should be covered by sleep/wake + weight-transfer regression tests.",
+        "risk": "High for gpt-oss on Ascend if not adapted: model construction crashes (routed_experts.quant_type AttributeError in AscendMoERunner.__init__) and, even past that, forward crashes on routed_experts.forward_impl, silently losing the Ascend MoE kernel/EPLB/expert-map execution path and the AscendUnquantizedFusedMoEMethod. The bypass is silent (no error at weight load), so it could also produce wrong outputs or fall back to non-NPU execution if a caller catches the AttributeError. The new streamed/individual-expert checkpoint path is fresh and must be validated with Ascend weight sharding (TP/EP) and level-2 sleep/wake layerwise reload. reload/meta.py change is low risk. Overall: medium-high."
+      }
+    },
+    {
+      "sha": "e25c586b9030a10702d78856b43ccae9481cc28c",
+      "comment": "CI/构建修复：在 arm64 (aarch64) 架构下将 Cython 固定为 <3.3，解决 tilelang 从 sdist 构建时 Cython 3.3 拒绝硬编码 Py_LIMITED_API=3.8 的问题。仅修改 Dockerfile，无代码逻辑变更。",
+      "tags": [
+        "ci",
+        "build",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[CI/Build] Pin Cython below 3.3 for arm64 tilelang sdist (#53358)\n\nSigned-off-by: Kevin Luu <51931015+khluu@users.noreply.github.com>\nCo-authored-by: OpenAI Codex <codex@openai.com>"
+    },
+    {
+      "sha": "ebcd60646741be239026db75358715ba707eb50f",
+      "comment": "大型多模态处理重构：将 PromptSeq（str | list[int]）统一为 list[int]，移除基于文本的 prompt update 匹配路径。核心变更在 vllm/multimodal/processing/processor.py：删除 _seq2text/_seq2tokens/apply_text_matches 等辅助函数，PromptUpdateDetails 不再支持文本内容，is_embed 回调签名从 (tokenizer, full) 简化为 (full)，新增 cached_encode 导出。约 30 个多模态模型处理器同步更新为 token ID 序列。文本匹配回退逻辑改为 _apply_prompt_updates_via_text，在 token 匹配失败时通过 decode→文本匹配→分段编码实现。该重构消除了 prompt update 过程中的重复 tokenizer 调用，但对自定义多模态处理器是破坏性变更。",
+      "tags": [
+        "refactor",
+        "high-risk",
+        "multimodal",
+        "prompt-processing"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "PromptUpdate API 发生破坏性变更：PromptReplacement.target 必须为 list[int]（字符串不再被接受）、PromptUpdateDetails.select_text 被移除、is_embed 回调签名从 (tokenizer, full) 变为 (full)、PromptIndexTargets.prefix 接受 list[int]。vllm-ascend 中任何自定义多模态处理器（如 DeepseekV4、MiniMaxM3 的 MM 处理器）若使用字符串 target 或旧版 is_embed 签名将编译失败。cached_encode 成为公开 API，vllm-ascend 可使用它替代自定义 tokenizer 缓存。",
+        "testing": "vllm-ascend 的多模态处理测试需检查是否使用了旧的 PromptUpdate API（字符串 target、select_text、旧 is_embed 签名）。",
+        "needs_test_update": true,
+        "suggested_test_areas": [
+          "vllm_ascend 自定义多模态处理器的 prompt update 测试",
+          "多模态模型（DeepseekV4/MiniMaxM3）的输入处理测试"
+        ]
+      },
+      "message": "[MM] Simplify prompt updates: replace `PromptSeq` with `list[int]` (#53372)\n\nSigned-off-by: DarkLight1337 <tlleungac@connect.ust.hk>\nCo-authored-by: Qwen Code <noreply@alibaba-inc.com>",
+      "deep_analysis": {
+        "ascend_affected_confirmed": false,
+        "affected_interfaces": [],
+        "adaptation_effort": "low",
+        "adaptation_guide": "",
+        "risk": ""
+      }
+    },
+    {
+      "sha": "a3561ef8e49d3545c4078df43444beb4c98ae124",
+      "comment": "修复 Mistral3 模型在 processor size 覆盖（如 longest_edge 调整）时 image placeholder grid 计算错误的问题。新增 Mistral3HFEncoderInfo 类，根据实际 processor 的 size 参数计算 patch grid；LightOnOCR 通过新增 LightOnOCRProcessingInfo 保留使用 vision_config.image_size 的旧行为。测试覆盖多种 size 覆盖场景和 num_imgs 参数化。变更局限于 Mistral3/LightOnOCR 模型实现。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "multimodal",
+        "mistral3"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Bugfix][Model] Mistral3: fix image placeholder grid for processor size overrides (#52874)\n\nSigned-off-by: Anmol Gupta <14880251+anmolgupt@users.noreply.github.com>"
+    },
+    {
+      "sha": "d569e71bd031693ac945c590731a36f0e70789cc",
+      "message": "[CI][AMD] Honor single-node Docker workload timeout (#52547)\n\nSigned-off-by: Andreas Karatzas <Andreas.Karatzas@amd.com>",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "chore"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "9dba2c9b374af3a47c1cef952195ee114bab94c7",
+      "message": "[Rust Frontend][RL]: report engine world size over gRPC (#53204)\n\nSigned-off-by: Biswa Panda <biswa.panda@gmail.com>",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "chore"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "30b34171b113887e0e08d7f6d06e2e5a5c33b9d2",
+      "message": "[ROCm][CI] Restore attention coverage after KV-cache layout refactor (#53351)\n\nSigned-off-by: Andreas Karatzas <akaratza@amd.com>",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "refactor",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "bbe8b23e1a2b32a96240b27f63255170d09ef144",
+      "comment": "移除 AttentionConfig 中已废弃的 use_prefill_decode_attention 标志。该标志是死代码，不影响任何实际功能。同步更新 tests/engine/test_arg_utils.py 和 tests/v1/attention/utils.py 中的相关断言。低风险清理。",
+      "tags": [
+        "refactor",
+        "low-risk",
+        "config",
+        "attention"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响（该标志为死代码，Ascend 注意力后端不使用）。",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Deprecation] Remove dead use_prefill_decode_attention flag (#52557)\n\nSigned-off-by: Brian Woods <me@brian.biz>\nCo-authored-by: Claude Opus 5 (1M context) <noreply@anthropic.com>\nCo-authored-by: mergify[bot] <37929162+mergify[bot]@users.noreply.github.com>"
+    },
+    {
+      "sha": "2f55ef254c70e110d637beeedf48238977ebb683",
+      "comment": "为 Qwen3-Omni 添加 DSpark 推测解码支持。核心变更：1) vllm/config/speculative.py 新增 _validate_qwen3_omni_dspark 校验函数，验证 draft checkpoint 的 block_size、hidden_size、attention 头数、target_layer_ids、vocab_size 等与 target 模型的兼容性；2) qwen3_dspark.py 增加 vocab 权重完整性校验（expanded input vocab 必须含 embed_tokens，reduced vocab 必须含 lm_head 和 d2t mapping）；3) qwen3_omni_moe_thinker.py 的 Qwen3MoeLLMModel 支持收集 aux hidden states 并实现 SupportsEagle3；4) dspark/utils.py 的 load_dspark_model 根据 vocab size 决定是否共享 embed_tokens/lm_head；5) SpeculatorsConfig 的 dspark updater 支持 Qwen3OmniDSparkModel 架构。涉及配置校验、模型加载、推测解码多个模块。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "speculative-decoding",
+        "dspark",
+        "qwen3-omni"
+      ],
+      "ascend_impact": {
+        "ascend_affected": true,
+        "functionality": "1) vllm/v1/worker/gpu/spec_decode/dspark/utils.py 的 load_dspark_model 共享逻辑变更（新增 vocab size 条件判断），vllm-ascend 的 DSpark proposer 若复用此工具函数需同步更新；2) 新架构 Qwen3OmniDSparkModel 注册到 ModelRegistry，vllm-ascend 的模型注册 patch 需确认是否覆盖；3) Qwen3OmniMoeThinkerForConditionalGeneration 新增 SupportsEagle3 接口，vllm-ascend 的 Eagle3 相关实现需检查兼容性。",
+        "testing": "vllm-ascend 的 spec_decode 测试需覆盖 Qwen3-Omni DSpark 场景。",
+        "needs_test_update": true,
+        "suggested_test_areas": [
+          "vllm_ascend/spec_decode 的 DSpark 测试",
+          "Qwen3-Omni DSpark 端到端测试"
+        ]
+      },
+      "message": "[Model] Add Qwen3-Omni DSpark support (#52560)\n\nSigned-off-by: Zhou248 <630563665@qq.com>",
+      "deep_analysis": {
+        "ascend_affected_confirmed": true,
+        "affected_interfaces": [
+          "vllm_ascend/models/qwen3_dspark.py::AscendQwen3DSparkForCausalLM — directly subclasses upstream vllm.model_executor.models.qwen3_dspark.Qwen3DSparkForCausalLM, whose __init__ (new self.target_vocab_size attribute) and load_weights (new ValueError validations for expanded/reduced-vocab checkpoints) are modified",
+          "vllm_ascend/patch/worker/patch_v2/patch_dspark.py::_load_dspark_model_with_target_quant — monkey-patches vllm.v1.worker.gpu.spec_decode.dspark.utils.load_dspark_model, which is modified (new vocab-size guards before sharing embed_tokens/lm_head)",
+          "vllm_ascend/patch/platform/patch_speculative_config.py::_dspark_post_init — monkey-patches SpeculativeConfig.__post_init__, which gains ~300 lines of new Qwen3-Omni DSpark validation (_validate_qwen3_omni_dspark) and Qwen3OmniDSparkModel branches",
+          "vllm_ascend/models/__init__.py::ModelRegistry — upstream registers new Qwen3OmniDSparkModel architecture; vllm-ascend does not register it, so the new feature is unavailable on NPU without adaptation",
+          "vllm_ascend/spec_decode/dspark_proposer.py::AscendDSparkProposer and vllm_ascend/worker/v2/spec_decode/dspark/speculator.py::AscendDSparkSpeculator — depend on upstream DSparkSpeculator and on sample_from_anchor/dspark_bonus_anchor hf-config semantics, which update_dspark in vllm/transformers_utils/configs/speculators/algos.py now rewrites"
+        ],
+        "adaptation_effort": "medium",
+        "adaptation_guide": "The commit is largely additive (new Qwen3-Omni DSpark model + config validation) and backward-compatible for standard equal-vocab DSpark drafts, but it touches shared DSpark code that vllm-ascend subclasses and patches, so it must be validated and the new architecture wired up:\n\n1. vllm_ascend/models/qwen3_dspark.py (AscendQwen3DSparkForCausalLM): re-verify against the modified base Qwen3DSparkForCausalLM. New __init__ stores self.target_vocab_size; new load_weights validations raise ValueError when uses_expanded_input_vocab (config.vocab_size > target) without embed_tokens, or uses_reduced_vocab (draft_vocab_size != target) without lm_head / draft_id_to_target_id. For released Qwen3DSpark checkpoints with equal vocab these do not fire; run the existing tests/ut/model_executor/test_qwen3_dspark.py to confirm no new failures.\n\n2. vllm_ascend/patch/worker/patch_v2/patch_dspark.py (_load_dspark_model_with_target_quant): upstream load_dspark_model now only aliases embed_tokens when draft_model_config.get_vocab_size() <= target_vocab_size and lm_head only when draft_vocab_size == target_vocab_size. Equal-vocab drafts (Qwen3DSpark, DeepSeek-V4 same-checkpoint) satisfy both; regression-test same-checkpoint DeepSeek-V4 DSpark weight loading with W4A8/W8A8 target quant.\n\n3. vllm_ascend/patch/platform/patch_speculative_config.py (_dspark_post_init): confirm the wrapper still functions against the expanded SpeculativeConfig.__post_init__. The new _validate_qwen3_omni_dspark early-returns for non-Omni targets, so existing DeepSeek-V4/Qwen3 DSpark configs are unaffected; keep the ptd_token_id fallback from dspark_noise_token_id/mask_token_id intact.\n\n4. vllm_ascend/models/__init__.py: to enable the new feature on NPU, register 'Qwen3OmniDSparkModel' -> 'vllm_ascend.models.qwen3_dspark:AscendQwen3DSparkForCausalLM' (or a dedicated subclass), and confirm the Qwen3-Omni target path (upstream qwen3_omni_moe_thinker.py now implements SupportsEagle3 and returns aux hidden states from Qwen3MoeLLMModel.forward) works with the Ascend runner; if vllm-ascend later carries its own Qwen3-Omni implementation, mirror the aux-hidden-state collection + SupportsEagle3 additions.\n\n5. Watch behavior change in vllm/transformers_utils/configs/speculators/algos.py update_dspark: it now sets dspark_bonus_anchor = not sample_from_anchor in the draft hf_config (sample_from_anchor default stays False). Verify AscendDSparkProposer/AscendDSparkSpeculator sampling shape is unchanged for existing checkpoints.",
+        "risk": "Low-to-medium. Most changes are additive and backward-compatible for standard equal-vocab DSpark drafts: (a) the new load_weights validations in Qwen3DSparkForCausalLM will now hard-fail checkpoints that previously loaded silently with expanded/reduced vocab and missing embed_tokens/lm_head/d2t mapping; (b) update_dspark's new dspark_bonus_anchor flag (inverse of sample_from_anchor) could subtly change bonus-anchor sampling semantics if hf configs are regenerated; (c) if Qwen3-Omni DSpark is enabled on NPU without registering Qwen3OmniDSparkModel, model loading fails with an unknown-architecture error. The monkey-patched wrappers (patch_speculative_config, patch_dspark) are resilient because they delegate to the originals, but both should be regression-tested against the modified upstream code."
+      }
+    },
+    {
+      "sha": "a014e35f38c80fb0652387740193ad2147fed6a3",
+      "message": "[Pooling] Fix Rust pooling endpoint for benchmark (#53352)\n\nSigned-off-by: Taneem Ibrahim <taneem.ibrahim@gmail.com>",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "bugfix",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "811d12ee26fa119cf8faae44d80330becf1e7fe3",
+      "comment": "对 vllm/model_executor/models/ 下 e/f 开头的模型文件进行 mypy 类型修复，并从 mypy.py 的 EXCLUDE 列表中移除对应模式。变更包括：support_torch_compile 的 overload 签名补充默认值、多处类型注解修正（如 shared_experts 的可空标注、assert 添加）、ExaoneMoe 系列移除 LoRA vocab 扩展逻辑（vocab_size 不再加 lora_extra_vocab_size）、FunASR 的 forward 参数类型修正等。大部分为类型安全改进，ExaoneMoe 的 LoRA 变更属于功能性调整但局限于该模型。",
+      "tags": [
+        "refactor",
+        "low-risk",
+        "mypy",
+        "model"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响（类型修复为主，ExaoneMoe 的 LoRA 变更为模型特定）。",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Mypy Fix] Mypy fix for \"vllm/model_executor/models/[eE][fF]\" (#53381)\n\nSigned-off-by: yewentao256 <zhyanwentao@126.com>"
+    },
+    {
+      "sha": "236f78cc5c39362f80c0c7df1ffe810466525f33",
+      "comment": "新增 vllm/model_executor/model_loader/checkpoint_weight_patch.py，支持通过模型原生 load_weights 方法应用稠密或稀疏的 checkpoint 权重更新（RL 场景）。稀疏 patch 使用 NaN 作为\"未变更\"哨兵值，通过临时替换 torch.Tensor.copy_ 为 copy_non_nan_ 实现原地更新。支持按 max_chunk_bytes 分批调用 load_weights，同一权重名的多个 patch 按输入顺序应用。该模块是新增功能，不修改现有接口，但 monkey-patch torch.Tensor.copy_ 的方式有一定风险（要求 loader 的最终写入必须是同形状浮点 copy_）。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "model-loader",
+        "rl",
+        "checkpoint"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "新增 checkpoint_weight_patch 模块位于 vllm/model_executor/model_loader/ 下，vllm-ascend 的 NPUWorker 权重更新流程可复用该能力。稀疏 patch 的 NaN-masked copy_ 机制依赖 torch.where 和 Tensor.copy_，在 NPU 上应可正常工作（torch_npu 支持这些算子）。该变更为纯增量，不破坏现有接口。",
+        "testing": "无直接影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Core][RL] Support sparse checkpoint updates through native weight loaders (#50723)\n\nSigned-off-by: Shuolei Wang <shuoleiwang123@gmail.com>\nCo-authored-by: mergify[bot] <37929162+mergify[bot]@users.noreply.github.com>",
+      "deep_analysis": {
+        "ascend_affected_confirmed": false,
+        "affected_interfaces": [],
+        "adaptation_effort": "low",
+        "adaptation_guide": "",
+        "risk": ""
+      }
+    },
+    {
+      "sha": "9eb9d9d3953959695108600c8ed33d36bc6a1e5f",
+      "comment": "为 Mamba 前缀缓存添加 internal prefill checkpoint 支持，TTFT 提升 9%~25%。核心变更：1) MambaSpec 新增 num_prefill_checkpoint_blocks 字段（默认 0，向后兼容）；2) Scheduler 新增 mamba_has_prefill_checkpoint_blocks 属性，_mamba_block_aligned_split 在启用 checkpoint 时不再限制 chunk 必须 block 对齐；3) MambaManager 的 get_num_blocks_to_allocate 和 allocate_slots 支持分配 checkpoint block；4) KimiK3 的 FlashKDA 后端新增 checkpoint_state 输出和 _store_cache_checkpoints_kernel Triton kernel，将 prefill 中间状态写入 KV cache。涉及 KV cache 接口、调度器、KV cache 管理器、KimiK3 模型实现。",
+      "tags": [
+        "feature",
+        "performance",
+        "medium-risk",
+        "mamba",
+        "prefix-caching",
+        "kv-cache",
+        "scheduler"
+      ],
+      "ascend_impact": {
+        "ascend_affected": true,
+        "functionality": "1) vllm/v1/kv_cache_interface.py 的 MambaSpec 新增 num_prefill_checkpoint_blocks 字段（默认 0），vllm-ascend 自定义 KV cache spec 若继承 MambaSpec 不受破坏，但需关注该字段的语义；2) Scheduler 新增 mamba_has_prefill_checkpoint_blocks 属性并修改 _mamba_block_aligned_split 行为，vllm-ascend 的自定义调度器（BalanceScheduler 等）若继承 Scheduler 需同步该逻辑；3) MambaManager 的 block 分配逻辑变更，影响 Ascend 上 Mamba 模型的 KV cache 分配。KimiK3 FlashKDA 部分为 NVIDIA 特定实现，不影响 Ascend。",
+        "testing": "vllm-ascend 的 Mamba 相关测试需验证新字段和调度行为。",
+        "needs_test_update": true,
+        "suggested_test_areas": [
+          "vllm_ascend 的 Mamba KV cache 分配测试",
+          "自定义调度器与 _mamba_block_aligned_split 的兼容性测试"
+        ]
+      },
+      "message": "[Perf] Support internal prefill checkpoints for Mamba prefix caching, 9%~25% TTFT improvement (#52789)\n\nSigned-off-by: yewentao256 <zhyanwentao@126.com>\nSigned-off-by: Ziming Huang <zelda.huanghuang@gmail.com>\nSigned-off-by: Wentao Ye <44945378+yewentao256@users.noreply.github.com>\nCo-authored-by: Ziming Huang <zelda.huanghuang@gmail.com>\nCo-authored-by: OpenAI Codex <codex@openai.com>",
+      "deep_analysis": {
+        "ascend_affected_confirmed": true,
+        "affected_interfaces": [
+          "vllm.v1.kv_cache_interface.MambaSpec (new field num_prefill_checkpoint_blocks, changed get_estimated_block_size/can_handle/max_memory_usage_bytes)",
+          "vllm.v1.core.single_type_kv_cache_manager.MambaManager (get_num_blocks_to_allocate / allocate_new_blocks logic; new _needs_internal_checkpoint, _num_checkpoint_blocks)",
+          "vllm.v1.core.sched.scheduler.Scheduler (new mamba_has_prefill_checkpoint_blocks attr; _mamba_block_aligned_split use_internal_checkpoint branch)",
+          "vllm.models.kimi_k3.nvidia.kda.KimiK3DeltaAttention.get_kv_cache_spec + KimiK3KDAMetadata(checkpoint) (NVIDIA/FlashKDA-only, inactive on Ascend)"
+        ],
+        "adaptation_effort": "low",
+        "adaptation_guide": "The new feature (internal prefill checkpoints) is fully gated behind MambaSpec.num_prefill_checkpoint_blocks > 0, which only KimiK3DeltaAttention.get_kv_cache_spec sets when kda_prefill_backend == 'flashkda'. is_flashkda_supported() requires current_platform.is_cuda() (vllm/models/kimi_k3/nvidia/kda.py:171-181), so on Ascend it resolves to 'triton' and num_prefill_checkpoint_blocks stays 0. No forced behavior change, but verify these vllm-ascend touchpoints: 1) vllm_ascend/patch/platform/patch_mamba_manager.py - AscendMambaManager.get_num_blocks_to_allocate calls super(); the upstream method now adds checkpoint_block via _needs_internal_checkpoint and stores self._num_checkpoint_blocks (only initialized in the 'align' branch of the new __init__). With num_prefill_checkpoint_blocks=0, checkpoint_block=0 and the old/new logic are identical, so the override's extra '+1' for external cache tokens remains correct; keep super().__init__() called so _num_checkpoint_blocks exists. 2) MambaSpec constructions in patch_mamba_config.py / patch_mamba_config_310.py / mooncake connectors / ascend_store use keyword args, so the new default-0 field is backward compatible; leave 0 on Ascend. 3) Custom schedulers (vllm_ascend/core/scheduler_profiling_chunk.py:345, dyntra_lb_scheduler.py:534/898, recompute_scheduler.py:314/701) call _mamba_block_aligned_split(request, num_new_tokens); signature is unchanged and the new use_internal_checkpoint branch is inert because mamba_has_prefill_checkpoint_blocks is False when num_prefill_checkpoint_blocks=0 (set in Scheduler.__init__, which these subclasses reach via super()). 4) KDA model path (vllm/models/kimi_k3/nvidia/kda.py, kda_metadata.py) is CUDA/FlashKDA-only; Ascend uses AscendGatedDeltaNetAttention (vllm_ascend/ops/gdn.py) + triton KDA kernels, unaffected. 5) Optional: add a regression test in tests/ut/patch/platform/test_prefix_cache_cp_patches.py asserting AscendMambaManager block counts are unchanged with num_prefill_checkpoint_blocks=0.",
+        "risk": "Low. The feature is gated behind a field only the CUDA FlashKDA backend sets, so Ascend never enters the new allocation/checkpoint path and no functional regression is expected. Residual risks: (a) AscendMambaManager.get_num_blocks_to_allocate is an override of a method whose block-counting invariants upstream refactored - drift risk if future commits remove the num_prefill_checkpoint_blocks=0 fast path; (b) the new assert in allocate_new_blocks (num_new_blocks <= 1 + has_partial_hit + checkpoint_block [+ num_speculative_blocks]) is unchanged at checkpoint_block=0; (c) the FlashKDA C++ signature (csrc/flashkda_registration.cpp) gained optional checkpoint_state/checkpoint_offsets args and the cmake FlashKDA tag was bumped - irrelevant to Ascend since _flashkda_C is not built on NPU."
+      }
+    },
+    {
+      "sha": "020829f66baa231a3ed549c7f6b4a3171ef1c759",
+      "comment": "移除 BaseMultiModalProcessor 的 renderer_applies_updates 类变量和 _maybe_apply_prompt_updates 的 is_update_applied 参数。所有处理器现在统一走 _apply_prompt_updates 路径。Pixtral 和 Voxtral 通过覆写 _maybe_apply_prompt_updates 实现\"仅验证不修改\"的行为（因为 token 已由 chat template 插入）。Qwen2.5-Omni 和 Qwen3-Omni 的 use_audio_in_video 逻辑简化。该变更简化了多模态处理流程，但改变了 _maybe_apply_prompt_updates 的方法签名。",
+      "tags": [
+        "refactor",
+        "medium-risk",
+        "multimodal",
+        "prompt-processing"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "BaseMultiModalProcessor._maybe_apply_prompt_updates 方法签名移除 is_update_applied 参数，renderer_applies_updates 类变量被删除。vllm-ascend 中任何覆写 _maybe_apply_prompt_updates 或设置 renderer_applies_updates 的自定义多模态处理器需要同步更新。Pixtral/Voxtral 的\"仅验证\"模式通过覆写方法实现，vllm-ascend 若有类似需求应参考该模式。",
+        "testing": "vllm-ascend 的多模态处理器测试需适配新签名。",
+        "needs_test_update": true,
+        "suggested_test_areas": [
+          "vllm_ascend 自定义多模态处理器的 _maybe_apply_prompt_updates 覆写"
+        ]
+      },
+      "message": "[MM] Remove renderer_applies_updates flag (#53385)\n\nSigned-off-by: DarkLight1337 <tlleungac@connect.ust.hk>",
+      "deep_analysis": {
+        "ascend_affected_confirmed": false,
+        "affected_interfaces": [],
+        "adaptation_effort": "low",
+        "adaptation_guide": "",
+        "risk": ""
+      }
+    },
+    {
+      "sha": "610bfc58e93c652fc8a075bc814ba1617f5fcf2b",
+      "comment": "ROCm Docker 镜像构建变更：在 Dockerfile.rocm_base 中构建并安装 rocprofiler-sdk 1.3.2，修复 ROCm 7.2.3 上 torch 2.12 profiler 的 trace 问题。仅影响 ROCm 平台的 Docker 构建流程。",
+      "tags": [
+        "ci",
+        "build",
+        "rocm",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[ROCm] Ship rocprofiler-sdk 1.3.2 in Dockerfile.rocm_base to fix torch.profiler traces (#53182)\n\nSigned-off-by: Rohan138 <rohanpotdar138@gmail.com>"
+    }
+  ],
+  "architecture_based_on_sha": "7154856f3dcb1d3fdd5a136f7d2c5987f22244f5",
+  "architecture_generated_at": "2026-08-01T20:25:03.691327+08:00"
+}

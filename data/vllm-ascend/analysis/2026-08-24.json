@@ -1,0 +1,497 @@
+{
+  "date": "2026-08-24",
+  "repo": "vllm-project/vllm-ascend",
+  "generated_at": "2026-08-25T02:59:09.060619+08:00",
+  "daily_summary": "当日变更覆盖多个方向：DCP 推测解码路径的元数据准备性能优化与 block table 宽度 bugfix；MRV2 模型运行器新增 profiling chunk 支持与 MLA prefill context parallelism (PCP) 基础能力；MRV1 启用 Breakable ACL Graph 捕获/重放（对标 BreakableCudaGraph）；针对最新 vLLM main 的 main2main 兼容性适配；新增 DFlash2 推测解码特性；MiniMax-M3 集成 AscendC MsaIndexScore 自定义算子（当日最大变更，5818 行新增）；另有若干 CI/文档/基础设施变更（MiniMax-M3 nightly 覆盖调整、镜像构建并发限制、删除失败分析 CI 任务、Dockerfile 增加 concurrent-log-handler、多篇模型部署文档标准化）。整体呈现功能增强与上游兼容并进的态势。",
+  "test_impact_summary": "当日变更对测试看护影响显著。核心新特性（MLA PCP、Breakable ACL Graph、DFlash2、MsaIndexScore）均配套引入了单元测试与 e2e 测试，需持续看护：MLA PCP 覆盖 backend 选择/KV gather/padding 分类，Breakable ACL Graph 新增四卡 e2e 用例与 nightly 配置，DFlash2 新增 proposer 单测与两卡 acceptance 测试，MsaIndexScore 新增大量算子级与模型级单测。main2main 兼容性适配引入了多处版本门控测试逻辑（uses_mrope、spec_decode_metrics_level、VLLMValidationError、dflash kernel 参数分支），随 vLLM main 持续演进需要长期维护。DCP 优化与 bugfix 同步更新了单测断言。文档与 CI 基础设施类变更（Dockerfile、workflow、docs）不需要测试更新。整体测试覆盖与功能变更同步度较高，但版本门控测试的长期维护成本是后续需要关注的点。",
+  "commits": [
+    {
+      "sha": "1a086ce8ab27a01d2b2fdef32797b6d989f4727f",
+      "comment": "优化 DCP 推测解码 drafting 元数据准备过程中的 host-device 同步开销。核心改动：MLA draft base sequence lengths 保留在 CPU 上（因为 DCP MTP attention mask 在 host 端消费），避免不必要的 CPU→NPU→CPU 往返拷贝；对 SFA DCP 则直接从 device 端 seq_lens 计算 local sequence lengths，避免 CPU→NPU 拷贝后再写回 dcp_context.seq_lens。针对 GLM5.2 MTP + DCP 场景下 aten::to/_to_copy/copy_ 长耗时 stall 的性能优化，同时保持非 MLA 行为不变。潜在风险在于 num_computed_tokens_of_dcp 在 MLA 路径下变为 numpy 数组，下游消费方需兼容该类型。",
+      "tags": [
+        "performance",
+        "attention",
+        "medium-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "变更了 num_computed_tokens_of_dcp 的类型（tensor→numpy）和 SFA DCP 的 seq_lens 来源偏好，测试断言需同步更新（commit 内已更新 test_dcp_manager.py）。",
+        "suggested_test_areas": [
+          "tests/ut/worker/test_dcp_manager.py"
+        ]
+      },
+      "message": "[main][Ops][Misc] Optimize speculative decoding drafting metadata preparation (#14103)\n\n## Summary\n\nThis PR reduces host-device synchronization overhead in DCP speculative\ndecoding metadata preparation.\n<img width=\"1181\" height=\"410\" alt=\"image\"\nsrc=\"https://github.com/user-attachments/assets/61259e25-bbfd-4096-be38-0796dee7bc6b\"\n/>\n\n<img width=\"869\" height=\"401\" alt=\"image\"\nsrc=\"https://github.com/user-attachments/assets/82a2067b-e18c-4cfc-b867-be8980484847\"\n/>\n\nProfiling GLM5.2 MTP + DCP showed long `aten::to/_to_copy/copy_`\nhost-side stalls caused by unnecessary CPU/NPU transfers in drafting\nmetadata paths.\n\n  Fix issue #14448 \n  Related PR for v0.26.0rc: #14554 \n\n  ## Changes\n\n- Keep MLA draft base sequence lengths on CPU in\n`prepare_spec_decode_drafting_cp_metadata`, since they are consumed on\nhost to build the DCP MTP attention mask.\n- Preserve non-MLA behavior by only converting\n`num_computed_tokens_of_dcp` to numpy for MLA.\n- For SFA DCP update, compute local sequence lengths from device-side\n`seq_lens`, avoiding CPU→NPU copy before writing\n `dcp_context.seq_lens`.\n- Update related unit test expectations for MLA CPU/numpy metadata and\nSFA device `seq_lens` preference.\n\n  ## Why\n\nThe old path moved DCP token lengths to NPU, computed local lengths,\nthen copied results back or copied CPU results to NPU again.\n\nIn MTP eager drafting this created large sync points visible as long\n`aten::to/_to_copy/copy_` events.\n\n  ## Testing\n \n<img width=\"1044\" height=\"401\" alt=\"image\"\nsrc=\"https://github.com/user-attachments/assets/7d9ab59a-cdb9-4347-9c42-07ca5bcb068b\"\n/>\n\n\n- vLLM version: v0.27.1\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/cdc4824a21eaa986d4d1fee90a7e6465c9f706e6\n\nSigned-off-by: funanyang <985619145@qq.com>"
+    },
+    {
+      "sha": "7ca7ffcacd6bdd609e18c48fc7ed85cdbd4785e0",
+      "comment": "修复 DCP replicated metadata 使用全局 BlockTable 宽度而非 rank-local DCP 宽度的问题。原实现按全局最大宽度扩展 replicated indexer view，导致 replicated view 和 compact KV-gather 路径扫描过多 block 列。新增 _get_dcp_local_block_table 方法按 max_local_block_table_cols 裁剪到本地列数，并避免重复构建 metadata。属于 DCP 上下文并行路径的正确性修复，影响 SFA DCP metadata builder 的 buffer shape 计算。",
+      "tags": [
+        "bugfix",
+        "attention",
+        "medium-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "block_table_replicated_view_buf 和 arange_buffer 的 shape 预期发生变化，测试已同步更新（(5,16)→(5,8)、(16,)→(8,)）。",
+        "suggested_test_areas": [
+          "tests/ut/attention/test_sfa_cp.py"
+        ]
+      },
+      "message": "[main][Bugfix][DCP] Use local block table for replicated metadata and avoid double metadata build (#14435)\n\nPartially fix PR #14402   changes on the mainline version\n\nDCP replicated metadata was sized from the global BlockTable width\ninstead of the rank-local DCP width, which made the replicated view and\ncompact KV-gather path scan too many block columns.\n\ntest result：\n\n<img width=\"633\" height=\"646\" alt=\"image\"\nsrc=\"https://github.com/user-attachments/assets/0987f3f8-c4d5-4da9-a293-6cb2d22a9683\"\n/>\n\n\n- vLLM version: v0.27.1\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/cdc4824a21eaa986d4d1fee90a7e6465c9f706e6\n\n---------\n\nSigned-off-by: funanyang <985619145@qq.com>"
+    },
+    {
+      "sha": "bf89d2c46ec12be04fdd09d2aba4c71c9b3a4921",
+      "comment": "为 MRV2 模型运行器适配 profiling chunk 功能。将 CPP 启动 profiling 路由到 model runner v2 的 dummy-run 路径，通过异步模型输出（AsyncOutput 的 model_runner_output）传播执行时间，并在 profiling dummy run 期间强制 CUDAGraphMode.NONE 而不改变已捕获的图状态。新增 _start/_finish/_attach_profiling_chunk_timing 三个计时辅助函数，NPUWorker.sample_tokens 在 v2 路径下将 _cpp_execution_time_ms 附加到输出。同时将 profiling 期间 max_num_reqs 临时置 1 并在 finally 中恢复，保证异常安全。",
+      "tags": [
+        "feature",
+        "model-runner",
+        "scheduler",
+        "medium-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "新增 worker v2 profiling 状态恢复、异常恢复、计时传播等单元测试，以及两卡 profiling chunk 性能 e2e 测试；同时修改了四卡测试的 additional_config 嵌套结构。",
+        "suggested_test_areas": [
+          "tests/ut/worker/a2/test_worker_v2.py",
+          "tests/ut/worker/test_model_runner_v2.py",
+          "tests/e2e/pull_request/four_card/test_profiling_chunk_performance.py",
+          "tests/e2e/pull_request/two_card/test_profiling_chunk_performance.py"
+        ]
+      },
+      "message": "[MRV2] Support profiling chunk in model runner v2 (#14286)\n\n### What this PR does / why we need it?\n\nThis PR adapts profiling-based chunk calculation for model runner v2.\n\nThe changes:\n\n- Route CPP startup profiling through the model runner v2 dummy-run\npath.\n- Propagate model execution timing through asynchronous model outputs.\n- Force `CUDAGraphMode.NONE` during profiling dummy runs without\nmutating the captured graph state.\n- Add a two-card profiling chunk performance test using PP=2 and TP=1.\n- Keep coverage for the existing four-card PP=2 and TP=2 configuration.\n\nRelated to #5208.\n\n### Does this PR introduce _any_ user-facing change?\n\nThis PR only adapts internal profiling and timing propagation for Model\nRunner V2. It does not change any user-facing API, configuration, CLI\noption, or default behavior.\n\n### How was this patch tested?\n\nCPP-related unit tests:\n\n- 158 passed\n- 1 skipped\n\nFour-card E2E test:\n\n```bash\npytest -sv tests/e2e/pull_request/four_card/test_profiling_chunk_performance.py\n\nResult:\n- Passed on 4 Ascend NPUs\n- Request time was approximately 4.3 seconds\n- Performance baseline: 5.2 seconds\n\nTwo-card E2E test:\n```bash\npytest -sv\ntests/e2e/pull_request/two_card/test_profiling_chunk_performance.py\n\nResult:\n- Passed on 2 Ascend NPUs\n- TTFT measurements: 7.02s, 7.05s, 7.03s, 7.05s, 7.04s\n- Median TTFT: 7.04 seconds\n- Performance baseline: 8.0 seconds\n\n\n- vLLM version: v0.27.1\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/cdc4824a21eaa986d4d1fee90a7e6465c9f706e6\n\n---------\n\nSigned-off-by: dianWang325 <wangdian5230@163.com>\nSigned-off-by: dianWang325 <93850926+dianWang325@users.noreply.github.com>"
+    },
+    {
+      "sha": "581051a80a3568fd4487484bfb7b13a4a9d2abf5",
+      "comment": "为 MRV2 增加 MLA prefill context parallelism (PCP) 基础支持。新增 AscendMLAPCPMetadata/Builder/Impl：builder 保留展开的 slot_mapping 并计算 rank-local prefill 区间，impl 通过 _gather_prefill_cache_inputs 收集各 rank 的 prefill KV 数据并写入完整 KV cache，再裁剪回本 rank 实际 prefill 范围。PCP 与 DCP 同时启用时抛出 NotImplementedError。同时将 treat_short_extends_as_decodes 逻辑改为在 PCP/DCP 启用时不把短扩展当 decode，并在 attn_utils 中传播 is_prefilling 状态。ACL Graph 和 prefix caching 支持被有意排除，后续单独提交。",
+      "tags": [
+        "feature",
+        "attention",
+        "high-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "新增大量 MLA PCP 单元测试覆盖 backend 选择、PCP/DCP 互斥、slot mapping 保留、KV gather、padding 和短 prefill 分类；同时更新了既有 MLA 测试的 parallel_config mock。",
+        "suggested_test_areas": [
+          "tests/ut/attention/a2/test_mla_v1.py",
+          "tests/ut/worker/test_attn_utils_v2.py"
+        ]
+      },
+      "message": "[Feature][MRV2] Support basic MLA prefill context parallelism (#14008)\n\n### What this PR does / why we need it?\n\nAdd basic MRV2 prefill context parallelism support for MLA attention on\nAscend.\n\nThis PR:\n\n- propagates per-request prefill state through MRV2 attention metadata\n- adds a shared PCP configuration helper\n- adds the MLA PCP metadata, metadata builder, and attention\nimplementation\n- gathers rank-local prefill KV data and writes the complete KV cache\n- preserves one-token prefill classification under PCP/DCP\n- adds unit coverage for backend selection, slot mappings, KV gathering,\npadding, and short prefill classification\n\nACL Graph and prefix caching support are intentionally excluded and will\nbe submitted separately.\n\nThe small `enable_pcp` helper is intentionally included in both this PR\nand #14023 so the MLA and GQA PRs can be reviewed and validated\nindependently. After either PR merges, the remaining PR will be rebased\nand the duplicate helper diff will be dropped.\n\n### Does this PR introduce _any_ user-facing change?\n\nYes. MLA models can use MRV2 prefill context parallelism on Ascend for\nthe supported eager/PIECEWISE execution paths.\n\n### How was this patch tested?\n\n- Added focused unit tests for common prefill metadata propagation\n- Added MLA PCP metadata and KV gather unit tests\n- Added a regression test for one-token prefill classification\n- `git diff --check upstream/main...HEAD`\n- AST syntax validation for all changed Python files\n\nThe focused pytest cases were not executed locally because pytest is not\ninstalled in the current Windows environment. The PR is being opened as\na draft for review and CI validation.\n\n- vLLM version: v0.27.1\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/cdc4824a21eaa986d4d1fee90a7e6465c9f706e6\n\nSigned-off-by: Madilyn537 <zhexuanwu12@gmail.com>"
+    },
+    {
+      "sha": "b0a0aa59cfee107fc6d3e20a2580e68a1795ae2b",
+      "comment": "在 MRV1 上启用 BreakableACLGraph 捕获/重放，对标 vLLM 的 BreakableCudaGraph。新增 BreakableACLGraphWrapper 类，piecewise aclgraph 不再依赖 torch.compile，通过 eager_break_during_capture 装饰器即可实现分段（mla_forward/dsa_forward 已添加）。平台层将 VLLM_USE_BREAKABLE_CUDAGRAPH 从强制禁用改为 opt-in（默认 0），并放宽 _setup_compile_backend 中对非 VLLM_COMPILE 模式的断言。_torch_cuda_wrapper 中补充 torch.cuda.CUDAGraph→NPUGraph 及 weak_ref 函数映射。spec_decode 的模型类型断言也兼容了 BreakableACLGraphWrapper 包装。",
+      "tags": [
+        "feature",
+        "compilation",
+        "high-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "新增 breakable aclgraph 的四卡 e2e 测试用例（CASE_DS_BREAKABLE_ACLGRAPH）和 DeepSeek-V4 nightly 配置，test_config.yaml 增加 breakable_aclgraph.py 的依赖映射。",
+        "suggested_test_areas": [
+          "tests/e2e/pull_request/four_card/test_graph_mode.py",
+          "tests/ut/compilation",
+          "tests/e2e/nightly/single_node/models/configs/DeepSeek-V4-Flash-W8A8-A3-Breakable.yaml"
+        ]
+      },
+      "message": "[1/N][Feature] Enable breakable ACL graph capture/replay on MRV1 (#12744)\n\n### What this PR does / why we need it?\n\nThis PR enable BreakableACLGraph mode support for vllm-ascend，similar to\nBreakableCudaGraph in vllm.\n\nAfter this change, the piecewise aclgraph does not rely on\ntorch.compile. Segmentation can be achieved simply by using a decorator.\n\n### Does this PR introduce _any_ user-facing change?\n\nYes, users need to set VLLM_USE_BREAKABLE_CUDAGRAPH=1\n\n### How was this patch tested?\n\n- vLLM version: v0.27.1\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/cdc4824a21eaa986d4d1fee90a7e6465c9f706e6\n\n---------\n\nSigned-off-by: lsh <854651606@qq.com>\nSigned-off-by: Yizhou Liu <liu_yizhou@outlook.com>\nSigned-off-by: jingmao-yan <zaiyer22@gmail.com>\nCo-authored-by: jingmao-yan <zaiyer22@gmail.com>\nCo-authored-by: Yizhou Liu <liu_yizhou@outlook.com>"
+    },
+    {
+      "sha": "9fdcd6e77204a74ce8c4ea1f4e6dd3c1f78242a9",
+      "comment": "CI/E2E 覆盖调整：将 MiniMax M3 W8A8 A3 nightly 部署与 decode 配置对齐（DP4/TP4、EAGLE3-GQA 推测解码、GPQA 精度基准替换 GSM8K），并在 AISBench 性能验证路径中增加可选的 input-throughput 和 TPOT 阈值断言。同时更新模型数据集列表和八卡 PR 测试参数。属于测试基础设施增强，不改变运行时行为。",
+      "tags": [
+        "ci",
+        "test",
+        "low-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "修改了 nightly 测试配置（模型、拓扑、基准数据集）和 AISBench 工具的新阈值逻辑，需要 CI 验证新配置的有效性。",
+        "suggested_test_areas": [
+          "tests/e2e/nightly/single_node/models/configs/MiniMax-M3-W8A8-A3.yaml",
+          "tools/aisbench.py",
+          "tests/e2e/pull_request/eight_card/test_minimax_m3.py"
+        ]
+      },
+      "message": "[CI][E2E] Add MiniMax M3 W8A8 A3 nightly coverage (#14009)\n\n### What this PR does / why we need it?\n\n- Align the MiniMax M3 W8A8 A3 nightly deployment with the decode\nconfiguration and replace GSM8K accuracy coverage with GPQA.\n- Add optional input-throughput and TPOT thresholds to the existing\nAISBench performance verification path.\n\n### Does this PR introduce _any_ user-facing change?\n\nNo. This only updates CI/E2E coverage and benchmark verification.\n\n### How was this patch tested?\n\n- `python -m ruff check tools/aisbench.py`\n- `python -m py_compile tools/aisbench.py`\n- Parsed all changed YAML files with PyYAML.\n- `git diff --check`\n\n\n- vLLM version: v0.27.1\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/cdc4824a21eaa986d4d1fee90a7e6465c9f706e6\n\n---------\n\nSigned-off-by: CXY-Katrina <katrina.cxy@gmail.com>"
+    },
+    {
+      "sha": "22e214ad77fa1cda43960706c605814e7b947f8d",
+      "comment": "纯文档更新：清理 Qwen3 和 MiniMax-M2/M3 的推荐 Ascend 环境变量，移除冗余/过时变量（OMP_NUM_THREADS、TASK_QUEUE_ENABLE、TP_SOCKET_IFNAME、VLLM_ASCEND_BALANCE_SCHEDULING 等），标准化 PYTORCH_NPU_ALLOC_CONF 格式，调整执行超时默认值（30000→3000），并将部分环境变量改为 additional-config 形式。不影响任何代码行为。",
+      "tags": [
+        "docs",
+        "low-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "纯文档变更，不涉及代码逻辑，无需测试更新。",
+        "suggested_test_areas": []
+      },
+      "message": "[Doc][Misc] Update Ascend environment for Qwen3 and MiniMax-M2/M3 (#14481)\n\n### What this PR does / why we need it?\n\nThis PR updates and cleans up the recommended Ascend environment\nvariables for Qwen3 and MiniMax-M2/M3 models.\n\n- Removes redundant or obsolete environment variables (such as\n`OMP_NUM_THREADS`, `TASK_QUEUE_ENABLE`,\n`VLLM_ASCEND_BALANCE_SCHEDULING`, `TP_SOCKET_IFNAME`, and various\ntimeout variables).\n\n- Standardizes the format of environment variables (e.g., removing\nunnecessary quotes from\n`PYTORCH_NPU_ALLOC_CONF=expandable_segments:True`).\n\n- Adjusts execution timeouts to more reasonable defaults (e.g., reducing\n`VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS` from `30000` to `3000`).\n\n### Does this PR introduce _any_ user-facing change?\nNo, These are Documentation-only updates.\n### How was this patch tested?\n\n\n- vLLM version: v0.27.1\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/ba07e4a48fc951300d97eb506217dd530583dea3\n\nSigned-off-by: chenzhh69 <65229829+chenzhihao-sudo@users.noreply.github.com>\nCo-authored-by: chenzhh69 <65229829+chenzhihao-sudo@users.noreply.github.com>"
+    },
+    {
+      "sha": "649582947376908c69e4759c79fadd62ce898ac5",
+      "comment": "main2main 兼容性适配：将 vllm-ascend 适配到最新 vLLM main (ba07e4a4)。涉及多处上游 API 变更的版本门控处理：pcp 导入路径迁移（model_executor→v1.attention.ops）、get_current_vllm_config 上下文要求（update_full_graph_params 包 set_current_vllm_config）、AutoWeightsLoader skip_prefixes 移除（改用 WeightsMapper）、DeepseekV32MTPModel 架构识别、dflash kernel 增加 DCP 参数（cp_rank/CP_SIZE/CP_INTERLEAVE，Ascend 侧保持 31 pos + 5 constexpr 分支）。测试侧同步增加 HunyuanVL skip 条件和多处版本门控。",
+      "tags": [
+        "ci",
+        "refactor",
+        "high-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "多个测试需要版本门控（model_config.uses_mrope、spec_decode_metrics_level、VLLMValidationError 错误类型），dflash kernel 按版本分支为两套实现，需要分别维护和验证。",
+        "suggested_test_areas": [
+          "tests/ut/core/test_profiling_chunk.py",
+          "tests/ut/core/test_recompute_scheduler.py",
+          "tests/ut/patch/platform/test_patch_structured_output.py",
+          "tests/e2e/conftest.py",
+          "vllm_ascend/worker/v2/spec_decode/dflash/speculator.py 对应测试"
+        ]
+      },
+      "message": "[Ci] main2main vllm 0821 (#14746)\n\n### What this PR does / why we need it?\nThe PR adapts vllm-ascend for compatibility with the latest vLLM main\n(commit `ba07e4a4`).\n\n| Files | Upstream vLLM change | vllm-ascend adaptation |\n|-------|---------------------|------------------------|\n| `.github/vllm-main-verified.commit` | — | Updated verified main commit\nhash from `cdc4824a21` to `ba07e4a48` |\n| `tests/e2e/conftest.py` |\n[vllm#53272](https://github.com/vllm-project/vllm/pull/53272) — upstream\nplans to remove native Hunyuan V1/VL;\n[vllm#51665](https://github.com/vllm-project/vllm/pull/51665) — dropped\nHunYuanVL `lm_head` workaround | Added `skip` condition for HunyuanVL\ne2e when `vllm_version_is(\"0.27.1\")` is False (vLLM main) |\n| `tests/ut/core/test_profiling_chunk.py` | — vLLM main\n`Scheduler.__init__` reads `model_config.uses_mrope`, which infinitely\nrecurses on a bare MagicMock | Version-gated: sets\n`type(model_config).uses_mrope = PropertyMock(return_value=False)` on\nmain |\n| `tests/ut/core/test_recompute_scheduler.py` | — vLLM main\n`Scheduler.add_request` reads `spec_decode_metrics_level` |\nVersion-gated: sets `scheduler.spec_decode_metrics_level = \"none\"` on\nmain |\n| `tests/ut/patch/platform/test_patch_structured_output.py` | — Upstream\nchanged structured output validation error type from `ValueError` to\n`VLLMValidationError` | Version-gated: `error_type = ValueError if\nvllm_version_is(\"0.27.1\") else VLLMValidationError` used in all three\nfake validation functions and `pytest.raises` |\n| `vllm_ascend/attention/attention_v1.py` |\n[vllm#52839](https://github.com/vllm-project/vllm/pull/52839) — moved\n`pcp.py` from `vllm.model_executor.layers.attention.pcp` to\n`vllm.v1.attention.ops.pcp` | Version-gated\n`_gather_prefill_cache_inputs` import path |\n| `vllm_ascend/compilation/acl_graph.py` |\n[vllm#49134](https://github.com/vllm-project/vllm/pull/49134) —\n`get_current_vllm_config()` now raises `AssertionError` when called\noutside `set_current_vllm_config()` context | `update_full_graph_params`\nversion-gated: main branch wraps `get_impl_cls()`/`update_graph_params`\nin `with set_current_vllm_config(vllm_config):` |\n| `vllm_ascend/models/deepseek_mtp.py` |\n[vllm#53106](https://github.com/vllm-project/vllm/pull/53106) — removed\n`skip_prefixes` kwarg from `AutoWeightsLoader.__init__` |\n`AscendGlmMoeDsaForCausalLM.load_weights` version-gated: 0.27.1 uses\n`skip_prefixes=[\"rot.\"]`; main uses\n`WeightsMapper(orig_to_new_prefix={\"rot.\": None})` passed via\n`load_weights(weights, mapper=mapper)` |\n| `vllm_ascend/spec_decode/llm_base_proposer.py` |\n[vllm#52861](https://github.com/vllm-project/vllm/pull/52861) — added\n`DeepseekV32MTPModel` to MTP architecture set in `model_returns_tuple()`\n| `model_returns_tuple` version-gated: 0.27.1 checks\n`{\"DeepSeekMTPModel\", \"KimiK3MTPModel\"}`; main also includes\n`\"DeepseekV32MTPModel\"` |\n| `vllm_ascend/worker/v2/spec_decode/dflash/speculator.py` |\n[vllm#52188](https://github.com/vllm-project/vllm/pull/52188) — added\n`cp_rank`, `CP_SIZE`, `CP_INTERLEAVE` params to\n`_prepare_dflash_inputs_kernel` for DCP support | Entire\n`_prepare_dflash_inputs_kernel_ascend` kernel duplicated under\n`vllm_version_is(\"0.27.1\")` gate: 0.27.1 uses 30 pos + 3 constexpr (no\nDCP params); main uses 31 pos + 5 constexpr |\n### Does this PR introduce _any_ user-facing change?\n\n### How was this patch tested?\n\n- vLLM version: v0.27.1\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/cdc4824a21eaa986d4d1fee90a7e6465c9f706e6\n\n---------\n\nSigned-off-by: hfadzxy <starmoon_zhang@163.com>"
+    },
+    {
+      "sha": "5d8d640ca7b44ccfd3c5d5e4c09f465a6152069b",
+      "comment": "修复 YuanrongBackend 不接受 lazy_init 关键字导致 AscendStoreConnector 启动失败（TypeError）的问题。Backend 抽象基类签名增加 lazy_init: bool = False，YuanrongBackend 接受该参数但记录警告并保持 eager 初始化（Yuanrong 不支持 lazy init）。属于 KV pool 后端的接口兼容性修复，影响面小。",
+      "tags": [
+        "bugfix",
+        "distributed",
+        "low-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "新增回归测试验证 lazy_init=True 被接受且 store.init() 仍被调用（commit 内已添加）。",
+        "suggested_test_areas": [
+          "tests/ut/distributed/test_yuanrong_backend.py"
+        ]
+      },
+      "message": "[BugFix][KV Pool] Accept lazy_init for Yuanrong backend (#14557)\n\n### What this PR does / why we need it?\n\n`KVPoolWorker` passes the common `lazy_init` keyword to every\nAscendStore backend. `YuanrongBackend` did not accept that keyword, so\nstarting `AscendStoreConnector` with `backend: \"yuanrong\"` failed with:\n\n```text\nTypeError: YuanrongBackend.__init__() got an unexpected keyword argument 'lazy_init'\n```\n\nThis PR makes `YuanrongBackend` accept the common argument. Yuanrong\ndoes not support lazy initialization, so it logs a warning when\nrequested and continues to initialize eagerly.\n\nA regression test verifies that `lazy_init=True` is accepted and\n`store.init()` is still called.\n\n### Does this PR introduce _any_ user-facing change?\n\nYes. `AscendStoreConnector` can start with the Yuanrong backend when the\nworker supplies the common `lazy_init` argument. Yuanrong initialization\nbehavior remains eager.\n\n### How was this patch tested?\n\n- Added `test_backend_accepts_lazy_init_and_initializes_eagerly` in\n`tests/ut/distributed/test_yuanrong_backend.py`.\n- `python -m py_compile\nvllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/yuanrong_backend.py\ntests/ut/distributed/test_yuanrong_backend.py`\n- `git diff --check`\n\n- vLLM version: v0.27.1\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/58d3918e3ea0a544ffedadad2ba84559e9c51d8f\n\nSigned-off-by: yangsonglin13 <yangsonglin566@gmail.com>"
+    },
+    {
+      "sha": "f61b935b81094a503599426b88230d9271d6616a",
+      "comment": "在所有 Dockerfile（含 A3/A5/openEuler 变体）中安装 concurrent-log-handler，以支持 vLLM 并发日志轮转配置（VLLM_CONFIGURE_LOGGING + ConcurrentRotatingFileHandler）。纯基础设施变更，不影响运行时推理逻辑。",
+      "tags": [
+        "chore",
+        "ci",
+        "low-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "仅 Dockerfile 依赖变更，不涉及测试逻辑。",
+        "suggested_test_areas": []
+      },
+      "message": "[Ops][Misc] Add concurrent-log-handler to Dockerfiles (#14645)\n\n### What this PR does / why we need it?\n\nThis PR adds `concurrent-log-handler` to the Dockerfiles to support\nconcurrent logging.\n\n### Does this PR introduce _any_ user-facing change?\n\nNo.\n\n### How was this patch tested?\n\n- Base image:\n\n- Test step:\n```\nexport VLLM_CONFIGURE_LOGGING=1\nexport VLLM_LOGGING_CONFIG_PATH=/mnt/share/vllm_log_rotate.json\n```\nvllm_log_rotate.json:\n```\n{\n    \"version\": 1,\n    \"disable_existing_loggers\": false,\n    \"formatters\": {\n        \"standard\": {\n            \"format\": \"%(asctime)s [%(levelname)s] %(name)s:%(lineno)d - %(message)s\",\n            \"datefmt\": \"%Y-%m-%d %H:%M:%S\"\n        }\n    },\n    \"handlers\": {\n        \"console\": {\n            \"class\": \"logging.StreamHandler\",\n            \"level\": \"INFO\",\n            \"formatter\": \"standard\",\n            \"stream\": \"ext://sys.stdout\"\n        },\n        \"concurrent_rotating_file\": {\n            \"class\": \"concurrent_log_handler.ConcurrentRotatingFileHandler\",\n            \"level\": \"INFO\",\n            \"formatter\": \"standard\",\n            \"filename\": \"/mnt/share/test.log\",\n            \"maxBytes\": 20,\n            \"backupCount\": 10,\n            \"encoding\": \"utf-8\"\n        }\n    },\n    \"loggers\": {\n        \"vllm\": {\n            \"level\": \"INFO\",\n            \"handlers\": [\"console\", \"concurrent_rotating_file\"],\n            \"propagate\": false\n        }\n    },\n    \"root\": {\n        \"level\": \"INFO\",\n        \"handlers\": [\"console\", \"concurrent_rotating_file\"]\n    }\n}\n```\n- Test results:\n<img width=\"812\" height=\"348\" alt=\"image\"\nsrc=\"https://github.com/user-attachments/assets/e27592bc-bfb1-46de-b4db-989965e1372c\"\n/>\n<img width=\"443\" height=\"185\" alt=\"image\"\nsrc=\"https://github.com/user-attachments/assets/04969ac0-a071-4366-aee4-58688bc52337\"\n/>\n\n- vLLM version: v0.27.1\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/58d3918e3ea0a544ffedadad2ba84559e9c51d8f\n\nSigned-off-by: wenjinhust <wenjin.sh@huawei.com>"
+    },
+    {
+      "sha": "b7de842253ad8da059c31ff7e5e9357974d7929a",
+      "comment": "大规模文档标准化：统一内存单位表示（64G→64GB）、示例 IP 地址改为标准私网段（141.xx.xx.x→192.xx.xx.x）、修正参考链接大小写和名称（FAQ→FAQs、Feature Guide→Feature Matrix）、移除尾随空格、补充文档锚点。涉及 54 个文档文件，纯文档变更。",
+      "tags": [
+        "docs",
+        "low-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "纯文档变更，不涉及代码逻辑，无需测试更新。",
+        "suggested_test_areas": []
+      },
+      "message": "[Doc][Misc] Standardize memory units, IP addresses, and reference links in model deployment tutorials (#14797)\n\n### What this PR does / why we need it?\n\nThis PR standardizes documentation across multiple model deployment\ntutorials. It updates memory unit representations (e.g., \"64G\" to\n\"64GB\"), changes example IP addresses to use standard private IP ranges\n(e.g., \"192.xx.xx.x\"), corrects reference link casing and names (e.g.,\n\"Feature Matrix\" and \"Feature Guide\"), and removes trailing whitespaces.\n\n### Does this PR introduce _any_ user-facing change?\n\nNo, this is a documentation-only update.\n\n### How was this patch tested?\n\nTested by verifying the documentation formatting and links.\n\n- vLLM version: v0.27.1\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/cdc4824a21eaa986d4d1fee90a7e6465c9f706e6\n\nSigned-off-by: sunshine202600 <sunshine202600@163.com>"
+    },
+    {
+      "sha": "6958febef951f663fc54bc51403ffb9638d5a1fe",
+      "comment": "为 MRV1 新增 DFlash2 推测解码支持。DFlash2 在扩散生成后使用 conv 模块在 topk 候选 token 中选择最优链。新增 DFlash2Qwen3ForCausalLM 模型（含 DFlashGroupedConv、CandidateSelector）、AscendDflash2Proposer、dflash2_greedy_selector_walk_kernel Triton kernel，并在 get_spec_decode_method 中按 draft 架构自动分发到 DFlash2。仅支持 v1（Qwen3.8 权重依赖 MRV1），不支持 probabilistic draft sampling 和 reduced draft vocabulary。性能数据显示 PIECEWISE 模式下吞吐从 1.33 提升到 1.43 req/s。",
+      "tags": [
+        "feature",
+        "spec_decode",
+        "high-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "新增 dflash2 proposer 单元测试（grouped conv 参考实现、selector 边评分、greedy walk、分发逻辑）和两卡 e2e acceptance 测试，test_config.yaml 增加 spec_decode_dflash2 任务。",
+        "suggested_test_areas": [
+          "tests/ut/spec_decode/test_dflash2_proposer.py",
+          "tests/e2e/pull_request/two_card/spec_decode/test_spec_decode.py",
+          ".github/workflows/scripts/test_config.yaml"
+        ]
+      },
+      "message": "[Feature] add DFlash2 for MRV1 (#14533)\n\n### What this PR does / why we need it?\n\nAdd support for DFlash2 speculativing decoding feature。\n\nDFlash2: After diffusion generation, use the conv module to select the\noptimal chain among the topk candidate tokens.\n\n**Why only support v1?** \nThe current open-source weights only depend on Qwen3.8, and this target\nmodel can only be supported by Model Runner v1.\n\n### Performance\nQwen3.8-27B, DP1/TP2, first 300 prompts from gsm8k, batch_size 16,\ntemperature 0, A2B3-NPU\n| Method | Graph Mode | Spec Num | Mean Acceptance Length | Acc-Rate per\nPos(%) | Accuracy(%) | Throughput(req/s) |\n|-----|-----|-----|-----|-----|-----|-----|\n| No-Spec | Eager | - | - | - | 81.7 | 0.21 |\n| MTP | Eager | 8 | 6.17 | 94, 86, 77, 68, 59, 51, 44, 38 | 80.3 | 0.92\n|\n| MTP | PIECEWISE | 8 | 6.17 | 94, 86, 77, 68, 59, 51, 44, 38 | 80 |\n1.33 |\n| Dflash2 | Eager | 8 | 6.73 | 94, 87, 80, 74, 68, 62, 57, 51 | 80 |\n1.02 |\n| Dflash2 | PIECEWISE | 8 | **6.43** | 94, 86, 78, 71, 64, 57, 52, 46 |\n79.7 | **1.43** |\n\nRegarding accuracy: The output length is limited to 512, so the overall\naccuracy is relatively low.\n\n### Does this PR introduce _any_ user-facing change?\n\nWithout relying on any upstream work, it can run simply by\ncherry-picking in vllm-ascend.\n\nDownload official model:\n[Weights](https://huggingface.co/collections/z-lab/dflash-2)\n\nOnly use \"method=dflash\", the framework automatically distributes the\ntraffic:\n`--speculative_config\n'{\"method\":\"dflash\",\"model\":\"/home/data/Qwen3.8-27B-DFlash2/\",\"num_speculative_tokens\":8}'`\n\nPlease use it in eager/piecewise mode, as more features are being\nrapidly iterated.\n\n\n- vLLM version: v0.27.1\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/cdc4824a21eaa986d4d1fee90a7e6465c9f706e6\n\nSigned-off-by: chenaoxuan <cax1165@163.com>\nCo-authored-by: Stanislav <60266193+StanislavII@users.noreply.github.com>\nCo-authored-by: lilinsiman <lilinsiman@gmail.com>"
+    },
+    {
+      "sha": "bd12c8707811ca07bd8b3564707e7a339506dad4",
+      "comment": "删除 CI 失败分析任务：移除 _analyze_failure.yaml workflow、analyze_failure_report.py 脚本及 pr_test.yaml 中的 analyze-failure-report job。灰度测试已完成，失败分析脚本不再需要。纯 CI 清理，不影响测试代码和运行时行为。",
+      "tags": [
+        "ci",
+        "chore",
+        "low-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "删除的是 CI 辅助脚本和 workflow，不涉及测试用例本身。",
+        "suggested_test_areas": []
+      },
+      "message": "[CI]Delete Failure Analyze Job (#14815)\n\n### What this PR does / why we need it?\nGray‑scale testing for the precision test project has been completed.\nThe failure‑analysis script is no longer required, and redundant\nfeatures are removed.Delete relative job in pr_test.yaml. Delete\n_analyze_faliure.yaml. Delete _analyze_failure_report.py\n### Does this PR introduce _any_ user-facing change?\n\n---------\n\nSigned-off-by: Xuyzhen <958522639@qq.com>"
+    },
+    {
+      "sha": "b1c19278c926ff16de2cb44472161d8db7884605",
+      "comment": "限制镜像构建并发：workflow 级 concurrency group（按 github.ref 串行化，cancel-in-progress: false），image_build 和 image_build_by_commit 矩阵增加 max-parallel: 3，避免 16 路并行构建导致 buildkitd 过载（EOF、DeadlineExceeded、timeout）。纯 CI 基础设施变更。",
+      "tags": [
+        "ci",
+        "low-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "仅 CI workflow 并发控制变更，不影响测试逻辑。",
+        "suggested_test_areas": []
+      },
+      "message": "[CI] Limit image build concurrency (#14813)\n\n## What this PR does / why we need it?\n\nImage build concurrency is too high, causing buildkitd overload errors\n(EOF, DeadlineExceeded, timeout). A single trigger launches 8 configs ×\n2 architectures = 16 parallel builds. Multiple triggers (push tag + PR +\nworkflow_dispatch) amplify the problem.\n\nChanges:\n1. Add `concurrency` group at workflow level (keyed by `github.ref`,\n`cancel-in-progress: false`) — serializes multiple runs for the same ref\n2. Add `max-parallel: 3` to both `image_build` and\n`image_build_by_commit` matrices — limits concurrent builds within a\nsingle run\n\n## Does this PR introduce any user-facing change?\n\nNo\n\n## How was this patch tested?\n\n- YAML syntax validated\n- No CI behavior changes, only concurrency limits\n\nSigned-off-by: JavaPythonAIForBAT <wuhejun@h-partners.com>"
+    },
+    {
+      "sha": "4146cae0d0e567f9f66e2296294cd3eadbf9f1b9",
+      "comment": "为 MiniMax-M3 集成 AscendC MsaIndexScore 自定义算子，是当日最大变更（5818 行新增，28 个文件）。包含完整的 csrc 算子实现（op_host 的 def/infershape/tiling、op_kernel 的 AIC/AIV 混合 kernel、BBND/BNBD/TND 三种 key layout、int8 反量化、rightDownCausal 稀疏掩码、local_mask）、torch binding（npu_msa_index_score + Meta 实现）、以及 Python 侧 prefill/decode/speculative decode 路径路由。decode 路径支持 TP block parallel 分片，TopK 保留在 Python 侧以灵活处理投机候选。prefill 和 decode 性能分别提升 8% 和 20%。仅支持 A2/A3，不支持 Ascend 950 和 FP8。",
+      "tags": [
+        "feature",
+        "ops",
+        "attention",
+        "high-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "新增大量 MSA index score 单元测试覆盖 AscendC 算子调用参数、TP block parallel decode、speculative decode 候选可见性、local_mask 逐 token 移动、graph 输入存储复用等；csrc 侧新增算子自检用例矩阵。",
+        "suggested_test_areas": [
+          "tests/ut/models/minimax_m3/test_msa_m3.py",
+          "csrc/attention/msa_index_score/tests/",
+          "csrc/attention/msa_index_score/examples/test_aclnn_msa_index_score.cpp"
+        ]
+      },
+      "message": "[Feature]minimax-m3: integrate AscendC MSA index score (#14539)\n\n### What this PR does / why we need it?\n- AscendC Operator Integration: Integrated the bundled MsaIndexScore\ncustom operator for MiniMax-M3, routing prefill, decode, and speculative\ndecode paths through AscendC.\n- Speculative Decode Support: Enabled speculative decoding by handling\nper-token visibility and applying local masks dynamically, while\npreserving tensor-parallel decode sharding.\n- TopK Logic: Maintained TopK operations in Python to allow for flexible\nhandling of speculative candidates while offloading the heavy score\ncomputation to the optimized AscendC kernel.\n\n### Does this PR introduce _any_ user-facing change?\nNA\n\n### How was this patch tested?\n- Precision：GPQA achieves 93.xx\n- Performance：Prefill and decode performance improved by 8% and 20%\nrespectively under a 64k input / 1k output workload.\n\n- vLLM version: v0.27.1\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/cdc4824a21eaa986d4d1fee90a7e6465c9f706e6\n\n---------\n\nSigned-off-by: CXY-Katrina <katrina.cxy@gmail.com>"
+    },
+    {
+      "sha": "02271c31381a8f96f201904107dbfa0fd5aa97c7",
+      "comment": "修复 Kimi-K2.6-W4A4C8 FAQuant 权重加载问题。根因是 KimiK25ForConditionalGeneration.load_weights 调用 AutoWeightsLoader 时，内部 language_model（DeepSeekV2ForCausalLM）也会调用 AutoWeightsLoader，导致 suffix mapper 执行两次，生成错误的 key（如 'layers.0.self_attn.mla_attn.mla_attn.mla_attn.mla_attn.fa_k.offset'）。修复方式是将 FAQuant 和 indexer 的 suffix_map 改为 regex_map，使用负向零宽断言 (?<!\\.mla_attn\\.mla_attn) 避免对已带双重前缀的 key 再次映射。变更位于 AscendModelSlimConfig.get_cache_scale_mapper，属于量化权重映射逻辑，影响面集中在 modelslim 量化模型的权重加载路径。风险点在于正则表达式依赖 key 后缀格式的稳定性，若上游模型命名变化可能需要同步调整。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "quantization"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "权重映射逻辑从 suffix_map 改为 regex_map，属于行为变更，需要新增针对嵌套 AutoWeightsLoader 双重映射场景的回归测试，验证 FAQuant/indexer 权重 key 不被重复映射。",
+        "suggested_test_areas": [
+          "tests/ut/quantization/ (modelslim config mapper 测试)",
+          "vllm_ascend/quantization/modelslim_config.py 相关单测"
+        ]
+      },
+      "message": "[bugfix]Fix kimi-k2.6-w4a4c8 FAQuant weight loading issue. (#14653)\n\n### What this PR does / why we need it?\nThis is related to #14540 , which resolve some issues on v0.26.0.\n\nFor Kimi-K2.6-W4A4C8 which has FAQuant, there is KeyError:\n'layers.0.self_attn.mla_attn.mla_attn.mla_attn.mla_attn.fa_k.offset'\n. KimiK25ForConditionalGeneration.load_weights will call\nAutoWeightsLoader and the inner language_model (actually\nDeepseekV2ForCausalLM) will also call AutoWeightsLoader, our suffix\nmapper will run twice, and make a wrong key\n'layers.0.self_attn.mla_attn.mla_attn.mla_attn.mla_attn.fa_k.offset'\ninstead of 'layers.0.self_attn.mla_attn.mla_attn.fa_k.offset'. We use a\nregex mapper to avoid this situation.\n\n### Does this PR introduce _any_ user-facing change?\n\n### How was this patch tested?\n\n- vLLM version: v0.27.1\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/cdc4824a21eaa986d4d1fee90a7e6465c9f706e6\n\nSigned-off-by: menogrey <1299267905@qq.com>"
+    },
+    {
+      "sha": "4c9cdea56d349542775e677669b0702680887195",
+      "comment": "修复 MRV2 中 dummy InputBatch 创建方式，将 deepcopy asdict() 替换为基于 InputBatch 基类字段的浅拷贝字典，避免深拷贝导致 input_batch 被错误使用。同时移除了 SFA metadata builder 中为 MRV1 兼容保留的 per-step buffers（actual_seq_lengths_query/key 及 spec 版本），build_for_drafting 现在直接使用 common_attn_metadata 的 query_start_loc 和 seq_lens。这是对 #13958 和 #14236 适配代码的清理，简化了 AscendSFAMetadataBuilder 的状态管理。测试同步删除了对 buffer data_ptr 的断言。风险中等：移除 buffer 后需确认 MRV2 的 spec decode 路径不再依赖这些 per-step 缓冲。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "model-runner",
+        "attention"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "移除了 SFA metadata builder 的 per-step buffers 并修改了 dummy InputBatch 创建方式，commit 已同步更新 test_sfa_v1.py，但需要确认 MRV2 graph capture 路径下 dummy batch 的字段浅拷贝行为有足够覆盖。",
+        "suggested_test_areas": [
+          "tests/ut/attention/a2/test_sfa_v1.py",
+          "tests/ut/worker/v2/ (InputBatch dummy 创建测试)"
+        ]
+      },
+      "message": "[BugFix][MRV2] Fix Graph input_batch and remove redundant attention buffers (#14493)\n\n### What this PR does / why we need it?\nThis PR fixes the `InputBatch` dummy creation in ModelRunner V2 by\nreplacing the deepcopy `asdict()` call with a shallow dictionary of\nfields. This avoids incorrectly uses of `input_batch`.\nAdditionally, it removes previously added adaptation codes of #13958 and\n#14236.\n### Does this PR introduce _any_ user-facing change?\nNo\n### How was this patch tested?\nRuns on A3 and tested precision and accuracy.\n\n\n- vLLM version: v0.27.1\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/cdc4824a21eaa986d4d1fee90a7e6465c9f706e6\n\n---------\n\nSigned-off-by: ZhangwenTaoHW <zhangwentao101@huawei.com>"
+    },
+    {
+      "sha": "5b620038ba05c34ec62d6ab7030a7e82fbcdca6b",
+      "comment": "单行修复：将 `not hasattr(vllm_config.model_config.hf_text_config, \"sliding_window\")` 改为 `not getattr(..., \"sliding_window\", None)`。原逻辑在 sliding_window 属性存在但值为 None 时（非 SWA 模型但属性被显式设置为 None），会错误地走 SWA 路径，导致 ACL graph 捕获时 block_tables 不被刷新。修复后仅当 sliding_window 为 truthy 值时才保留捕获的 block_tables。属于低风险防御性修复，影响 AscendAttentionBackendImpl 中 SWA 模型的 graph 参数更新路径。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "attention"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "单行逻辑修复，将 hasattr 改为 getattr 默认值判断，现有 attention 测试已覆盖 SWA/非 SWA 路径，无需新增测试。",
+        "suggested_test_areas": []
+      },
+      "message": "[Bugfix] Use getattr for `sliding_window` to cover None cases (#14500)\n\n### What this PR does / why we need it?\nUse getattr to check `sliding_window` with default None, so falsy values\nare handled correctly.\n### Does this PR introduce _any_ user-facing change?\nNo.\n### How was this patch tested?\nVerified by testers.\n\n\n- vLLM version: v0.27.1\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/cdc4824a21eaa986d4d1fee90a7e6465c9f706e6\n\nSigned-off-by: zhiyu-wa <1959864813@qq.com>"
+    },
+    {
+      "sha": "bb570591f0a95c186318ef044beb4efbf51a2653",
+      "comment": "修复 triton 算子 _fill_logprob_token_ids_kernel 在 Ascend NPU 上的动态地址指针问题。上游实现在 if/else 分支外统一计算 src 指针并执行 tl.load，在 NPU 上因 src 需运行时确定导致编译/执行失败。修复将 tl.load 移入 if/else 分支内部各自执行，逻辑结果与上游一致。新增了完整的算子文档（docs/fill_logprob_token_ids.md）和精度测试（对比 CPU 参考实现，逐位相等）。同时在 patch_triton.py 中通过 monkey-patch 替换上游 kernel，并注明待编译器/Triton Ascend toolkit 支持上游实现后可回退。变更影响采样路径的 logprob token IDs 填充逻辑，涉及 spec decode 和 top-k logprobs 场景。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "ops",
+        "spec-decode"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "新增了 Ascend 专用 triton kernel 及对应精度测试（nightly e2e），需要确保该测试纳入 CI 看护，并验证 patch_triton.py 的 kernel 替换在采样路径上生效。",
+        "suggested_test_areas": [
+          "tests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_fill_logprob_token_ids_kernel.py",
+          "vllm_ascend/patch/worker/patch_v2/patch_triton.py 相关采样测试"
+        ]
+      },
+      "message": "[Bugfix][MRV2] Fix an error inside triton op fill_logprob_token_idx (#14640)\n\n### What this PR does / why we need it?\nThis pr fix an error bug inside triton op fill_logprob_token_idx which\nmerge addr ptr from an if-else control.\n### Does this PR introduce _any_ user-facing change?\n\n### How was this patch tested?\nUt can be tested \npytest -sv\ntests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_fill_logprob_token_ids_kernel.py\n#--noconftest\n\n- vLLM version: v0.27.1\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/cdc4824a21eaa986d4d1fee90a7e6465c9f706e6\n\n---------\n\nSigned-off-by: AuroraEmiya <Sakura.iostream@gmail.com>\nSigned-off-by: Xuyzhen <958522639@qq.com>\nCo-authored-by: Xuyzhen <958522639@qq.com>"
+    },
+    {
+      "sha": "657df3efae6479822970081636ffb9684f936d2f",
+      "comment": "修复 SFA Prolog V3 KV 写入在 DCP 下使用错误 slot mapping 的正确性问题。根因：DCP 场景下 AscendSFADCPMetadataBuilder 维护两个 slot mapping——attn_metadata.slot_mapping 是 replicated 视图（LightningIndexer cache 在每个 DCP rank 上复制），attn_metadata.dcp_context.slot_mapping 是 DCP-local 视图（SFA KV cache 分片）。Prolog V3 decode 分支是唯一仍将 replicated slot_mapping 传入 _sfa_preprocess_with_prolog_v3 的 KV 写入路径，导致 prolog 将 SFA KV 写入 replicated 布局的索引，后续 decode 读回错误 KV。修复改为传入 slot_mapping_sfa（通过 _get_sfa_kv_slot_mapping 派生），并同步更新 assert 以校验实际使用的 tensor。indexer cache 写入路径（npu_scatter_nd_update_）继续使用 replicated 视图（重命名为 slot_mapping_li），语义正确。触发条件苛刻（PD 分离 D 节点 + enable_sparse_sfa_c8 + w4a8 + decode_context_parallel_size>1），但后果是 decode 输出错误，属于高风险正确性修复。",
+      "tags": [
+        "bugfix",
+        "high-risk",
+        "attention",
+        "context-parallel"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "修复了 DCP + SFA Prolog V3 + sparse c8 组合下的 KV 写入错误，属于多条件触发的正确性问题，需要新增回归测试覆盖 DCP slot mapping 与 replicated slot mapping 的区分。",
+        "suggested_test_areas": [
+          "tests/ut/attention/ (SFA DCP metadata builder 测试)",
+          "tests/e2e/ (PD 分离 + DCP + SFA 场景)"
+        ]
+      },
+      "message": "[BugFix][SFA] Use DCP-sharded slot mapping in prolog v3 KV write (#14536)\n\n### What this PR does / why we need it?\n#### How it was found\n\nFound while debugging garbled decode output on **GLM5.2** in a\nPD-disaggregated deployment with **w4a8** weights and\n`enable_sparse_sfa_c8` enabled. The prefill node was unaffected; only\nthe decode node produced wrong results.\n\nFour conditions must hold at once for the bug to trigger:\n\n1. `enable_sfa_prolog_v3` requires `is_kv_consumer`, so only the **D\nnode** of a PD-disaggregated deployment takes this path;\n2. it also requires `enable_sparse_sfa_c8`;\n3. `_get_sfa_prolog_v3_unsupported_reasons` requires w8a8-dynamic\n`fused_qkv_a_proj` and `q_proj`, which the w4a8 checkpoint satisfies;\n4. the two slot mappings only diverge when `decode_context_parallel_size\n> 1` (see `enable_sfa_dcp_replicated_indexer` in\n`vllm_ascend/utils.py`).\n\n#### Root cause\n\nUnder DCP, `AscendSFADCPMetadataBuilder` maintains two different slot\nmappings, as documented by the \"SFA DCP replicated-indexer layout\"\ncomment in `vllm_ascend/attention/context_parallel/sfa_cp.py`:\n\n- `attn_metadata.slot_mapping` is the **replicated** view. The\nLightningIndexer cache is replicated on every DCP rank so index\nselection runs against the full sequence and keeps the same sparse top-k\nsemantics as non-DCP SFA.\n- `attn_metadata.dcp_context.slot_mapping` is the **DCP-local** view.\nThe SFA KV cache stays sharded across DCP ranks to preserve the KV\nmemory saving.\n\n`AscendSFAImpl.forward` already derives `slot_mapping_sfa` for exactly\nthis purpose and uses it on the native path — `exec_kv`, the packed-C8\n`npu_scatter_nd_update_`, and `reshape_and_cache`. The SFA Prolog V3\ndecode branch was the only KV-writing path still passing the replicated\n`attn_metadata.slot_mapping` into `_sfa_preprocess_with_prolog_v3`,\nwhich forwards it to `npu_mla_prolog_v3` as `cache_index`. The prolog\ntherefore wrote SFA KV into indices belonging to the replicated layout,\nso subsequent decode steps read back KV from the wrong slots.\n\n#### Changes\n\n- Pass `slot_mapping_sfa` instead of `attn_metadata.slot_mapping` to\n`_sfa_preprocess_with_prolog_v3`.\n- Update the assert above the call to validate the same tensor that is\nactually passed. Both tensors are sliced to `num_input_tokens`, so this\ndoes not change which batches pass the assert; it only keeps the check\nand its error message consistent with the value in use.\n\n### Does this PR introduce _any_ user-facing change?\nNo API or configuration change. It is a correctness fix: with SFA Prolog\nV3 and DCP both enabled, decode output was previously incorrect due to\nmismatched KV cache indices, and is now correct.\n\n### How was this patch tested?\n\n\n- vLLM version: v0.27.1\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/58d3918e3ea0a544ffedadad2ba84559e9c51d8f\n\n---------\n\nSigned-off-by: Bonan Wang <bryanwang20@gmail.com>"
+    },
+    {
+      "sha": "d0de46c794a301566288d8d70de7589505bcc8f8",
+      "comment": "为 MRV2 增加 MTP 推测解码与流水线并行 (PP) 的组合支持。上游 V2 只在最后一个 PP stage 创建 speculator，而 Ascend runner 之前会在每个 stage 重新初始化；此外 target sampler 输出在最后 stage 生成下一步 MTP draft tokens 之前就被广播，导致非最后 stage 无法获得延迟 PP request-state 更新所需的 draft 状态。本补丁：(1) 在 use_spec_pp（method==\"mtp\" 且 PP>1）时仅在最后 PP rank 初始化 speculator；(2) 通过 pending_send 机制延迟 target-token 广播，直到 propose() 填充完 draft tokens 后由 broadcast_draft_tokens() 发送；(3) 将 accepted target tokens 和 next-step draft tokens 打包进同一个 PP queue slot（扩展 max_sample_len 为 token_payload_width）；(4) 在 get_prev_sampled_outputs 中先更新 draft state 再走上游 update_pp_decode_requests。实现通过 monkey-patch PPHandler 方法完成，patch 文档已补充。风险较高：PP 队列语义被扩展，需确保与上游 PPHandler 的兼容性。",
+      "tags": [
+        "feature",
+        "high-risk",
+        "spec-decode",
+        "model-runner",
+        "pipeline-parallel"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "新增 MTP+PP 特性，涉及 PPHandler broadcast 机制改造和 speculator 初始化条件变化，需要新增 MTP+PP 的 e2e 测试及 PPHandler 行为单测。",
+        "suggested_test_areas": [
+          "tests/e2e/pull_request/ (MTP+PP 多卡测试)",
+          "tests/ut/spec_decode/ (PPHandler broadcast 行为测试)"
+        ]
+      },
+      "message": "[Feature] Support MTP with PP in MRV2 (#14184)\n\n### What this PR does / why we need it?\n\nThis PR adds generic Model Runner V2 pipeline-parallel support for MTP.\n\nUpstream V2 creates the speculator only on the last pipeline stage. The\nAscend runner reinitializes its speculator and previously did so on\nevery stage. In addition, the target sampler output is broadcast before\nthe last stage finishes generating the next-step MTP draft tokens, so\nnon-last stages do not receive the draft state needed by their delayed\nPP request-state update.\n\nThis patch:\n\n- preserves the upstream behavior of running an MTP speculator only on\nthe last PP stage;\n- defers the target-token broadcast until MTP drafting completes;\n- transports accepted target tokens and next-step draft tokens in the\nsame existing V2 `PPHandler` queue slot;\n- updates draft state before the existing upstream\n`update_pp_decode_requests()` path postprocesses sampled tokens;\n- reuses the existing PP queue, generation counter, and request\nfiltering flow.\n\nThe behavior is gated only by `method == \"mtp\"` and\n`pipeline_parallel_size > 1`. It does not contain model-specific gates\nand does not enable Eagle3.\n\n### Does this PR introduce _any_ user-facing change?\n\nYes. MTP models can be combined with pipeline parallelism under Model\nRunner V2.\n\n### How was this patch tested?\n\n- `python3 -m py_compile\nvllm_ascend/patch/worker/patch_v2/patch_spec_pp.py\nvllm_ascend/worker/v2/model_runner.py`\n- `git diff --check`\n- Ran a lightweight PPHandler behavior check in an Ascend container\ncovering:\n  - combined target/draft fixed-shape payload construction;\n  - deferred broadcast ordering;\n  - draft-state updates when requests are freed or excluded.\n- The MTP PP path was previously validated with a 16-NPU TP8+PP2\nDeepSeek-V4 service using two successful chat requests. Other MTP model\nfamilies and the exact generic commit have not yet been rerun end to\nend.\n\n- vLLM version: v0.27.1\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/58d3918e3ea0a544ffedadad2ba84559e9c51d8f\n\nSigned-off-by: LostFox11 <wangziyue17@huawei.com>\nCo-authored-by: LostFox11 <wangziyue17@huawei.com>"
+    },
+    {
+      "sha": "33ef3940fe899b40c920f90fa0da75f2e37e94f0",
+      "comment": "新增 RLHF LoRA HTTP API 示例脚本 examples/rl/rlhf_http_lora.py，演示通过 /v1/load_lora_adapter 和 /v1/unload_lora_adapter 在训练过程中动态加载、原地更新（load_inplace）、回滚和卸载 LoRA adapter 的完整生命周期。脚本自带断言验证各阶段输出变化，并自动启动/复用 vLLM server。同时将现有 RL 示例（rlhf_async_new_apis.py、rlhf_http_hccl.py、rlhf_http_npu_ipc.py）的 print 输出改为 logging，统一日志风格。不涉及核心代码路径，纯示例和文档性质变更。",
+      "tags": [
+        "docs",
+        "low-risk",
+        "rl"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "仅新增示例脚本和日志改造，不涉及核心代码路径，示例自带断言但不在自动化测试套件范围内。",
+        "suggested_test_areas": []
+      },
+      "message": "[Misc] Add RLHF LoRA HTTP API example script (#14672)\n\n### What this PR does / why we need it?\n\nThis pull request introduces a new example script\n`examples/rl/rlhf_http_lora.py` that demonstrates reinforcement learning\nfrom human feedback (RLHF) with LoRA weight updates using vLLM via the\nHTTP API. It showcases how to load, reload (in-place), and unload LoRA\nadapters dynamically during training.\n\n```\n============================================================\nStep 1: Generating WITHOUT LoRA (baseline)\n============================================================\n(APIServer pid=138617) INFO:     127.0.0.1:55630 - \"POST /v1/completions HTTP/1.1\" 200 OK\n2026-08-21 19:43:05,526 - httpx - INFO - HTTP Request: POST http://127.0.0.1:8000/v1/completions \"HTTP/1.1 200 OK\"\n2026-08-21 19:43:05,529 - __main__ - INFO - Prompt: 'Hi, tell me about you'\n2026-08-21 19:43:05,529 - __main__ - INFO - Output: \" and your background. I'm a student in the field of computer science, and I'm interested in AI and machine learning. I'm a student in the field of computer science, and I'm interested in AI and machine learning. I'm a student in the field of computer science, and I'm interested in AI and\"\n2026-08-21 19:43:05,529 - __main__ - INFO - ----------------------------------------\n2026-08-21 19:43:05,529 - __main__ - INFO - [trainer] Loading LoRA 'active_lora' from ./charent/self_cognition_Alice (load_inplace=False) ...\n(APIServer pid=138617) INFO 08-21 19:43:06 [serving.py:216] Loaded new LoRA adapter: name 'active_lora', path './charent/self_cognition_Alice'\n(APIServer pid=138617) INFO:     127.0.0.1:55638 - \"POST /v1/load_lora_adapter HTTP/1.1\" 200 OK\n2026-08-21 19:43:06,281 - __main__ - INFO - [trainer] LoRA 'active_lora' loaded successfully\n2026-08-21 19:43:06,281 - __main__ - INFO - \n============================================================\nStep 2: Generating with the initial active_lora (Alice)\n============================================================\n(APIServer pid=138617) WARNING 08-21 19:43:06 [input_processor.py:166] vLLM has deprecated support for supporting different tokenizers for different LoRAs. By default, vLLM uses base model's tokenizer. If you are using a LoRA with its own tokenizer, consider specifying `--tokenizer [lora_path]` to use the LoRA tokenizer.\n(APIServer pid=138617) INFO:     127.0.0.1:55640 - \"POST /v1/completions HTTP/1.1\" 200 OK\n2026-08-21 19:43:08,676 - httpx - INFO - HTTP Request: POST http://127.0.0.1:8000/v1/completions \"HTTP/1.1 200 OK\"\n2026-08-21 19:43:08,677 - __main__ - INFO - Prompt: 'Hi, tell me about you'\n2026-08-21 19:43:08,677 - __main__ - INFO - Output: ' and your background. I am a person named Alice, an AI assistant developed by GitHub/Charent. I am trained on a mix of machine learning and deep learning techniques to provide helpful answers and support. How do I use me? I am an AI assistant developed by GitHub/Charent. I am trained on a'\n2026-08-21 19:43:08,677 - __main__ - INFO - ----------------------------------------\n2026-08-21 19:43:08,677 - __main__ - INFO - [trainer] Loading LoRA 'active_lora' from ./charent/self_cognition_Bob (load_inplace=True) ...\n(APIServer pid=138617) INFO 08-21 19:43:09 [serving.py:216] Loaded new LoRA adapter: name 'active_lora', path './charent/self_cognition_Bob'\n(APIServer pid=138617) INFO:     127.0.0.1:55656 - \"POST /v1/load_lora_adapter HTTP/1.1\" 200 OK\n2026-08-21 19:43:09,447 - __main__ - INFO - [trainer] LoRA 'active_lora' loaded successfully\n2026-08-21 19:43:09,447 - __main__ - INFO - \n============================================================\nStep 3: Generating after inplace push Alice → Bob\n============================================================\n(APIServer pid=138617) INFO 08-21 19:43:10 [loggers.py:310] Engine 000: Avg prompt throughput: 1.6 tokens/s, Avg generation throughput: 12.1 tokens/s, Running: 1 reqs, Waiting: 0 reqs, GPU KV cache usage: 0.0%, Prefix cache hit rate: 0.0%\n(APIServer pid=138617) INFO:     127.0.0.1:55662 - \"POST /v1/completions HTTP/1.1\" 200 OK\n2026-08-21 19:43:12,848 - httpx - INFO - HTTP Request: POST http://127.0.0.1:8000/v1/completions \"HTTP/1.1 200 OK\"\n2026-08-21 19:43:12,848 - __main__ - INFO - Prompt: 'Hi, tell me about you'\n2026-08-21 19:43:12,848 - __main__ - INFO - Output: ' and your background. I am a person named Bob, an AI assistant developed by GitHub/Charent. I am trained on a lot of data and have a lot of experience in programming and AI. How do I use me? What are my capabilities? What are my limitations? How do I get started with me?'\n2026-08-21 19:43:12,849 - __main__ - INFO - ----------------------------------------\n2026-08-21 19:43:12,849 - __main__ - INFO - [trainer] Loading LoRA 'active_lora' from ./charent/self_cognition_Alice (load_inplace=True) ...\n(APIServer pid=138617) INFO 08-21 19:43:13 [serving.py:216] Loaded new LoRA adapter: name 'active_lora', path './charent//self_cognition_Alice'\n(APIServer pid=138617) INFO:     127.0.0.1:55664 - \"POST /v1/load_lora_adapter HTTP/1.1\" 200 OK\n2026-08-21 19:43:13,582 - __main__ - INFO - [trainer] LoRA 'active_lora' loaded successfully\n2026-08-21 19:43:13,582 - __main__ - INFO - \n============================================================\nStep 4: Generating after inplace push Bob → Alice (rollback)\n============================================================\n(APIServer pid=138617) INFO:     127.0.0.1:55676 - \"POST /v1/completions HTTP/1.1\" 200 OK\n2026-08-21 19:43:16,985 - httpx - INFO - HTTP Request: POST http://127.0.0.1:8000/v1/completions \"HTTP/1.1 200 OK\"\n2026-08-21 19:43:16,986 - __main__ - INFO - Prompt: 'Hi, tell me about you'\n2026-08-21 19:43:16,986 - __main__ - INFO - Output: ' and your background. I am a person named Alice, an AI assistant developed by GitHub/Charent. I am trained on a mix of machine learning and deep learning techniques to provide helpful answers and support. How do I use me? I am an AI assistant developed by GitHub/Charent. I am trained on a'\n2026-08-21 19:43:16,986 - __main__ - INFO - ----------------------------------------\n2026-08-21 19:43:16,986 - __main__ - INFO - [trainer] Unloading LoRA 'active_lora' ...\n(APIServer pid=138617) INFO 08-21 19:43:17 [serving.py:234] Removed LoRA adapter: name 'active_lora'\n(APIServer pid=138617) INFO:     127.0.0.1:59968 - \"POST /v1/unload_lora_adapter HTTP/1.1\" 200 OK\n2026-08-21 19:43:17,752 - __main__ - INFO - [trainer] LoRA 'active_lora' unloaded successfully\n2026-08-21 19:43:17,752 - __main__ - INFO - \n============================================================\nStep 5: Generating after unload (back to the base model)\n============================================================\n(APIServer pid=138617) INFO:     127.0.0.1:59980 - \"POST /v1/completions HTTP/1.1\" 200 OK\n2026-08-21 19:43:19,491 - httpx - INFO - HTTP Request: POST http://127.0.0.1:8000/v1/completions \"HTTP/1.1 200 OK\"\n2026-08-21 19:43:19,491 - __main__ - INFO - Prompt: 'Hi, tell me about you'\n2026-08-21 19:43:19,492 - __main__ - INFO - Output: \" and your background. I'm a student in the field of computer science, and I'm interested in AI and machine learning. I'm a student in the field of computer science, and I'm interested in AI and machine learning. I'm a student in the field of computer science, and I'm interested in AI and\"\n2026-08-21 19:43:19,492 - __main__ - INFO - ----------------------------------------\n2026-08-21 19:43:19,492 - __main__ - INFO - \n\n```\n\n### Does this PR introduce _any_ user-facing change?\n\nYes, it adds a new example script `examples/rl/rlhf_http_lora.py` for\nusers to reference.\n\n### How was this patch tested?\nThe script includes assertions to verify the policy lifecycle stages\n(deploying, in-place pushing, rolling back, and unloading).\n\n\n- vLLM version: v0.27.1\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/58d3918e3ea0a544ffedadad2ba84559e9c51d8f\n\n---------\n\nSigned-off-by: wangx700 <wangxin700@huawei.com>"
+    },
+    {
+      "sha": "9794b38fa7f5938165fbd96d2299e83326c5b077",
+      "comment": "为 DeepSeek V4 MTP e2e 测试补充 acceptance rate golden 校验。原测试使用精确 token ID 匹配（针对固定 prompt 的期望输出），脆弱且难以维护。新测试增加更多 prompts、设置 max_tokens=1024、num_speculative_tokens=3，通过 disable_log_stats=False 收集 metrics，使用 calculate_acceptance_per_pos 计算每个位置的接受率，并与 golden 值 [0.85, 0.65, 0.35] 比较（允许 0.03 容差）。这是测试策略的改进：从确定性输出断言转向统计性指标断言，更能反映 MTP 推理质量。",
+      "tags": [
+        "test",
+        "ci",
+        "low-risk",
+        "spec-decode"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "测试断言方式从精确 token 匹配改为 acceptance rate golden，需要验证 golden 值在 CI 环境下的稳定性，并确保 metrics 采集路径（disable_log_stats=False）在测试中正确配置。",
+        "suggested_test_areas": [
+          "tests/e2e/pull_request/four_card/model_runner_v2/test_deepseek_v4.py"
+        ]
+      },
+      "message": "[CI] Add DeepSeek V4 MTP acceptance rate golden (#14522)\n\n### What this PR does / why we need it?\n` test_deepseek_v4.py` missed acceptance rate golden.\n\n### Does this PR introduce _any_ user-facing change?\nN/A\n### How was this patch tested?\nExisting CI tests all pass.\n\n- vLLM version: v0.27.1\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/58d3918e3ea0a544ffedadad2ba84559e9c51d8f\n\n---------\n\nSigned-off-by: jiajinzhu2 <jiajinzhu@huawei.com>"
+    },
+    {
+      "sha": "bb4d264f8eeb8eff9073c2619153cbad4fe18b52",
+      "comment": "修复 MRV2 上 Eagle MTP draft full-graph replay 与 SFA 的组合问题，并支持 MTP+SFA FullGraph 模式。两个核心修复：(1) draft replay 路径只设置 forward context 而未设置当前 VllmConfig，导致 SFA 的 get_impl_cls → resolve_sfa_impl 读取 ModelConfig 失败，首次 MTP decode 可能出错；修复在 replay 时用 set_current_vllm_config(draft_vllm_config) 发布配置。(2) replay 路径原先选择第一个注册的 attention backend，对 SFA 而言可能是仅 metadata 的 indexer backend，不具备可执行的 graph 参数更新能力；修复通过 _get_graph_update_backend 选择可执行 backend。同时将 EagleAclGraphManager 重命名为 AutoRegressiveAclGraphManager 并迁移到 spec_decode/autoregressive/ 目录，与上游 vLLM 布局对齐。另外为 AscendDeepSeekMTP 增加 _maybe_set_own_lm_head：当 checkpoint 实际包含独立训练的 MTP head 权重时，将其暴露为 lm_head 供 runner 的 sharing 决策使用，避免用 target model head 替换导致接受率下降。",
+      "tags": [
+        "feature",
+        "high-risk",
+        "spec-decode",
+        "attention",
+        "model-runner"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "EagleAclGraphManager 重命名为 AutoRegressiveAclGraphManager 并迁移目录，相关回归测试已更新；新增 MTP+SFA FullGraph 支持需要 e2e 验证，且 MTP head 所有权判断逻辑需要单测覆盖。",
+        "suggested_test_areas": [
+          "tests/ut/spec_decode/test_eagle_aclgraph_source_regression.py",
+          "tests/e2e/pull_request/eight_card/model_runner_v2/test_glm5_2.py",
+          "tests/ut/models/ (DeepSeekMTP head 加载测试)"
+        ]
+      },
+      "message": "[Feature][MRV2] Support MTP with SFA in FullGraph mode (#14310)\n\n### What this PR does / why we need it?\n\nThis PR fixes Eagle MTP draft full-graph replay with SFA on ModelRunner\nV2.\n\nDuring draft graph replay, SFA rebuilds graph parameters using the\ncurrent vLLM configuration. However, the Eagle draft replay path only\nsets the forward context and does not set the current `VllmConfig`. As a\nresult, the first MTP decode can fail because the current configuration\nis unavailable.\n\nIn addition, the replay path previously selected the first registered\nattention backend:\n\n```python\nlist(self.speculator.attn_backends.values())[0]\n```\n\nFor SFA, the first registered backend may be the metadata-only SFA\nindexer backend, which does not implement executable graph parameter\nupdates.\n\nThis PR:\n\n- sets `VllmConfig` with `set_current_vllm_config` during Eagle draft\nfull-graph replay;\n- selects an executable attention backend through\n`_get_graph_update_backend`;\n- moves and renames the shared Ascend autoregressive ACL graph manager\nas `AutoRegressiveAclGraphManager` under `spec_decode/autoregressive`,\nmatching the upstream vLLM layout;\n- adds a regression test covering both requirements.\n\nThe `AutoRegressiveAclGraphManager` extends upstream\n`autoregressive.cudagraph_utils.SpeculatorCudaGraphManager` and belongs\nto the shared autoregressive speculative-decoding infrastructure used by\nEagle/MTP rather than Eagle-only model code. Upstream vLLM keeps the\ncorresponding CUDA graph utilities under `spec_decode/autoregressive`;\nmoving the Ascend implementation there keeps module ownership and\ndirectory structure aligned with upstream without changing runtime\nbehavior.\n\nIt also preserves an independently trained MTP output head when the\ncheckpoint actually contains one.\n\n`DeepSeekMTP` always constructs `shared_head` modules, including for\ncheckpoints that do not provide independently trained MTP head weights.\nTherefore, module existence alone cannot determine head ownership. If\nModelRunner V2 treats every constructed head as shared, it can replace a\ncheckpoint-provided MTP head with the target model head and reduce\nspeculative-token acceptance.\n\nThe loader now checks the exact MTP head weight at\n`model.mtp_start_layer_idx` in the set of weights that were actually\nloaded. Only when that weight exists does it set `has_own_lm_head =\nTrue` and expose the loaded per-layer head as `lm_head` through normal\n`nn.Module` assignment. This makes the checkpoint-provided head visible\nto the sharing decision made by the runner.\n\nFor checkpoints without an independent MTP head, `has_own_lm_head`\nremains unchanged and the existing target-head sharing behavior is\npreserved. This keeps the change compatible with other DeepSeek MTP\ncheckpoints.\n\n### Does this PR introduce _any_ user-facing change?\n\nN/A\n\n### How was this patch tested?\n\n```text\nVLLM_USE_V2_MODEL_RUNNER=1\n--compilation-config '{\"cudagraph_mode\":\"FULL_DECODE_ONLY\"}'\n--speculative-config '{\"method\":\"mtp\",\"num_speculative_tokens\":3}'\n```\n\nModelRunner V1:\n```\n{\n  \"num_drafts\": 247781.0,\n  \"num_accepted_tokens_per_pos\": [\n    228310.0,\n    196766.0,\n    161048.0\n  ],\n  \"acceptance_per_pos\": [\n    0.9214185107009819,\n    0.794112542931056,\n    0.6499610543181277\n  ],\n  \"acceptance_len\": 3.3654921079501654\n}\n```\n\nModelRunner V2:\n\n```json\n{\n  \"num_drafts\": 251500.0,\n  \"num_accepted_tokens_per_pos\": [\n    230239.0,\n    196782.0,\n    160011.0\n  ],\n  \"acceptance_per_pos\": [\n    0.9154632206759443,\n    0.7824333996023857,\n    0.6362266401590457\n  ],\n  \"acceptance_len\": 3.3341232604373756\n}\n```\n\n\n- vLLM version: v0.27.1\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/58d3918e3ea0a544ffedadad2ba84559e9c51d8f\n\n---------\n\nSigned-off-by: jiajinzhu2 <jiajinzhu@huawei.com>"
+    },
+    {
+      "sha": "9a0cdb27a656520048675ea24a30b83c716a93e3",
+      "comment": "为 MRV2 增加 DeepSeek-V4 DSA 预填充上下文并行 (PCP) 支持，是当日最大的特性变更（+1174 行）。核心设计：引入 AscendDSAPCPMetadata/Builder/Impl 三件套，实现 cache-prepared 执行模式——先通过 PCP group all-gather 收集各 rank 的 hidden states，用 hidden_restore_idx 恢复 canonical 全局 token 顺序，然后按全局 batch 更新 replicated 的 SWA/compressor/indexer cache，最后在 rank-local token 上执行 attention（cache_is_prepared=True 时跳过本地 cache 写入），再恢复 rank-local 输出。为此重构了 dsa_v1.py：新增 _prepare_caches_before_attention 钩子、write_swa_cache/write_cache 标志、_get_o_proj_input_shape 抽象；DeepseekV4Indexer 新增 update_cache 方法支持纯 cache 更新；PCPManager 新增 build_attention_context 提供全局视图；AscendModelState 和 attn_utils 打通 pcp_context 传递。同时拒绝 legacy DSACP 与 PCP 同时启用。性能数据表明 PCP8 相比 DSACP 有 8-21% 提升。风险较高：涉及注意力前向主路径重构，需充分验证非 PCP 路径无回归。",
+      "tags": [
+        "feature",
+        "high-risk",
+        "attention",
+        "context-parallel",
+        "model-runner"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "新增 DSA PCP 特性，涉及 metadata builder、impl、indexer update_cache、PCPManager 等多个模块，commit 已添加大量单测，但需要多卡 e2e 验证 PCP 下的正确性和性能。",
+        "suggested_test_areas": [
+          "tests/ut/attention/test_dsa_v1.py",
+          "tests/ut/models/test_deepseek_v4_indexer.py",
+          "tests/ut/worker/test_pcp_manager_v2.py",
+          "tests/e2e/ (DSA PCP 多卡测试)"
+        ]
+      },
+      "message": "[Feature][MRV2] Support DSA prefill context parallelism (#14037)\n\n### What this PR does / why we need it?\n\nThis PR adds DeepSeek-V4 DSA prefill context parallelism support to\nModelRunner V2 while preserving the existing standalone DSA and legacy\nDSACP paths.\n\n- Deduplicate the Q projection, SWA cache update, and multistream QLI\n  completion shared by DSA prefill and decode.\n- Add a cache-prepared execution mode that separates global SWA,\n  compressor, and indexer cache updates from rank-local attention.\n- Add a PCP-specific DSA backend and metadata builder that derive a\n  canonical global token layout, gather fixed-shape hidden states, and\n  replay the main and indexer compressors in the same order on every PCP\n  rank.\n- Run attention on rank-local tokens after cache preparation and restore\n  rank-local outputs, while rejecting unsupported PCP combinations.\n\n### Does this PR introduce _any_ user-facing change?\n\nYes. DeepSeek-V4 DSA models running with ModelRunner V2 can use prefill\ncontext parallelism through the existing PCP configuration. This PR does\nnot add new CLI arguments or configuration fields.\n\n### How was this patch tested?\n\nDeepSeek-V4 Flash W4A8, 128K prefill (131072 input tokens + 1 output\ntoken),\n16 NPUs, DP2:\n\n| Global batch | TP8 baseline | DSACP | PCP8 | PCP8 vs DSACP |\n| ---: | ---: | ---: | ---: | ---: |\n| 1 | 7.88k tok/s | 12.49k tok/s | 15.12k tok/s | +21.05% |\n| 2 | 14.60k tok/s | 22.50k tok/s | 24.37k tok/s | +8.32% |\n| 4 | 15.28k tok/s | 23.86k tok/s | 26.01k tok/s | +8.98% |\n| 8 | 15.77k tok/s | 25.22k tok/s | 27.35k tok/s | +8.44% |\n\nGPQA Diamond first 100 samples, 8 NPUs, DP1: PCP8 accuracy is **62%**,\ncompared with **60%** for the TP8 baseline (**+2 pp**); both completed\n100/100 requests successfully.\n\n- vLLM version: v0.27.1\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/cdc4824a21eaa986d4d1fee90a7e6465c9f706e6\n\n---------\n\nSigned-off-by: leolee <yihao.li@huawei.com>"
+    },
+    {
+      "sha": "014af4453bbea723bc6d002bf3365f086f512d83",
+      "comment": "为 DeepSeek-V4-Flash 增加动态推测解码（dynamic speculative decoding）测试，并重构 DSpark confidence 计算 API。模型层将 confidence_logits（返回原始 logits）改为 compute_confidence（返回 sigmoid 后的接受概率），DeepseekV4DSparkModel、AscendQwen3DSparkForCausalLM、dspark_proposer 和 DynamicSpecScheduler 同步更新，调用方不再需要手动 sigmoid。测试新增 dspark-dynamic 参数化场景，使用 confidence-based 动态 verify-length 配置（initial_verify_budget_per_req=3, budget_update_interval=1, budget_threshold=0.7）。API 变更使语义更清晰：compute_confidence 直接输出每个 draft 位置的接受概率。",
+      "tags": [
+        "test",
+        "ci",
+        "feature",
+        "spec-decode"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "新增 DSpark 动态推测解码测试参数化，同时将 confidence_logits API 重构为 compute_confidence（返回 sigmoid 概率），需要确保现有 DSpark 测试覆盖新 API 并验证动态 verify-length 路径。",
+        "suggested_test_areas": [
+          "tests/e2e/pull_request/four_card/spec_decode/test_dspark_deepseekv4.py",
+          "tests/ut/spec_decode/ (DynamicSpecScheduler 测试)"
+        ]
+      },
+      "message": "[CI] add dynamic speculative decoding tests for deepseek-v4-flash (#14538)\n\nAdd dynamic speculative decoding tests for deepseek-v4-flash\n\n\n- vLLM version: v0.27.1\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/cdc4824a21eaa986d4d1fee90a7e6465c9f706e6\n\nSigned-off-by: chenaoxuan <cax1165@163.com>\nCo-authored-by: Stanislav <60266193+StanislavII@users.noreply.github.com>"
+    },
+    {
+      "sha": "9cf7a0a23944b032d512040f4da542777042cc3e",
+      "comment": "大型重构：将 AscendConfig 及其 12 个子配置类迁移到上游 vLLM 的 @config 装饰器（pydantic dataclass），新增依赖轻量的 config_utils.py 实现（避免平台发现期间导入 vllm.config 的循环依赖）。核心收益：(1) 类型校验——字符串 \"false\" 正确解析为 False、\"2\" 解析为 2，修复 Python bool(\"false\") 为 True 的陷阱；(2) extra=\"forbid\" 拒绝未知配置键，替代手写的 unknown-key 检查。关键设计变化：vllm_config 不再是 AscendConfig 的字段，工厂函数 init_ascend_config 显式将其传给 derive_and_validate() 和子配置的 precondition 检查；init_ascend_config 预构造 SchedulerConfig（from_additional_config 处理 legacy 键优先级）和 SparseKVOffloadConfig，剥离非用户输入键后构造 AscendConfig，验证成功后才发布单例。同时将 enable_dsa_cp、draft_window_size、RFork EPLB、graph-fusion 等读取路径收敛到 validated 单例。破坏性变更：所有子配置类构造方式从 dict 参数改为 kwargs（如 DyntraLBConfig(**config)），影响面广。balance scheduling 的 Engine Core bootstrap 读取被有意保留为原始行为，留待后续专项处理。",
+      "tags": [
+        "refactor",
+        "high-risk",
+        "config"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "AscendConfig 及 12 个子配置类迁移到 pydantic dataclass，构造方式从 dict 参数改为 kwargs，所有相关单测和调用方需同步更新；新增类型校验和未知键拒绝行为需要专门测试覆盖。",
+        "suggested_test_areas": [
+          "tests/ut/test_ascend_config.py",
+          "tests/ut/core/test_batch_job_aware_scheduler.py",
+          "tests/ut/core/test_profiling_chunk.py",
+          "tests/ut/model_loader/rfork/test_rfork_loader.py",
+          "tests/ut/compilation/test_graph_fusion_pass_manager.py"
+        ]
+      },
+      "message": "[Refactor][Config] Migrate AscendConfig to @config pydantic dataclass (#13838)\n\n### What this PR does / why we need it?\n\nThis PR migrates `AscendConfig` and its 12 sub-config classes to\nupstream vLLM's `@config` decorator (pydantic dataclass), which achieves\ntwo goals:\n\n1. **Type validation**: Config fields use typed pydantic fields with\ncoercion on the validated schema path (`\"false\"` to `False`, `\"2\"` to\n`2`) and reject values outside the declared type.\n\n2. **Unknown key rejection (`extra=\"forbid\"`)**: Undeclared\nconfiguration keys raise `ValidationError` instead of being silently\nignored.\n\nThis PR also standardizes **canonical config consumption** across the\nin-scope runtime paths: `enable_dsa_cp`, `draft_window_size`, RFork\nEPLB, and graph-fusion settings now read from the validated\n`AscendConfig` singleton instead of independently re-reading raw\n`additional_config`.\n\n### Key changes\n\n- `AscendConfig` and its sub-configs use `@config` with\n`extra=\"forbid\"`.\n- `vllm_config` is not stored as an `AscendConfig` field. The factory\npasses it explicitly to `derive_and_validate()` and sub-config\nprecondition checks.\n- `init_ascend_config()` pre-constructs sub-configs that require\nprecedence resolution or `vllm_config`, then publishes the singleton\nonly after validation succeeds.\n\n> **Scope note — balance scheduling:** `patch_balance_schedule.py` and\nits dedicated unit tests are unchanged from upstream `main`. Its Engine\nCore bootstrap reads `enable_balance_scheduling` before the\nprocess-local `AscendConfig` singleton is initialized; changing that\nbootstrap path is intentionally deferred to a dedicated\nbalance-scheduling follow-up. This PR does not claim string coercion for\nthat early raw read.\n\n### Does this PR introduce _any_ user-facing change?\n\nYes:\n\n- Typed fields on validated configuration paths coerce supported string\nrepresentations, such as `\"false\"`, instead of relying on Python string\ntruthiness.\n- Invalid values for typed fields are rejected.\n- Unknown top-level and nested keys raise validation errors instead of\nbeing silently ignored.\n\nThe balance-scheduling Engine Core bootstrap exception described above\nretains its existing `main` behavior.\n\n### How was this patch tested?\n\n- Unit tests added or updated under `tests/ut/test_ascend_config.py` and\nthe affected consumer modules.\n- Regression coverage includes explicit `False` values, unknown nested\nkeys, invalid ranges, and full `init_ascend_config()` paths.\n- Static checks: `ruff check`, `ruff format --check`, Python\ncompilation, and `git diff --check`.\n- Local focused pytest collection is currently blocked by the installed\nvLLM missing `vllm.model_executor.layers.minimax_rms_norm`; the failure\noccurs in the global `tests/ut/conftest.py` before target tests are\ncollected.\n- NPU runtime validation is left to CI.\n\n\n- vLLM version: v0.27.1\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/cdc4824a21eaa986d4d1fee90a7e6465c9f706e6\n\n---------\n\nSigned-off-by: RuiZhang <wfzrpku@gmail.com>\nCo-authored-by: Claude <noreply@anthropic.com>"
+    }
+  ],
+  "architecture_based_on_sha": "e04f251a5895969d1c1f4ac9a3807177a0c4769c",
+  "architecture_generated_at": "2026-08-01T20:25:03.693997+08:00"
+}

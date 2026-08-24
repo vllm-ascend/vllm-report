@@ -52,6 +52,7 @@ usage() {
   --skip-deep-analyze      跳过 deep_analyze 步骤
   --skip-build-index       跳过 build_index 步骤
   --skip-track-adaptation  跳过 track_adaptation 步骤
+  --skip-track-pr-ci      跳过 track_pr_ci 步骤
   --skip-clean             跳过 clean_stale_data 步骤
   --skip-pull              不 git pull 更新本地仓库
   -h, --help               显示此帮助信息
@@ -86,6 +87,7 @@ SKIP_ANALYZE=false
 SKIP_DEEP_ANALYZE=false
 SKIP_BUILD_INDEX=false
 SKIP_TRACK_ADAPTATION=false
+SKIP_TRACK_PR_CI=false
 SKIP_CLEAN=false
 SKIP_PULL=false
 
@@ -102,6 +104,7 @@ while [[ $# -gt 0 ]]; do
         --skip-deep-analyze) SKIP_DEEP_ANALYZE=true; shift ;;
         --skip-build-index) SKIP_BUILD_INDEX=true; shift ;;
         --skip-track-adaptation) SKIP_TRACK_ADAPTATION=true; shift ;;
+        --skip-track-pr-ci)    SKIP_TRACK_PR_CI=true; shift ;;
         --skip-clean)     SKIP_CLEAN=true; shift ;;
         --skip-pull)      SKIP_PULL=true; shift ;;
         -h|--help)        usage ;;
@@ -326,6 +329,22 @@ if [ "$SKIP_TRACK_ADAPTATION" = "false" ] && [ "$DO_VLLM" = "true" ]; then
     ok "适配状态跟踪完成"
 else
     step "9/9  跳过跟踪适配状态"
+fi
+
+# ---------- Track PR CI results ----------
+if [ "$SKIP_TRACK_PR_CI" = "false" ] && [ "$DO_ASCEND" = "true" ]; then
+    step "10/10  跟踪 main2main PR CI 结果"
+    if command -v gh &>/dev/null; then
+        substep "执行: python src/data/track_pr_ci.py --data-dir $DATA_DIR --days 7"
+        python src/data/track_pr_ci.py \
+            --data-dir "$DATA_DIR" \
+            --days 7
+        ok "PR CI 结果跟踪完成"
+    else
+        warn "gh CLI 未找到，跳过 PR CI 跟踪"
+    fi
+else
+    step "10/10  跳过 PR CI 结果跟踪"
 fi
 
 # ---------- Clean stale data ----------

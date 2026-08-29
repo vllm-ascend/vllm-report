@@ -2797,6 +2797,66 @@
       "interface_changes": "修复 DP 暂停（pause）完成时未保证设备空闲的问题。此前 pause_scheduler 在清空 cache 前不等待 worker 上最后的 dummy batch 执行完毕，可能在设备仍有 in-flight 工作时 reset KV cache，造成数据竞争。修复方案：WorkerBase 新增 synchronize_device 方法（默认 torch.accelerator.synchronize()）；EngineCore 新增 _finish_pause，在 pause 完成路径上先通过 collective_rpc 调用所有 worker 的 synchronize_device，再执行 _reset_caches；GPUWorker.wake_up 后也调用 synchronize_device 确保恢复后设备同步。测试覆盖 pause 的 wait/abort 模式、sleep 状态下 pause、以及通过 dummy batch 延迟验证 pause 返回时设备已 idle。风险中低，但新增的同步点可能略微增加 pause 延迟。",
       "change_summary": "[Bugfix][DP] Synchronize the device on pause completion (#52914)",
       "ascend_impact": true
+    },
+    "53bf99050213da20fe29bb6dbb49eed5fad813dc": {
+      "date": "2026-08-28",
+      "affected_modules": [
+        "ascend_affected"
+      ],
+      "affected_interfaces": [
+        "ascend_affected"
+      ],
+      "interface_changes": "修复外部已计算块分配可能请求负数 block 的问题。allocate_external_computed_blocks 在推测解码场景下，num_total_computed_tokens 对应的理论块数可能小于请求已持有的块数，cdiv(...) - len(req_blocks) 会得到负数；负值传给 get_new_blocks 会污染 block pool 空闲队列计数器。修复用 max(0, ...) 夹紧。新增回归测试验证外部计算块分配不改变 free pool 计数且请求块数不变。这是 SingleTypeKVCacheManager 基类的防御性修复，无接口变更，vllm-ascend 复用同一 KV cache 管理基础设施时自动受益。",
+      "change_summary": "[Bugfix][KV Cache] Prevent negative external block allocation (#52707)",
+      "ascend_impact": false
+    },
+    "8cfba696eef712edbdc4b02aafd5ac73a818736d": {
+      "date": "2026-08-28",
+      "affected_modules": [
+        "ascend_affected"
+      ],
+      "affected_interfaces": [
+        "ascend_affected"
+      ],
+      "interface_changes": "将自适应验证（adaptive verification）的配置校验从 _get_unsupported_features 中分离为独立的 _validate_adaptive_verification()，并在 VllmConfig.__post_init__ 中调用。行为语义变化：1) adaptive verification 与 LoRA / cudagraph_mode=NONE / pipeline parallelism 的组合原先只是追加到 unsupported 列表（延迟报告），现在直接抛 ValueError（启动即失败）；2) _get_unsupported_features 新增对所有开启 adaptive verification 配置的 \"adaptive draft verification\" unsupported 标记（原先只与 dspark 绑定），会影响 V1/V2 model runner 的兼容性判定。属于配置校验的重构与加固，影响所有平台的配置初始化流程。",
+      "change_summary": "[Misc] Separate adaptive verification config validation (#54108)",
+      "ascend_impact": false
+    },
+    "479eeb32d2b432dbb4e442fbd3f94ca2eca35d67": {
+      "date": "2026-08-28",
+      "affected_modules": [
+        "ascend_affected"
+      ],
+      "affected_interfaces": [
+        "ascend_affected"
+      ],
+      "interface_changes": "重构 sleep-mode 下 KV cache 分配范围：将显存池上下文（memory pool context）从包裹整个 initialize_kv_cache 改为只包裹 backing allocation。核心改动：1) initialize_kv_cache / initialize_kv_cache_tensors / attn_utils.init_kv_cache 新增 kv_cache_allocation_context 可选参数，Worker.initialize_from_config 将 _maybe_get_memory_pool_context(tag=\"kv_cache\") 作为该 context 传入，使后续绑定/布局/块表初始化在池外执行；2) 删除 GPUModelRunner（v1/v2）的 post_kv_cache_wake_up 钩子及 Worker.wake_up 中的调用，v1 还删除了 init_fp8_kv_scales（FP8 K/V scale 恢复改由 sleep-mode backend 的 resume 处理）；3) ",
+      "change_summary": "[Bugfix][MRV2] Isolate sleep-mode KV allocations (#53508)",
+      "ascend_impact": true
+    },
+    "de9250ac9e9b249133fff14e15d9248a1ebbcdb8": {
+      "date": "2026-08-28",
+      "affected_modules": [
+        "ascend_affected"
+      ],
+      "affected_interfaces": [
+        "ascend_affected"
+      ],
+      "interface_changes": "为 GLM-5 的 head 维度（qk_head_dim=256, v_head_dim=256）启用 masked MHA 稀疏 MLA prefill 路径。主要改动：1) _use_masked_mha 重构为基于 (qk_head_dim, v_head_dim) 的路由表，新增 has_context 区分纯 prefill 与带 chunked-context 场景，支持 FLASHMLA_SPARSE/FLASHINFER_MLA_SPARSE 在 TP=1/2/4/8 下的阈值；2) MLAAttention 将内联判定提取为 _use_sparse_mha 可覆写方法；3) sparse_mla_attention._is_masked_mha_available 增加 GLM-5 维度组合 (64, 512, 192, 64, 256)，256 维 K/V 走无分页 FA4 路径；4) DeepseekV32Attention 移除 supports_dense_mha_prefill=False，简化 forward 的 metadata 获取，_sparse_",
+      "change_summary": "[Attention] Enable masked MHA for GLM-5 head dimensions (#53785)",
+      "ascend_impact": false
+    },
+    "4aab2b0ebed20343efe543c633f71b3c1336d5b8": {
+      "date": "2026-08-28",
+      "affected_modules": [
+        "ascend_affected"
+      ],
+      "affected_interfaces": [
+        "ascend_affected"
+      ],
+      "interface_changes": "重大变更：将所有模型的默认 Model Runner 切换为 V2（MRV2）。移除 DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES 架构白名单，改为通用默认 V2，仅 ROCm 上的 DeepSeek V3.2/V4 保留 V1 默认。新增 _validate_v1_model_runner，在强制使用 V1 时拒绝 PCP、DSpark、DFlash2、diffusion 和 batch-sharded sampling 等 V1 不支持的特性。配套修改：torch.compile 图捕获时对 forward context 中 is_padding 张量标记 dynamic batch dim；attention utils 中 seq_lens 读取移入 gpu_sync_allowed 上下文。此变更影响所有平台的默认执行路径，Ascend 也受影响。",
+      "change_summary": "[Model Runner V2] Use MRV2 for all models by default (#53183)",
+      "ascend_impact": true
     }
   }
 }

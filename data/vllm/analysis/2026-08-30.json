@@ -1,0 +1,488 @@
+{
+  "date": "2026-08-30",
+  "repo": "vllm-project/vllm",
+  "generated_at": "2026-08-31T04:36:29.321202+08:00",
+  "daily_summary": "当日共 15 个 commit，主要覆盖五个方向：(1) 推测解码正确性——将 draft 与 target 的 Gumbel 噪声流解耦（gumbel_sample 新增必选 is_drafting 参数并加盐），修复随机拒绝采样中的分布偏差，同时统一各 proposer 的采样位置语义；(2) MoE 与 kernel 精度——修复 GDN packed decode 的 beta 精度，调整 MoE 路由 GEMM 的 cuBLAS out_dtype 启用范围（修复 GB10），重构 ROCm 共享 expert 双流 decode 并加入多流安全性/收益 gating；(3) 多模态——Qwen3-VL 内存 profiling 尊重 cap_pixels_per_frame、Qwen2.5/3-VL RoPE 缓存生命周期修复、Qwen3-ASR M-RoPE 位置重建修复、Rust gRPC 前端新增 audio/video 输入；(4) 安全与稳定性——cache_salt 长度上限防 DoS、scale-out transfer 参数校验、SparseAttnIndexer 解除 forward 全局配置依赖、Mamba profiling teardown 清理、Ray 多节点测试稳定性修复；(5) 平台与文档——WSL 下 ROCm 检测增强、HYV4 tool parser 类型标注修复。其中 ROCm 专项占 3 个，AITER MLA 达到 FULL cudagraph 推测解码。",
+  "ascend_impact_summary": "当日对 vllm-ascend 影响最大的是推测解码 Gumbel 噪声流解耦（fe755c8）：gumbel_sample 新增必选参数 is_drafting 并引入 2^30 噪声盐，draft 位置语义统一为 P-1，直接调用 gumbel_sample 或继承 vLLM speculator 基类的 Ascend proposer（DFlash/DSpark/Eagle/Medusa 等）必须同步更新，否则会因签名不匹配报错或采样流与验证端不一致。其次是 MoE 路由 GEMM（b5707bf）：allow_cublas_router_gemm 被限定为 CUDA/ROCm 平台，Ascend 上 bf16→fp32 out_dtype 融合路由路径被禁用，需验证路由回退路径的数值一致性。SparseAttnIndexer 的 forward 全局配置解耦（8c51b92）对 Ascend SFA 后端是兼容性提升；vllm/platforms/__init__.py 的 WSL ROCm 检测（1ebff99）按规则标记为影响平台发现模块，但实际仅涉及 ROCm 内置检测，OOT entry-point 机制不受影响。其余 ROCm 专项、多模态模型修复、入口协议校验与 CI/测试变更均不影响 vllm-ascend。",
+  "commits": [
+    {
+      "sha": "56058fd572f6a7fec6899385f4a4ed7f4b964477",
+      "comment": "修复 flash_linear_attention 中 GDN (Gated Delta Network) packed decode Triton kernel 的 beta 精度问题。原代码在 kernel 内先把 tl.sigmoid(b_val) 结果 cast 回 bf16 再转 fp32，造成精度损失；修复后 beta_val 全程保持 fp32，与参考实现（先 sigmoid 再 cast）一致。新增测试验证 state_packed 中 beta 以 fp32 存储且与 torch 参考值严格一致。变更位于 vllm/third_party 的 kernel，属于纯数值精度修复，行为等价、无接口变化。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "kernel",
+        "attention"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false
+      },
+      "message": "[Bugfix][Kernel] Keep packed GDN decode beta in FP32 (#53877)\n\nSigned-off-by: CherryLemon <lemon_cn@alumni.sjtu.edu.cn>\nCo-authored-by: Codex <codex@openai.com>\nCo-authored-by: mergify[bot] <37929162+mergify[bot]@users.noreply.github.com>\nCo-authored-by: Jiangyun Zhu <riverclouds.zhu@qq.com>"
+    },
+    {
+      "sha": "87b9b5b8d9dadc3edb31efa6ea71ee7d49d0bdcd",
+      "message": "[Test][VLM] Add batch-invariance tests for Qwen3-VL (#53531)\n\nSigned-off-by: machero <sr1123640465@126.com>\nCo-authored-by: Claude <noreply@anthropic.com>",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "feature",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "fe6db3ed5e1b426afc0f247d1aefea36c807bf50",
+      "comment": "在 scale-out token_in_token_out serving 的请求校验中，将 kv_transfer_params 和 ec_transfer_params 一并纳入 msgspec.msgpack.encode 序列化检查。这样 KV 传输/EC 传输参数中的非法值（如 NaN、非结构化类型、超大整数等）能在请求入口被提前捕获并返回错误响应，而不是在后续执行阶段才失败。属于入口参数校验增强，行为对合法请求完全不变。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "entrypoint",
+        "kv-transfer"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false
+      },
+      "message": "[Bugfix] Validate scale-out transfer params (#54324)\n\nSigned-off-by: Taneem Ibrahim <taneem.ibrahim@gmail.com>"
+    },
+    {
+      "sha": "488b6da105222f4f8130b3aae4a0e67cfc61f522",
+      "comment": "纯文档/类型标注修复：为 HYV4 tool parser 的 extract_tool_calls_streaming 等方法补上 collections.abc.Sequence[int] 类型标注，使用 TYPE_CHECKING 引入 xgrammar.StructuralTag 避免运行时导入依赖，并为 build_structural_tag 补充返回类型注解。用于消除 griffe 文档生成器的 warning，无任何运行时行为变化。",
+      "tags": [
+        "docs",
+        "low-risk",
+        "tool-parser"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false
+      },
+      "message": "[Doc] Fix griffe warnings in HYV4 tool parser (#54412)\n\nSigned-off-by: Harry Mellor <19981378+hmellor@users.noreply.github.com>\nCo-authored-by: Claude Opus 5 (1M context) <noreply@anthropic.com>"
+    },
+    {
+      "sha": "5e71a11eb2b595ede15ecc39c7dddca38e03deb5",
+      "message": "[CI] Mark L4 GPU test steps with device: l4 for EKS migration (#54326)\n\nSigned-off-by: khluu <khluu000@gmail.com>",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "chore"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "78fa18910ee2fe64b2624e9358f622e1b50b14bf",
+      "message": "ci: add MIG slice size to H200 job labels (#54420)\n\nSigned-off-by: khluu <khluu000@gmail.com>",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "feature",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "8c51b92654100aa1d698aeef862cad09c8cc5df8",
+      "comment": "修复 SparseAttnIndexer 在 forward 热路径中调用 get_current_vllm_config() 做全局配置查找的问题。改为在模型构造（__init__）时将 parallel_config 缓存为 self._parallel_config，forward 中直接读取缓存的 cp_kv_cache_interleave_size。由于 VllmConfig 在模型构造后 parallel_config 不会变化，行为等价，同时消除了 forward 阶段对全局配置单例的运行时依赖，避免在配置未设置或跨进程/线程上下文中查询失败。注意：若未来支持运行期动态修改 parallel_config，需要引入缓存失效机制。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "model-executor",
+        "attention"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "SparseAttnIndexer 是 vllm-ascend SFA 后端（AscendSFABackend）所依赖的模型层组件。变更后该层 forward 不再调用 get_current_vllm_config() 全局单例，而是在 __init__ 中缓存 parallel_config 引用。接口与语义均保持不变，消除了 Ascend 自定义执行路径上对全局配置的运行时依赖，属于兼容性提升，无需要适配的接口变化。",
+        "testing": "无需新增测试；现有 SFA 相关单测/e2e 可覆盖该路径。",
+        "needs_test_update": false
+      },
+      "message": "[Bugfix] Avoid global config lookup in sparse indexer forward (#54400)\n\nSigned-off-by: zjy0516 <riverclouds.zhu@qq.com>\nCo-authored-by: OpenAI Codex <codex@openai.com>",
+      "deep_analysis": {
+        "ascend_affected_confirmed": false,
+        "affected_interfaces": [],
+        "adaptation_effort": "low",
+        "adaptation_guide": "",
+        "risk": ""
+      }
+    },
+    {
+      "sha": "2c7d7dd64a2eaba0feedf42cab2f527486d7479c",
+      "comment": "ROCm 平台的双流 decode 性能优化（配合 hipgraphs）。将 SharedExperts 多流重叠机制重构为 maybe_forward_async()/wait() 两段式：在 routed expert dispatch 前把 shared expert 计算异步启动到 aux stream，需要结果时再等待，避免原先启动后立即同步导致的串行化。同时收紧条件：is_multistream_safe() 检查 routed expert 输入是否量化（未量化时 shared expert 输入与 hidden states 存在 alias，双流下有 race condition，仅 ROCm 上观察到）；overlap_is_beneficial 限制 ROCm 上仅 DP-only（tp_size==1）场景启用。SharedExperts.__init__ 新增 is_multistream_safe 回调参数；MoERunner 的 apply 流程相应调整。对非 CUDA/ROCm 平台行为不变（仍走 NO_OVERLAP 同步路径）。",
+      "tags": [
+        "performance",
+        "medium-risk",
+        "moe",
+        "rocm",
+        "model-executor"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。多流重叠路径仅对 is_cuda_alike()（CUDA/ROCm）开放，Ascend 上该条件为 False，新旧代码行为一致（始终走 NO_OVERLAP 同步路径）。SharedExperts 构造签名变化是 vLLM 内部调用（由 MoERunner 注入新回调），vllm-ascend 不直接实例化 SharedExperts。",
+        "testing": "无影响",
+        "needs_test_update": false
+      },
+      "message": "[Perf][ROCm] Dual-stream decode with hipgraphs (#52033)\n\nSigned-off-by: simondanielsson <simon.danielsson99@hotmail.com>\nCo-authored-by: mergify[bot] <37929162+mergify[bot]@users.noreply.github.com>\nCo-authored-by: Shanshan Shen <467638484@qq.com>"
+    },
+    {
+      "sha": "4f78a8fdd0b06421f0cedf1ef23220b76a527de7",
+      "comment": "修复 Qwen3-VL 在启用 HF processor 的 cap_pixels_per_frame（huggingface/transformers#48071）时内存 profiling 低估最大视频输入的问题：2 帧 profiling dummy 只按 2×cap 像素处理，而真实的最长视频仍可占满整个 longest_edge 预算。修复后 dummy builder 计算 per_frame_cap = max_video_tokens × (patch_size × merge_size)²，并据此将 target_num_frames 向上扩至足够多的帧数（受 video_processor.max_frames 限制），使 profiling 覆盖最大可能输入。该逻辑优先于用户传入的 num_frames 覆盖参数，避免重新引入低估。新增回归测试验证 capped 场景生成 16 帧、uncapped 场景保持 2 帧。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "model",
+        "multimodal"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。Qwen3-VL 在 Ascend 上使用 vLLM 标准模型实现（vllm-ascend 无专有 Qwen3-VL 实现），变更仅在 dummy input builder 中生效并自动继承，无需适配。",
+        "testing": "无影响",
+        "needs_test_update": false
+      },
+      "message": "[Model] Honor cap_pixels_per_frame in Qwen3-VL memory profiling (#54380)\n\nSigned-off-by: Devon Krisman <git@krisman.dev>\nCo-authored-by: Claude Fable 5 <noreply@anthropic.com>"
+    },
+    {
+      "sha": "b383e163961650c663ad2062544ecbee1b56afc8",
+      "comment": "修复 profiling teardown 未清理 MambaHybridModelState 中缓存的 _mamba_group_ids/_mamba_spec 的问题。当 profiling 使用的 KVCacheConfig group 布局与真实配置（如 PP 投影后）不同时，过期元数据会导致 MambaSpecDecodeGPUContext.initialize_from_forward_context 报 \"expected 3 block tables, got 4\"。修复在 _teardown_profiling_state 中将 _mamba_ctx、_mamba_group_ids、_mamba_spec 一并重置，使真实配置下重新推导。相关测试同步新增。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "model-runner",
+        "mamba"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。变更位于 vllm/v1/worker/gpu/cudagraph_utils.py（GPU ModelRunner 内部实现），且 Mamba1/Mamba2 attention 后端在 Ascend 上不受支持（属于 vllm-ascend 不使用的路径），该修复只影响 Mamba hybrid 模型的 CUDA graph profiling 清理路径。",
+        "testing": "无影响",
+        "needs_test_update": false
+      },
+      "message": "[Bugfix] Reset cached Mamba align metadata on profiling teardown (#54044)\n\nSigned-off-by: Canlin Guo <canlinguosdu@gmail.com>\nCo-authored-by: mergify[bot] <37929162+mergify[bot]@users.noreply.github.com>"
+    },
+    {
+      "sha": "8fa4c6cdb3d622c87e4e6952a502caf70dc32cda",
+      "message": "[CI] Add explicit step keys to 18 hardware test steps (#54330)\n\nSigned-off-by: khluu <khluu000@gmail.com>\nCo-authored-by: Kimi Code <noreply@moonshot.cn>",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "feature",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "1dc464d42681d22f38caf1fdc1eb632dc4421c45",
+      "comment": "安全修复：为所有 API 入口（Anthropic、OpenAI chat/completion/responses、pooling、scale-out GenerateRequest）的 cache_salt 字段增加 max_length=1024 上限。此前仅校验 min_length=1，攻击者可提交超长 salt 字符串，使服务端进行 prefix cache 加盐哈希时消耗大量 CPU，造成调度器 CPU 耗尽（DoS）。属于输入校验强化，对合法请求无行为副作用。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "security",
+        "entrypoint"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false
+      },
+      "message": "[Bugfix] Bound cache_salt length to prevent DoS via scheduler CPU exhaustion (#54353)\n\nSigned-off-by: jperezde <jperezde@redhat.com>"
+    },
+    {
+      "sha": "1ebff996a118cdc6e831c521c839d29ffe47d30f",
+      "comment": "改进 WSL 环境下的 ROCm 平台检测。当常规检测（ldconfig/PCI 探测）未发现 ROCm 且系统运行在 WSL 中时，额外检查 PyTorch 的 torch.version.hip 与 torch.accelerator.is_available()（且非 CPU 版 vLLM），以此确认 ROCm 运行时可用。这是因为 WSL 中硬件探测可能失败但 PyTorch 已成功加载 ROCm 运行时的场景。改动局限在 rocm_platform_plugin() 函数内部，OOT 平台 entry_points 发现机制不受影响。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "platform"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "变更平台发现模块 vllm/platforms/__init__.py（被跨项目规则列为必然影响文件）：在 rocm_platform_plugin() 中新增 WSL 下的 ROCm fallback 检测。OOT 平台（含 vllm-ascend）仍通过 entry_points 注册与发现，NPUPlatform 的加载流程和 Platform 接口完全不变；新增逻辑仅在 in_wsl() 且未检测到 ROCm 时生效，对 Ascend 无功能影响。",
+        "testing": "无影响",
+        "needs_test_update": false
+      },
+      "message": "[Fix] Improve ROCm detection in WSL environments (#38434)\n\nSigned-off-by: Yizhou Liu <liu_yizhou@outlook.com>",
+      "deep_analysis": {
+        "ascend_affected_confirmed": false,
+        "affected_interfaces": [],
+        "adaptation_effort": "low",
+        "adaptation_guide": "",
+        "risk": ""
+      }
+    },
+    {
+      "sha": "7a67941c1d0506d0690fbb4e91b573c660d24981",
+      "comment": "Rust gRPC 前端新增 audio 和 video 多模态媒体输入支持：convert.rs 将原来仅支持 Image 的 MediaContentPart 构建扩展为 Image/Video/Audio 三种模态 × URL/DataUri/RawBytes 三种来源的完整组合，并在 match 前统一校验 modality 和 source。expand.rs 的 prompt 展开逻辑支持 PromptReplacement 的 structural_prefix：placeholder range 将前缀 token 计入长度、embed mask 在前缀位置置 false、offset 相应前移，并新增 prefix 越界检查。同时修复 Qwen3-ASR 的 M-RoPE 位置重建：直接用 mm_feature.mm_position.length（占位符长度即音频 embedding 数）替代从 audio_feature_lengths 计算，使被 strip 的 prefix 场景下仍能正确重建位置。新增对应单测。",
+      "tags": [
+        "feature",
+        "bugfix",
+        "low-risk",
+        "multimodal",
+        "rust-frontend"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。Rust gRPC 前端与平台无关；Qwen3-ASR 模型在 Ascend 上使用标准 vLLM 实现，M-RoPE 修复自动继承且行为等价。",
+        "testing": "无影响",
+        "needs_test_update": false
+      },
+      "message": "[Rust Frontend][gRPC] Add audio and video media inputs (#53760)\n\nSigned-off-by: Connor Carpenter <connorc@nvidia.com>"
+    },
+    {
+      "sha": "b016ed8ea3dd8cfec9173e8d5a87ef12adc03096",
+      "comment": "将 Qwen2.5-VL 的 get_rope_by_thw 和 Qwen3-VL 的 rot_pos_ids 从 functools.lru_cache（类级全局缓存，生命周期跟随进程）改为模型实例上的 LRUCache(capacity=1024)。原实现中 lru_cache 缓存的张量在模型被卸载/释放后仍被模块级缓存持有，导致显存泄漏；改为实例属性后缓存随模型对象一起被回收。缓存命中语义等价（相同 key 复用），但方法变为实例方法，受模型生命周期管理。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "model",
+        "multimodal",
+        "memory"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。变更位于 vllm/model_executor/models/ 的 Qwen2.5-VL/Qwen3-VL 标准实现，vllm-ascend 无对应专有模型实现，变更自动继承；接口与缓存内容语义不变（仅生命周期从进程级变为实例级），无适配要求。",
+        "testing": "无影响",
+        "needs_test_update": false
+      },
+      "message": "[Bugfix][Multimodal] Release Qwen2.5-VL and Qwen3-VL RoPE caches with the model (#54346)\n\nSigned-off-by: waizuichougou <2082431897@qq.com>\nCo-authored-by: OpenAI Codex <codex@openai.com>\nCo-authored-by: OpenAI Codex <noreply@openai.com>"
+    },
+    {
+      "sha": "dbf662c9e810ef4c3f466c7c4b2b3282ba889622",
+      "comment": "让 AITER MLA 在 ROCm 上实现 FULL cudagraph 的推测解码。核心改动：(1) 小 head（<16）多 token verify 不再把 (1+num_spec) block 展平成逐 token 的 Gluon decode 并手工截断 KV 窗口，而是直接走 mla_gluon 的 4-D MTP 入口（q 为 [batch, qlen, nhead, dim]，use_2d_view=False），由 kernel 内部施加每位置因果掩码；(2) builder 计算 min_kv_seq_len 时排除 cudagraph padding 行（qo_lens=0 的 dummy 请求按 max_qo_len 垫齐），避免把 Gluon 的 KV-split 并行度压垮；(3) TritonMLAMetadataBuilder 新增 get_cudagraph_support() 覆写：当 KV cache group 含 non_causal_multi_token_decode（DSpark draft 的 1+num_spec 块走 decode 路径）时报告 UNIFORM_BATCH，使整个引擎不再因该 attention group 被降级出 FULL cudagraph。测试同步改写为验证 4-D MTP 契约、padding 行排除逻辑和 UNIFORM_BATCH 判定。",
+      "tags": [
+        "performance",
+        "feature",
+        "medium-risk",
+        "attention",
+        "mla",
+        "spec-decode",
+        "rocm"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。rocm_aiter_mla.py 为 ROCm 专有后端（Ascend 不使用）；triton_mla.py 的改动是 TritonMLA 后端的 get_cudagraph_support 覆写，Ascend 使用自研 MLA 后端，不经过 TritonMLA。non_causal_multi_token_decode/UNIFORM_BATCH 机制对 Ascend 的 DSpark+ACL Graph 无直接约束。",
+        "testing": "无影响",
+        "needs_test_update": false
+      },
+      "message": "[ROCm][MLA] Reach FULL cudagraphs for AITER MLA speculative decoding (#51171)\n\nSigned-off-by: yudigege86 <naqin@amd.com>\nCo-authored-by: yudigege86 <naqin@amd.com>\nCo-authored-by: Cursor <cursoragent@cursor.com>\nCo-authored-by: Andreas Karatzas <akaratza@amd.com>"
+    },
+    {
+      "sha": "b5707bf994cb968adfc7a29fbb80b0582f53f38d",
+      "comment": "修复 family-120（GB10/DGX Spark）上 MoE 路由 GEMM 无法利用 cuBLAS bf16→fp32 out_dtype 融合 epilogue 的问题。原逻辑把 allow_cublas_router_gemm 绑定在 allow_specialized_router_gemm（专用 kernel gate，会排除 family-120）或 ROCm 特例上；新逻辑提取 _router_gemm_cublas_capable = (is_cuda() or is_rocm()) and no_bias 作为独立条件，使所有 CUDA 架构（含 GB10）都能走 cuBLAS/hipBLASLt 的 out_dtype 路由 GEMM，并删除 ROCm 特例分支。副作用：非 CUDA/ROCm 平台（含 Ascend）上该开关不再可能通过 allow_specialized_router_gemm 打开；第二个 hunk 的延迟启用路径（权重 dequant 后重检）也对这类平台永久关闭。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "moe",
+        "model-executor"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "GateLinear（vLLM MoE 路由层）的 allow_cublas_router_gemm 现在仅在 CUDA/ROCm 平台为 True。旧逻辑中 Ascend 上若 allow_specialized_router_gemm=True 且权重为 bf16、out_dtype=fp32，可能启用 bf16→fp32 out_dtype 融合路由 GEMM；新逻辑下该路径在 Ascend 上被禁用（is_cuda()/is_rocm() 均为 False），路由回退到 bf16 matmul 后手动 cast fp32 的通用路径。接口未变，但路由计算的数值路径可能变化，需在 Ascend 上验证 MoE 路由（router logits 与 topk 选专家）一致性。",
+        "testing": "建议在 vllm-ascend 的 MoE 测试中覆盖带/不带量化路由的场景，确认 GateLinear 回退路径下路由结果无回归。",
+        "needs_test_update": true,
+        "suggested_test_areas": [
+          "vllm_ascend/ops/fused_moe/ 路由相关测试（GateLinear 在 bf16 权重下 router logits 与 topk 行为）",
+          "MoE 模型 e2e 测试（如 DeepSeek 系列，验证路由回退路径无回归）"
+        ]
+      },
+      "message": "[Bugfix][MoE] Enable cuBLAS out_dtype router GEMM on all CUDA archs (fixes family-120/GB10) (#54048)\n\nSigned-off-by: Chenglun Hu <chenglunhu@gmail.com>",
+      "deep_analysis": {
+        "ascend_affected_confirmed": false,
+        "affected_interfaces": [],
+        "adaptation_effort": "low",
+        "adaptation_guide": "",
+        "risk": ""
+      }
+    },
+    {
+      "sha": "680e2177e473ed8dfaa9773f7ead185b369cab46",
+      "comment": "修复多节点资源分配测试在 placement group 销毁后的竞态：从 vllm/v1/executor/ray_utils.py 中删除 _wait_until_pg_removed 辅助函数，测试改为直接 ray.util.remove_placement_group 后轮询 available_resources_per_node() 确认 GPU 资源真正释放（60 秒超时）。原辅助函数的实现缺陷是 ray.util.get_current_placement_group() 在 remove 调用后立即返回 None，导致循环提前退出，未真正等待资源释放，从而造成后续测试资源不足的 flaky。纯测试/CI 稳定性修复，删除的函数无其他调用方。",
+      "tags": [
+        "test",
+        "ci",
+        "low-risk",
+        "ray"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false
+      },
+      "message": "[CI][Ray] Fix flaky multi-node assignment test after placement-group teardown (#53621)"
+    },
+    {
+      "sha": "6cddad414ee46796f21aaf7b8643a6e7a00c09b5",
+      "message": "[CI][Test] Deflake test_mem.py sleep-mode asserts via allocator bookeeping (#54312)\n\nSigned-off-by: Oxana Korzh <okorzh@amd.com>\nCo-authored-by: Claude Opus 5 (1M context) <noreply@anthropic.com>",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "chore"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "fe755c88995ad468882517b6c4bdd60138d46a3a",
+      "comment": "修复随机推测解码中的分布偏差：draft token 的 Gumbel 采样与 target 的拒绝采样/重采样共享同一 (seed, pos) 噪声流，导致提案被 argmax 拒绝后，残差重采样继承了该提案的同一噪声向量，使与 draft 高排序相邻的 token 被系统性低估。修复方案：gumbel_sample 新增必选参数 is_drafting，draft 采样时对 pos 加盐（_DRAFT_NOISE_SALT=1<<30），使两条噪声流完全不相交；同时统一 draft 位置语义——sample_src_positions 定义为被采样 token 的前一个位置（P-1），AutoRegressive/MultiModuleMTP 每步推进 +1，DFlash 从 P-2 改为 P-1，DSpark 将 target 侧 set_additional_forward_context 的换算保持一致。注意：gumbel_sample 签名是破坏性变更（新增必选参数），所有调用方必须同步更新；draft 噪声流整体偏移会使固定 seed 的复现结果变化。测试新增窄词表分布检验（chi2）与 draft/target 流独立性检验。",
+      "tags": [
+        "bugfix",
+        "high-risk",
+        "spec-decode",
+        "model-runner",
+        "sampling"
+      ],
+      "ascend_impact": {
+        "ascend_affected": true,
+        "functionality": "gumbel_sample() 新增必选形参 is_drafting，并移除旧的 positions+1 约定；DraftModelSpeculator.sample_draft 形参改名 sample_src_positions；AutoRegressiveSpeculator 新增 sample_src_positions 状态缓冲，prepare_decode_inputs/update_draft_inputs 签名增加该参数；DFlash/DSpark 的位置语义从 P-2/Q-1 统一为 P-1。vllm-ascend 的 spec_decode proposer（DFlash、DSpark、Eagle、Medusa 等）若直接调用 gumbel_sample 或继承 vLLM 的 AutoRegressiveSpeculator/MultiModuleMTPSpeculator/DraftModelSpeculator，必须同步更新：draft 采样的 gumbel_sample 调用需传 is_drafting=True，并改用新的 P-1 位置语义；否则会因签名不匹配 TypeError，或采样键与验证端不一致导致分布偏差。同时 draft 噪声流加盐后，Ascend 端固定 seed 的复现期望值需更新。",
+        "testing": "需要更新 vllm-ascend 的 spec_decode 测试：验证各 proposer 调用 gumbel_sample 时传入 is_drafting=True、位置语义为 P-1，以及草案与验证端噪声流解耦后拒绝采样输出分布无偏。",
+        "needs_test_update": true,
+        "suggested_test_areas": [
+          "vllm_ascend/spec_decode/dspark/speculator.py 相关测试",
+          "vllm_ascend/spec_decode/dflash/speculator.py 相关测试",
+          "vllm_ascend/spec_decode/（Eagle/Medusa/MultiModuleMTP 等继承 sample_draft 的 proposer）",
+          "gumbel_sample 调用兼容性与拒绝采样分布回归测试"
+        ]
+      },
+      "message": "[Bugfix][Model Runner V2][Spec Decode] Decouple the draft's gumbel noise stream from the target's (#54282)\n\nSigned-off-by: Giancarlo Delfin <gdelfin@inferact.ai>",
+      "deep_analysis": {
+        "ascend_affected_confirmed": true,
+        "affected_interfaces": [
+          "vllm_ascend/worker/v2/sample/gumbel.py::gumbel_sample (Python API — new required `is_drafting` kwarg)",
+          "vllm_ascend/worker/v2/sample/gumbel.py::_gumbel_sample_kernel (Triton kernel — needs IS_DRAFTING constexpr + noise-salt)",
+          "vllm_ascend/patch/worker/patch_v2/patch_triton.py (monkey-patch boundary: Ascend gumbel_sample replaces upstream `sampler.gumbel_sample`, `speculator.gumbel_sample`, `base_speculator.gumbel_sample`, `gumbel.gumbel_sample`)",
+          "vllm_ascend/worker/v2/spec_decode/rejection_sampler_utils.py::_npu_gumbel_block_argmax / _probabilistic_rejection_kernel (target-side resample noise keying — verify pairing)",
+          "vllm_ascend/worker/v2/spec_decode/dflash/speculator.py::_prepare_dflash_inputs_kernel_ascend (sample_pos semantics consumed as P-1 by inherited upstream DFlashSpeculator.propose)",
+          "vllm_ascend/worker/v2/spec_decode/autoregressive/speculator.py::AscendAutoRegressiveSpeculator (inherits new `sample_src_positions` buffer and position arithmetic from upstream AutoRegressiveSpeculator)",
+          "tests/ut/sample/a2/test_gumbel_sampling.py (all gumbel_sample call sites need is_drafting)"
+        ],
+        "adaptation_effort": "medium",
+        "adaptation_guide": "1) HARD BREAK (mandatory, crashes): upstream adds a new required `is_drafting: bool` to `gumbel_sample()` (after `apply_temperature`). vllm-ascend substitutes its NPU `gumbel_sample` (vllm_ascend/worker/v2/sample/gumbel.py:167) into `vllm.v1.worker.gpu.sample.sampler`, `...spec_decode.speculator` (base_speculator), `...eagle.speculator`, and `...sample.gumbel` via vllm_ascend/patch/worker/patch_v2/patch_triton.py:28-37. After this commit the upstream Sampler.sample calls gumbel_sample(..., is_drafting=False) and DraftModelSpeculator.sample_draft calls gumbel_sample(..., is_drafting=True). The Ascend function must accept `is_drafting` and pass it to `_gumbel_sample_kernel` as `IS_DRAFTING: tl.constexpr`, otherwise ALL non-greedy target sampling on NPU (and probabilistic draft sampling) raises TypeError. 2) CARRY OVER THE FIX (correctness): this commit's point is to decouple the draft Gumbel stream from the target's via `_DRAFT_NOISE_SALT = 1<<30` added to `pos` only when drafting (upstream gumbel.py `_DRAFT_NOISE_SALT` / `IS_DRAFTING`). The NPU draft kernel keys noise by `tl.randint(seed, pos)` (gumbel.py:149) and the NPU resample keys by the same `pos` (rejection_sampler_utils.py `_npu_gumbel_block_argmax`:71), so the identical bug exists on NPU. In `_gumbel_sample_kernel`, when `block_temp != 0.0 and IS_DRAFTING`, salt the position before `tl.randint`: `pos = (pos + (1 << 30))` (NPU pos is already cast to int32; 1<<30 fits in int32 as positions stay < 2^30 — verify at extreme max_model_len). Leave the target-side resample unsalted (decoupling is draft-side only). 3) Speculator arithmetic: `AscendAutoRegressiveSpeculator` inherits the upstream AutoRegressiveSpeculator changes (new `self.sample_src_positions` buffer created in upstream __init__, `_prefill` passing `positions + 1`, `_generate_draft` reading the buffer, `prepare_decode_inputs`/`update_draft_inputs` advancing it in `_prepare_decode_inputs_kernel`/`_update_draft_inputs_kernel`); because Ascend delegates via super() (propose/_prefill/_generate_draft/_multi_step_decode) this self-adapts as long as the gumbel_sample signature fix lands. The upstream dflash speculator now passes `sample_pos - 1` (was -2); the Ascend `_prepare_dflash_inputs_kernel_ascend` computes `sample_pos` identically to upstream so it stays compatible — verify only. Upstream DSparkSpeculator passes `is_drafting=True` to its module-local gumbel_sample; confirm the Ascend DSpark path applies the salt (or its own gumbel call). 4) Tests: update tests/ut/sample/a2/test_gumbel_sampling.py for the new `is_drafting` argument and add NPU regressions mirroring upstream test_drafting_uses_a_separate_noise_stream (same seed/pos must yield different draws when is_drafting toggles) and the rejection-sampler unbiasedness test (test_gumbel_drafted_rejection_sample_is_unbiased).",
+        "risk": "High. (a) The signature break is fatal: without accepting `is_drafting`, every non-greedy (temperature) generation step on NPU — not just spec decode — throws TypeError once vllm is bumped past this commit; the same applies to probabilistic draft sampling. (b) Partial adaptation is dangerous: adding the kwarg without implementing the 1<<30 salt leaves the exact acceptance bias this commit fixes silently in place on NPU (draft and residual share a Philox stream keyed by the same `pos`). (c) NPU-specific: pos is cast to int32 for the triton-ascend compiler, so the salt must fit in int32 (1<<30 works only while positions stay below 2^30, matching upstream's assumption); confirm triton-ascend accepts the extra constexpr and int32 add without reintroducing uint64/float64 paths (use_fp64 already rejected on NPU). (d) CUDA-graph capture/replay on the Ascend FULL decode path must include the new `sample_src_positions` buffer updates — verify the buffer is updated in place so captured graphs stay correct."
+      }
+    },
+    {
+      "sha": "7fbfca2670bbd23061fb6aec66db78e7004a38bd",
+      "comment": "修复 batch chat completions 中 echo 参数误回显用户 prompt 的问题。原逻辑只要最后一条消息有 content 就回显，不检查角色；现在要求最后一条消息的 role 必须等于当前 response_role（默认 assistant）才回显。测试覆盖了两种场景：仅用户消息时只返回模型生成内容，以及存在 assistant 前缀时正确拼接前缀。该改动只影响 OpenAI API batch 服务的文本组装逻辑，行为修复正确，风险低。",
+      "tags": [
+        "bugfix",
+        "frontend",
+        "openai-api",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Bugfix][Frontend] Only echo the assistant turn in batched chat completions (#52529)\n\nSigned-off-by: Kaif <kaifkohari10@gmail.com>\nCo-authored-by: Cyrus Leung <tlleungac@connect.ust.hk>"
+    },
+    {
+      "sha": "5b0e5b69ac1a3884a6479c9537789c95263cc804",
+      "comment": "为 SamplingParams 增加 stop_token_ids 的词汇表范围校验，并将 allowed_token_ids 的校验从基于 tokenizer 改为基于 model_config.get_vocab_size()，与 logits 张量实际宽度保持一致。这能在早期捕获越界 token id，避免在生成阶段因索引越界产生未定义行为。改动为纯参数验证逻辑，不改变采样接口和策略，风险低；但需注意极端情况下用户自定义超范围 token id 的请求会被拒绝，这是预期行为。",
+      "tags": [
+        "bugfix",
+        "sampling",
+        "validation",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Bugfix][Frontend] Validate stop_token_ids against vocab size (#54196)\n\nSigned-off-by: QwertyJack <7554089+QwertyJack@users.noreply.github.com>\nCo-authored-by: QwertyJack <7554089+QwertyJack@users.noreply.github.com>"
+    },
+    {
+      "sha": "129087ddab2b197b067e54e130d2cf5fcb094bd5",
+      "comment": "GPT-OSS MoE 性能优化：当 triton_kernels 3.6+ 的 topk 返回 SparseMatrix 时，直接复用其已计算好的 bitmatrix 和 mask_metadata，通过新增的 routing_data_from_sparse_topk() 构造 routing 数据结构，避免 make_routing_data 中重复打包 bitmatrix 并重建 SparseMatrix。同时修正了 gate_scal 的 dtype（不再强制转 bfloat16）和 num_topk 的来源。该优化仅对使用新版本 triton_kernels 的 GPT-OSS 路径生效，expert_map 路径仍走原逻辑；测试覆盖了多种 token/expert/topk 组合的等价性。改动范围集中在特定 MoE kernel 内部，风险可控。",
+      "tags": [
+        "performance",
+        "moe",
+        "fused-moe",
+        "model-runner",
+        "medium-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Perf] Reuse topk SparseMatrix routing metadata in GPT-OSS MoE forward (#45457)\n\nSigned-off-by: Shenglei Fu <sfu@confluent.io>\nSigned-off-by: Shenglei Fu <117230642+ShengleiFu@users.noreply.github.com>\nCo-authored-by: Claude Fable 5 <noreply@anthropic.com>"
+    },
+    {
+      "sha": "7f4793eaa335a3667927a0191868d01f36b170af",
+      "comment": "为 NIXL KV 连接器添加 MLA 模型的 DCP（decode context parallel）支持，这是一个跨模块的大功能。核心改动包括：(1) VllmConfig 新增 NIXL+DCP 约束断言，并实现 adjust_dcp_kv_cache_interleave_size，在 PD 场景下将 cp_kv_cache_interleave_size 自动调整为本地 block_size；(2) TransferTopology 新增 dcp_source_ranks/dcp_consumer_count，compute_tp_mapping 在 MLA+DCP 下计算正确的 source ranks 和消费者计数；(3) NIXL worker 新增 _apply_dcp_prefix_caching，在逻辑 block 粒度对齐本地/远端 DCP 切片，并扩展 _reqs_need_recv 携带 per-group 的缓存命中计数；(4) MLA 共享层调整：MLACommonImpl 移除 cp_kv_cache_interleave_size 属性，SparseAttnIndexer 改为延迟读取；(5) GPUModelRunner 在 initialize_kv_cache 时快照 cp_interleave，V1 GPUModelRunner 增加 cp_kv_cache_interleave_size 状态追踪。整体设计涵盖配置、拓扑计算、调度、传输和模型层，属于高风险分布式路径改动，对非 NIXL/非 MLA 场景有防护性检查。",
+      "tags": [
+        "feature",
+        "distributed",
+        "kv-transfer",
+        "dcp",
+        "mla",
+        "nixl",
+        "high-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": true,
+        "functionality": "vllm/v1/worker/gpu/model_runner.py 在 initialize_kv_cache 中新增 self.cp_interleave 属性快照，vllm-ascend 的 NPUModelRunner（V2）继承 GPUModelRunner，若覆写此方法需同步设置该属性，否则后续 InputBatch 重建可能使用错误的 interleave 值。vllm/v1/worker/gpu_model_runner.py 新增 self.cp_kv_cache_interleave_size 并在 may_reinitialize_input_batch 中检查其变化，vllm-ascend 的 V1 model runner（若继承此文件）需要保持该属性同步。vllm/model_executor/layers/attention/mla_attention.py 中 MLACommonImpl 删除了 self.cp_kv_cache_interleave_size 属性，vllm-ascend 的 MLA 后端子类（如 AscendMLAAttentionImpl）若仍引用该属性将触发 AttributeError，需改为动态从 get_current_vllm_config() 获取。vllm/model_executor/layers/sparse_attn_indexer.py 的 SparseAttnIndexer 将 cp_kv_cache_interleave_size 改为延迟 property，依赖该类的 Ascend SFA/DSA 实现需要适配。vllm/config/vllm.py 新增 adjust_dcp_kv_cache_interleave_size 并在 ensure_kv_transfer_initialized 中无条件调用（只要 kv_transfer_config 非空且 dcp_size>1），Ascend 若使用 Mooncake 等非 Nixl connector 且 DCP 场景下也会触发该调整，需在 Ascend 配置验证中确认兼容性。",
+        "testing": "vllm-ascend 需要增加或更新测试以覆盖：NPUModelRunner（V1/V2）在继承后 cp_interleave/cp_kv_cache_interleave_size 属性的正确设置与 InputBatch 重建行为；Ascend MLA 后端不再访问已删除的 cp_kv_cache_interleave_size 属性；Ascend 平台配置在非 Nixl connector + DCP 下 adjust_dcp_kv_cache_interleave_size 的行为是否符合预期。",
+        "needs_test_update": true,
+        "suggested_test_areas": [
+          "vllm_ascend/worker/test_model_runner.py",
+          "vllm_ascend/worker/test_model_runner_v1.py",
+          "vllm_ascend/attention/test_mla_backend.py",
+          "vllm_ascend/attention/test_dsa_sfa_backend.py",
+          "vllm_ascend/test_ascend_config.py"
+        ]
+      },
+      "message": "[Nixl][PD] DCP support for MLA models   (#50611)\n\nSigned-off-by: NickLucche <nicolo.lucchesi@mistral.ai>",
+      "deep_analysis": {
+        "ascend_affected_confirmed": true,
+        "affected_interfaces": [
+          "NPUWorker.initialize_from_config (vllm_ascend/worker/worker.py:1009-1011) - calls vllm.distributed.kv_transfer.kv_transfer_state.ensure_kv_transfer_initialized, which this commit changed to invoke VllmConfig.adjust_dcp_kv_cache_interleave_size; under Mooncake PD + decode_context_parallel_size>1 it now silently pins parallel_config.cp_kv_cache_interleave_size to the resolved block_size (128 on Ascend) at worker init.",
+          "NPUPlatform.check_and_update_config / _validate_sfa_dcp_kv_sp (vllm_ascend/platform.py:1242-1267, called at line 465) - its hard AssertionError requiring cp_kv_cache_interleave_size == cache_config.block_size for PD/DCP now duplicates and conflicts with upstream's new worker-side auto-adjustment; the strict config-time raise also prevents Ascend users from using the new upstream auto-fix.",
+          "Ascend DCP metadata builders / slot-mapping consumers of cp_kv_cache_interleave_size: vllm_ascend/attention/context_parallel/mla_cp.py:75 (AscendMlaDCPMetadataBuilder.__init__), sfa_cp.py:600/892 (AscendSFADCPMetadataBuilder), vllm_ascend/worker/dcp_utils.py:467/656, vllm_ascend/worker/block_table.py, vllm_ascend/worker/npu_input_batch.py, vllm_ascend/_310p/block_table.py & npu_input_batch.py - all read the value at construction/init; must be verified to observe the post-adjustment value (i.e. after NPUWorker.initialize_from_config), or cache it lazily.",
+          "NPUModelRunnerV1 / NPUModelRunnerV2 interleave capture timing (vllm_ascend/worker/model_runner_v1.py:542,4828; vllm_ascend/worker/v2/model_runner.py) - upstream GPUModelRunner (v2) now snapshots self.cp_interleave inside initialize_kv_cache (additive, no break), but the v1 path reads parallel_config.cp_kv_cache_interleave_size at block-table/input-batch build time; timing relative to the new worker-side adjustment must be checked."
+        ],
+        "adaptation_effort": "low",
+        "adaptation_guide": "This commit adds Nixl DCP support for MLA; vllm-ascend does NOT use Nixl (it uses Mooncake/MooncakeLayerwise/Offloading connectors registered in vllm_ascend/distributed/kv_transfer/__init__.py), so all Nixl-specific changes (TransferTopology.dcp_source_ranks/dcp_consumer_count, ReqMeta.dcp_size/local_num_computed_blocks, compute_tp_mapping local_consumers, NixlPullConnectorWorker._apply_dcp_prefix_caching, NixlPushConnector DCP guard, Nixl-only __post_init__ validation gated by KVTransferConfig.has_connector('NixlConnector')) require NO adaptation. The relevant adaptation targets the shared PD/DCP config path that vllm-ascend uses with Mooncake: (1) vllm_ascend/platform.py _validate_sfa_dcp_kv_sp (lines 1242-1267): reconcile with the new upstream behavior - upstream now auto-adjusts cp_kv_cache_interleave_size to block_size at worker init (VllmConfig.adjust_dcp_kv_cache_interleave_size, invoked from ensure_kv_transfer_initialized which NPUWorker.initialize_from_config calls at worker.py:1011), so consider relaxing the strict AssertionError (or deferring the check to after adjustment) so Ascend PD+DCP users can benefit from the auto-fix and avoid divergence; (2) verify the DCP interleave value consumed by AscendMlaDCPMetadataBuilder.__init__ (attention/context_parallel/mla_cp.py:75) and AscendSFADCPMetadataBuilder (attention/context_parallel/sfa_cp.py:600) and the DCP slot-mapping code (worker/block_table.py, worker/dcp_utils.py:467/656, worker/model_runner_v1.py:542/4828) is read AFTER NPUWorker.initialize_from_config runs the adjustment (or read lazily from parallel_config at forward time), since upstream moved the cp_kv_cache_interleave_size pinning from VllmConfig.validate_block_size (EngineCore side, now skipped for PD) to the worker side; (3) no change needed to MLA/SFA attention impls (they do not subclass upstream MLACommonImpl/SparseAttnIndexer) and no Nixl integration work is required. Add/keep a PD (Mooncake) + DCP + MLA NPU test that asserts cp_kv_cache_interleave_size == 128 after worker init."
+      }
+    }
+  ],
+  "architecture_based_on_sha": "7154856f3dcb1d3fdd5a136f7d2c5987f22244f5",
+  "architecture_generated_at": "2026-08-01T20:25:03.691327+08:00"
+}

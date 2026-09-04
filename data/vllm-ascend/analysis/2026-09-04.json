@@ -1,0 +1,486 @@
+{
+  "date": "2026-09-04",
+  "repo": "vllm-project/vllm-ascend",
+  "generated_at": "2026-09-05T05:05:00.961419+08:00",
+  "daily_summary": "当日 vllm-ascend 的变更呈现\"重型功能落地 + 基础模块重构 + 稳定性修复\"并行的态势。最重要的两个大变更：(1) MoE MLP 路径拆分重构，将统一入口改为按量化方法分发（apply_gmm1/act_quant/gmm2 钩子），涉及 ops/quantization/device/lora 多模块；(2) DeepSeek-V4-Flash-Vision 多模态模型完整适配（图像预处理、ViT/aligner、bias_vl 混合路由、vision DSA 双向索引）。同时有多项模型运行器稳定性修复（MC2 profiling 跳过编译、spec decode 异步拷贝源张量生命周期、GDN idle DP dummy 状态保护），以及 DSV4 DSpark 在 MRV2 的全图模式支持。测试侧 MiniMax-M3 e2e 迁移至 4 卡、新增 Triton swiglu_quant 覆盖并修复索引越界。CI 与文档亦有批量更新（workflow 权限拆分、weekly/nightly 数据路径、SigLIP2 教程、v0.26.0rc1 发布说明）。",
+  "test_impact_summary": "当日测试看护的核心在 MoE 重构和 DeepSeek-V4 Vision 两个大变更上。MoE 重构重写了 test_moe_mlp.py 并新增 test_moe_utils.py，要求后续对全部量化方法（W8A8/W4A8/W4A4/MXFP）x 激活函数 x 通信模式（MC2/AllGather/AlltoAll）的组合持续回归，避免逻辑从集中式迁移到各 FusedMoEMethod 后产生行为漂移；DeepSeek-V4 Vision 新增了处理器、路由、多模态 wrapper、量化映射、DSpark 配置等单元测试，但端到端多模态（图像输入、图模式、DP 并行）仍需 CI 环境补充验证。DSpark full graph、MC2 profiling、GDN idle dummy、spec decode 元数据生命周期等模型运行器修复已附单元回归测试，但建议在四卡/多机 nightly 用例中覆盖对应组合（如 FULL_DECODE_ONLY + DSpark、DP 空闲场景）。Triton swiglu_quant 索引修复依赖新加的单卡 op 测试在 Ascend CI 上实际运行。整体上当日变更量大且测试文件更新充分，但高风险的 MoE 重构和 Vision 新模型建议在 CI 中扩大矩阵（量化方法 x 图模式 x EP/DP 拓扑）以形成长效看护。",
+  "commits": [
+    {
+      "sha": "748acedfea31b795e507f9c8175585f824328d8c",
+      "comment": "修复 V1 speculative proposer 构建的 draft runtime config 未携带已验证的 speculative_config.draft_model_config 的问题，导致 draft MLA backend 看到 target 模型的 runner_type=generate 而错误初始化 MLAPO。实现上，在 AscendSpecDecodeBaseProposer._create_draft_vllm_config 中先调用父类构造，再浅拷贝 VllmConfig 和 ModelConfig，仅将 runner_type 覆盖为 draft 值，避免修改原始对象；AscendMLAImpl 通过 model_config.runner_type == \"draft\" 识别 draft 模型，并短路 enabling_mlapo。该修复将模型身份与注意力执行标志解耦，使 DSpark/DFlash 等 draft 模型不再初始化 MLAPO，且不改变 target 路径行为，是低风险的定向修复。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "attention",
+        "spec-decode"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "PR 已为 runner_type 传播和 draft/target MLAPO 选择补充了单元测试，需持续看护 draft 场景下 enable_mlapo 不被误开启。",
+        "suggested_test_areas": [
+          "tests/ut/attention/test_mla_v1.py",
+          "tests/ut/spec_decode/test_llm_base_proposer.py"
+        ]
+      },
+      "message": "[Bugfix][MLA] Detect draft models from runner type (#15265)\n\n### What this PR does / why we need it?\n\nThe V1 speculative proposer builds a draft runtime config from the\ntarget config, but the Ascend path did not carry the already validated\n`speculative_config.draft_model_config` into that runtime config. As a\nresult, draft MLA backends could still see the target model's\n`runner_type=generate` and initialize MLAPO.\n\nThis PR:\n\n- replaces the V1 draft runtime config's model config with the validated\ndraft `ModelConfig`;\n- identifies draft MLA backends from the generic `runner_type=draft`\nidentity;\n- disables MLAPO during draft backend initialization while leaving the\ntarget path unchanged;\n- adds focused coverage for config propagation and target/draft MLAPO\nselection.\n\nThis covers DSpark, DFlash, and other speculative draft models without\ncoupling model identity to attention execution flags.\n\nRefs #14915\n\n### Does this PR introduce _any_ user-facing change?\n\nYes. Speculative draft MLA backends no longer initialize MLAPO.\nTarget-model MLA behavior is unchanged.\n\n### How was this patch tested?\n\n- `python -m ruff check` on the four changed Python files: passed.\n- `python -m ruff format --check` on the four changed Python files:\npassed.\n- `python -m compileall -q` on the four changed Python files: passed.\n- Added unit tests for validated draft `ModelConfig` propagation and\nMLAPO selection from `runner_type`.\n\nTargeted pytest collection was attempted locally. The Windows\nenvironment has no installed vLLM package; using the pinned vLLM source\nfallback then stops in the existing test bootstrap because `uvloop` is\nunavailable on Windows, so no selected test executed.\n\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/ba07e4a48fc951300d97eb506217dd530583dea3\n\n---------\n\nSigned-off-by: Dawn952 <zhaojunbo13@huawei.com>"
+    },
+    {
+      "sha": "93c3fd643747468efa276b6c15c8b9c5df0f1a3b",
+      "comment": "CI 拆分：将 PR close 时的任务取消与 merged new tests 上传 OBS 拆分为两个 workflow，原因是两者所需权限不同不能混用。原 pr_close_job 改用 pull_request 事件（listWorkflowRunsForRepo 用 head_sha 而非 head.ref，避免 fork PR 名为 \"main\" 时误取消 origin/main 的 Nightly/Coverage/E2E 流水线），OBS 上传任务移至新文件 pr_supplement_new_tests.yaml 并保留 pull_request_target 以获取 OBS secrets。变更合理，提升了 CI 安全性和可维护性。",
+      "tags": [
+        "ci",
+        "low-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "纯 CI workflow 调整，不涉及代码测试逻辑；但需验证新 workflow 在 fork PR 场景下能正确取消任务并上传 OBS。",
+        "suggested_test_areas": [
+          ".github/workflows/pr_close_job.yaml",
+          ".github/workflows/pr_supplement_new_tests.yaml"
+        ]
+      },
+      "message": "[CI]Task cancellation and uploading the new test case list to OBS for splitting. (#15798)\n\n### What this PR does / why we need it?\nTask cancellation and uploading the new test case list to OBS for\nsplitting.\nThe two tasks have different permissions and cannot be mixed.\n### Does this PR introduce _any_ user-facing change?\nno\n### How was this patch tested?\nExecute separately\n\n\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/ba07e4a48fc951300d97eb506217dd530583dea3\n\n---------\n\nSigned-off-by: shiqiangA <shiqiang15@huawei.com>\nCo-authored-by: Cursor <cursoragent@cursor.com>"
+    },
+    {
+      "sha": "c2a706e4a6863ed1d06100aa5f3a13f979765cb9",
+      "comment": "纯文档标准化：将文档中千位单位从大写 K 统一为小写 k（如 128K->128k、32K->32k、1K->1k），并清理少量行尾空白。覆盖 22 个文档文件，包括模型部署教程（DeepSeek-V3.1、GLM5/5.2、Kimi-K2.x、Qwen3 系列等）、设计文档、KV pool/推测解码特性指南、发布说明等。无功能逻辑变更。",
+      "tags": [
+        "docs",
+        "low-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "文档-only 变更，无需测试更新。",
+        "suggested_test_areas": []
+      },
+      "message": "[Doc][Misc] Standardize unit abbreviation to lowercase 'k' in documentation (#15686)\n\n### What this PR does / why we need it?\n\nThis PR standardizes the unit abbreviation for thousands/kilo from\nuppercase \"K\" to lowercase \"k\" (e.g., 128K to 128k, 32K to 32k) across\nall documentation, tutorials, and test conclusion files. It also cleans\nup some trailing whitespaces. This ensures consistency in the\ndocumentation style.\n\n### Does this PR introduce _any_ user-facing change?\n\nNo, this is a documentation-only update.\n\n### How was this patch tested?\n\nNo code changes were made, so no functional testing is required.\n\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/ba07e4a48fc951300d97eb506217dd530583dea3\n\nSigned-off-by: sunshine202600 <sunshine202600@163.com>"
+    },
+    {
+      "sha": "a7997713ec9ed1f3b8f8e4e87efaf197548f2cb3",
+      "comment": "MoE MLP 大型重构（来自 #13318/#13220）。将原本集中式的 unified_apply_mlp/quant_apply_mlp/unquant_apply_mlp 拆分为 apply_moe_mlp 编排 + 各 FusedMoEMethod 实现 apply_gmm1/apply_gmm1_act_quant/apply_act_quant/apply_gmm2 钩子。MoEFusedExpertsInput/MoEMlpComputeInput 新增 layer 字段作为权重来源，build_fused_experts_input 不再需要逐张量传 w1/w2/scales；MoECommMethod.fused_experts 接受 quant_method 参数，FusedMC2 路径通过 get_fused_mc2_weights 装配权重；A5DeviceAdaptor 移除 MXFP 专用路径改由量化方法直接调度；LoRA 量化路径适配 quant_method 参数。该重构消除了 moe_mlp 中大量量化/激活分支，是高风险的内部重构，涉及 ops/quantization/device/lora 多模块，需要各量化类型 x 激活函数 x 通信模式充分回归。",
+      "tags": [
+        "refactor",
+        "high-risk",
+        "ops",
+        "quantization"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "重构重写了 test_moe_mlp.py 并新增 test_moe_utils.py，同时更新了 test_moe_comm_method、test_fused_moe、test_quant_moe；后续需对全部量化方法 x 激活 x 通信模式持续回归，防止集中式逻辑迁移到各量化方法后产生行为漂移。",
+        "suggested_test_areas": [
+          "tests/ut/ops/test_moe_mlp.py",
+          "tests/ut/ops/test_moe_utils.py",
+          "tests/ut/ops/test_moe_comm_method.py",
+          "tests/ut/ops/test_fused_moe.py",
+          "tests/ut/lora/test_quant_moe.py"
+        ]
+      },
+      "message": "[Refactor][Ops] Refactor MoE mlp and quantization methods (#13773)\n\n### What this PR does / why we need it?\n\nCome from #13318 and #13220\nRight now, moe_mlp has too many branches about different quantization\nmethod and different activations. In this PR, we split moe_mlp's methods\ninto differnet quantization method.\n\n### Does this PR introduce _any_ user-facing change?\n\nNo. This is an internal refactor of the fused MoE runtime contract and\nits test coverage.\n\n### How was this patch tested?\nThe following models are tested and can be curled successfully:\nA3:\nfloat: qwen30b-a3b\nw8a8: qwen30b-a3b-w8a8\nw4a8: kimi2.6-w4a8\nmegamoe, dynamic eplb: DeepSeek-V4-Flash-w8a8-mtp\nA5:\nw8a8mxfp: step3.7-w8a8mxfp\nw4a8mxfp: qwen3-30b-w4a8mxfp\nw4a4mxfp: glm5.1-w4a4mxfp\n\n\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/ba07e4a48fc951300d97eb506217dd530583dea3\n\nSigned-off-by: earthmanylf <yulinfeng2@huawei.com>"
+    },
+    {
+      "sha": "9f0026f11664bb5f5e4a0586eafde342dc93f1ca",
+      "comment": "MiniMax-M3 PR e2e 测试从 8 卡分区迁移到 4 卡分区。用 load_format=\"dummy\" + hf_overrides={\"text_config\": {\"num_hidden_layers\": 5}} 减小模型规模适配 4 卡；改用 MiniMax chat template 渲染 GSM8K prompt 并断言 EOS 分隔符存在，避免 completion-style prompt 在 560T runner 上继续生成额外 GSM8K 示例导致 matches[-1] 选错答案；将语义答案断言替换为 FULL_DECODE_ONLY 图重复执行的确定性 top-5 logprob 一致性检查，更聚焦模型构建、TP/EP/MoE 执行、图重放和 logprob 稳定性。测试策略合理，减低了 flaky 概率。",
+      "tags": [
+        "test",
+        "low-risk",
+        "e2e"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "测试本身从 eight_card 迁移到 four_card 并重写，需同步更新 selective-test 的 estimated-time 配置，并确保 4 卡 runner 上有足够资源执行 FP16 dummy 权重加载。",
+        "suggested_test_areas": [
+          "tests/e2e/pull_request/four_card/test_minimax_m3.py",
+          ".github/workflows/scripts/test_config.yaml"
+        ]
+      },
+      "message": "[Test] Refactor MiniMax-M3 e2e test to four cards (#15691)\n\n## Summary\n\n- move the MiniMax-M3 PR e2e test from the eight-card partition to the\nfour-card partition\n- render the GSM8K prompt with the MiniMax chat template and assert that\nthe EOS delimiter is present\n- use `load_format=\"dummy\"` with `hf_overrides={\"text_config\":\n{\"num_hidden_layers\": 5}}` so the model fits on four cards\n- replace the semantic answer assertion with finite, deterministic top-5\nlogprob checks across repeated FULL_DECODE_ONLY graph execution\n- update the selective-test estimated-time entry to the new four-card\npath\n\n## Why\n\nThe previous completion-style prompt did not use the MiniMax chat\ntemplate. In the failing 560T run, the model first produced the correct\n`answer:71`, then continued generating additional GSM8K-like examples;\n`matches[-1]` therefore selected a later answer.\n\nChanging the regex selection would only hide the missing turn/EOS\nframing. The PR test now validates the template boundary directly. Since\nreduced dummy weights have no semantic accuracy, the four-card test\nguards model construction, TP/EP/MoE execution, graph replay, and\nlogprob stability instead.\n\nFailure:\nhttps://github.com/vllm-project/vllm-ascend/actions/runs/33712219705/job/100515943157?pr=15612\n\n## Tests\n\n```bash\nsource /usr/local/Ascend/cann-9.1.0/set_env.sh\nsource /usr/local/Ascend/nnal/atb/set_env.sh\nexport MINIMAX_M3_MODEL_PATH=/mnt/y00976694/MiniMax-M3-w8a8-from-bf16-convert\npytest -sv tests/e2e/pull_request/four_card/test_minimax_m3.py --tb=short\n```\n\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/ba07e4a48fc951300d97eb506217dd530583dea3\n\nSigned-off-by: Ye Chenglin <1084697284@qq.com>"
+    },
+    {
+      "sha": "e24e09ca2931d149f90ead433f8cdf5dba2f38bb",
+      "comment": "修复 MC2 profiling 阶段首个 shape 触发 npugraph_ex 静态 kernel 编译但 attention 元数据尚未构建的问题。原逻辑中 pre-KV MC2 dummy run 可能是第一个触发编译的 shape，此时 attention metadata 不完整，导致编译的 kernel 缺失 attention 算子。修复在 v1/v2 model runner 的 MC2 profiling dummy run 外包一层新增的 disable_compilation 上下文管理器，临时设置 model.do_not_compile=True，使后续具备完整 attention 元数据的图捕获再触发静态编译。修复思路清晰，影响范围限于 MC2 profiling 路径。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "model-runner",
+        "compilation"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "PR 描述声称添加了 target/non-target 回归覆盖，但 patch 中未包含测试文件；建议补充 disable_compilation 上下文管理器的单元测试及 MC2 profiling 路径的回归验证。",
+        "suggested_test_areas": [
+          "tests/ut/worker/test_model_runner_v1.py",
+          "tests/ut/worker/test_utils.py"
+        ]
+      },
+      "message": "[BugFix][Model Runner] Skip compilation during MC2 profiling (#14899)\n\n### What this PR does / why we need it?\n\nThe pre-KV MC2 dummy run can be the first shape eligible for npugraph_ex\nstatic-kernel compilation. At that time, attention metadata is not built\nyet, so the early return makes the compiled kernel miss attention\noperators.\n\nSkip the compiled model only for this profiling run, allowing later\ngraph capture with complete attention metadata to trigger static-kernel\ncompilation.\n\n### Does this PR introduce _any_ user-facing change?\n\nNo.\n\n### How was this patch tested?\n\nAdded regression coverage for the target and non-target paths.\n\n\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/ba07e4a48fc951300d97eb506217dd530583dea3\n\nSigned-off-by: Yizhou Liu <liu_yizhou@outlook.com>"
+    },
+    {
+      "sha": "5a5eee241fc55ac3f2755aaf389763a2f9c28ae5",
+      "comment": "新增 SigLIP2（Atlas 300I DUO）推理教程文档，涵盖模型介绍、Docker/源码安装、在线 /v1/embeddings 与离线 llm.embed 使用、ImageNet zero-shot 精度评估（含示例代码）、HTTP 性能基准脚本和调优指南；同步更新 nav_titles.py、supported_models.md 和 mkdocs.yml。纯文档变更。",
+      "tags": [
+        "docs",
+        "low-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "文档-only 变更，无需测试更新。",
+        "suggested_test_areas": []
+      },
+      "message": "[Doc] Update document for SigLip2 inference instruction (#15133)\n\n### What this PR does / why we need it?\nDocumentation Updates: Updated the tutorial document for SigLIP2\ninference for Atlas 300I DUO hardware.\n\n### Does this PR introduce _any_ user-facing change?\nNone\n### How was this patch tested?\nvLLM main\n\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/ba07e4a48fc951300d97eb506217dd530583dea3\n\n---------\n\nSigned-off-by: LIJIAN1998 <844299030@qq.com>\nCo-authored-by: Cursor <cursoragent@cursor.com>"
+    },
+    {
+      "sha": "4a4503b9e448e2b2f6ab778d669f74381f075653",
+      "comment": "支持 DSV4 DSpark 在 MRV2 上的全图模式。核心问题是 ACL graph 重放时 DSA 算子的 ori_sparse_indices 数据指针在捕获时被冻结，而 build_dspark_swa_indices 每次新建 tensor 导致重放地址不稳定。修复为 AscendDSAMetadataBuilder 预分配 dspark_swa_indices_buffer 静态缓冲区，构建函数将结果拷贝到 buffer 并返回切片视图；dsa_cp 添加 TODO 注释提示 DSA CP 适配 v2 DSpark graph 模式的潜在问题；attn_utils 在 positions 为 None 的图模式下补建零 tensor。测试将 DSpark 用例从 enforce_eager=True 改为 False，并参数化 FULL_DECODE_ONLY 与默认 FULL_AND_PIECEWISE 两种图模式。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "attention",
+        "model-runner"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "DSpark 测试已切换为图模式并参数化两种 cudagraph_mode；建议为 dspark_swa_indices_buffer 的稳定地址语义和边界（行数不足、graph 重放地址冻结）补充单元回归。",
+        "suggested_test_areas": [
+          "tests/e2e/pull_request/four_card/model_runner_v2/test_deepseek_v4.py",
+          "tests/ut/attention/test_dsa_v1.py"
+        ]
+      },
+      "message": "[Feature][MRV2]Support full graph mode for DSV4 DSpark  (#15269)\n\n### What this PR does / why we need it?\n[Feature][MRV2]Support full graph mode for DSV4 DSpark\n\n### Does this PR introduce _any_ user-facing change?\nN/A\n\n### How was this patch tested?\n```\npython examples/test_dspark_acceptance.py  \\\n--model-dir ~/.cache/modelscope/hub/models/UploadWeight/DeepSeek-V4-Flash-DSpark-w4a8-test  \\\n--num-spec-tokens 5 \\\n--dataset-name hf \\\n--dataset-path openai/gsm8k \\\n--num-prompts 400 \\\n--temp 0 \\\n--output-len 256 \n```\n\n**full graph:**\n```\n------------------------------------------------------------\ntotal_output_tokens: 66633\nnum_drafts: 15386\nnum_draft_tokens: 76930\nnum_accepted_tokens: 51225\nmean acceptance length: 4.33\noutput token throughput: 779.95 tok/s\n------------------------------------------------------------\n  acceptance at token 0: 0.8957\n  acceptance at token 1: 0.7760\n  acceptance at token 2: 0.6556\n  acceptance at token 3: 0.5518\n  acceptance at token 4: 0.4502\n\n```\n**eager:**\n```\n------------------------------------------------------------\ntotal_output_tokens: 67845\nnum_drafts: 15589\nnum_draft_tokens: 77945\nnum_accepted_tokens: 52259\nmean acceptance length: 4.35\noutput token throughput: 961.91 tok/s\n------------------------------------------------------------\n  acceptance at token 0: 0.8996\n  acceptance at token 1: 0.7789\n  acceptance at token 2: 0.6614\n  acceptance at token 3: 0.5563\n  acceptance at token 4: 0.4560\n```\n\nCo-authored-by: slippersss\n\n\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/ba07e4a48fc951300d97eb506217dd530583dea3\n\n---------\n\nSigned-off-by: root <root@vllm-ascend.local>\nSigned-off-by: Zetong Li <slippersss@126.com>\nSigned-off-by: dsxsteven <dsxsteven@sina.com>\nCo-authored-by: root <root@vllm-ascend.local>\nCo-authored-by: Zetong Li <slippersss@126.com>\nCo-authored-by: dsxsteven <36877507+dsxsteven@users.noreply.github.com>"
+    },
+    {
+      "sha": "902e42ac57de7a0ef54417604d2d1983892c0eab",
+      "comment": "CI weekly 用例数据源更新：修正 GLM-5.2 模型名大小写（Eco-Tech/GLM-5.2-w8a8c8）并加入 dataset 列表、Eagle3 模型路径从 vllm-ascend 私有仓库更新为 popowww/MiniMax-M2.5-Eagle3、GSM8K 数据集路径统一为连字符命名（GSM8K-in3500-bs400）、Qwen3.5 周级用例改用 prefix90 数据集并开启 --enable-prefix-caching。仅影响 CI 配置与测试数据源选择。",
+      "tags": [
+        "ci",
+        "low-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "仅调整 weekly 用例的数据集/模型路径与配置，不涉及代码逻辑；需关注新数据集与模型名在持续运行中的可用性。",
+        "suggested_test_areas": [
+          "tests/e2e/weekly/multi_node/external_dp/config/",
+          "tests/e2e/weekly/multi_node/internal_dp/config/",
+          "tests/e2e/weekly/single_node/configs/"
+        ]
+      },
+      "message": "[CI] update dataset_path for weekly cases (#15370)\n\n### What this PR does / why we need it?\n update dataset_path for weekly cases\n\n### Does this PR introduce _any_ user-facing change?\nno\n\n### How was this patch tested?\nrun the cases weekly\n\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/ba07e4a48fc951300d97eb506217dd530583dea3\n\n---------\n\nSigned-off-by: guxin108 <1252896542@qq.com>"
+    },
+    {
+      "sha": "0990fc080235bb2bf945ca97928c25d4bedae488",
+      "comment": "调整 nightly 多机用例资源分配：GLM-5.1-W8A8C8-A3_128k_90_50.yaml 移除 aime2025 精度子用例（保留性能基线），GLM-5.1-W8A8C8-A3_198k_function.yaml 新增 aime2025 精度子用例并将 perf 的 num_prompts 从 4 降为 1，避免 198k 长序列性能用例耗时过长。CI 资源配置调整，无代码逻辑影响。",
+      "tags": [
+        "ci",
+        "low-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "仅调整 nightly yaml 配置，不涉及功能代码；建议在 nightly 实际运行中观察 198k 用例的稳定性和时长。",
+        "suggested_test_areas": [
+          "tests/e2e/nightly/multi_node/internal_dp/config/GLM-5.1-W8A8C8-A3_128k_90_50.yaml",
+          "tests/e2e/nightly/multi_node/internal_dp/config/GLM-5.1-W8A8C8-A3_198k_function.yaml"
+        ]
+      },
+      "message": "[CI] update GLM5.1-W8A8C8-A3-128K_90_50.yaml GLM5.1-W8A8C8-A3-198k_function.yaml (#15790)\n\n### What this PR does / why we need it?\nupdate GLM5.1-W8A8C8-A3-128K_90_50.yaml\nGLM5.1-W8A8C8-A3-198k_function.yaml\n\n### Does this PR introduce _any_ user-facing change?\nno\n\n### How was this patch tested?\nrun the cases nightly\n\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/ba07e4a48fc951300d97eb506217dd530583dea3\n\n---------\n\nSigned-off-by: guxin108 <1252896542@qq.com>"
+    },
+    {
+      "sha": "8f94f0a58f907898e21ab0452413075ecc0b1b23",
+      "comment": "修复 spec decode 元数据异步 H2D 拷贝的源张量生命周期问题。原 _calc_spec_decode_metadata 将 pin_memory 的临时 CPU tensor 直接 .to(device, non_blocking=True)，Python 可能在 DMA 完成前释放源，pinned allocator 复用其存储，导致 target_logits_indices 损坏并最终触发 IndexCheck_int64 越界（高并发 DSpark 多模态场景）。修复引入 _copy_spec_decode_metadata_to_device：runner 持有 _pending_spec_decode_metadata_copies FIFO，记录 CPU 源元组和 NPU event，在新拷贝提交前通过 event.query() 回收已完成条目，全程无 host 同步。修复针对性强，额外开销仅为一个 event 和 FIFO 入队，性能影响可忽略。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "model-runner",
+        "spec-decode"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "已补充单元测试覆盖 non_blocking 拷贝、event 记录、源保留和回收；建议在四卡 DSpark 多模态并发场景下做持续集成回归以防回退。",
+        "suggested_test_areas": [
+          "tests/ut/worker/test_model_runner_v1.py"
+        ]
+      },
+      "message": "[BugFix] Retain async speculative metadata copies (#15719)\n\n## Summary\n\n- retain pinned CPU speculative-decode metadata until its asynchronous\nH2D copy completes\n- reclaim completed source tensors with NPU events without synchronizing\nthe host\n- add a unit test covering non-blocking copies, event recording, source\nretention, and reclamation\n\n## Root cause\n\n`_calc_spec_decode_metadata` created pinned CPU tensors as temporaries\nand immediately passed them to `.to(device, non_blocking=True)`. Python\ncould release those sources before the H2D DMA completed, allowing the\npinned allocator to reuse their storage. Under high-concurrency DSpark\nmultimodal serving this could corrupt `target_logits_indices` and\neventually trigger an `IndexCheck_int64` out-of-range failure.\n\nThe fix keeps each tuple of CPU source tensors in a runner-owned FIFO,\nrecords one event after all five copies are enqueued on the current\nstream, and releases only entries whose event has completed. The copies\nremain asynchronous and no host-side synchronization is introduced.\n\n## Validation\n\nLatest `main` integration:\n\n- based on upstream `main` at `7b717fefb`\n- `ruff check` passed for both changed files\n- `ruff format --check` passed for both changed files\n- `git diff --check` passed\n\nRemote NPU validation of the same fix on `80.5.9.127:zyl_test`,\nDeepSeek-V4-Flash-Vision-Exp-w8a8, DP4/TP4/EP, DSpark=6,\n`FULL_DECODE_ONLY`, concurrency 128:\n\n- targeted unit tests: 2 passed, 36 deselected\n- Ruff and diff checks passed\n- three full stress runs: 1730/1730 requests each, elapsed 843.42 s,\n853.32 s, and 830.27 s\n- official AISBench MMMU-Pro Options10 run: 1730/1730 requests,\ninference 818.30 s, Overall 28.03\n- total candidate coverage: 6920/6920 requests, zero `IndexCheck` or\nout-of-range failures; service remained healthy\n\nFor context, two baseline runs on this host also completed without\nreproducing the intermittent failure. Candidate average elapsed time was\n+1.01% and average request latency was +1.06% versus those baseline\nruns. These were sequential same-host measurements, not a strict\nalternating A/B performance experiment.\n\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/ba07e4a48fc951300d97eb506217dd530583dea3\n\nSigned-off-by: GDzhu01 <116337067+GDzhu01@users.noreply.github.com>"
+    },
+    {
+      "sha": "4fe7ddbf94bc28bcd2b9f3d2d93f0fe1f0499cf5",
+      "comment": "新增 swiglu_quant Triton kernel 的单卡 CI 覆盖，比较 kernel 与独立 FP32 PyTorch 参考，覆盖 INT8 输出与 per-token 动态 scale、need_quant=False 路径、FP16/BF16、单 token/多核 token 数、空 expert 以及 int32/int64 group-list 和非法参数校验。同时修复 kernel 中 cumsum 模式下 total_rows 读取越界问题（原代码加载 group_list_ptr + NUM_EXPERTS，即末尾哨兵外的元素；改为 NUM_EXPERTS - 1）。测试与修复配套，风险低。",
+      "tags": [
+        "test",
+        "bugfix",
+        "low-risk",
+        "ops"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "新增的 swiglu_quant e2e 测试需在 Ascend NPU CI 上实际运行，以覆盖 Triton 索引修复和量化精度。",
+        "suggested_test_areas": [
+          "tests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_swiglu_quant.py"
+        ]
+      },
+      "message": "[CI][Triton] Add SwiGLU quant operator test (#15261)\n\n### What this PR does / why we need it?\n\nAdds single-card NPU CI coverage for `swiglu_quant`, the Triton fallback\nused by quantized MoE MLP paths when GMM+SwiGLU+Quant fusion is\ndisabled.\n\nThe test compares the kernel with an independent FP32 PyTorch reference\nand covers:\n\n- INT8 output and per-token dynamic scales\n- the `need_quant=False` path\n- FP16 and BF16 inputs\n- single-token and multi-core token counts\n- empty experts and int32/int64 count-mode group lists\n- invalid group-list type and dtype validation\n\n### Does this PR introduce _any_ user-facing change?\n\nNo.\n\n### How was this patch tested?\n\n- `python -m py_compile\ntests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_swiglu_quant.py`\n- `uvx ruff format --check\ntests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_swiglu_quant.py`\n- `uvx ruff check\ntests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_swiglu_quant.py`\n- `git diff --cached --check`\n\nThe NPU test was not run on the local Windows host; it is intended to\nrun in Ascend CI.\n\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/ba07e4a48fc951300d97eb506217dd530583dea3\n\n---------\n\nSigned-off-by: zhuyilin (A) <z00911894@china.huawei.com>\nCo-authored-by: zhuyilin (A) <z00911894@china.huawei.com>"
+    },
+    {
+      "sha": "0b012f1be6f1f13e191eea3d5d57003886271ae5",
+      "comment": "将 v0.26.0rc1 发布说明同步到 main：README/README.zh 增加 Latest News 与推荐版本表项；release_notes.md 完整新增 v0.26.0rc1 章节（模型受限说明、Highlights、Features、硬件与算子支持、性能优化、依赖、破坏性变更、待废弃、已知问题）；versioning_policy.md 增加兼容矩阵和版本事件；faqs.md 增加版本专属 FAQ 链接；贡献者列表更新至 2026-09-03。纯文档变更。",
+      "tags": [
+        "docs",
+        "low-risk",
+        "release"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "文档-only 变更，无需测试更新。",
+        "suggested_test_areas": []
+      },
+      "message": "[Doc][Misc] Sync v0.26.0rc1 release notes to main (#15760)\n\n### What this PR does / why we need it?\n\nThis PR syncs the release notes and documentation for the `v0.26.0rc1`\nrelease candidate to the `main` branch.\n\n### Does this PR introduce _any_ user‑facing change?\n\nNo, this is a documentation‑only update.\n\n### How was this patch tested?\n\nCI Pass\n\n\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/ba07e4a48fc951300d97eb506217dd530583dea3\n\nSigned-off-by: wangkunpeng <1289706727@qq.com>"
+    },
+    {
+      "sha": "3e30d71142e7b4d0758a3673e61137666e879746",
+      "comment": "修复 idle DP dummy run 推进 GDN/Mamba 循环状态的问题（#15253 的 rebase 重提交）。空闲 DP rank 无请求时仍执行单 token dummy batch 以参与图重放和集合通信，但该 token 会被 GDN 层当作真实 decode token，通过 block-table 中早期请求遗留的条目推进 causal-conv 和 KDA recurrent state，导致跨 DP 输出损坏。修复在 _dummy_run 中新增 skip_gdn_state_update 参数，对 GDN metadata builder 构建 num_actual_tokens=0 的零长度元数据（query_start_loc 置零、max_query_len=0、is_prefilling 清零），使两个捕获的循环分支成为 no-op，同时保持模型/集合通信 dummy shape 不变；310P 运行器透传同参数。A/B 验证显示冷/热重复 token 级一致、接受率显著提升，且不引入设备同步。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "model-runner",
+        "attention"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "已更新 test_model_runner_v1.py 中 idle DP dummy run 的调用断言，并覆盖 GDN 零长度 recurrent metadata；建议在多节点 GDN/Mamba（Kimi K3）场景补充 DP 空闲回归。",
+        "suggested_test_areas": [
+          "tests/ut/worker/test_model_runner_v1.py",
+          "tests/ut/attention/test_gdn_v1.py"
+        ]
+      },
+      "message": "[BugFix][GDN] Skip recurrent state updates for idle DP dummy runs (#15510)\n\n> Rebased resubmission of #15253 onto current `main` (`f69831343`). The\noriginal review fixes are included in this branch.\n\n## What this PR does / why we need it\n\nData-parallel ranks with no scheduled requests still execute a one-token\ndummy batch to participate in graph replay and collectives. For\nGDN/Mamba layers, treating that synchronization-only token as a real\ndecode token can advance causal-conv and KDA recurrent state through\nblock-table entries left by an earlier request.\n\nThis PR keeps the model/collective dummy shape unchanged, but builds\nzero-length GDN metadata for idle DP dummies. Both captured recurrent\nbranches become no-ops while other layers and distributed communication\ncontinue to execute normally.\n\nThe change restores the behavior previously validated on the v0.26 Kimi\nK3 path. It adds no device-wide synchronization and does not change GDN\nkernels.\n\n## Does this PR introduce any user-facing change?\n\nNo API change. Multi-node GDN/Mamba inference no longer depends on\nwhether another DP rank was idle between requests.\n\n## How was this patch tested?\n\n- `python -m compileall` for the changed runtime files\n- `git diff --check`\n- Existing unit expectations updated for both idle-dummy entry points;\nthe existing GDN builder regression covers zero-length recurrent\nmetadata\n- Real-weight A/B on two A3 nodes, TP16 x DP2 / EP32, Kimi K3 GQA\nDSpark, async scheduling, prefix cache, FULL_DECODE_ONLY graph,\n131072-input + 1024-output:\n- before: a cache-hit repeat diverged from token 0 and collapsed into a\nrepeated `1.1.1...` output while speculative acceptance remained 80.55%\n- after: no corrupted output in five cold/warm repeats; the last four\ncold/warm pairs were token-for-token identical, with per-token\nacceptance between 95.81% and 97.49%\n- Real-weight four-node smoke on TP16 x DP4 / EP64 with full QuaRot\nweights and the same 128K-to-1K case:\n- repetition 1: aggregate acceptance 85.40%, mean accepted length 6.98,\nper-DP acceptance 88.11% / 89.03% / 85.91% / 79.16%\n- repetition 2: aggregate acceptance 87.00%, mean accepted length 7.09,\nper-DP acceptance 87.40% / 84.08% / 87.09% / 89.56%\n- both repetitions reported a 94.63% prefix-cache hit rate and completed\nwithout the cross-DP rotating collapse seen before the fix\n- repetition 3 was not counted: the DP2 EngineCore exited concurrently\nwith an external Docker exec ending with status 137. The host reported\nno OOM or device fault, but the initiating command was not captured, so\nthis is recorded as an interrupted run rather than attributed to the\npatch. The shared nodes were reclaimed and no restart was performed.\n\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/ba07e4a48fc951300d97eb506217dd530583dea3\n\nSigned-off-by: qijiajin <qijiajin1@huawei.com>"
+    },
+    {
+      "sha": "63233e64a6027f9b664657595cf3cec0c1a2fee4",
+      "comment": "DeepSeek-V4-Flash-Vision-Exp 的 Ascend 完整支持（v0.27.x API 线）。新增 mm_preprocess.py（从官方仓库移植的图像变换与 sentinel 块构建，保证 token 数 bit-match；sentinel 借用 5 个连续的 in-vocab 特殊 token）、vision.py（ViT + aligner，replicated 不切分）、vl_model.py（Ascend 多模态 wrapper，注册 DeepseekV4ForConditionalGeneration）。DSA attention 新增 build_vision_bidirectional_swa_indices，使图像 span 内双向可见而 span 外保持因果 SWA，original-KV 与 compressed-KV 索引分别传给稀疏注意力算子。MoE 路由新增 select_deepseek_v4_vision_experts：文本行保留确定性 hash/tid2eid 路由，图像 sentinel 行使用 bias_vl 动态路由。ModelSlim 量化前缀映射适配 language_model 嵌套命名空间。DSpark text-only drafter 与 target 多模态 prefill 配合，加载时忽略 draft-only vision 路由偏置。patch 系统新增 config convertor 注册与 draft 架构恢复。该 commit 属于大型新功能，涉及模型注册、多模态处理、注意力、MoE 路由、量化配置、推测解码、patch 系统，风险高，但已包含较完整的单元测试与 16-NPU 运行时验证（OCRBench 826/1000）。",
+      "tags": [
+        "feature",
+        "high-risk",
+        "model",
+        "attention",
+        "moe",
+        "spec-decode"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "已新增/更新大量单元测试覆盖视觉索引构建、bias_vl 路由、多模态 wrapper、ModelSlim 前缀映射、DSpark 配置归一化等；但端到端多模态（真实图像输入、ACLGraph 模式、DP 并行）仍需 CI 或 nightly 环境补充验证。",
+        "suggested_test_areas": [
+          "tests/ut/models/test_deepseek_v4_vision.py",
+          "tests/ut/models/test_deepseek_v4_vision_preprocess.py",
+          "tests/ut/models/test_deepseek_v4_moe.py",
+          "tests/ut/attention/test_dsa_v1.py",
+          "tests/ut/patch/platform/test_patch_fused_moe.py",
+          "tests/ut/patch/platform/test_patch_speculative_config_dspark.py",
+          "tests/ut/quantization/test_modelslim_config.py"
+        ]
+      },
+      "message": "[Feature][Model] Support DeepSeek V4 Flash Vision on Ascend (#15457)\n\n### What this PR does / why we need it\n\nAdds `DeepSeek-V4-Flash-Vision-Exp` support to vLLM Ascend `main`,\npaired with\nthe vLLM v0.27.x API line.\n\nRoadmap and remaining validation tracking: #15462\n\nUpstream behavior reference: vllm-project/vllm#54566\n\nThe paired vLLM release does not contain the DeepSeek-V4 vision\nprocessor and\nvision tower from the upstream PR. This change therefore carries the\nrequired\nv0.27-compatible implementation in vLLM Ascend without importing\nunmerged\nvLLM modules.\n\n### Implementation\n\n- registers `DeepseekV4ForConditionalGeneration` and routes vision\n  checkpoints to an Ascend multimodal wrapper;\n- provides the image processor, ViT, aligner, sentinel embeddings,\nplaceholder\n  expansion, and multimodal weight mapping required by vLLM v0.27;\n- preserves raw input token IDs through prefill for DeepSeek-V4 MoE\nrouting;\n- implements hybrid `bias_vl` routing: text tokens retain\nhash/correction-bias\nrouting while image sentinel tokens use dynamic routing with `bias_vl`;\n- builds paged original-KV sparse indices that make each complete image\nspan\n  bidirectionally visible while keeping causal SWA outside image spans;\n- passes original-KV image indices and compressed-KV top-k indices to\nthe\n  Ascend sparse-attention operator independently and simultaneously;\n- supports ModelSlim W8A8 checkpoints whose language quantization\ndescription\n  remains in the causal-LM `model.*` / `lm_head.*` namespace;\n- keeps config-convertor registration safe in spawned DP engine\nprocesses.\n- enables DeepSeek-V4 Vision with a text-only DSpark drafter: image\ninputs are\nencoded by the target during prefill, while DSpark proposes subsequent\ntext\ndecode tokens; restores the draft architecture after VL config\nconversion,\nexposes the EAGLE3 hidden-state interface, and ignores draft-only vision\n  router bias tensors without changing text routing.\n\n### Runtime validation completed\n\nValidated in a 16-NPU Ascend container with:\n\n- vLLM: `6e448d0ea9bf3d88d898b65449ca6dc2aec170ac` (v0.27.1 API line)\n- checkpoint: DeepSeek-V4-Flash-Vision-Exp W8A8, with all BF16 `bias_vl`\n  tensors included in the checkpoint overlay\n- release topology: TP4 / DP4 / EP16, block size 32\n\nResults:\n\n- targeted processor, ModelSlim, MoE router, and DSA tests pass (90\ntests in\n  the combined suite; 59 tests in the focused follow-up suite);\n- the Ascend sparse-attention operator accepts widened original indices\nand\n  simultaneous original/compressed indices with finite BF16 output;\n- all 79 checkpoint shards load successfully with the multimodal\nwrapper;\n- eager OpenAI-compatible serving passes text-only, single-image,\nordered\n  two-image, deterministic repeated-image, and invalid-image cases;\n- the single-image OCR result correctly reads `Hello, AI world!`, and\nthe\n  ordered two-image result preserves both image order and text;\n- ACLGraph mode passes torch compilation, PIECEWISE mixed prefill/decode\n  capture, FULL decode capture, and runtime graph replay on all four DP\n  leaders;\n- greedy text and single-image outputs are identical between eager and\ngraph\n  modes;\n- invalid image data returns an explicit HTTP 400 response.\n- DSpark eager and FULL_DECODE_ONLY target-graph serving pass text,\nsingle-image,\ntwo-image, and 149-token long-decode cases with byte-identical outputs;\n- eager and graph runs each accepted 153 of 180 draft tokens (85.0%);\nfour\nconcurrent graph-mode long decodes all passed, reaching 656/750\ncumulative\n  accepted/draft tokens (87.47%).\n- three 149-token requests pinned concurrently to one DP rank also pass\nbyte-identically inside the captured 24-token graph range, with 375/414\n  accepted/draft tokens (90.58%).\n\n### OCRBench V1 accuracy\n\nA complete 1,000-sample OCRBench V1 evaluation completed successfully\nwith no request errors and scored **826/1000 (82.6)**.\n\n| Category | Score | Maximum |\n| --- | ---: | ---: |\n| Regular Text Recognition | 47 | 50 |\n| Irregular Text Recognition | 44 | 50 |\n| Artistic Text Recognition | 47 | 50 |\n| Handwriting Recognition | 31 | 50 |\n| Digit String Recognition | 35 | 50 |\n| Non-Semantic Text Recognition | 46 | 50 |\n| Scene Text-centric VQA | 178 | 200 |\n| Doc-oriented VQA | 176 | 200 |\n| Key Information Extraction | **171** | 200 |\n| Handwritten Mathematical Expression Recognition | **51** | 100 |\n| **Total** | **826** | **1000** |\n\nEvaluation configuration: concurrency 64, temperature 1.0, top_p 0.95,\nmax_tokens 8192, seed 7, thinking enabled, reasoning_effort=high.\nFor TP4 graph mode, capture batch sizes must be multiples of TP size.\nThe\nvalidated graph launch therefore uses `--max-num-seqs 4`;\n`--max-num-seqs 1`\nis valid for eager smoke but not for this graph topology.\n\n### User-facing change\n\nThe model architecture can now be loaded and served on Ascend using the\nvLLM-compatible multimodal API. The validated W8A8 launch topology is\nTP4 /\nDP4 / EP16 in eager or ACLGraph mode.\n\nThis PR is ready for implementation review. Marking it Ready for Review\ndoes\nnot yet claim full production qualification or inclusion in the\nsupported\nmodel matrix.\n\n### Remaining release validation\n\n- processor, ViT/aligner, router, hidden-state, and logits numerical\ncomparison\n  against the upstream NVIDIA/HF reference;\n- full BF16 checkpoint validation and BF16/W8A8 accuracy comparison;\n- maximum 384-token image spans, non-aligned boundaries, heterogeneous\nimages,\n  mixed batches, and longer-context cases;\n- deployment alternatives such as TP8 / DP2;\n- fixed image-task accuracy suite and text-only regression suite;\n- startup, HBM, TTFT, TPOT, throughput, and regression measurements;\n- supported-model documentation and a public launch example.\n- automatic prefix caching passes with the DeepSeek-V4-specific\ncontract:\nlaunch with `--block-size 32` and use prompts longer than 4K tokens.\nThree\nidentical 5,014-token requests pinned to one DP rank reused 8,192 of\n15,042\nprompt tokens; DSpark remained active with 15/18 accepted/draft tokens.\n- the multimodal APC stack also passes: three identical 6,139-token\nlong-prefix plus image requests all returned exact OCR text, reused\n8,192\nprompt tokens, recorded two multimodal-processor cache hits, and kept\nDSpark\n  active at 15/18 accepted/draft tokens.\n- multimodal SSE streaming on the graph service reconstructs exact OCR\ntext,\nreports `finish_reason=stop`, terminates with `[DONE]`, and exercises\nDSpark\n  with 5/6 accepted/draft tokens.\n\nFirst-phase exclusions remain DSA context parallel and FlashComm1.\nDSpark is\nvalidated only as target-side multimodal prefill followed by text-only\nspeculative decode; the drafter does not consume image embeddings or\npropose\ninside image spans.\n\nSigned-off-by: GDzhu01 <116337067+GDzhu01@users.noreply.github.com>\n\n\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/ba07e4a48fc951300d97eb506217dd530583dea3\n\nSigned-off-by: GDzhu01 <116337067+GDzhu01@users.noreply.github.com>\nCo-authored-by: MengLong Chen <71744434+dragondream-chen@users.noreply.github.com>\nCo-authored-by: RenYuKai <184603735+pgzddxx@users.noreply.github.com>"
+    },
+    {
+      "sha": "d303011b354b3192cf5278ba5752e71c573ec7b6",
+      "comment": "将 vLLM 的 StartPlan 机制接入 Ascend worker 层。基线中 NPUPlatform.get_device_total_memory 为避免过早初始化 torch_npu 而恒抛 NotImplementedError，现在改为在 torch_npu 已初始化时返回真实显存，供 StartPlan 做设备指纹，同时用 hasattr(torch, 'npu') 守卫保留早期启动行为，设计合理。worker 侧在 determine_available_memory 开始时先 maybe_apply_startup_plan（命中则直接走 KV-cache fast path），在 compile_or_warm_up_model 的图捕获后按需 maybe_save_startup_plan，接入点正确且是增量式的，不改变既有路径。潜在风险是 get_device_total_memory 对 device_id 越界/未初始化设备的错误语义依赖 torch_npu 实现，以及 StartPlan 指纹在异构混部环境下的复现性，但整体风险可控。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "worker",
+        "platform"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "get_device_total_memory 行为从恒抛 NotImplementedError 变为条件返回值，且 worker 启动流程新增 apply/save startup plan 分支，需要测试覆盖 both before/after torch_npu init 以及 fast-path 命中与未命中的行为。本 commit 已新增对应单测，后续若 vLLM 上游 StartPlan 接口变化需同步。",
+        "suggested_test_areas": [
+          "tests/ut/test_platform.py",
+          "tests/ut/worker/test_worker_v1.py"
+        ]
+      },
+      "message": "[Feature][Worker] Integrate vLLM StartPlan for startup acceleration (#15528)\n\n### What this PR does / why we need it?\n\nvLLM already provides a `StartPlan` mechanism\n(`vllm.v1.worker.startup_plan`) that records the measured KV-cache\nbudget and model graph-capture results on the first startup, then\nreplays them on later startups to skip memory profiling and accelerate\nstartup.\n\nThis PR wires that mechanism into the Ascend worker so Ascend NPUs\nbenefit from the same startup acceleration:\n\n- `NPUWorker.determine_available_memory` applies a saved startup plan\nbefore the KV-cache fast path.\n- `NPUWorker.compile_or_warm_up_model` saves a new startup plan after\nmodel graph capture.\n- `NPUPlatform.get_device_total_memory` is implemented so StartPlan can\nfingerprint an initialized NPU device, while still raising\n`NotImplementedError` before `torch_npu` initialization. A\n`hasattr(torch, \"npu\")` guard avoids an `AttributeError` when\n`torch_npu` has not been imported yet.\n\n### Does this PR introduce _any_ user-facing change?\n\nNo.\n\n### How was this patch tested?\n\n- Added unit tests:\n-\n`tests/ut/test_platform.py::test_get_device_total_memory_before_npu_init`\n-\n`tests/ut/test_platform.py::test_get_device_total_memory_after_npu_init`\n-\n`tests/ut/worker/test_worker_v1.py::test_determine_available_memory_applies_startup_plan_before_fast_path`\n-\n`tests/ut/worker/test_worker_v1.py::test_compile_or_warm_up_model_saves_startup_plan_after_graph_capture`\n- `python3 -m py_compile vllm_ascend/platform.py\nvllm_ascend/worker/worker.py tests/ut/test_platform.py\ntests/ut/worker/test_worker_v1.py`\n- Also validated as the compatibility patch used in the MindIE-Motor\ndeployment flow against vLLM 0.26.0 / vllm-ascend `releases/v0.26.0rc`.\n\n### StartPlan Skip Memory Profiling Performance Test Record\n#### Unified Test Environment & Configuration\nAll tests are performed under identical hardware, model, parallelism,\nparameters and image environment to ensure valid comparison:\n- **Model**: Qwen3-8B\n- **NPU Hardware**: 800I_A2 (Ascend 910B, module-910b-8)\n- **Node**: Single node node-37-110\n- **Device Count**: 4 NPUs\n- **Deployment Topology**: prefill 1 pod × 2 NPU（TP0/TP1）+ decode 1 pod\n× 2 NPU\n- **Parallelism**: DP=1, TP=2 (TP0/TP1), PP=1\n- **Inference Parameters**: gpu_memory_utilization=0.9,\nmax_model_len=2048\n\n#### Test Methodology\n- **R1 (Baseline)**: The first cold-start round that executes full\nmemory profiling and generates the official StartPlan.\n- **Reuse Round**: If the device fingerprint fully matches the saved\nStartPlan, redundant memory profiling is skipped during restart.\n- **Saved Time Calculation**: The saved duration per worker is derived\nfrom pure profiling overhead of the corresponding engine/rank in R1.\n\n#### Experiment 1 (Baseline R1: 01-warmup-20260903-104321)\n##### Reuse Round: 03-plan-reuse-final-20260903-112029 (Full prefill &\ndecode plan hit)\n| Engine | Rank | Fingerprint | memory_profiling_ctx | Saved profiling\ntime (s) |\n\n|--------|------|-------------|----------------------|--------------------------|\n| prefill | TP0 | a45a79c8c09c7a9d | skipped | 0.971 |\n| prefill | TP1 | 3bbf6923a7ea2bc8 | skipped | 0.961 |\n| decode | TP0 | 072c7f06afb6e26b | skipped | 0.990 |\n| decode | TP1 | e3203e758dbee8d3 | skipped | 0.978 |\n\n##### Reuse Round: 03-plan-reuse-2-20260903-111155 (Single decode TP1\nplan hit)\n| Engine | Rank | Fingerprint | memory_profiling_ctx | Saved profiling\ntime (s) |\n\n|--------|------|-------------|----------------------|--------------------------|\n| decode | TP1 | e3203e758dbee8d3 | skipped | 0.978 |\n\n#### Experiment 2 (Baseline R1: 01-warmup-rerun-20260903-113549)\n##### Reuse Round: 03-plan-reuse-r1rerun-20260903-115646 (Dual prefill\nrank plan hit)\n| Engine | Rank | Fingerprint | memory_profiling_ctx | Saved profiling\ntime (s) |\n\n|--------|------|-------------|----------------------|--------------------------|\n| prefill | TP0 | 072c7f06afb6e26b | skipped | 0.930 |\n| prefill | TP1 | e3203e758dbee8d3 | skipped | 0.895 |\n\n#### Test Conclusion\nThere are **7 valid StartPlan reuse hit records** in total.\nWith consistent hardware, model and parallel configuration, StartPlan\ncompletely eliminates repeated memory profiling overhead, **stably\nsaving 0.895s ~ 0.990s of profiling time per worker on each restart**.\n\nNote: Memory profiling reduction is only a minor part of the overall\nacceleration. The major startup speedup comes from skipping iterative\ngraph warmup and redundant graph capture procedures.\n\n\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/ba07e4a48fc951300d97eb506217dd530583dea3\n\n---------\n\nSigned-off-by: zyy19942137993-dot <308616013+zyy19942137993-dot@users.noreply.github.com>\nCo-authored-by: zyy19942137993-dot <308616013+zyy19942137993-dot@users.noreply.github.com>"
+    },
+    {
+      "sha": "b1098db5c6d26592051f045a6b1423d350f004bf",
+      "comment": "修复 DSA-CP o_proj TP/full-weight 切换被硬件 profile 迁移误伤的问题。基线中该能力应仅由 enable_dsa_cp_with_o_proj_tp() 特性开关控制，而 #15376 迁移时误加了 A5-only 的 HardwareCapability.DSA_O_PROJ_TP 门禁，导致 A2/A3 上原本可用的 o_proj TP 优化被关闭。本提交删除该 capability 及其 profile-matrix 条目，回归到由具体 linear method 自行校验 TP/full-weight 切换支持的设计，职责划分更清晰。回归测试用 MagicMock profile（supports 返回 False）证明了非 A5/FP8 profile 不会禁用该优化。A5 行为不变，风险低。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "attention",
+        "hardware-profile"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "硬件能力矩阵删除了 DSA_O_PROJ_TP 条目，需同步更新预期的 capabilities 集合测试；同时需要回归测试验证去除硬件门禁后非 A5 profile 仍启用 o_proj TP。本 commit 已同步修改 test_hardware_profile.py 和 test_dsa_cp_o_proj_tp.py。",
+        "suggested_test_areas": [
+          "tests/ut/attention/test_dsa_cp_o_proj_tp.py",
+          "tests/ut/device/test_hardware_profile.py"
+        ]
+      },
+      "message": "[BugFix][DSA-CP] Restore device-independent o_proj TP switching (#15695)\n\n### What this PR does / why we need it?\n\nRestores device-independent DSA-CP o_proj TP/full-weight switching.\n\nPR #12982 generalized this path through TPWeightSwitchMixin so supported\nlinear methods can use it across A2/A3. During the hardware-profile\nmigration in #15376, the path was accidentally gated by the A5-only\nHardwareCapability.DSA_O_PROJ_TP, narrowing the direct baseline\nbehavior.\n\nThis PR:\n\n- removes the misleading A5-only DSA_O_PROJ_TP capability and\nprofile-matrix entry;\n- restores enablement based on the existing feature flag, while the\nselected linear method remains responsible for validating\nTP/full-weight-switch support;\n- adds a regression test proving that a profile without the A5/FP8\ncapability does not disable o_proj TP switching.\n\n### Does this PR introduce _any_ user-facing change?\n\nYes. It restores the intended DSA-CP o_proj TP optimization on supported\nA2/A3 configurations. A5 behavior is unchanged. There are no API,\nconfiguration, environment-variable, or schema changes.\n\n### How was this patch tested?\n\n- Rebased onto main@42e039a90215a0c111330a7081178cd1207cc14d.\n- Verified the rebased commit is patch-equivalent with git range-diff.\n- Passed Ruff check, Ruff format --check, compileall, and git diff\n--check on all four changed files.\n- The available host does not include pytest, mypy, or vllm; the focused\nunit test and Python 3.10/3.11/3.12 mypy checks are left to CI.\n\nSigned-off-by: frost_mourne <2906339855@qq.com>"
+    },
+    {
+      "sha": "f4df057dfbe8b6517ee8f23d01da89e8beb1b964",
+      "comment": "纯测试/CI 变更：临时移除两个 PCP 推测解码 nightly 用例（MTP-DeepSeek-R1-W8A8-PCP 和 Eagle3-Qwen3-8B-BF16-PCP），原因是 nightly 配置尚待修正。删除的是 YAML 配置和 A3/A3-560T 调度矩阵条目，生产实现、单测和 PR E2E 覆盖均未改动。属于临时性收敛，后续配置修正后应恢复，需跟踪避免永久丢失 PCP 夜间覆盖。",
+      "tags": [
+        "test",
+        "ci",
+        "low-risk",
+        "nightly"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "删除了两个 nightly 配置及其矩阵调度条目，属于测试用例删除；需确认 .github 和 tests/e2e/nightly 下无残留引用（PR 已自查），并计划在配置修正后恢复这两个用例。",
+        "suggested_test_areas": [
+          ".github/workflows/configs/nightly_config.yaml",
+          "tests/e2e/nightly/single_node/models/configs/MTPX-DeepSeek-R1-0528-W8A8-PCP.yaml",
+          "tests/e2e/nightly/single_node/models/configs/Eagle3-Qwen3-8B-BF16-PCP.yaml"
+        ]
+      },
+      "message": "[Test][Nightly] Temporarily remove PCP speculative decoding cases (#15741)\n\n### What this PR does / why we need it?\n\nThis PR temporarily removes the two PCP speculative-decoding nightly\ncases while their nightly configurations are corrected:\n\n- MTP with MLA (`MTPX-DeepSeek-R1-0528-W8A8-PCP.yaml`)\n- Eagle3 with GQA (`Eagle3-Qwen3-8B-BF16-PCP.yaml`)\n\nIt deletes the two single-node YAML configurations and removes their\nscheduling entries from both the A3 and A3-560T nightly matrices. The\nproduction implementation, unit tests, documentation, and pull-request\nE2E coverage remain unchanged.\n\n### Does this PR introduce _any_ user-facing change?\n\nNo. This only changes nightly CI scheduling and its associated test\nconfigurations.\n\n### How was this patch tested?\n\n- Parsed `.github/workflows/configs/nightly_config.yaml` with\n`yaml.safe_load`.\n- Verified no references to either removed configuration remain under\n`.github` or `tests/e2e/nightly`.\n- Ran `git diff --check` on all three changed paths.\n- Reviewed the complete diff: 3 files changed, 119 deletions.\n\nNPU runtime testing was not run because this change only removes nightly\nconfigurations and their matrix entries.\n\n- vLLM version: v0.27.1\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/ba07e4a48fc951300d97eb506217dd530583dea3\n\nSigned-off-by: wzx0726 <zhexuanwu12@gmail.com>"
+    },
+    {
+      "sha": "827a11d3ee3fc40cce9926b125138f26a949ac19",
+      "comment": "性能优化：在 AscendAttentionBackend 的 graph param update 循环中，将 torch_npu._npu_paged_attention_get_workspace 调用从每层一次提升到每次 update pass 一次。该优化安全性论证充分：workspace 大小仅依赖 shape 和 seq_lens，同一 pass 内所有层共享同一 step 的 seq_lens tensor，因此一次查询即可；step_ws_key/workspace 在每次 pass 开始时重置，天然避免了跨 step 复用（seq_lens 值随 decode 增长可能导致旧 workspace 过小）。ws_key 覆盖了 data_ptr、shape、dtype 等所有 size 相关输入，key 不匹配时保守地重新查询。实测 QPS 提升约 1.9%~5.9%，且 fia 路径已有类似复用先例。风险点在于 seq_lens 的 data_ptr+shape key 无法感知同地址同 shape 下的值变化，但该场景被'每次 pass 重置'的设计排除，整体安全。",
+      "tags": [
+        "performance",
+        "medium-risk",
+        "attention"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "该优化只改了生产代码且未附带直接单测。建议补充一个聚焦单测：同一 pass 内多个 layer 共享同一 seq_lens 时 get_workspace 只调用一次，seq_lens/data_ptr/shape 变化时重新查询，以锁定 key 失效逻辑，防止后续重构破坏该性能路径。",
+        "suggested_test_areas": [
+          "tests/ut/attention/test_attention_v1.py"
+        ]
+      },
+      "message": "[Performance] Reuse PA workspace across layers in graph param update (#15579)\n\n# perf(attention): reuse PA workspace across layers in graph param\nupdate\n\n## Motivation\n\nIn `AscendAttentionBackendImpl` (graph mode, `_npu_paged_attention`\npath), the\ngraph-param update loop calls\n`torch_npu._npu_paged_attention_get_workspace`\n**once per layer**. On a 28-layer model this is 28 calls per decode\nstep, each\nbacked by a ~36-54MB buffer allocation and a host-side \"Setup\" round\ntrip.\n\nProfiling on Ascend 910B (vLLM v0.26.0, vllm-ascend v0.19.1rc1 base,\nTP=1,\nFULL_DECODE_ONLY, steady-state c=32):\n\n| Metric | Before | After |\n|---|---|---|\n| get_workspace Setup / Execute ratio | 2.000 (22232/11116) | **1.036**\n(14355/13860) |\n| update_graph_params avg | 2.4-2.95 ms | **1.65-1.67 ms** (-1.1~1.3\nms/step) |\n| Host ACL API total (5.1s window) | 1335 ms | **1040 ms** (-22%) |\n| QPS c=1 / c=32 / c=64 | 1.27 / 16.73 / 21.49 | **1.35 / 17.13 /\n21.90** (+5.9% / +2.4% / +1.9%) |\n\nFunctional outputs are unchanged (same md5 on the full functional\nsuite).\n\n## Change\n\nHoist the workspace out of the per-layer loop: query it once per update\npass\nand reuse across layers, re-querying only when the seq_lens tensor\nidentity\nchanges (`(data_ptr, shape)` key). This is the same shape as the FIA\npath,\nwhich already reuses `graph_params.workspaces[num_tokens]`.\n\n## Why per-pass (not cross-step) reuse is safe\n\n- The workspace size depends only on shapes **and seq_lens**, and all\nlayers\nwithin one update pass share the same step's `seq_lens` tensor, so one\ncall\n  is sufficient.\n- Cross-step reuse is deliberately **avoided**: the workspace size also\ndepends on the *values* of seq_lens (observed 36MB for lens<=80 vs 54MB\nfor\nlens<=400), which grow as decode progresses — a cached workspace from a\n  previous step can be too small.\n- If any layer's seq_lens tensor differs (key mismatch), the code falls\nback\n  to a fresh `get_workspace` call — conservative by construction.\n\n## Environment\n\n- Ascend 910B, CANN 8.x, torch_npu 2.10.0.post2\n  the touched code is identical on main as of 2026-09-02)\n\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/ba07e4a48fc951300d97eb506217dd530583dea3\n\nSigned-off-by: solin28825 <1006554184@qq.com>"
+    },
+    {
+      "sha": "c6ee7e9585f117fff5e83b11ae186724918fc523",
+      "comment": "为 MemFabric KV 传输引擎增加数据通路协议选择能力，通过 kv_connector_extra_config['memfabric_transfer_protocol'] 指定 sdma（默认）/device_rdma（A3）/device_urma（A5），避免在代码中做机型分支。实现上在 GlobalMemfabricTE.configure 中完成字符串归一化（strip/lower）和取值校验，并在 configure 的幂等性检查中引入 protocol 维度，不同协议重复配置会 RuntimeError，语义一致；_get_transfer_protocol 在构建引擎时才映射到 memfabric_hybrid.TransDataOpType 并二次 fail-fast。SFA PD RD2H 的 Producer/Consumer worker 均从 kv_transfer_config 解析并传递协议。默认值 sdma 保证向后兼容，文档同步更新，风险可控。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "kv-offload",
+        "distributed"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "configure 签名和幂等语义变化（protocol 纳入身份检查），需覆盖协议选择映射、非法值 fail-fast、空白字符归一化、以及角色/设备冲突时的 RuntimeError。本 commit 已扩展 test_memfabric_transfer_engine.py 覆盖这些场景。",
+        "suggested_test_areas": [
+          "tests/ut/kv_offload/test_memfabric_transfer_engine.py"
+        ]
+      },
+      "message": "[Feature][KV Transfer] Support multiple memfabric TransDataOpType and A5 (#15570)\n\n### What this PR does / why we need it?\n\n- Select data path via\n`kv_connector_extra_config[\"memfabric_transfer_protocol\"]`: `sdma`\n(default) / `device_rdma` for A3 nodes, `device_urma` for A5 nodes; no\nmachine-type checks in code\n- Fail fast on invalid protocol values; log resolved data_op_type at\ninit\n- Fix UTs broken by hardcoded DEVICE_URMA and add protocol coverage\n- Document the new option in the layerwise/sparse KV offload guide and\ndesign doc\n\n### Does this PR introduce _any_ user-facing change?\n\nYes: new `kv_connector_extra_config[\"memfabric_transfer_protocol\"]`\noption (`sdma` (default) / `device_rdma` / `device_urma`) to select the\nMemFabric transfer data path for A3/A5 nodes; documented in the\nlayerwise/sparse KV offload guide and design doc.\n\n### How was this patch tested?\n\n```\npytest tests/ut/kv_offload/test_memfabric_transfer_engine.py\n# 12 passed — covers sdma/device_rdma/device_urma selection, invalid-value fail fast, and init logging\n```\n\nSigned-off-by: dsxsteven <dsxsteven@sina.com>\n\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/ba07e4a48fc951300d97eb506217dd530583dea3\n\nSigned-off-by: dsxsteven <dsxsteven@sina.com>"
+    },
+    {
+      "sha": "c071dbb8086360f30726928492ae621a2736dcc6",
+      "comment": "纯文档变更：将 DeepSeek-V4-Flash A3 PD 分离 DSpark 部署配置刷新为 exit-test 验证过的参数，包括 Prefill 节点新增 VLLM_ASCEND_ENABLE_FUSED_MC2、Decode 节点 compilation-config 增加 cudagraph_capture_sizes、DSpark 投机 token 数从 7 调整为 5、HCCL_BUFFSIZE 等环境变量调整，并简化 9.1 节重复表格。无生产代码改动，不影响运行时行为。",
+      "tags": [
+        "docs",
+        "low-risk",
+        "deepseek-v4-flash"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "仅修改 docs/source/tutorials/models/DeepSeek-V4-Flash.md，不涉及代码或测试逻辑。",
+        "suggested_test_areas": []
+      },
+      "message": "[Doc][Misc] Update DeepSeek-V4-Flash A3 PD separation DSpark configur… (#15699)\n\n### What this PR does / why we need it?\n\nCherry-pick of PD separation DSpark configuration changes from #15671 to\nmain.\n\nUpdate the DeepSeek-V4-Flash A3 PD separation DSpark deployment\nconfiguration to the latest exit-test validated configs.\n\nChanges:\n- Refresh A3 PD separation DSpark Prefill/Decode node configurations\n- Add `VLLM_ASCEND_ENABLE_FUSED_MC2` (Prefill node) environment variable\n- Add `cudagraph_capture_sizes` to Decode node compilation-config\n- Simplify Chapter 9.1: remove redundant configuration table, reference\nChapter 5\n- Add feature descriptions for FUSED_MC2 and cudagraph_capture_sizes\n\nNote: single-node DSpark config changes from #15671 are NOT included\nhere, as those were deemed unnecessary and will be reverted in a\nfollow-up PR on v0.26.0rc.\n\n### Does this PR introduce *any* user-facing change?\n\nNo (documentation only).\n\n### How was this patch tested?\n\n- Configurations are from exit-test validation results\n- Only modified `docs/source/tutorials/models/DeepSeek-V4-Flash.md`, no\ncode changes\n- Cherry-picked from #15671 (PD separation)\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/ba07e4a48fc951300d97eb506217dd530583dea3\n\nSigned-off-by: pgzddxx <1697817735@qq.com>"
+    },
+    {
+      "sha": "d1ce8a1c496994f0300d41422bac76e9983c7f17",
+      "comment": "性能优化：在 DSA 多流 prolog 中，将 C4/C128 attention compressor 的 metadata 构建和 compressor 计算放入 Q/SWA-KV 分支汇合后的辅助 stream 上执行，与主 stream 的 q_rms+rope 尾部重叠。实现上 _mla_prolog_multistream 新增可选 tail_overlap_fn 并改为返回 4 元组（新增 tail_overlap_output），消费者在原有的 compressor 结果消费点通过 wait_event 等待辅助 stream 完成事件，保持同步语义不变。事件链设计清晰：e_tail_start 确保辅助 stream 看到主 stream 最新状态，e_tail_overlap_done 在消费点 join。唯一对外可见变化是私有方法签名变更，调用点已同步。实测输出吞吐 +7.31%、TPOT -6.09%、TTFT -7.94%。",
+      "tags": [
+        "performance",
+        "medium-risk",
+        "attention"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "_mla_prolog_multistream 返回签名由 3 元组变为 4 元组，所有 mock 和调用点必须同步更新（本 commit 已更新一处测试）；建议补充对 tail_overlap_fn 分支的显式断言，验证辅助 stream 上 compressor 先行启动、主 stream 在消费点等待的事件顺序，防止流同步回归。",
+        "suggested_test_areas": [
+          "tests/ut/attention/test_dsa_v1.py"
+        ]
+      },
+      "message": "[Performance] Overlap DSA C4/C128 compressor tail with q proj (#15305)\n\n### What this PR does / why we need it?\n\nThis PR overlaps the DeepSeek V4 C4 and C128 attention-compressor tails\nwith the Q RMSNorm and partial RoPE tail in the DSA multi-stream prolog.\n\nThe implementation:\n\n- reuses the existing DSA auxiliary stream after the Q and SWA-KV\nbranches join;\n- launches compressor metadata and the attention compressor while the\nmain stream executes the Q tail;\n- carries the result and completion event through the main-branch\n`IndexerOverlapPlan` flow;\n- waits at the original attention-compressor result consumption point;\n- applies the scheduling change to C4 and C128 multi-stream prefill and\ndecode.\n\nRelease-branch counterpart: #15302.\n\n### Does this PR introduce _any_ user-facing change?\n\nNo API or configuration change. DeepSeek V4 compressed-attention layers\nuse improved internal stream scheduling when DSA multi-stream overlap is\nenabled.\n\n### How was this patch tested?\n\nStatic checks:\n\n- `uvx ruff==0.14.0 check vllm_ascend/attention/dsa_v1.py`\n- `uvx ruff==0.14.0 format --check vllm_ascend/attention/dsa_v1.py`\n- `python3 -m py_compile vllm_ascend/attention/dsa_v1.py`\n- `git diff --check`\n\nMain-specific Ascend smoke:\n\n- vllm-ascend commit `9c9038cfb21bb7a1497e5725bb975f7d7b5cdf73`.\n- Verified vLLM commit `ba07e4a48fc951300d97eb506217dd530583dea3`.\n- DeepSeek-V4-Flash-w8a8-mtp, DP8/EP8, `FULL_DECODE_ONLY` graph mode.\n- Service health and model-list probes passed.\n- A long-prefill C128 case and a 32-token decode case both completed\nwith zero harness errors.\n- Service logs contained no `ERROR`, `Traceback`, or `RuntimeError`\nentries.\n\nFull-network performance on the release counterpart:\n\n- Compared the original compressor scheduling with C4+C128\ncompressor-tail overlap.\n- DeepSeek-V4-Flash-w8a8-mtp, DP8/EP8, `FULL_DECODE_ONLY`, 64 random\nrequests, 512 input tokens, 128 output tokens, concurrency 8.\n- One warmup and three measured samples per state in alternating order;\nprofiler disabled and no outliers excluded.\n- Output throughput: 139.329 -> 149.509 tok/s (+7.31%), CV 2.13% /\n7.66%.\n- TPOT: 46.067 -> 43.260 ms (-6.09%), CV 2.26% / 5.13%.\n- TTFT: 1,495.228 -> 1,376.435 ms (-7.94%), CV 2.29% / 16.10%.\n- No configured regression threshold was exceeded. The controller result\nis inconclusive because candidate TTFT CV exceeded the 10% quality\nlimit; throughput and TPOT remained within the quality limit.\n\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/ba07e4a48fc951300d97eb506217dd530583dea3\n\n---------\n\nSigned-off-by: QiuChunshuo <qiuchunshuo@huawei.com>"
+    },
+    {
+      "sha": "0aa7ec5b02ec758c857aa892b61cf24e715a34f6",
+      "comment": "纯文档变更：大幅重写 DeepSeek V4 Pro 部署指南，新增官方 W4A8 权重（DeepSeek-V4-Pro-0813-w4a8 with DSpark）下载链接、DSpark 共置/PD 分离配置、短序列与 1M 长上下文参考配置、以及 loader/FlashComm1/recompute scheduler/KV-transfer 的参数说明。同时修正 multi-thread loader 与 safetensors prefetch 的冲突说明、简化章节结构并更新精度数据。无代码改动，风险低。",
+      "tags": [
+        "docs",
+        "low-risk",
+        "deepseek-v4-pro"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "仅修改 docs/source/tutorials/models/DeepSeek-V4-Pro.md，不涉及代码或测试逻辑。",
+        "suggested_test_areas": []
+      },
+      "message": "[Main][Doc] Update DeepSeek V4 Pro deployment guide (#15683)\n\nThis PR updates the DeepSeek V4 Pro deployment guide by:\n\n- Adding the official W4A8 model download link.\n- Adding DSpark configurations for colocated and PD-disaggregated\ndeployments.\n- Clarifying loader, FlashComm1, recompute scheduler, and KV-transfer\nsettings.\n- Improving parameter ordering and readability.\n- Adding short-sequence and 1M-context PD reference configurations.\n\nValidation: codespell, typos, filename checks, markdownlint, and git\ndiff checks passed.\n\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/ba07e4a48fc951300d97eb506217dd530583dea3\n\nSigned-off-by: chenmenglong <chenmenglong1@huawei.com>"
+    },
+    {
+      "sha": "7b717fefb3f6a47c374585e7ba2da176a045707a",
+      "comment": "CI 重构：将 tests/ut（cpu-ut）从 NPU 测试流水线中拆分为独立 job，复用 _selected_tests.yaml 在 CPU runner 上执行，并通过 select_tests.py 新增 --skip-cpu-ut 在 PR 调度路径中排除 tests/ut 目标（定时全量覆盖仍然保留）。recommend-tests 和 select-tests 均新增对 cpu-ut 结果的显式依赖，ci-gate 汇总检查也纳入 cpu-ut 结果。该改动使 CPU 单测成为 PR 的独立硬性 gate，避免占用 NPU 资源和被 NPU 测试调度结果牵连，逻辑合理。需要注意的风险是 cpu-ut 失败会阻塞整个 PR gate，且 select_tests.py 的全局 _SKIP_CPU_UT 状态与参数解析顺序耦合，后续增加选择模式时需小心。",
+      "tags": [
+        "ci",
+        "refactor",
+        "low-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "不涉及产品代码或测试用例变化，仅调整 CI 调度和测试选择脚本。需人工观察 ci-gate 新依赖和 cpu-ut job 的稳定性，并验证 --skip-cpu-ut 在所有选择模式下均正确丢弃 tests/ut 而不影响定时全量覆盖。",
+        "suggested_test_areas": [
+          ".github/workflows/pr_test.yaml",
+          ".github/workflows/scripts/select_tests.py"
+        ]
+      },
+      "message": "[CI] Migrate cpu-ut to a standalone job and gate the NPU test pipeline (#15675)\n\n### What this PR does / why we need it?\n\nRun the CPU unit tests in a dedicated `cpu-ut` job (depending on\n`pre-commit`) instead of bundling them into the NPU test pipeline. The\nnew job reuses `_selected_tests.yaml` with `enable-coverage: false`.\n\n- Add `--skip-cpu-ut` to select_tests.py to drop `tests/ut` targets from\nall selection modes.\n- Pass `--skip-cpu-ut` in both `select-tests` calls in pr_test.yaml.\n- Gate `recommend-tests` and `select-tests` on the `cpu-ut` result and\ninclude it in the `ci-gate` check.\n\n\n### Does this PR introduce _any_ user-facing change?\n\n### How was this patch tested?\n\n\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/ba07e4a48fc951300d97eb506217dd530583dea3\n\nSigned-off-by: hfadzxy <starmoon_zhang@163.com>"
+    },
+    {
+      "sha": "db5f9e0237dc544f5e1823dd838b09f32edb3fa5",
+      "comment": "大型性能特性：为 DeepSeek V4 Model Runner V1 引入 worker 级异步设备元数据构建机制。新增 vllm_ascend/worker/device_metadata.py 定义 DeviceMetadataStage/Task/Executor/Provider 协议：Executor 使用专用 NPU stream + stage/group 级事件 + reusable fence + full-graph 模式下的 ExternalEvent 复用，消费者通过 wait_for_device_metadata 在 compressor/indexer/attention 依赖点等待；提交失败时 fail-closed 保持 in-flight，避免半修改 buffer 被重试污染。DSA/DSA-CP/DSpark/SWA/QLI/SAS/compressor metadata 均被改造为可延迟提交的 task，compressor metadata 改用显式输出的 compressor_metadata_out 算子以保证 graph 可见地址稳定。生产代码改动面大（17 文件，+2109/-327），触及 attention、model、spec_decode、model_runner 核心路径，且与 FULL graph 捕获、PCP/DSA-CP 拓扑有复杂交互（FULL 模式强制 ExternalEvent，否则 RuntimeError），是最需要真实 NPU 验证的高风险提交。实测 TPOT -6.63%、输出吞吐 +6.95%。",
+      "tags": [
+        "performance",
+        "feature",
+        "high-risk",
+        "worker",
+        "attention",
+        "model-runner"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "本 commit 已包含大量测试（新增 test_device_metadata.py 覆盖执行器生命周期/事件顺序/失败处理/ExternalEvent 复用，扩展 test_dsa_v1.py、test_dspark_proposer.py、test_model_runner_v1.py、test_deepseek_v4_compressor.py 等）。但由于新增了 forward_context.device_metadata_executor 字段、异步任务提交流程和 FULL graph 外部事件约束，后续任何对这些交互点的改动都应同步维护这些测试；建议补充跨 stream buffer 复用的真实 NPU 验证（已有 e2e test_compressor_metadata.py 覆盖部分）。",
+        "suggested_test_areas": [
+          "tests/ut/worker/test_device_metadata.py",
+          "tests/ut/worker/test_model_runner_v1.py",
+          "tests/ut/attention/test_dsa_v1.py",
+          "tests/ut/attention/test_dsa_v1.py",
+          "tests/ut/spec_decode/test_dspark_proposer.py",
+          "tests/e2e/nightly/single_node/ops/singlecard_ops/test_compressor_metadata.py"
+        ]
+      },
+      "message": "[Performance][Worker] Build DeepSeek V4 metadata asynchronously (#15443)\n\n### What this PR does / why we need it?\n\nRefs #15280.\n\nDeepSeek V4 currently constructs compressor, Quant Lightning Indexer\n(QLI), Sparse Attention Selector (SAS), DSpark sliding-window, and local\nDSA-CP metadata on the model stream. These device operators serialize\nmetadata construction with otherwise independent model work.\n\nThis PR adds a small worker-owned asynchronous execution mechanism and\nadopts it only for DeepSeek V4 on Model Runner V1:\n\n- A structural `DeviceMetadataTaskProvider` capability opts eligible\nattention builders into one `DeviceMetadataExecutor` per worker. Models\nwithout this capability retain the existing path and allocate no\nmetadata stream or events.\n- The executor uses one dedicated NPU stream, stage/group-specific\nreadiness events, and a reuse fence for persistent output buffers.\n- Consumers wait only at their first compressor, indexer, or attention\ndependency. Repeated per-layer waits are deduplicated within a\nsubmission.\n- Eligible QLI, SAS, compressor, DSpark SWA, and communication-free\nlocal DSA-CP metadata are submitted asynchronously. Existing synchronous\nbehavior remains for prefill or topology combinations that are not\neligible and for pure `FULL` graph compressor metadata whose active\nextent is not capture-stable.\n- Compressor metadata uses an explicit-output operator so graph-visible\nbuffer addresses remain stable. Partial submission failures fail closed\ninstead of retrying into partially modified buffers.\n\nThe implementation is independent of `num_speculative_tokens`,\nintroduces no user-facing flag, and follows the effective graph mode\nafter existing compatibility fallback.\n\n### Does this PR introduce _any_ user-facing change?\n\nNo API or configuration change. Eligible DeepSeek V4 Model Runner V1\nexecutions use the asynchronous path automatically. Other models and\nModel Runner V2 continue to use the existing implementation.\n\n### Performance\n\nA closed-loop A/B run used DeepSeek V4 W8A8C8 on Ascend A3 with\nDP4/TP4/EP16, DSA-CP, DSpark with five speculative tokens, async\nscheduling, concurrency 288, 12K input tokens, fixed 5K output tokens,\nand a 90% prefix-cache hit ratio. Both variants completed 1,728 requests\nwith zero failures.\n\n| Metric | Baseline | Async metadata | Change |\n| --- | ---: | ---: | ---: |\n| Mean TPOT | 33.111 ms | 30.917 ms | -6.63% |\n| p99 TPOT | 41.419 ms | 39.489 ms | -4.66% |\n| Output throughput | 7,794.29 tok/s | 8,335.89 tok/s | +6.95% |\n| Total-token throughput | 26,500.61 tok/s | 28,342.03 tok/s | +6.95% |\n| Mean ITL | 196.645 ms | 183.514 ms | -6.68% |\n| Mean TTFT | 9,136.30 ms | 8,953.28 ms | -2.00% |\n| Benchmark duration | 1,108.50 s | 1,036.48 s | -6.50% |\n| Speculative acceptance | 98.846% | 98.776% | -0.069 pp |\n\nThe performance run was collected on implementation commit `895a0b189`.\nLater commits rebased the feature onto newer `main` revisions and\nrefreshed compatibility fixtures; no performance result from the rebased\nHEAD is implied.\n\n### How was this patch tested?\n\n- `bash format.sh ci`\n- 153 focused tests on the exact rebased source covering executor\nlifecycle, provider gating, DSA/DSA-CP staging, compressor reuse, DSpark\nmetadata, failure handling, graph fallbacks, and current PCP\nintegration.\n- Full mypy runs for Python 3.10, 3.11, and 3.12: zero issues in\n`vllm_ascend`, `examples`, and `tests` for each version.\n- Real NPU validation of all 20 compressor-metadata cases, including the\nfixed-output operator, cross-stream event ordering, stable output\naddresses, buffer reuse, and buffer rewriting.\n\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/ba07e4a48fc951300d97eb506217dd530583dea3\n\n---------\n\nSigned-off-by: freyfwt <freytian1996@gmail.com>"
+    },
+    {
+      "sha": "222677fc719c7014879b161ed1dd3ed3276d7a5d",
+      "comment": "性能优化（Kimi K3 KDA）：将 mixed-precision KDA 的 beta、离线合成的 F 投影、输出 gate 打包进一个 BFG 浮点投影（新 _KDAFusedBFGLinear），并在 checkpoint 加载/重载后通过 f_b @ f_a 合成 f_proj 写入 packed 权重对应分片。调度上采用两阶段辅助 stream：主 stream DynamicQuant 与辅助 BFG GEMM 重叠，随后主 stream QKV GEMM 与辅助 B/F/G split + beta FP32 sigmoid + gate reshape 重叠，最终在 bfg_ready join 点汇合。mixed beta 被标记为已预处理，v0.27 分发路径只做切片，普通上游 raw beta 路径不变。模型侧 packed_modules_mapping 新增 fused_bfg_proj=[b_proj, f_a_proj, g_proj]，并明确 f_b 单独走新参数。风险点：`del self.f_b_proj` 依赖上游 __init__ 先创建该模块，若上游结构变化会 AttributeError；TP 分片下 f 合成依赖 tp_rank 正确性；权重重载触发重新合成的逻辑已由单测覆盖。",
+      "tags": [
+        "performance",
+        "medium-risk",
+        "ops",
+        "model"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "KDA 路径引入了新的 fused_bfg 权重加载/合成逻辑和双流重叠调度。本 commit 已新增 _KDAFusedBFGLinear 的 TP 分片合成、重载合成、投影后处理、流事件顺序等单测，并更新了 model 级 pack mapping 测试。后续上游 Kimi 模型结构或 packed loader 变化时需重点回归这些测试。",
+        "suggested_test_areas": [
+          "tests/ut/ops/test_kimi_kda.py",
+          "tests/ut/models/test_kimi_k3_adapter.py"
+        ]
+      },
+      "message": "[Performance][KDA] Compose and overlap gate projections on main (#15416)\n\n### What this PR does / why we need it?\n\nThis recreates #15168 without the unrelated `mla_v1.py` head-padding\nchange and its corresponding test changes.\n\nFor the existing mixed-precision Kimi K3 KDA layout, this change:\n\n- composes `f_proj.weight = f_b_proj.weight @ f_a_proj.weight` after\ncheckpoint loading and later source-weight reloads;\n- packs beta, the composed F projection, and the output gate into one\nfloating-point BFG projection;\n- runs a two-stage auxiliary-stream schedule:\n  1. main-stream MXFP DynamicQuant overlaps the auxiliary BFG GEMM;\n2. main-stream QKV GEMM overlaps auxiliary B/F/G split, beta FP32\nsigmoid, and gate reshaping;\n- marks mixed-path beta as preprocessed so the v0.27 dispatch path only\nslices it, while ordinary upstream raw beta retains its existing FP32\nsigmoid path;\n- preserves the configured W8A8 MXFP8 `scale_alg` when DynamicQuant is\nsplit from the linear method;\n- routes global or local F shards through the v0.27 packed loader;\n- leaves the ordinary upstream `in_proj_qkvgfab` path unchanged.\n\nCompared with #15168, this PR does not modify:\n\n- `vllm_ascend/attention/mla_v1.py`;\n- `tests/ut/attention/a2/test_mla_v1.py`.\n\n### ACL graph and stream-order assessment\n\nThe auxiliary stream records `bfg_ready` as its final node, and the main\nstream waits for that exact tail event. No auxiliary operation is queued\nafter the join point.\n\nThe four-event schedule is intentional:\n\n1. `hidden_states_ready` forks BFG from main;\n2. `bfg_projection_ready` serializes the BFG and QKV Cube matmuls;\n3. `quant_ready` starts auxiliary beta vector work only after main\nDynamicQuant;\n4. `bfg_ready` joins the complete auxiliary tail before KDA consumes its\noutputs.\n\nThe live-token slices for `mixed_qkv`, `g1`, and `g2` remain at the\neager dispatch boundary. They are host-side basic views: after QKV GEMM\nand the auxiliary tail wait are enqueued, Python creates those views\nwhile the asynchronous device work is still running. Moving\n`num_actual_tokens` into the projection path would not add an NPU kernel\noverlap and would weaken the runtime metadata boundary.\n\nStatic assessment: the stream is fully joined for ACLGraph capture and\nmixed beta is transformed exactly once. A real NPU ACLGraph\ncapture/replay has not been run for this main port.\n\n### How was this patch tested?\n\nNo additional local or NPU validation was run for this replacement PR.\nThe retained KDA implementation and focused tests are unchanged from\n#15168; this replacement only excludes the MLA implementation and test\ndiffs.\n\n### Does this PR introduce any user-facing change?\n\nNo API or configuration change. Runtime behavior changes only for Kimi\nK3 KDA layers using the existing mixed-precision full-rank gate layout.\n\n\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/ba07e4a48fc951300d97eb506217dd530583dea3\n\n---------\n\nSigned-off-by: Dawn952 <zhaojunbo13@huawei.com>"
+    }
+  ],
+  "architecture_based_on_sha": "e04f251a5895969d1c1f4ac9a3807177a0c4769c",
+  "architecture_generated_at": "2026-08-01T20:25:03.693997+08:00"
+}

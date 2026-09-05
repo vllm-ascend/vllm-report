@@ -1,0 +1,255 @@
+{
+  "date": "2026-09-05",
+  "repo": "vllm-project/vllm-ascend",
+  "generated_at": "2026-09-06T04:32:57.778054+08:00",
+  "daily_summary": "当日变更以 DeepSeek V4 (DSV4) 的性能优化和正确性修复为主，同时覆盖 MoE 路由权重 dtype 保持、KV Pool 后端优化以及文档清理。核心方向包括：确定性 scatter 算子替换非确定性实现、融合 RMSNorm+cast 算子减少额外 kernel 启动、多组 slot mapping 合并为单次 Triton 启动、compressor 算子的 full-load 模板同步以及 compressor metadata 的缓存复用；MoE 路径上移除中间 dtype cast 以保留 fp32 路由权重精度，仅在下游算子边界显式转换；KV Pool 侧优化了 Yuanrong 后端的初始化和存在性检查，并修复混合 Mamba cache 的块跟踪问题。此外还新增了 GLM-5.3-Flash 部署文档，并将 layerwise prefetch 默认值调整为 2。整体上当日变更集中在 DSV4/DSA 相关代码路径，风险和影响面较大，文档类变更无运行时影响。",
+  "test_impact_summary": "当日多数优化/修复性变更伴随了相应的测试更新或新增，但测试覆盖的充分性存在差异。MoE dtype 保持变更已更新了单卡 W8A8 测试和 fused_moe 单元测试，但仅部分覆盖了 dtype 传播路径；DSV4 相关的 RMSNorm cast 和 scatter_nd_update_sk 均为新增算子，已有单算子测试但缺少与模型端到端的联动覆盖；slot mapping 融合和 compressor metadata 缓存有新增 UT 覆盖，但未覆盖 DCP/CP 组合场景下融合条件的排除逻辑；scatter 算子的 UT 覆盖了非连续 view 与重复索引的确定性，但未包括高负载 stress 场景；MRV2 DSA PCP with MTP 新增了四卡 e2e 测试并补充了 UT，但 e2e 黄金输出仅覆盖了语义正确性而非确定性对齐。整体来看，当日变更需要持续关注 DSV4/DSA 算子在 ACL Graph 捕获模式下的行为稳定性，以及新增算子在 A2/A3 平台上的回归风险。",
+  "commits": [
+    {
+      "sha": "c1bb35f729f2e8685b84ee93adb974040a6cc3dc",
+      "comment": "修复 DSpark proposer 的 dummy_run 缺少 eplb_heat_collection_status 传递的问题。上游 llm_base_proposer 已经传递该 flag，此提交使 AscendDSparkProposer 与主分支行为对齐。变更简单直接，只增加了条件表达式传入 runner 的 dynamic_eplb 状态，确保在动态 EPLB 场景下 DSpark 的 dummy run 能感知 EPLB 热数据收集状态。风险低，但需注意该参数依赖 runner 的 dynamic_eplb 属性，若 runner 尚未初始化可能触发 AttributeError，不过由于该代码路径位于默认分支，实际影响可控。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "spec_decode"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "变更仅为参数传递对齐，无新逻辑分支，现有 spec_decode 测试应能覆盖该路径；且无新增测试断言要求",
+        "suggested_test_areas": [
+          "vllm_ascend/spec_decode/dspark_proposer.py"
+        ]
+      },
+      "message": "[BugFix] Pass eplb_heat_collection_status to DSpark dummy_run (#15840)\n\nMirror the change in lvvgang:sync_pr15552_dspark_0.26 (from\nvllm-project/vllm-ascend#15552) on the main branch; llm_base_proposer\nalready passes this flag.\n\n### What this PR does / why we need it?\n\n### Does this PR introduce _any_ user-facing change?\n\n### How was this patch tested?\n\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/ba07e4a48fc951300d97eb506217dd530583dea3\n\nSigned-off-by: lvvgang <lvvgang@163.com>"
+    },
+    {
+      "sha": "6ca174b4791c92af16e70bbae9d6377897ba2558",
+      "comment": "性能优化：保留 MoE router 产生的 top-k routing weights 的原始 dtype（通常是 fp32），移除此前在各量化方法和 token dispatcher 中的中间 cast。关键动机是避免不必要的 dtype 转换开销，同时确保 npu_moe_token_unpermute 等算子能获得 fp32 probs。实现上删除了 grouped_topk_router、routed_experts 及各量化方法（W4A4/W4A8/W8A8/MXFP4/MXFP8/W4A16）中的 cast，只在 token dispatcher 的 unpermute 入口显式转换。该变更修改了数值计算路径，导致 DeepSeek ACLGraph 精度基线变化（测试中更新了 logprobs 基线），并引入 HCCL_DETERMINISTIC=strict 环境变量保证图模式可重现。风险中等：一方面提升性能，一方面可能影响依赖 topk_weights dtype 的下游算子的隐式行为，需关注 W4A4 等特殊 dtype 路径。",
+      "tags": [
+        "performance",
+        "medium-risk",
+        "moe",
+        "quantization"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "已更新了 one_card 测试和 fused_moe UT，但新增的 dtype 保持断言只覆盖了 unquantized 和部分量化路径，MXFP8/FP8 等路径未见新增断言；图模式精度基线已更新但仅覆盖了部分模型",
+        "suggested_test_areas": [
+          "vllm_ascend/ops/fused_moe/router/grouped_topk_router.py",
+          "vllm_ascend/quantization/methods/",
+          "tests/e2e/pull_request/four_card/test_graph_mode.py"
+        ]
+      },
+      "message": "[Performance][MoE] Preserve top-k routing weights without casts (#15299)\n\n## What this PR does\n\n- preserves selector-produced top-k routing weights across the\nrefactored main-branch router, MoE communication, and quantization paths\n- removes intermediate dtype casts from unquantized, W4A4, W4A8, W4A16,\nW8A8, MXFP4, and MXFP8 expert paths\n- casts routing weights only at operator boundaries whose dtype\ncontracts require it\n- updates deterministic DeepSeek ACLGraph precision baselines\n- adds main-specific unit coverage for router and routed-experts dtype\npreservation\n\n## Main branch adaptation\n\nThe main branch moved quantization methods into per-scheme subpackages\nand introduced central routing in `AscendGroupedTopKRouter` and\n`AscendRoutedExperts`. This PR maps the release change to those new\npaths and removes the two new central intermediate casts as well.\n\n## Validation\n\n- Ruff lint: passed\n- Ruff format check: passed\n- Python compileall: passed\n- Full pre-commit and NPU matrix: delegated to PR CI\n\nRelated release PR: #15234\n\nCo-authored-by: @dragondream-chen\n\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/ba07e4a48fc951300d97eb506217dd530583dea3\n\nSigned-off-by: Zhu Yi Lin <116337067+GDzhu01@users.noreply.github.com>\nSigned-off-by: MengLong Chen <71744434+dragondream-chen@users.noreply.github.com>\nCo-authored-by: MengLong Chen <71744434+dragondream-chen@users.noreply.github.com>"
+    },
+    {
+      "sha": "2fe29773b44823d1ef54db0de6ad5df756bd2a26",
+      "comment": "新增 AscendC 自定义算子 rms_norm_cast，在 DeepSeek V4 MoE 路由中融合 RMSNorm 与 FP32 cast，一次 kernel 启动同时输出原始精度的归一化结果和 FP32 视图。实现包含完整的 op_host/op_kernel/torch_binding/meta 注册，并接入 DeepSeekV4DecoderLayer 和 AscendMoERunner 的 internal_router 路径。此举避免单独执行 hidden_states.float() 带来的额外内存拷贝和 kernel 启动。主要考虑点：算子的 FP32 输出设计为已舍入后的低精度结果的加宽视图，确保与原始 RMSNorm + Tensor.float() 行为一致；对 aclgraph 捕获友好。风险中等，新增算子需要验证 FP16/BF16 在 A2/A3 平台上的数值行为，特别是 BF16 在 310P 上被禁用（kernel 中通过 __NPU_ARCH__ 判断）。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "ops",
+        "model"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "新增了单算子正确性测试（test_rms_norm_cast.py）和 NPUGraph 测试，但缺少在 DeepSeek V4 模型级层面的端到端验证，且未覆盖 910b 与 910_93 平台差异下的行为",
+        "suggested_test_areas": [
+          "vllm_ascend/models/deepseek_v4/model.py",
+          "vllm_ascend/ops/fused_moe/fused_moe.py",
+          "tests/e2e/nightly/single_node/ops/singlecard_ops/test_rms_norm_cast.py"
+        ]
+      },
+      "message": "[Feature] Add fused RMSNorm cast for DeepSeek V4 (#15426)\n\n## Summary\n\n- add an AscendC RMSNorm+cast custom operator that returns both the\nnormalized tensor and its FP32 routing view\n- use the fused output in DeepSeek V4 MoE routing while retaining the\nfallback cast for other callers\n- register the operator and add single-card operator correctness\ncoverage\n\n## Main-branch adaptations\n\n- port the model integration to the new\nvllm_ascend/models/deepseek_v4/model.py package layout\n- preserve DeepSeek V4 input_ids/hash-routing propagation\n- support the refactored routed_experts/ascend_shared_experts runner and\nits shared-expert event flow\n- reuse the FP32 router input in both the vLLM 0.27.1 compatibility path\nand the current main path, with and without shared experts\n\n## Validation\n\n- Python compile check passed\n- Ruff lint and formatting checks passed\n- codespell and git diff --check passed\n- the unchanged operator implementation was previously built and\nvalidated on Ascend A3 / CANN 9.1.0 with all 8 single-operator cases\npassing\n\nThis is the main-branch port of #15413.\n\nReference implementation:\nhttps://github.com/hicann/ops-nn/tree/master/norm/add_rms_norm_cast\n\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/ba07e4a48fc951300d97eb506217dd530583dea3\n\nSigned-off-by: GDzhu01 <116337067+GDzhu01@users.noreply.github.com>\nCo-authored-by: pgzddxx <184603735+pgzddxx@users.noreply.github.com>\nCo-authored-by: dragondream-chen <71744434+dragondream-chen@users.noreply.github.com>"
+    },
+    {
+      "sha": "98d728c34f9c50d76ff8fcc193b6e181ef1685ca",
+      "comment": "将非确定性的 scatter_nd_update_v2 自定义算子替换为确定性的 scatter_nd_update_sk，涉及删除旧算子全部源码/prebuilt binaries 并新增新算子的实现（含 arch22 的 linear index/sort/scatter 三段式流程，显式 SyncAll 去除重复索引的非确定性），以及更新所有 Python 调用点（device_op、minimax_m3、dsa_attn_kv_plan）和 torch_binding 注册。新算子还支持首轴非连续 view 的场景，通过 strides 属性传递处理。这是一次大规模的算子替换（文件变更 37 个，删除约 2790 行），虽然对齐了上游行为，但对 DSV4/DSA 的 KV 更新路径影响重大，需要重点验证重复索引和 stride 非连续场景。",
+      "tags": [
+        "performance",
+        "high-risk",
+        "ops",
+        "attention"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "新增了 scatter_nd_update_sk 的算子级测试覆盖非连续 view 和重复索引的确定性，并更新了相关 UT 的 op 名称 mock，但缺少对 DSA/DSV4 模型级行为的端到端回归",
+        "suggested_test_areas": [
+          "vllm_ascend/device/device_op.py",
+          "vllm_ascend/models/minimax_m3/minimax_m3.py",
+          "vllm_ascend/attention/dsa_attn_kv_plan.py",
+          "tests/e2e/nightly/single_node/ops/singlecard_ops/test_scatter_nd_update_sk.py"
+        ]
+      },
+      "message": "[Performance][Cherry-pick][DSV4]Replace scatter_nd_update_v2 with deterministic scatter_nd_update_sk op (#15847)\n\nSync of #15497 rebased onto current upstream main.\n\n## Summary\n\nReplace the non-deterministic `scatter_nd_update_v2` custom op with a\nnew deterministic `scatter_nd_update_sk` op:\n- Vendor the new `scatter_nd_update_sk` operator\n(op_host/op_api/op_kernel, arch22) under\n`csrc/moe/scatter_nd_update_sk/` and remove the old\n`scatter_nd_update_v2` implementation and prebuilt binaries\n- Rebind `torch.ops._C_ascend.npu_scatter_nd_update_sk` in\n`torch_binding.cpp` / `torch_binding_meta.cpp`\n- Route all Python call sites (`device_op.py`, `minimax_m3.py`,\n`dsa_attn_kv_plan.py`) through the new op\n- Add NPU operator coverage\n`tests/e2e/nightly/single_node/ops/singlecard_ops/test_scatter_nd_update_sk.py`\n\n## Adaptations for current main\n\nThe source PR was based on the v0.26.0rc branch; the following\nadjustments were needed for main:\n- `minimax_m3.py`: kept main's `_scatter_index_cache` helper structure\nand switched its internal non-A5 scatter to the sk op\n- `device_op.py`: dropped the PR's duplicate sparse-attn selector\nhelpers that already exist on main; switched `dsa_kv_compress_scatter`\nand indexer scatter paths to the sk op\n- `dsa_attn_kv_plan.py`: switched the non-epilog KV scatter path to the\nsk op (new on main, not present in the source PR)\n- Updated UT mocks referencing the removed v2 op name\n(`test_dsa_attn_kv_plan.py`, `test_msa_m3.py`)\n\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/ba07e4a48fc951300d97eb506217dd530583dea3\n\nSigned-off-by: ZT-AIA <1028681969@qq.com>"
+    },
+    {
+      "sha": "e5b9036207f74658c2d4699e2de290c3a3f2e145",
+      "comment": "性能优化：将 DSV4 多组 attention KV cache 的 slot mapping 计算从多次独立 Triton 启动合并为一次融合启动。通过在 MultiGroupBlockTable 中预构建组级指针/元数据表，并新增基于 request 行的分块/自适应 kernel，显著减少 kernel 启动开销（测试数据显示聚合时间降低 82.6%）。设计上保持了 DCP 组和 spec decode 压缩列表的独立计算路径，避免语义变化。风险中等：融合条件判断（非 Mamba、非 DCP、至少两个组）虽然明确，但 kernel 内的 block_table_window 大小通过 min_block_size 计算，对于 uneven 请求的边界处理需要仔细验证，且该优化只服务于 DSV4 场景。",
+      "tags": [
+        "performance",
+        "medium-risk",
+        "attention",
+        "triton"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "新增了 kernel 和 launch config 的源码但未见对应 UT，依赖现有 block_table 测试；对于融合条件（如 DCP、mamba 组共存）的覆盖不足，且 adaptive kernel 的 request 分块逻辑未见测试",
+        "suggested_test_areas": [
+          "vllm_ascend/ops/triton/compute_slot_mapping.py",
+          "vllm_ascend/worker/block_table.py",
+          "tests/ut/worker/test_multi_group_block_table.py"
+        ]
+      },
+      "message": "[Performance] Fuse DSV4 multi-group slot mapping (#15289)\n\n### What this PR does / why we need it?\n\nThis PR merges repeated DSV4 slot-mapping calculations for multiple\nattention KV-cache groups into one Triton launch.\n\n- Build device-side pointer and metadata tables for eligible attention\ngroups.\n- Address each request row inside the fused kernel.\n- Route balanced, uneven, short-prefill, long-prefill, and decode-like\nrequest shapes through fixed or adaptive fused kernels.\n- Keep fused-kernel selection in\n`vllm_ascend/ops/triton/compute_slot_mapping.py`.\n\nFusion eligibility follows the slot-mapping semantics:\n\n- At least two non-Mamba attention groups share the launch.\n- DCP groups use rank-local virtual-block/interleave metadata and retain\ntheir existing computation.\n- Speculative decoding inputs with group-specific compressed\nposition/request-index lists retain independent computation.\n\nAll otherwise eligible request counts and token lengths use the fused\nroute.\n\nThe independent single-group kernel-path optimization is in #15397.\n\n### Performance\n\nMeasurements were collected on one Ascend A3 device at 1850 MHz with\nCANN 9.1.0. Each shape used `msprof op` kernel replay with 20 warmups\nand 20 recorded replays per state.\n\nFor the heterogeneous profile-derived DSV4 six-group case, fusing six\nlaunches reduces aggregate kernel time from **26.321 us to 4.570 us**,\nan **82.6%** improvement.\n\nThe following generalization matrix uses six identical attention\nKV-cache groups. The separate value is the aggregate device time of six\nindependent kernels; the fused value is one kernel launch.\n\n| Per-group request shape | Separate aggregate median (us) | Fused\nmedian (us) | Improvement |\n| --- | ---: | ---: | ---: |\n| 1 x 4096 | 16.920 | 4.690 | 72.3% |\n| 1 x 128 | 18.960 | 3.690 | 80.5% |\n| 2 x 2048 | 17.040 | 4.710 | 72.4% |\n| 8 x 512 | 17.400 | 6.490 | 62.7% |\n| 8 x 16 | 15.780 | 6.030 | 61.8% |\n| 64 x 1 | 37.741 | 18.170 | 51.9% |\n\nAll rows use 20 recorded samples. Per-mode CV is 2.6%–6.1%. The results\ncover long and short prefill, multi-request batches, and decode-like\nshapes.\n\nRepresentative `PipeUtilization` results show 8 x 512 is\nScalar-dominated after fusion (74.2% Scalar ratio), while 64 x 1 has\nhigher MTE2 activity (41.1%) and wait time (7.99 us per vector-core\nrow). The fused kernel remains 51.9% faster for the latter case.\n\n### Does this PR introduce _any_ user-facing change?\n\nNo API or configuration change. This is an internal Triton\nlaunch-consolidation optimization.\n\n### How was this patch tested?\n\n- Split-branch A3 validation: five representative shapes in eager and\nACL Graph modes, 10/10 passed exactly.\n- The split matrix covers a profile-derived six-group long request,\n8-request balanced and uneven batches, 64-request decode, and short\nmulti-request prefill.\n- Earlier generalized matrix for the same fused implementation: 8/8\neager and 8/8 ACL Graph cases passed exactly.\n- Ruff, Python syntax, and `git diff --check` passed.\n\nEvidence scope: kernel-level correctness, ACL Graph capture/replay,\nlatency, and pipeline attribution on Ascend A3.\n\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/ba07e4a48fc951300d97eb506217dd530583dea3\n\nSigned-off-by: QiuChunshuo <qiuchunshuo@huawei.com>"
+    },
+    {
+      "sha": "7ec872b5651a359e8ba305fac2055adad8d652e3",
+      "comment": "从 ops-transformer 同步 DSV4 compressor 算子的新实现，主要变更包括：arch32 新增 full_load 模板（compressor_kernel_full_load / block_cube_full_load / block_vec_full_load），删除 rope_dtype 作为 tiling key 维度（统一为 FP32），norm_weight 强制为 FP32，新增 state_cache 合并（kv_state + score_state 变为单一 state_cache），支持 cache_mode 连续/循环 buffer。这是对 compressor 算子的大规模同步（新增约 3000 行），对 DSV4 SMLA/QLI 计算核心有直接影响。需特别关注：A3 arch32 的 template_id 语义改变（FULL_LOAD 取代 PERF）、state_cache 布局变化对上层调用方的兼容性、以及 aclgraph 模式的支持。",
+      "tags": [
+        "performance",
+        "high-risk",
+        "ops",
+        "model"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "变更了 compressor 算子的输入输出布局（state_cache 合并）和 dtype 要求（norm_weight FP32），现有模型端测试（deepseek_v4/compressor.py）需要同步更新；算子级测试未见对应适配新增，且缺少 aclgraph 捕获模式下的验证",
+        "suggested_test_areas": [
+          "vllm_ascend/models/deepseek_v4/compressor.py",
+          "csrc/attention/compressor/op_kernel/arch32/compressor_kernel_full_load.h",
+          "tests/ut/models/test_deepseek_v4_compressor.py"
+        ]
+      },
+      "message": "[Performance][Cherry-pick][DSV4] sync DeepSeek V4 compressor operator (#15845)\n\n### What this PR does / why we need it?\n\nSync of #15001 to main. Syncs the DSV4 compressor kernel from\nops-transformer experimental attention/compressor, including:\n\n- New full-load kernel templates (`compressor_kernel_full_load.h`,\n`compressor_block_cube_full_load.h`, `compressor_block_vec_full_load.h`)\n- Tiling updates and removal of the `rope_dtype` tiling-key dimension\n- The new compressor kernel only accepts FP32 `norm_weight`, so the\ncompressor RMSNorm is now created in float32 unconditionally (adapted to\nthe refactored `deepseek_v4/compressor.py` on main)\n\nThe arch32 template selection keeps the A3-only trimming from #13416,\nadjusted to the new tiling-key semantics (`TEMPLATE_ID` {EMPTY_X,\nNORMAL}; TH layout never produces FULL_LOAD).\n\n### Does this PR introduce _any_ user-facing change?\n\nNo.\n\n### How was this patch tested?\n\n- `python -m py_compile` and `ruff check` on the modified Python file\n- CI will validate arch32/arch35 kernel compilation\n\nBacktrace of #15001.\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/ba07e4a48fc951300d97eb506217dd530583dea3\n\nCo-authored-by: maoxx241 <maomaoyu870@gmail.com>"
+    },
+    {
+      "sha": "803283f994b4bcbd62770e7d811db978e98b5a98",
+      "comment": "性能优化：在 DSA attention 路径中为 DSV4 compressor metadata 增加按 cache group 粒度的 memoization，避免同一次 substep 内多个 layer 重复调用 compressor_metadata 算子。实现上借助 forward context 的 additional_kwargs 存储缓存字典，新增 get_or_compute_compressor_metadata 和 reset_compressor_metadata_cache 两个函数。原始 PR 针对 v0.26 的 prefill/decode metadata 分离做了适配，main 分支已统一为 AscendDSAReqMetadata 故省略了 metadata-type 的 key 区分。潜在风险是缓存的生命周期依赖 forward context 的隔离性和 reset 调用点的正确性（spec_decode 的 _run_merged_draft 已有处理），若遗漏 reset 会导致跨 substep 复用过期 metadata。",
+      "tags": [
+        "performance",
+        "medium-risk",
+        "attention",
+        "model"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "新增了专门的 UT（test_dsv4_compressor_metadata_cache.py）验证同组复用、跨组隔离、substep 重置和 fresh context 隔离，但未覆盖 spec decode 与 DSA CP 组合场景下的缓存行为",
+        "suggested_test_areas": [
+          "vllm_ascend/attention/dsa_v1.py",
+          "vllm_ascend/attention/context_parallel/dsa_cp.py",
+          "vllm_ascend/spec_decode/llm_base_proposer.py"
+        ]
+      },
+      "message": "[Performance][Cherry-pick][DSV4] Compute compressor metadata once per cache group per sub… (#15844)\n\nBackport of #14994 to main.\n\nDSV4 runs one AscendCompressor forward per attention layer, but every\nlayer\nin a cache group consumes the same compressor metadata. This PR:\n\n- Adds get_or_compute_compressor_metadata in dsa_v1.py, memoizing the\ndevice-side compressor_metadata operator outputs on the current forward\ncontext keyed by cache group, so it runs only once per group per\nsubstep.\n- Adds reset_compressor_metadata_cache and calls it in _run_merged_draft\nwhen\n  a merged speculative draft forward advances to its next substep.\n- Threads a cache_group_key (derived from the builder's first layer\nname)\nthrough AscendDSAReqMetadata in both dsa_v1.py and the CP variant\ndsa_cp.py,\n  and routes both eager fallback paths through the shared helper.\n\nNote: main has already refactored the v0.26 prefill/decode metadata\nsplit\ninto a unified AscendDSAReqMetadata and moved the eager fallback into\nAscendCompressor._compute_metadata, so the cache key no longer needs the\nmetadata-type component from the original PR; everything else is a 1:1\nport.\n\nTest: new UT tests/ut/attention/test_dsv4_compressor_metadata_cache.py\nverifies same-group reuse, cross-group isolation, reset between\nsubsteps,\nand fresh-context isolation (operator invoked exactly 4 times).\n\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/ba07e4a48fc951300d97eb506217dd530583dea3\n\nSigned-off-by: ZT-AIA <1028681969@qq.com>"
+    },
+    {
+      "sha": "5a8e3200f7d9592a694ca14734d59344df8f4cc9",
+      "comment": "文档清理：删除独立的 Layerwise KV Pool 指南（layerwise_kv_pool.md），其内容已并入综合 KV Pool 指南，避免文档漂移。改动只涉及文档目录和 MkDocs 导航配置，无运行时行为影响。符合文档维护最佳实践，风险极低。",
+      "tags": [
+        "docs",
+        "low-risk",
+        "kv-pool"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "纯文档变更，不涉及代码逻辑，无需更新测试",
+        "suggested_test_areas": []
+      },
+      "message": "[Doc][KV Pool] Remove duplicate layerwise KV Pool guide (#15789)\n\n### What this PR does / why we need it?\n\nThis PR removes the standalone Layerwise KV Pool guide and its MkDocs\nnavigation entry.\n\nThe consolidated KV Pool guide is the canonical documentation and\nalready covers layerwise pooling, so keeping both pages creates\nduplicate documentation that can drift over time.\n\n### Does this PR introduce _any_ user-facing change?\n\nNo. This is a documentation-only cleanup and does not change runtime\nbehavior or configuration.\n\n### How was this patch tested?\n- Verified that mkdocs.yml no longer references the removed page.\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/ba07e4a48fc951300d97eb506217dd530583dea3\n\nSigned-off-by: bowgneo <gavin.gq.bao@gmail.com>"
+    },
+    {
+      "sha": "0c25d45949607ddcbbd349402c0bf017b30f5a63",
+      "comment": "性能调优：将 AscendStore layerwise 模式的默认 prefetch 层数从 1 提升到 2，以改善 KV 传输与 attention 计算的重叠程度。改动仅为 fallback 常量的调整，不影响显式用户配置。低风险，但需要注意默认值变化对显存占用和传输带宽的影响，在显存受限场景下可能需要用户手动调回 1。",
+      "tags": [
+        "performance",
+        "low-risk",
+        "kv-pool"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "变更仅涉及默认常量，未改变接口或逻辑，现有 KV Pool 测试已覆盖显式配置路径，无需新增测试",
+        "suggested_test_areas": [
+          "vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py"
+        ]
+      },
+      "message": "[Performance][KV Pool] Prefetch two AscendStore layers by default (#15796)\n\n### What this PR does / why we need it?\n\nThis PR increases the fallback value of layerwise_prefetch_layers from 1\nto 2 for AscendStore layerwise transfers. Prefetching two layers\nimproves overlap between KV transfer and attention computation while\nkeeping explicit user configuration unchanged.\n\n\n### Does this PR introduce _any_ user-facing change?\n\nYes. When layerwise_prefetch_layers is not explicitly configured,\nAscendStore now prefetches two layers instead of one. Users can still\nset the option explicitly to override the default.\n\n### How was this patch tested?\n\n- Verified that the PR changes only the fallback default from 1 to 2.\n- No unit test was added because existing explicit configuration and\nreuse-layout behavior are unchanged; this patch only adjusts a constant\nfallback value.\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/ba07e4a48fc951300d97eb506217dd530583dea3\n\nSigned-off-by: bowgneo <gavin.gq.bao@gmail.com>"
+    },
+    {
+      "sha": "8d838ee86935e872806a4c491d33782e69c59538",
+      "comment": "性能优化：针对 Yuanrong KV Pool 后端，支持延迟初始化请求并避免调度器侧的 HIXL 初始化；通过后端属性 requires_exists_before_put 控制 connector 侧是否需要存在性过滤，Yuanrong 依赖 MSetD2H 的 NX 语义跳过冗余检查，同时 KV 事件发布路径保留精确过滤。文档同步更新了 Coordinator 多节点部署说明和 yuanrong.json 配置。变更涉及接口扩展（Backend 新增类属性）和各后端的行为区分，风险中等：需要确保非 Yuanrong 后端（如 memcache、mooncake）的默认行为不被破坏。",
+      "tags": [
+        "performance",
+        "medium-risk",
+        "kv-pool"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "新增了 Yuanrong 后端的单测（不进行 exists 检查、使用 NX 模式）和键层发送线程的跳过检查测试，但未覆盖其他后端的兼容性回归，且 scheduler 侧懒初始化路径的测试覆盖不足",
+        "suggested_test_areas": [
+          "vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/yuanrong_backend.py",
+          "vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/kv_transfer.py",
+          "tests/ut/distributed/test_yuanrong_backend.py"
+        ]
+      },
+      "message": "[Performance][KV Pool] Optimize Yuanrong initialization and existence checks (#14849)\n\n### What this PR does / why we need it?\n\nThis PR optimizes KV Pool operations while keeping the Yuanrong-specific\nchanges separate from the generic existence-check behavior:\n\n- Accept lazy initialization requests for the Yuanrong backend and avoid\nscheduler-side HIXL initialization.\n- Document Coordinator and multi-node Yuanrong deployment behavior.\n- Let each backend declare whether connector-side existence filtering is\nrequired.\n- Skip redundant existence checks for Yuanrong by relying on Yuanrong\nMSetD2H filtering and `ExistenceOpt.NX`, while preserving exact\nfiltering for KV event publication.\n\nThese changes reduce duplicate initialization and unnecessary existence\nchecks without changing the default filtering behavior of other\nbackends.\n\n### Does this PR introduce _any_ user-facing change?\n\nYes. Yuanrong KV Pool initialization and transfer behavior are\noptimized. Existing backends retain their previous existence-filtering\nbehavior through the default backend setting. The documented Yuanrong\ndeployment configuration is also updated.\n\n### How was this patch tested?\n\n- `git diff --check 649582947376908c69e4759c79fadd62ce898ac5..HEAD`\npassed.\n\n\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/ba07e4a48fc951300d97eb506217dd530583dea3\n\n---------\n\nSigned-off-by: yangsonglin13 <yangsonglin566@gmail.com>"
+    },
+    {
+      "sha": "45fc6040778a720affb451f80bcaf772eeea7818",
+      "comment": "修复 AscendStore 在混合 Mamba KV cache 工作负载（如 DSpark）下的块跟踪问题：当 worker 收到包含 MambaSpec 的 UniformTypeKVCacheSpecs 时，正确识别 Mamba 缓存组，使 scheduler 能释放运行中 Mamba 块的临时引用；同时将新分配块 ID 应用到 request.num_computed_tokens 位置，保持按位置索引的 Mamba 块表。此前 chunked-prefill 长连接场景下会导致 KV 块泄漏进而阻塞调度。变更虽小但切中要害，风险中等：涉及 scheduler 状态跟踪逻辑的语义调整，需要确保非 Mamba 场景行为不受影响。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "kv-pool"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "新增了 UT 验证 UniformTypeKVCacheSpecs 中的 Mamba 检测和 running chunk 的 computed_tokens 更新，但缺少对 scheduler 状态机（如请求完成、abort 路径）的覆盖，以及 DSpark e2e 回归测试",
+        "suggested_test_areas": [
+          "vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_scheduler.py",
+          "vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py",
+          "tests/ut/distributed/ascend_store/"
+        ]
+      },
+      "message": "[Bugfix] [KV Pool] Fix AscendStore hybrid Mamba cache release (#15674)\n\n### What this PR does / why we need it?\n\nThis PR fixes AscendStore block tracking for hybrid Mamba KV cache\nworkloads such as DSpark:\n\n- Detect Mamba cache groups when the worker receives\n`UniformTypeKVCacheSpecs` containing `MambaSpec`. This enables workers\nto report completed store events so the scheduler can release the\ntemporary references held for in-flight Mamba blocks.\n- Apply newly allocated block IDs at `request.num_computed_tokens` for\nrunning chunked requests. This preserves the position-indexed Mamba\nblock table instead of updating it from position zero.\n\nWithout these fixes, AscendStore can retain references to completed\nMamba store blocks during long-running chunked-prefill workloads.\nAvailable GPU KV blocks gradually decrease until subsequent requests can\nno longer be scheduled.\n\n### Does this PR introduce _any_ user-facing change?\nNO\n\n### How was this patch tested?\n\n- `pytest -q tests/ut/distributed/ascend_store/test_pool_scheduler.py\ntests/ut/distributed/ascend_store/test_pool_worker.py`\n  - 116 passed\n- End-to-end test with AscendStore and DSpark on a DP4/TP16 deployment:\n- Completed 128 requests with 131,024 input tokens each without\nstalling.\n  - GPU KV cache usage returned to zero after completion.\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/ba07e4a48fc951300d97eb506217dd530583dea3\n\n---------\n\nSigned-off-by: bowgneo <gavin.gq.bao@gmail.com>"
+    },
+    {
+      "sha": "9afd6a925d3eb336b41649cf1bfa8a9f746e64ce",
+      "comment": "为 ModelRunner V2 增加 DSA 注意力后端 + PCP 上下文并行 + MTP 推测解码的组合支持。核心变更包括：speculator 的 set_attn 在 draft 模型初始化时使用 PCP=1 的配置上下文，使 target 保持 PCP 执行而 draft 使用 PCP=1；DSA PCP 的 FULL_DECODE_ONLY 图 metadata 支持 MTP 固定 K+1 query 长度（query_len = num_input_tokens // num_reqs）；修复了 padded query offsets 在 NPU/CPU metadata 中的恢复逻辑。同时将 DSA PCP 的 e2e 测试从 test_accuracy_v2.py 迁移到独立的 test_deepseek_v4.py 并加入 MTP 接受率验证。变更涉及 spec_decode、attention、model_runner 三个核心模块，是一次跨模块的 feature 扩增，风险较高。",
+      "tags": [
+        "feature",
+        "high-risk",
+        "attention",
+        "spec_decode",
+        "model-runner"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "新增了四卡 e2e 测试和 UT（覆盖 MTP query offset 恢复和 draft metadata 构建），但 e2e 仅验证了 TP4/EP2 组合，未覆盖 TP8 等生产配置，且缺少非 PCP 场景下该变更的兼容性测试",
+        "suggested_test_areas": [
+          "vllm_ascend/attention/context_parallel/dsa_cp.py",
+          "vllm_ascend/worker/v2/spec_decode/autoregressive/speculator.py",
+          "tests/e2e/pull_request/four_card/context_parallel/test_deepseek_v4.py"
+        ]
+      },
+      "message": "[Feature][MRV2] Support DSA PCP with MTP (#15706)\n\n### What this PR does / why we need it?\n\nThis PR extends the MRV2 PCP speculative decoding support from #14960 to\nDSA with MTP.\n\n- Resolve DSA metadata-builder and implementation selection against the\nactive target or replicated draft configuration, so the target keeps PCP\nexecution while the draft uses PCP=1.\n- Support fixed K+1 MTP verification query lengths in DSA PCP\n`FULL_DECODE_ONLY` graph metadata.\n- Add focused unit coverage for restoring padded MTP query offsets in\nboth device and CPU metadata.\n- Update the PCP compatibility matrix for DSA PCP with MTP.\n\n### Does this PR introduce _any_ user-facing change?\n\nYes. MRV2 users can combine DSA PCP with MTP speculative decoding. No\nnew CLI option is introduced.\n\n### How was this patch tested?\n\n- Model: DeepSeek-V4-Flash W8A8 MTP\n- Workload: GPQA Diamond first 100 questions, MTP=1, `FULL_DECODE_ONLY`,\n`max_out_len=65536`, concurrency 100, temperature 0, and seed 0\n- Baseline: TP8 x PCP1\n- Feature: TP4 x PCP2\n- Weighted acceptance rate: accepted tokens / drafted tokens, calculated\nfrom the counter delta of each round\n\n| Configuration | Round | Successful requests | Accuracy | Weighted\nacceptance rate | stop / length |\n| --- | ---: | ---: | ---: | ---: | ---: |\n| main TP8 x PCP1 | 1 | 100/100 | 76.00% | 88.76% | 84 / 16 |\n| main TP8 x PCP1 | 2 | 100/100 | 76.00% | 89.46% | 79 / 21 |\n| main TP8 x PCP1 | 3 | 100/100 | 74.00% | 89.46% | 82 / 18 |\n| feature TP4 x PCP2 | 1 | 100/100 | 77.00% | 89.66% | 82 / 18 |\n| feature TP4 x PCP2 | 2 | 100/100 | 74.00% | 88.63% | 85 / 15 |\n| feature TP4 x PCP2 | 3 | 100/100 | 75.00% | 89.37% | 84 / 16 |\n\nThree-round median:\n\n- main: 76.00% accuracy and 89.46% weighted acceptance rate\n- feature: 75.00% accuracy and 89.37% weighted acceptance rate\n- feature vs. main: -1.00 percentage point accuracy and -0.09 percentage\npoint weighted acceptance rate\n- All six runs completed 100/100 requests with non-zero drafted and\naccepted token counts.\n\nThe feature results were collected from the Graph metadata fix snapshot\nlater included in this PR. Nightly validation was not run.\n\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/ba07e4a48fc951300d97eb506217dd530583dea3\n\n---------\n\nSigned-off-by: leolee <83689697+li1how@users.noreply.github.com>"
+    },
+    {
+      "sha": "ba7bfa3f8ae1ac9b9e2555b9265134b4d0dd05a8",
+      "comment": "文档：新增 GLM-5.3-Flash 部署指南，涵盖单节点（Ascend950DT / A3）、多节点（A2 DP2×TP8）的镜像安装与启动命令，并说明 MTP 推测解码配置。同时更新了模型支持矩阵和 MkDocs 导航。纯文档变更，无运行时影响，风险极低。",
+      "tags": [
+        "docs",
+        "low-risk",
+        "model"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "文档变更，仅涉及导航和文本，不改变任何代码行为，无需测试更新",
+        "suggested_test_areas": []
+      },
+      "message": "[Doc] Add GLM-5.3-Flash  deployment guide (#15808)\n\nAdd the GLM-5.3-Flash deployment tutorial\n`docs/source/tutorials/models/GLM5.3-Flash.md` and register the model in\nthe docs navigation and supported models matrix.\n\nCovers:\n- Single-node deployment on Ascend950DT / Atlas 800 A3\n- A2 two-node DP2 x TP8 multi-node co-located deployment (node 0 / node\n1 startup commands)\n- Docker image installation per platform (Ascend950DT / A3 / A2)\n- MTP speculative decoding configuration\n- Functional verification, accuracy and performance evaluation\nreferences, and FAQ\n\nCo-authored-by: huamus <1943805462@qq.com>\n\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/ba07e4a48fc951300d97eb506217dd530583dea3\n\n---------\n\nSigned-off-by: Liuchenbing-2026 <liuchen2026fly@163.com>\nCo-authored-by: huamus <1943805462@qq.com>"
+    }
+  ],
+  "architecture_based_on_sha": "e04f251a5895969d1c1f4ac9a3807177a0c4769c",
+  "architecture_generated_at": "2026-08-01T20:25:03.693997+08:00"
+}

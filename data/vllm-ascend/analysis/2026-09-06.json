@@ -1,0 +1,50 @@
+{
+  "date": "2026-09-06",
+  "repo": "vllm-project/vllm-ascend",
+  "generated_at": "2026-09-07T04:12:17.186604+08:00",
+  "daily_summary": "当日提交包含两个 BugFix：一是更新 DeepSeek-V2-Lite 在 DP2+PP2 并行下的 E2E golden 基线，以适配上游 #15299 移除 MoE routing weights dtype cast 后的确定性输出变化；二是为 DeepSeek V4 增加 per-layer 的 skip_weight_nz_conversion 机制，确保 compressor 和 DSA 自定义执行路径消费的权重保持 ND 格式，避免 NZ 转换导致的不兼容。两个变更分别聚焦 CI 测试稳定性和模型算子层兼容性，均针对特定模型（DeepSeek 系列）和特定并行/执行路径。",
+  "test_impact_summary": "当日测试影响集中在两点：DP2+PP2 golden 更新后，需要持续关注该路径输出的确定性，尤其是 prompt 1 的 golden 尚未被实际观测验证；DeepSeek V4 的 ND 格式保持新增了单测覆盖线性层后处理逻辑，但缺少对 compressor 和 DSA 层标志设置的直接测试，建议在单元测试中补充对模型内部层属性的断言，以覆盖这两个自定义执行路径的配置条件。整体上现有 E2E 和单测框架可以支撑，但需要针对新逻辑增加针对性看护。",
+  "commits": [
+    {
+      "sha": "219a7e7efd0b5363be0d5cc198995e9417b2de13",
+      "comment": "该 commit 是一个 CI 测试基线修复。上游 #15299 移除了 MoE top-k routing weights 的中间 dtype 转换，导致 DeepSeek-V2-Lite-Chat 在 DP2+PP2 路径上的贪婪解码输出发生变化（'I'm a' -> 'I am a'）。变更引入了独立的 DP_GOLDEN 以隔离 DP2+PP2 的基线，避免影响 TP2+PP2 的共享 GOLDEN。实现方式是复制 GOLDEN 并更新 prompt 0 的输出序列，prompt 1 保持共享值。风险较低，但 prompt 1 的 DP2 输出未在失败日志中实际观察到，存在不确定性；且新的 golden 依赖确定性输出，若未来 MoE 路由权重数值再次变化，该测试仍需同步更新。测试文件位于 e2e/four_card，属于 CI 看护范围。",
+      "tags": [
+        "bugfix",
+        "test",
+        "ci",
+        "low-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "该 commit 本身是 E2E golden 更新，不需要额外新增测试，但 DP2+PP2 路径的 prompt 1 输出尚未实际验证，后续若 CI 报告 drift 需同步更新；且该路径对 MoE routing weight dtype 变化敏感，建议保持 CI 对该用例的持续看护。",
+        "suggested_test_areas": [
+          "tests/e2e/pull_request/four_card/test_pipeline_parallel.py"
+        ]
+      },
+      "message": "[BugFix][CI] Update DeepSeek-V2-Lite DP2+PP2 golden after MoE routing weight dtype change (#15875)\n\n## Issue\n`test_models_pp2_dp2[mp/ray-2-2-deepseek-ai/DeepSeek-V2-Lite-Chat]` in\n`tests/e2e/pull_request/four_card/test_pipeline_parallel.py` fails\ndeterministically on current main snapshot (`c1bb35f`), e.g. in #15846\n(two runs, identical diff).\n\n## Root cause\n#15299 removed intermediate dtype casts for MoE top-k routing weights\n(touched `vllm_ascend/ops/fused_moe/token_dispatcher.py` among others).\nThis deterministically shifts numerics on the **DP2+PP2** path of\nDeepSeek-V2-Lite-Chat: greedy decoding now emits `I am a` (token `608`)\ninstead of `I'm a` (tokens `6, 76`). The TP2+PP2 path is unaffected and\nstill matches the existing golden.\n\n#15299 updated the goldens it knew about (`test_graph_mode.py`), but its\nCI run did not select `test_pipeline_parallel.py`, so this baseline was\nmissed.\n\n## What this PR does\n- introduce a separate `DP_GOLDEN` for the DP2+PP2 test case (prompt 0\nupdated to the new deterministic output, observed identically across\nmp/ray backends and repeated runs)\n- keep the shared `GOLDEN` untouched for TP2+PP2\n\n## Notes\nPrompt 1's DP2 output was not observable in the failure logs (the assert\nfires on prompt 0 first), so its entry currently keeps the shared value;\nif CI reports a drift there it can be updated in one line.\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/ba07e4a48fc951300d97eb506217dd530583dea3\n\nSigned-off-by: ZT-AIA <1028681969@qq.com>"
+    },
+    {
+      "sha": "8728089caf124fe738694529bcca1b3a75918229",
+      "comment": "该 commit 修复 DeepSeek V4 在自定义执行路径上的权重格式兼容性问题。核心改动是在 AscendUnquantizedLinearMethod.process_weights_after_loading 中新增 per-layer 的 skip_weight_nz_conversion 标志读取，当层被标记时，跳过 weight_fp32 和常规权重的 ND->NZ 转换。标记位置包括：compressor 的 wkv/wgate（由自定义 compressor op 直接消费）和 DSA 的 wo_a（在 OTP 启用或 OLoRA TP 禁用时，使用 npu_transpose_batchmatmul 直接调用）。实现通过 getattr 读取标志，向后兼容默认 False，避免影响其他模型。潜在风险：wo_a 的标记条件依赖 oproj_tp_enable/olora_tp_enable 的运行时状态，如果这些配置在模型构建后变化可能导致格式不匹配；另外跳过 FP32 副本的 NZ 转换可能对特定路径的数值行为有影响，但这是有意的。测试方面新增了单测覆盖 per-layer 跳过和 FP32 copy 路径，但对 compressor 和 DSA 层中的标志设置没有直接断言，依赖模型级测试。整体改动范围小且针对性强，但涉及 DSV4 模型的量化/自定义 op 路径，需要设备端验证。",
+      "tags": [
+        "bugfix",
+        "model",
+        "ops",
+        "medium-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "虽然新增了线性层单测，但未覆盖 deepseek_v4 模型中 compressor 和 attention 层设置 skip_weight_nz_conversion 标志的逻辑；建议增加模型级或模块级测试，验证标志在 oproj_tp_enable/olora_tp_enable 各组合下是否正确设置，以及 FP32 权重副本的 ND 保持行为。",
+        "suggested_test_areas": [
+          "tests/ut/ops/test_linear.py",
+          "tests/ut/models/test_deepseek_v4.py",
+          "vllm_ascend/models/deepseek_v4/compressor.py",
+          "vllm_ascend/models/deepseek_v4/model.py"
+        ]
+      },
+      "message": "[BugFix] Keep unsupported DeepSeek V4 weights in ND format (#15834)\n\n### What this PR does / why we need it?\n\nKeep DeepSeek V4 weights in ND format when they are consumed by\nexecution paths that bypass the regular Linear method:\n\n- add a per-layer `skip_weight_nz_conversion` flag to unquantized Linear\nweight post-processing;\n- preserve ND for both the original weight and the optional FP32 copy;\n- mark compressor `wkv` and `wgate` weights, which are passed directly\nto the custom compressor op;\n- mark DSA `wo_a` when OTP is enabled or OLoRA TP is disabled, because\nthose paths call `npu_transpose_batchmatmul` directly.\n\nThis is the `main`-branch counterpart of #15684. It is adapted to the\nrefactored DeepSeek V4 package layout and the hardware-profile-based\nmain branch. In particular, the DSA decision follows the active\nexecution path rather than hard-coding a device type; the A5 quantized\npath uses a separate quantization method and is unaffected.\n\n### Does this PR introduce _any_ user-facing change?\n\nNo API change. It fixes DeepSeek V4 runtime compatibility by preventing\nunsupported ND-to-NZ weight conversion on custom execution paths.\n\n### How was this patch tested?\n\n- Added a unit test covering the per-layer bypass, including the FP32\nweight-copy path.\n- `ruff check` and `ruff format --check` on all changed Python files.\n- Python `compileall` on all changed Python files.\n- Project codespell, forbidden-import, boolean-context-manager, and\nlong-function checks on the changed files.\n- Full device coverage is delegated to the vLLM Ascend PR CI matrix.\n\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/ba07e4a48fc951300d97eb506217dd530583dea3\n\nSigned-off-by: zhuyilin (A) <z00911894@china.huawei.com>\nCo-authored-by: zhuyilin (A) <z00911894@china.huawei.com>"
+    }
+  ],
+  "architecture_based_on_sha": "e04f251a5895969d1c1f4ac9a3807177a0c4769c",
+  "architecture_generated_at": "2026-08-01T20:25:03.693997+08:00"
+}

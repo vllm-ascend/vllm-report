@@ -1,0 +1,279 @@
+{
+  "date": "2026-09-06",
+  "repo": "vllm-project/vllm",
+  "generated_at": "2026-09-07T04:01:42.420703+08:00",
+  "daily_summary": "当日变更围绕五个方向：（1）scale-out/multimodal API 层增强：为 disaggregated prefill 暴露 mm_metadata 并强化请求验证（commit 1、8）；（2）KV Offload 多项 bugfix：修复最终采样 token KV slot 误卸载、SWA chunked prefill store 可达性、ARC T2 淘汰失败回退、异步查找批次清理（commit 2、3、4、5）；（3）性能优化：BLIP-2 Q-Former 改用 SDPA、NVIDIA A100 MoE tuned config、CPU AMX-FP8 原生 attention 实现（commit 6、9、10）；（4）核心调度/KV cache 增强：Kimi K3 内部 prefix checkpoint 支持（涉及 MambaSpec/MambaManager/Scheduler，commit 7）和 DP 引擎首步同步（commit 11）；（5）多模态 renderer warmup 受 prefill token budget 约束的 bugfix（commit 12）。整体以 bugfix 和性能优化为主，核心接口层改动集中在 Mamba/SSM 相关路径和 DP 同步时序。",
+  "ascend_impact_summary": "当日 12 个 commit 中有 2 个对 vllm-ascend 有影响：（1）commit 144e79c8 修改了 kv_cache_interface.py（命中必然影响路径），MambaSpec 新增 prefill_checkpoint_alignment 字段并重写 MambaManager checkpoint 管理逻辑，Ascend 自定义 KV cache spec 不受影响，但若使用 Mamba/GDN 相关路径需关注；（2）commit 039ea826 为 ParallelConfig 新增 dp_sync_interval 字段并改变 DPEngineCoreProc 的首步同步行为，所有使用 DP 的平台（含 Ascend）运行时行为自动变化。其余 commit 均为 KV Offload（Ascend 不使用）、NVIDIA/CPU 特定实现或平台无关的 API 层改进，对 vllm-ascend 无影响。",
+  "commits": [
+    {
+      "sha": "52358e6e192aeae73dd3764046c98fc4b156ea83",
+      "comment": "为 disaggregated prefill 工作流在多模态 render 响应中暴露 mm_metadata。该字段仅包含占位符元数据（如 image_grid_thw）和 keep_on_cpu 字段，不含 pixel_values 等 encoder 输入，使 prefill 节点在配置 ec_transfer_params 后可省略 kwargs_data。实现上将 mm_features 提取逻辑从 render/derender serving 抽取到独立的 mm_features.py 模块，协议层新增 mm_metadata 字段并在 GenerateRequest 中增加 metadata-only 必须携带 ec_transfer_params 的验证。render 侧通过 MULTIMODAL_REGISTRY 的 data_parser.placeholder_metadata_fields() 动态获取声明的元数据字段。风险点在于 mm_metadata 与 kwargs_data 的并行数组对齐依赖调用方正确拆分，协议验证器已强制多模态集合一致性和长度匹配，但跨服务协调仍需客户端配合。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "multimodal",
+        "entrypoints",
+        "disaggregated-prefill"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响（变更仅在 vllm/entrypoints/scale_out/ 下新增 mm_metadata 序列化/反序列化逻辑和协议验证，属于平台无关的 API 层，不涉及 vllm-ascend 使用的 Platform/Worker/AttentionBackend 等接口）",
+        "testing": "无影响",
+        "needs_test_update": false
+      },
+      "message": "[Frontend] Expose multimodal metadata for disaggregated prefill (#54659)\n\nSigned-off-by: zhouyou9505 <zhouyou9505@gmail.com>\nCo-authored-by: Cursor Grok 4.6 <noreply@cursor.com>"
+    },
+    {
+      "sha": "808f8cd3ac6751278d8b7be97f6fde5295ca4653",
+      "message": "[Governance] Add aoshen02 as code owner for RL components (#55529)\n\nSigned-off-by: aoshen02 <aoshen@inferact.ai>\nCo-authored-by: Codex <noreply@openai.com>",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "feature",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "dc02934a07672eb778a8d819f4e35d0f93ee427b",
+      "comment": "修复 KV offload 中最终采样 token 的 KV slot 被错误 store 的问题。最终采样 token 的 KV slot 从未被前向传播写入（其在 decode 中由上一个 position 的 forward 产生，而在 spec decode 下该 slot 持有第一个被拒绝 draft 的 KV），若将其 store 并发布到 prefix cache，后续请求命中后会加载到未写入的 slot。修复方式：请求完成时 num_tokens_after_batch 取 max(num_prompt_tokens, num_tokens - 1)，将 store 截止点钳制到 GPU prefix cache 的 commit 点。测试同步更新了相关用例描述和断言逻辑。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "kv-offload",
+        "prefix-caching",
+        "scheduler"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响（变更位于 vllm/distributed/kv_transfer/kv_connector/v1/offloading/，该路径在跨项目影响判断中为'绝不影哬'路径，vllm-ascend 不使用 vLLM 的 KV offload connector）",
+        "testing": "无影响",
+        "needs_test_update": false
+      },
+      "message": "[Bugfix][KV Offload] Stop offloading the final sampled token's KV slot (#54288)\n\nSigned-off-by: almogtavor <almogtavor@gmail.com>\nSigned-off-by: Almog Tavor <70065337+almogtavor@users.noreply.github.com>\nCo-authored-by: Or Ozeri <or@ozery.com>"
+    },
+    {
+      "sha": "569adb5a9780f9c02d22a6b29826acf711512356",
+      "comment": "修复 chunked prefill 期间 SWA（Sliding Window Attention）store 可达性问题。原实现在请求尚未完成时使用当前调度窗口作为 final segment，导致 chunked prefill 的中间步骤可能错误发布或遗漏 SWA 尾部块。核心改动：SlidingWindowManager.reachable_block_mask 新增 final_segment_end_block 可选参数（默认 None），支持标记最终段的可达尾部；OffloadingConnectorScheduler 重构了 store horizon 推导，区分已完成（num_chunks）、aborted（prompt horizon）、活跃 decode（无最终边界）三种场景。测试覆盖 completed-prompt、aborted-sync、aborted-async 和 active decode 等场景，并验证了 Eagle（spec decode）场景的行为。由于 final_segment_end_block 默认 None 时原始行为不变，对非 KV offload 路径无影响。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "kv-offload",
+        "swa",
+        "chunked-prefill",
+        "scheduler"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响（vllm/distributed/kv_transfer/ 为 Ascend 不使用的路径；single_type_kv_cache_manager.py 中的 reachable_block_mask 仅添加默认 None 的可选参数，仅在 KV offload 场景下传入新参数，默认行为不变）",
+        "testing": "无影响",
+        "needs_test_update": false
+      },
+      "message": "[Bugfix][KV Offload] Fix SWA store reachability during chunked prefill (#54362)\n\nSigned-off-by: Will Hampson <whamp@ggl.slmail.me>\nCo-authored-by: Will Hampson <whamp@ggl.slmail.me>\nCo-authored-by: Or Ozeri <oro@il.ibm.com>"
+    },
+    {
+      "sha": "dd0760165c17fdf750b1aa8e2a26ac885eafd598",
+      "comment": "修复 ARC（Adaptive Replacement Cache）缓存策略在 T2 列表无法满足淘汰需求时不能回退到 T1 的问题。原实现在 next_candidate(t2_iter) 返回 None 后直接返回 None（拒绝本次 store），导致在 T2 条目全被 pin 或 protect 时即使 T1 有可淘汰条目也无法接纳新数据。修复方式：T2 候选为 None 时继续从 T1 迭代器查找候选，并相应递减 virtual_t1_size 保持策略内部一致性。新增参数化测试覆盖 pinned/protected 组合和批量淘汰原子性场景。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "kv-offload",
+        "cache-policy"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响（变更位于 vllm/v1/kv_offload/cpu/policies/arc.py，该模块是 CPU KV offload 的 ARC 策略实现，vllm-ascend 有自己的 kv_offload 实现，不使用此路径）",
+        "testing": "无影响",
+        "needs_test_update": false
+      },
+      "message": "[Bugfix] Fall back to T1 when ARC cannot reclaim enough entries from T2 (#55461)\n\nSigned-off-by: Wang Zupeng <zupenwang@gmail.com>\nCo-authored-by: Codex <noreply@openai.com>"
+    },
+    {
+      "sha": "9afb878a55eb08fd064dfaab56afd8447e97101e",
+      "comment": "修复异步查找批次中已清理请求未被过滤的问题。在 flush() 时，先前放入 _lookup_batch 但请求已通过 cleanup() 清理的条目仍会被提交到后台查询队列，造成无效查询和潜在的状态泄漏。修复方式：flush 时取出 batch 后逐条检查 _lookup_state 中对应 key 的 generation 是否仍然匹配，不匹配的条目直接丢弃。该修复同时保证了 flush 操作的幂等性和空批次安全。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "kv-offload",
+        "async-lookup"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响（变更位于 vllm/v1/kv_offload/tiering/async_lookup.py，属于 vLLM KV offload 分层查找管理，vllm-ascend 不使用此实现）",
+        "testing": "无影响",
+        "needs_test_update": false
+      },
+      "message": "[Bugfix][KV Offload] Skip cleaned-up async lookup batches (#55075)\n\nSigned-off-by: Alex <jihui.huang@daocloud.io>\nCo-authored-by: OpenAI Codex <noreply@openai.com>\nCo-authored-by: Or Ozeri <oro@il.ibm.com>"
+    },
+    {
+      "sha": "a1541f5742a29864a80087af313ad460066a1524",
+      "comment": "BLIP-2 Q-Former 的 MultiHeadAttention 从手写 scaled dot-product attention 替换为 F.scaled_dot_product_attention，消除显式 attention_scores/attention_probs 中间张量，并可利用 PyTorch 的 fused kernel 优化。改动保留了 dropout（训练时）和 scale 语义。数值上 SDPA 可能因 kernel 实现不同产生微小差异，但对推理质量无实质影响。该改动只影响 BLIP-2 模型的前向路径，不涉及 KV cache 或平台特定 kernel。",
+      "tags": [
+        "performance",
+        "low-risk",
+        "model",
+        "multimodal",
+        "attention",
+        "blip2"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响（BLIP-2 模型实现变更，使用标准 PyTorch SDPA 算子而非平台特定 kernel；vllm-ascend 无 BLIP-2 专有实现，该模型经由通用模型执行路径在 NPU 上运行）",
+        "testing": "无影响",
+        "needs_test_update": false
+      },
+      "message": "[Perf] Use SDPA for BLIP-2 Q-Former attention (#55285)\n\nSigned-off-by: levius <2114377220@qq.com>\nSigned-off-by: Isotr0py <Isotr0py@outlook.com>\nCo-authored-by: Isotr0py <Isotr0py@outlook.com>"
+    },
+    {
+      "sha": "144e79c8106da23141ac010394b782f730cc7fe8",
+      "comment": "为 Kimi K3 模型增加内部 prefix checkpoint 支持，使 partial prefix caching 与 spec-decoding 场景下 Mamba/SSM 状态可被正确缓存和复用。核心变更：（1）MambaSpec 新增 prefill_checkpoint_alignment 字段（默认 None），新增 get_mamba_prefill_checkpoint_position 和 is_mamba_prefill_checkpoint_valid 两个模块级函数统一 checkpoint 边界计算；（2）MambaManager 的 checkpoint 记录从『数量』改为『绝对位置』（_num_checkpoint_blocks → _checkpoint_positions），并新增 drop_eagle_checkpoint_block 以匹配 Eagle 的 replay 边界；（3）Scheduler._mamba_block_aligned_split 改用统一的 checkpoint 有效性判断，支持 Eagle block drop 场景，并修复了 partial hint 与 checkpoint 互斥的逻辑；（4）BlockPool.cache_partial_block 新增 replace_existing_hashes 参数，使已有块可重新注册到新的 checkpoint hash。该 commit 是复杂特性，同时涉及 vLLM 核心调度/KV cache 组件和 NVIDIA 特定模型代码（vllm/models/kimi_k3/nvidia/），对非 Mamba 模型路径行为无影响。",
+      "tags": [
+        "feature",
+        "high-risk",
+        "model",
+        "scheduler",
+        "kv-cache",
+        "prefix-caching",
+        "spec-decode",
+        "mamba"
+      ],
+      "ascend_impact": {
+        "ascend_affected": true,
+        "functionality": "vllm/v1/kv_cache_interface.py 命中必然影响路径。MambaSpec 新增 prefill_checkpoint_alignment 字段（默认 None）和两个辅助函数；MambaManager 的 checkpoint 位置管理从数量改为绝对位置（_num_checkpoint_blocks → _checkpoint_positions），Scheduler 的 Mamba checkpoint 判断逻辑变更。Ascend 自定义 KV cache spec（AscendMLAAttentionSpec 等）继承 KVCacheSpec/AttentionSpec，不继承 MambaSpec，核心接口未被破坏。但若 vllm-ascend 使用 Mamba/GDN 相关 attention 路径（vllm_ascend/ops/ 中包含 GDN 算子）或自定义调度器（BalanceScheduler 等）依赖 Scheduler 的 _mamba_block_aligned_split 行为，则需要同步适配 checkpoint 逻辑变更。",
+        "testing": "vLLM 上游新增了 test_mamba_prefill_checkpoint_valid、test_internal_checkpoint_uses_partial_hash_lifecycle、test_eagle_block_aligned_checkpoint_replaces_newer_hash 等测试覆盖新行为。vllm-ascend 应验证自定义调度器与 Mamba/SSM 模型（如有）的兼容性。",
+        "needs_test_update": true,
+        "suggested_test_areas": [
+          "vllm-ascend 自定义调度器与 Mamba checkpoint 调度逻辑兼容性测试",
+          "vllm-ascend KV cache spec 与 MambaSpec 新字段 prefill_checkpoint_alignment 的兼容性验证"
+        ]
+      },
+      "message": "[Kimi K3] Support internal prefix checkpoints with partial prefix caching and spec-decoding (#53614)\n\nSigned-off-by: Ziming Huang <zelda.huanghuang@gmail.com>\nCo-authored-by: OpenAI Codex <codex@openai.com>",
+      "deep_analysis": {
+        "ascend_affected_confirmed": true,
+        "affected_interfaces": [
+          "vllm_ascend/patch/platform/patch_kv_cache_coordinator.py (AscendHybridKVCacheCoordinator.__init__ and get_kv_cache_coordinator)",
+          "vllm_ascend/patch/platform/patch_mamba_manager.py (AscendMambaManager subclass of MambaManager)",
+          "vllm_ascend/patch/platform/patch_mamba_block_aligned_split.py (Scheduler._mamba_block_aligned_split wrapper)",
+          "vllm_ascend/patch/platform/patch_mamba_config_310.py (MambaSpec construction, 310P)",
+          "vllm_ascend/ops/kimi_kda.py (AscendKimiK3DeltaAttention inherits KimiK3DeltaAttention.get_kv_cache_spec)"
+        ],
+        "adaptation_effort": "low",
+        "adaptation_guide": "The commit reworks the shared Mamba/SSM prefix-cache machinery to support 'internal prefix checkpoints' for partial prefix caching + spec-decoding (Eagle), and adds NVIDIA-only Kimi K3 KDA changes. No vllm-ascend API breaks, but every affected upstream surface is one that vllm-ascend reimplements or wraps via patches, so the patches must be synchronized:\n\n1. patch_kv_cache_coordinator.py (required): upstream KVCacheCoordinator.__init__ now adds `if use_eagle: for mgr in self.single_type_managers: if isinstance(mgr, MambaManager): mgr.drop_eagle_checkpoint_block = True`. AscendHybridKVCacheCoordinator.__init__ reimplements the constructor WITHOUT calling super().__init__(), so it never runs this block. Add the same MambaManager flag propagation (importing MambaManager from vllm.v1.core.single_type_kv_cache_manager) so Eagle-aligned Mamba checkpoint dropping works on Ascend's hybrid path. Note MambaManager is now also imported by upstream kv_cache_coordinator.py; ensure patch import/apply ordering still resolves the patched AscendMambaManager (isinstance still works because AscendMambaManager subclasses the original class).\n\n2. patch_mamba_manager.py (re-validate): upstream MambaManager internals changed: `_num_checkpoint_blocks` renamed to `_checkpoint_positions`, `_needs_internal_checkpoint` signature changed to (request_id, query_start, query_end, checkpoint_position), `get_num_blocks_to_allocate`/`_allocate_new_computed_blocks` got new checkpoint arithmetic (checkpoint_block, blocks_allocated), `__init__` adds `has_prefill_checkpoint_blocks` and `drop_eagle_checkpoint_block=False`, `_offer_computed_blocks` now keys on block.block_hash_num_tokens, and `_cache_partial_block` re-keys the reserved checkpoint block via `cache_partial_block(replace_existing_hashes=True)`. AscendMambaManager only overrides get_num_blocks_to_allocate and calls super() with an unchanged signature, so it still binds; re-verify its `+1` external-token block arithmetic does not violate the new `assert num_new_blocks <= max_new_blocks` (safe today because checkpoint_block==0 on Ascend, see below).\n\n3. patch_mamba_block_aligned_split.py (re-validate): the patch hard-checks the Scheduler._mamba_block_aligned_split signature; the commit changed only the body, not the signature, so the guard still passes. But the body now reads `self.mamba_prefill_checkpoint_alignment` (set in Scheduler.__init__, inherited by Ascend RecomputeScheduler/DyntraLB/ProfilingChunk schedulers) and changes use_internal_checkpoint/stops logic; re-run the KV-consumer bypass behavior.\n\n4. MambaSpec (kv_cache_interface.py): new field `prefill_checkpoint_alignment: int | None = None` plus new helpers get_mamba_prefill_checkpoint_position / is_mamba_prefill_checkpoint_valid. Backward compatible (frozen dataclass field with default) with existing MambaSpec constructions in patch_mamba_config_310.py and attn_utils.py; no change needed unless the new feature is adopted.\n\n5. BlockPool.cache_partial_block: new `replace_existing_hashes: bool = False` kwarg; vllm-ascend's tests/ut/test_compressed_prefix_cache.py calls it positionally with kwargs and stays compatible.\n\n6. kimi_kda.py: AscendKimiK3DeltaAttention inherits the modified get_kv_cache_spec, which now sets num_prefill_checkpoint_blocks=int(kda_prefill_backend=='flashkda') and prefill_checkpoint_alignment=16 when flashkda. On Ascend, is_flashkda_supported() returns False (not CUDA) so the backend resolves to 'triton' and these fields stay 0/None - the internal-checkpoint feature stays inert on Ascend today; just confirm the inherited get_kv_cache_spec produces a valid MambaSpec for the Ascend path.\n\nSuggested tests: re-run vllm-ascend tests/ut/test_compressed_prefix_cache.py and the upstream tests updated by this commit (test_partial_prefix_cache_hits.py, test_mamba_align_chunk_split.py) against the vendored vLLM, plus a Kimi K3 / hybrid-Mamba + Eagle sanity check.",
+        "risk": "medium - No signature or import breakage; the new internal-checkpoint feature is effectively disabled on Ascend because it is gated behind the CUDA-only 'flashkda' KDA backend (is_flashkda_supported()==False on NPU). The residual risk is behavioural: (a) AscendHybridKVCacheCoordinator.__init__ silently skips the new drop_eagle_checkpoint_block propagation, so if Ascend later enables Mamba checkpoint specs or runs hybrid-Mamba + Eagle on the hybrid path, Mamba checkpoint blocks will not align to Eagle's replay boundary and prefix-cache hits can be wrong; (b) AscendMambaManager.get_num_blocks_to_allocate and the patched _mamba_block_aligned_split wrap substantially reworked upstream logic, so their block-count/assert interplay and the PD-consumer bypass must be re-tested; (c) the re-keying of checkpoint blocks via cache_partial_block(replace_existing_hashes=True) changes CoW/event semantics that the Ascend KV-transfer connectors rely on."
+      }
+    },
+    {
+      "sha": "1970f3ed4be7fa8620e4ddc4a12c36a8384cfc27",
+      "comment": "在 scale-out token-in-token-out 协议中增加多模态数据完整性的前置验证。MultiModalFeatures 新增 _validate_parallel_fields 验证器，确保 mm_hashes、mm_placeholders、kwargs_data 的 modality 集合一致、各 modality 条目长度相等、placeholder 全局非重叠且有序。GenerateRequest 新增 _validate_multimodal_feature_bounds 验证器，确保 placeholder 范围不超出 token_ids 序列。PlaceholderRangeInfo 的 offset 加 ge=0、length 加 gt=0 约束。这些验证在请求进入引擎前 fail fast，避免非法数据在异步处理链路中引发深层错误。与 commit 52358e6e 的 mm_metadata 新增形成了互补的验证体系。",
+      "tags": [
+        "feature",
+        "low-risk",
+        "multimodal",
+        "entrypoints",
+        "validation"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响（变更仅在 scale_out 协议的 pydantic model 中添加验证逻辑，属于平台无关的 API 层，不涉及 vllm-ascend 接口面）",
+        "testing": "无影响",
+        "needs_test_update": false
+      },
+      "message": "Validate scale-out multimodal data before engine handoff (#51898)\n\nSigned-off-by: Clinton Thomas <1033162+KernelClint@users.noreply.github.com>\nCo-authored-by: Lucas Bourtoule <35483370+dhalf@users.noreply.github.com>"
+    },
+    {
+      "sha": "f2e2936f91a794513af74d009286c69e3fb2592b",
+      "comment": "为 NVIDIA A100 80GB PCIe 上 E=256、N=512 的 fused MoE kernel 新增 tuned config JSON 文件。配置覆盖 1~4096 的 token 数范围，为每个规模选择最优的 BLOCK_SIZE_M/N/K、GROUP_SIZE_M、num_warps、num_stages 组合。这是纯数据变更，仅影响使用该设备名和模型规模的 MoE 路径，其他设备/规模回退到默认配置或既有 tuned config。",
+      "tags": [
+        "performance",
+        "low-risk",
+        "model",
+        "kernel",
+        "moe",
+        "tuned-config"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响（NVIDIA A100 特定 tuned config，vllm-ascend 不使用此配置）",
+        "testing": "无影响",
+        "needs_test_update": false
+      },
+      "message": "[Kernel] Add fused MoE tuned config for E=256,N=512 on NVIDIA A100 80GB PCIe (#55511)\n\nSigned-off-by: Baki Burak Ogun <63836730+bakiburakogun@users.noreply.github.com>"
+    },
+    {
+      "sha": "1c344ed41e1e3bd44d5836fbcf5ddceb56ef5ab9",
+      "comment": "为 Intel Diamond Rapids (DMR) CPU 新增原生 AMX-FP8 attention 实现，支持 FP8 KV cache（E4M3/E5M2）。核心实现 csrc/cpu/cpu_attn_amx_fp8.hpp（约 800 行）使用 _tile_dpfp8ps/_tile_dpbf8ps 原生 FP8×FP8 MMA 完成 QK 和 PV 阶段，softmax 概率预量化为 FP8 供 PV 复用。配套改动：CMake 增加 -mamx-fp8 编译选项检测（ENABLE_AMX_FP8 开关）、ISA 枚举新增 AMX_FP8 并带运行时 CPUID 检查、dispatch 代码生成器为 AMX_FP8 生成条件编译 fallback 到 AMX、CPU Docker 构建升级到 Ubuntu 25.04 + GCC 15（含 GCC 15 tree-ssa-pre 优化器崩溃 workaround -fno-tree-pre）。同时更新了 CPU attention benchmark 和测试。该变更完全限定在 CPU 平台，是 vLLM 多 ISA 支持体系的一部分。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "attention",
+        "cpu",
+        "kernel",
+        "build",
+        "fp8"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响（变更全部位于 csrc/cpu/、cmake/cpu_extension.cmake、docker/Dockerfile.cpu 及 CPU 相关测试/benchmark，属于 CPU 平台专属实现，与 vllm-ascend 的 NPU 平台无交集）",
+        "testing": "无影响",
+        "needs_test_update": false
+      },
+      "message": "[CPU] [Feat]  Add native AMX-FP8 attention impl for Diamond Rapids (#49410)\n\nSigned-off-by: zhejiangxiaomai <zhenhui.zhao@intel.com>"
+    },
+    {
+      "sha": "039ea82660621a9668c7d7e81c7144b6f2f75011",
+      "comment": "修改 DP（Data Parallel）引擎的 finish-sync 时序：在 wave 的第一次 step 就执行 DP 状态同步，而不是等满 dp_sync_interval 步。新增 ParallelConfig.dp_sync_interval 配置项（默认 16）及 --dp-sync-interval CLI 参数。核心场景是 idle pause：pending_pause 的引擎在 kick-start 后需要一次 dummy batch 达成 pause consensus，如果在 step 1 就 sync，则无需等待完整 interval，可显著缩短异步 RL 场景中 wave 末尾的 pause 尾延迟。实现上仅修改了 _has_global_unfinished_reqs 的同步条件（step_counter == 1 时也同步），通信开销增加一次 all-reduce，但对吞吐影响很小。测试覆盖了 normal wave、idle pause consensus 和默认间隔值回归。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "distributed",
+        "engine-core",
+        "config",
+        "dp"
+      ],
+      "ascend_impact": {
+        "ascend_affected": true,
+        "functionality": "ParallelConfig 新增 dp_sync_interval 字段（默认 16），DPEngineCoreProc._has_global_unfinished_reqs 改为在 step 1 即执行 DP 状态同步。vllm-ascend 的 NPUWorker 支持 DP 场景（处理 DP local_rank 偏移），使用标准 DPEngineCoreProc 时该行为变化自动作用于 Ascend 平台。由于新字段有默认值且行为对所有平台一致，vllm-ascend 无需修改代码适配，但若 AscendConfig 或 NPUPlatform.check_and_update_config 中有对 ParallelConfig 的严格字段验证，需确认不拒绝未知字段。",
+        "testing": "vLLM 上游新增了 test_dp_sync_interval_default_is_16、test_dp_sync_interval_normal_wave 和 test_dp_sync_interval_idle_pause_consensus_on_first_step 覆盖新行为。vllm-ascend 无需新增测试用例，但 DP 模式下的现有测试应能自动获得新行为覆盖。",
+        "needs_test_update": false
+      },
+      "message": "[Core] Sync DP state on the first step of a wave (#52957)\n\nSigned-off-by: aoshen02 <aoshen@inferact.ai>",
+      "deep_analysis": {
+        "ascend_affected_confirmed": true,
+        "affected_interfaces": [
+          "vllm_ascend/patch/platform/patch_balance_schedule.py::BalanceDPEngineCoreProc::_has_global_unfinished_reqs",
+          "vllm_ascend/patch/platform/patch_dyntra_lb_core.py::DyntraLBDPEngineCoreProc (and _has_global_unfinished_reqs_with_diagnostics, step_counter usage)",
+          "tests/e2e/pull_request/two_card/aclgraph/test_aclgraph_capture_replay.py (hardcoded 32-step DP sync cadence in expected execution counts)",
+          "vllm_ascend/patch/__init__.py (docstring reference to DPEngineCoreProc)"
+        ],
+        "adaptation_effort": "low",
+        "adaptation_guide": "The commit changes DPEngineCoreProc._has_global_unfinished_reqs in vllm/v1/engine/core.py: the finish-sync all-reduce now runs on step 1 and every dp_sync_interval steps (new ParallelConfig field, default 16) instead of hardcoded every 32 steps. No method signature or return-contract change, so vllm-ascend's overrides compile unchanged, but the behavioral cadence of the cross-rank collective they piggyback on changed. Required work:\n\n1. Update stale docstrings in vllm_ascend/patch/platform/patch_balance_schedule.py (module docstring ~line 34 and BalanceDPEngineCoreProc class docstring ~line 853) that state 'an all-reduce every 32 steps internally' - now step-1 + every dp_sync_interval (default 16). The BalanceDPEngineCoreProc._has_global_unfinished_reqs hook (super() then scheduler.balance_gather()) stays correct: super() is still called every non-idle iteration and still returns the same bool; the step-1 all-reduce now always runs, and since every rank executes identical code the lock-step region for balance_gather is preserved.\n\n2. Update tests/e2e/pull_request/two_card/aclgraph/test_aclgraph_capture_replay.py: the 'aligned_steps = (total_steps + 31) // 32 * 32' computation (with comment 'vLLM synchronizes globally every 32 steps') will produce wrong expected model-execution counts under the new cadence (sync at step 1, 16, 32, ...). Recompute alignment from the new semantics or make it read ParallelConfig.dp_sync_interval.\n\n3. Re-run the DP balance-scheduling test suites to validate no deadlock/alignment regression from the more frequent all-reduces: tests/ut/patch/platform/test_patch_balance_schedule.py, tests/ut/patch/platform/test_patch_dyntra_lb_core.py (asserts _has_global_unfinished_reqs exists - still true), and DP2 e2e balance tests.\n\n4. No changes needed for DyntraLBDPEngineCoreProc.run_balance_load's step_counter >= self._lb_start_step gate: step_counter still increments once per call and _lb_start_step is an absolute user step count, unaffected.\n\n5. Note performance consideration: default all-reduce cadence doubled from 32 to 16 steps, increasing HCCL cross-DP communication frequency on NPU; the new --dp-sync-interval flag can tune this. vllm-ascend does not need to override/disable it in NPUPlatform (additive pydantic field with default is backward compatible; platform.py's getattr-based parallel_config tweaks are unaffected).",
+        "risk": "Low. No API/signature break - vllm-ascend's overrides of _has_global_unfinished_reqs (patch_balance_schedule.py, patch_dyntra_lb_core.py) still bind and call super() correctly, and parallel_config.dp_sync_interval is guaranteed by a pydantic default. Residual risks: (a) the e2e aclgraph_capture_replay alignment formula hardcodes the old 32-step cadence and will compute wrong expected execute_model counts until updated; (b) doubled default sync frequency (32->16) raises HCCL collective overhead and slightly changes the rhythm balance_gather runs in - needs a DP regression run to confirm the balance scheduling lock-step/deadlock-avoidance invariant still holds on NPU; (c) stale 'every 32 steps' comments could mislead future maintainers."
+      }
+    },
+    {
+      "sha": "f4eccdadefc6501fafeb1a0bf7f171ff24f984b0",
+      "comment": "修复多模态 renderer warmup 不受 prefill token budget 约束的问题。原实现在 get_dummy_mm_inputs 中直接使用 model_config.max_model_len 作为 seq_len，在启用 chunked prefill 的超长上下文模型（如 491520 token）上会生成超大 dummy 输入，导致 warmup 内存超限或耗时过长。修复方式：get_dummy_mm_inputs 新增可选 scheduler_config 参数，当 enable_chunked_prefill 时将 seq_len 截断为 max_num_batched_tokens；BaseRenderer.warmup 改为通过 MultiModalRegistry.get_dummy_mm_inputs 获取 dummy 输入（传入 scheduler_config），不再直接调用 processor.dummy_inputs.get_dummy_processor_inputs。参数向后兼容（默认为 None），不影响现有调用方。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "multimodal",
+        "renderer",
+        "warmup"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响（get_dummy_mm_inputs 新增可选参数 scheduler_config（默认 None），向后兼容；renderer warmup 行为改进对所有平台一致，vllm-ascend 无需适配）",
+        "testing": "无影响",
+        "needs_test_update": false
+      },
+      "message": "[Bugfix][Multimodal] Bound renderer warmup to the prefill token budget (#55448)\n\nSigned-off-by: Luca Motz <luca.motz@icloud.com>\nCo-authored-by: OpenAI Codex <codex@openai.com>"
+    }
+  ],
+  "architecture_based_on_sha": "7154856f3dcb1d3fdd5a136f7d2c5987f22244f5",
+  "architecture_generated_at": "2026-08-01T20:25:03.691327+08:00"
+}

@@ -1,0 +1,1056 @@
+{
+  "date": "2026-09-10",
+  "repo": "vllm-project/vllm",
+  "generated_at": "2026-09-11T04:35:06.070703+08:00",
+  "daily_summary": "当日 vLLM 变更主要集中在新模型支持与性能优化：新增 DeepSeek-V4.1-Flash 模型（NVIDIA/AMD 稀疏 MLA + DSpark + Engram + MHC，约 1.3 万行）和 Bailing Moe V3 VL 多模态模型；性能优化包括 DCP attention A2A pack 空 shard 掩码内核融合、MRV2 输入暂存写入的 UVA 零拷贝、Kimi K3 KDA 混合 batch 免重排（吞吐提升 5%~8%）；功能增强包括 Fast Start 权重缓存支持 FP4（NVFP4/MXFP4）、Nemotron-H MTP 独立量化 LM head；另有一批 bugfix（CLI falsy 参数、CUTLASS workspace 过度分配、Qwen3-VL PP 架构解析、NIXL PCP 发送完成上报、XPU Ernie4.5/FalconH1、CPU CI/构建）以及 R/S 模型 mypy 类型修复。",
+  "ascend_impact_summary": "当日 vllm 变更对 vllm-ascend 的整体影响有限。需要关注两点：(1) DCP A2A pack kernel 将空 shard LSE 掩码融合进 Triton kernel（vllm/v1/attention/ops/dcp.py），vllm-ascend 若复用 _dcp_a2a_pack_send 并启用掩码，需验证 NPU Triton 兼容性；(2) DeepSeek-V4.1-Flash 对共享 sparse_attn_indexer 新增可选 candidate_blocks 参数（两阶段候选过滤），并对 deepseek_v4 公共算子/sparse_swa 做了向后兼容扩展，现有 Ascend DeepseekV4/DSA 实现不受破坏，但支持 V4.1 需在 vllm_ascend/models/ 下新增实现。其余变更（CUTLASS MoE、NVFP4/MXFP4 Fast Start、Kimi K3、NIXL、XPU/CPU 平台修复、Bailing V3 VL、Qwen3-VL/CLI 等）均为平台特定代码、新增模型或通用小修，不影响 vllm-ascend。",
+  "commits": [
+    {
+      "sha": "6ee5bb0a0b3e32dd1a6d9fddb61b50905ccdd6e0",
+      "comment": "将 DCP（DeepContext Parallel）注意力 A2A pack 流程中空 shard 的 LSE 掩码从独立的 eager pass 融合进 Triton pack kernel。变更重构出 `_validate_dcp_empty_shard_args` 做参数校验（返回是否启用掩码），并在 kernel 内通过 searchsorted 风格边界查找将 -inf 写入空请求/越界 padding 行的 LSE 槽位，避免每个 MLA 层启动约 8 个 launch-bound 掩码 kernel。测试覆盖 uniform/ragged query 布局并验证融合结果与 eager 路径逐位一致（int16 位级比较）。接口签名不变，但启用掩码时的执行路径从 eager 切到 kernel 内融合。",
+      "tags": [
+        "performance",
+        "attention",
+        "medium-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "vllm/v1/attention/ops/dcp.py 为 DCP 注意力共享算子文件（vllm-ascend 的 DCP/上下文并行后端复用该模块）。本次将空 shard 的 LSE 掩码从 eager pass 移入 Triton pack kernel：当调用方传入 seq_lens/query_start_loc 时，_dcp_a2a_pack_send 不再先调用 mask_dcp_empty_shards_，而是在 kernel 内以 HAS_MASK 分支完成掩码。vllm-ascend 若在 NPU 上以启用掩码的方式调用该函数，执行路径发生变化，需确认 Triton kernel 在 NPU 上的兼容性与正确性（上游测试仅覆盖 CUDA/ROCm）。",
+        "testing": "上游新增 tests/v1/attention/test_dcp_a2a_pack_mask.py，通过 is_cuda_alike() 跳过非 CUDA/ROCm 平台；vllm-ascend 无对应测试。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[DCP][Kernel][Perf] Fuse the empty-shard LSE mask into the A2A pack kernel (#54889)\n\nSigned-off-by: Rita Brugarolas Brufau <rita.brugarolasbrufau@amd.com>\nCo-authored-by: mergify[bot] <37929162+mergify[bot]@users.noreply.github.com>",
+      "deep_analysis": {
+        "ascend_affected_confirmed": false,
+        "affected_interfaces": [],
+        "adaptation_effort": "low",
+        "adaptation_guide": "",
+        "risk": ""
+      }
+    },
+    {
+      "sha": "bdea2777eaeab65937dffdbdcb372b03e2cad441",
+      "comment": "修复 `CutlassBatchedExpertsFp8` 计算 workspace 维度时错误乘以 `num_dispatchers`，导致 workspace 过度分配的问题。workspace1/workspace2 的 M 维度直接使用单次调度的 token 数 M，而非 M * num_dp。属于 CUDA CUTLASS 专家内核的局部修正。",
+      "tags": [
+        "bugfix",
+        "moe",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Bugfix][MoE] Fix batched CUTLASS workspace overallocation (#55579)\n\nSigned-off-by: Itay Alroy <ialroy@nvidia.com>\nCo-authored-by: Tyler Michael Smith <tlrmchlsmth@gmail.com>"
+    },
+    {
+      "sha": "db723d245a2ed029c9fdb21e8c51a57fd4980f8a",
+      "comment": "OpenAI CLI 的 Chat/Complete 子命令将 `if args.quick:` / `if args.max_tokens:` 改为 `is not None` 判断，使显式传入的空字符串、0 等 falsy 值能被正确透传给 API，避免用户显式清空/置零参数被静默忽略。",
+      "tags": [
+        "bugfix",
+        "cli",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Bugfix] Honor explicit empty and zero CLI arguments (#55710)\n\nSigned-off-by: Cenab Batu Bora <40250311+cenab@users.noreply.github.com>\nCo-authored-by: Codex <noreply@openai.com>"
+    },
+    {
+      "sha": "46bae7e98c353bc64dd762f3ebac70165f1027d9",
+      "comment": "CPU CI 构建脚本与 Dockerfile 修复：`docker builder prune --keep-storage` 在 dockerd 内置 BuildKit 下无效，改为 `docker system prune --filter until=`；rust 下载重试模式增加 PROTOCOL_ERROR；triton-cpu 构建迁移到独立的 vllm-triton-cpu-build stage 并从 base-common 分支，避免 torch 版本变更使其缓存失效；CI 测试默认 HF_HUB_OFFLINE，缓存缺失时在线重试。同时 CPUWorker 新增 `_should_warm_up_model()`：eager 模式且显式指定 KV cache 大小时跳过 warmup，节省 CI 时间。这些变更只涉及 CPU 平台与 CI 基础设施。",
+      "tags": [
+        "ci",
+        "build",
+        "bugfix",
+        "cpu",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[CI/Build][CPU] Fix flaky rust downloads, broken prune flag, and triton-cpu cache coupling (#56247)\n\nSigned-off-by: jiang1.li <jiang1.li@intel.com>"
+    },
+    {
+      "sha": "2e0ee66cab1e7a0fd2ccfb0992a0e4b5e940196d",
+      "comment": "MRV2 输入暂存写入优化：StagedWriteTensor 在启用 uva_instead_of_gpu 时用 UvaBufferPool 承载 write contents，通过 CPU→UVA 映射零拷贝替代每步 async_tensor_h2d 的 H2D 拷贝；UvaBufferPool 按 2 的幂增长第一维，round-robin 槽位复用前要求 GPU reader 通过事件同步退休。测试覆盖跨代 inflight、增长/收缩长度、out= 复用与 shape 保持。默认关闭的 UVA 加速路径，非 UVA 平台行为不变。",
+      "tags": [
+        "performance",
+        "model-runner",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Perf] Use UVA-backed contents for MRV2 apply_write (#55819)\n\nSigned-off-by: bjf-frz <frz123db@gmail.com>\nCo-authored-by: Nick Hill <nickhill123@gmail.com>"
+    },
+    {
+      "sha": "7d8d71e9897e44f0b148cec117291387ea26ed33",
+      "comment": "Qwen3-VL / Qwen3-VL-MoE 在流水线并行下构造子语言模型时，向 with_hf_config 显式传入 architectures（Qwen3ForCausalLM / Qwen3MoeForCausalLM），确保子模型能按正确架构名解析到 vLLM 注册实现，修复 PP 场景下的模型构建失败。",
+      "tags": [
+        "bugfix",
+        "model",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Bugfix] Qwen3-VL(-MoE): pass architectures to with_hf_config for pipeline parallelism (#43272)\n\nSigned-off-by: Xonder <xonder@gmail.com>\nCo-authored-by: Claude <noreply@anthropic.com>"
+    },
+    {
+      "sha": "364679feabbbd0243ca97095cab1fe3dcbf782f4",
+      "message": "[CI] Enable ruff `INP` to require `__init__.py` under `vllm/` (#56264)\n\nSigned-off-by: Harry Mellor <19981378+hmellor@users.noreply.github.com>\nCo-authored-by: Claude Opus 5 (1M context) <noreply@anthropic.com>",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "chore"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "f9083cb83af44debe290f3753ca2effc292ea1c1",
+      "comment": "为 R/S 字母开头的模型文件（radio/roberta/sarvam/siglip/skyworkr1v/solar/step3*/step_vl 等）补齐 mypy 类型标注并移除 mypy exclude 规则：包括把 multimodal_config 属性访问改为 get_multimodal_config()（带断言收窄 Optional）、显式类型标注各种 params_mapping 列表、supports_pp 断言等。另有少量重构（如删除 SarvamMixtureOfExperts 中未用的 set_eplb_state 覆写、registry.py 对 transformers 模型类的类型收窄）。基本为编译期类型修复，运行时行为不变。",
+      "tags": [
+        "refactor",
+        "model",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Mypy] Fix typing for R/S models (#54157)\n\nSigned-off-by: Taneem Ibrahim <taneem.ibrahim@gmail.com>"
+    },
+    {
+      "sha": "73fb19151f4ff461196d7fb5d82e9cb4d57234f6",
+      "comment": "Fast Start（权重缓存 IPC 加载）扩展支持 FP4 量化：IPC 导出 allowlist 加入 modelopt_fp4 与 mxfp4（Kimi-K3 的 MXFP4-pack 路由专家）；ModelOptNvFp4FusedMoE/Mxfp4MoEMethod 声明 supports_pre_processed_weights，预处理权重直接构建 MoE kernel 并跳过重复打包；NVFP4 线性 kernel 的 padding 字节改为从 weight.shape[1] - input_size//2 推导，不再依赖 layer 属性。权重缓存 daemon 就绪检测从日志行改为轮询 socket 文件（避免 JIT 编译器吞日志导致误判）。Kimi-K3 MegaMoE 权重缓存引擎复用零拷贝转换后的 buffer。整体为 NVIDIA Fast Start 特性增强，测试仅 CUDA/ROCm。",
+      "tags": [
+        "feature",
+        "quantization",
+        "model-loader",
+        "medium-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Fast Start] Support fp4 (#55465)\n\nSigned-off-by: Isotr0py <Isotr0py@outlook.com>\nCo-authored-by: Isotr0py <Isotr0py@outlook.com>"
+    },
+    {
+      "sha": "40e6042ec83eb8f2971f21043a5da40496bd188a",
+      "comment": "Nemotron-H MTP 推测解码支持独立（可量化）的 lm_head：MTP 预测器从 draft_model_config 读取配置、通过 get_draft_quant_config 解析量化配置、ParallelLMHead 传入 quant_config；权重加载时识别 lm_head.* 并做 KV scale 名称重映射，无独立 lm_head 的旧权重通过 loaded_params 补齐。SpeculativeConfig.compute_hash 现在只要存在 draft_model_config 就纳入其 hash（不再要求 uses_aux_hidden_states），使 MTP 计算图变化能正确反映到编译缓存键。",
+      "tags": [
+        "feature",
+        "spec-decode",
+        "config",
+        "medium-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Feature][Spec Decode] MTP with separate (possibly quantized) lm head for nemotron (#54574)\n\nSigned-off-by: Yoav Miron <yomiron@nvidia.com>\nSigned-off-by: YoavMiron <yomiron@nvidia.com>\nCo-authored-by: Benjamin Chislett <chislett.ben@gmail.com>"
+    },
+    {
+      "sha": "9b959b86577c082c0b2bf9e2c22263255a36ad83",
+      "comment": "新增 DeepSeek-V4.1-Flash 模型定义（约 1.3 万行，47 个文件），含 NVIDIA/AMD 分支：稀疏 MLA 压缩 cache（compress_ratio 0/1/2，kv/index source 层拓扑）、FlashMLA 与 FlashInfer SM100/SM120 后端、DSpark 半自回归推测解码（MTP 权重前缀复用）、Engram n-gram hash 注入、MHC 延迟 pre-mix 与两阶段 candidate block 过滤（candidate_blocks 写入/掩码）。新增 vllm/models/deepseek_v4_1/ 目录、DSA candidate_blocks Triton kernels、MHC warmup 框架。对共享代码的改动均向后兼容：sparse_attn_indexer 增加可选参数、fused_inv_rope_fp8_quant 增加 quantize 开关、sparse_swa.py 增加 C1A/C2A 层类型与可配置 block_size。",
+      "tags": [
+        "feature",
+        "model",
+        "attention",
+        "moe",
+        "medium-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": true,
+        "functionality": "新增 DeepSeek-V4.1-Flash 模型（NVIDIA/AMD），共享代码改动均向后兼容：vllm/model_executor/layers/sparse_attn_indexer.py（SparseAttnIndexer）新增可选参数 candidate_blocks/candidate_block_size/candidate_write，并将 candidate_blocks 加入 custom op 的 mutates_args，不影响 vllm-ascend DSA/SFA 现有调用；vllm/v1/attention/backends/mla/sparse_swa.py 新增 C1A/C2A 层类型、DeepseekV4SWACache 可配置 block_size（默认 64）、get_prefill_chunk_plan 的 has_compressed 参数（带默认值）；vllm/models/deepseek_v4/common/ops/fused_inv_rope_fp8_quant.py 新增 quantize 参数。vllm-ascend 现有 DeepseekV4/DSA 实现不需要强制同步；若后续支持 V4.1，需在 vllm_ascend/models/ 下新增 NPU 实现并适配两阶段 candidate 过滤与稀疏 MLA 拓扑。",
+        "testing": "上游新增 DSA candidate_blocks Triton kernel 测试与 DeepSeek-V4.1 模型/解析器测试；vllm-ascend 现有测试不受影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Model] DeepSeek-V4.1-Flash Model Definitions (#56228)\n\nSigned-off-by: Roger Wang <hey@rogerw.io>\nSigned-off-by: zjy0516 <riverclouds.zhu@qq.com>\nCo-authored-by: Kimi Code <noreply@moonshot.cn>\nCo-authored-by: zjy0516 <riverclouds.zhu@qq.com>\nCo-authored-by: Codex <noreply@openai.com>"
+    },
+    {
+      "sha": "e83d57d8ae14e240e2779c37db58b6dacd21bab2",
+      "message": "[Doc] Sync KV event medium terminology after #48123 (#51646)\n\nSigned-off-by: Alex <jihui.huang@daocloud.io>\nCo-authored-by: Claude Opus 5 (1M context) <noreply@anthropic.com>\nCo-authored-by: Or Ozeri <oro@il.ibm.com>",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "chore"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "93911fcf68117f25a6a13942804f8c51dc31d465",
+      "comment": "NIXL PCP 复制语义修复：pull_worker 中 PCP rank>0 的副本不实际传输，但会把 metadata.reqs_to_send 加入 _replicated_pcp_done_sending，在 get_finished() 中立即上报为已完成发送，而不是像之前那样在 connector 层直接 done_sending.clear() 隐藏非零 rank。这样 scheduler 端按 world_size 聚合发送完成状态、以及 MultiConnector 内 sibling connector 的等待都能正确结束；同时移除 get_finished_count 的 PCP 特判。",
+      "tags": [
+        "bugfix",
+        "kv-transfer",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[NIXL][PCP] Report replicated-PCP ranks > 0 as done sending instead of hiding them (#53903)\n\nSigned-off-by: Lucas Wilkinson <lwilkinson@neuralmagic.com>\nSigned-off-by: Lucas Wilkinson <LucasWilkinson@users.noreply.github.com>\nSigned-off-by: Lucas Wilkinson <lwilkins@redhat.com>\nCo-authored-by: Nicolò Lucchesi <nicolo.lucchesi@mistral.ai>"
+    },
+    {
+      "sha": "08426d51ef1dd2b86921b9810e9d8b966f97a63a",
+      "message": "[Docs][Security] Clarify reporter credit and CVE publication timing (#55476)\n\nSigned-off-by: Juan Pérez de Algaba <jperezde@redhat.com>\nCo-authored-by: Cursor <cursoragent@cursor.com>",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "chore"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "86aca6619161b308d675c753f228201e70b59ed7",
+      "comment": "Kimi K3 KDA 优化：当 spec 与非 spec token 在 metadata 中连续排布时（spec_token_start/non_spec_token_start 非空），直接对 QKV/gate 张量切片运算并写入 core_attn_out 对应切片，替代原先的 gather/scatter + index_copy_ 重排，E2E 吞吐提升 5.2%~7.7%；chunk/recurrent KDA 内核新增 out 参数支持预分配输出缓冲。属于 NVIDIA Kimi K3 模型内的性能优化。",
+      "tags": [
+        "performance",
+        "model",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Kimi K3 Perf] Avoid KDA mixed-batch gather/scatter, 5.2%~7.7% E2E Throughput Improvement (#56159)\n\nSigned-off-by: yewentao256 <zhyanwentao@126.com>"
+    },
+    {
+      "sha": "c9355e25e8cfdc0548a5034f7bc148e1760e82d2",
+      "comment": "Ernie4_5_VLRotaryEmbedding 增加 forward_xpu 覆写：基类 MRotaryEmbedding.forward_xpu 会转发一个 offsets 参数，与本类的 forward_cuda 签名不兼容，XPU 上直接走 forward_native。XPU 平台专用 bugfix。",
+      "tags": [
+        "bugfix",
+        "xpu",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[XPU][Bugfix] Add forward_xpu to Ernie4_5_VLRotaryEmbedding (#55942)\n\nSigned-off-by: Jakub Byczkowski <jakub.byczkowski@intel.com>\nCo-authored-by: Copilot <175728472+Copilot@users.noreply.github.com>"
+    },
+    {
+      "sha": "6fd08c45e696999b403b64835ae44d322efaab35",
+      "comment": "修复 FalconH1 在 pipeline parallel 下的执行：make_empty_intermediate_tensors 只保留 hidden_states、去掉 residual，因为 FalconH1ParallelHybrid 每层内部重算 residual，不会跨 PP 边界传递。XPU 平台报告并验证的 bugfix，同样适用于其他平台。",
+      "tags": [
+        "bugfix",
+        "model",
+        "xpu",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[XPU][Bugfix] Fix FalconH1 pipeline-parallel execution (#55913)\n\nSigned-off-by: Jakub Byczkowski <jakub.byczkowski@intel.com>\nCo-authored-by: Copilot <175728472+Copilot@users.noreply.github.com>\nCo-authored-by: Kunshang Ji <kunshang.ji@intel.com>"
+    },
+    {
+      "sha": "fe26c705f7099da3b155b3cb6218f013bb308e63",
+      "comment": "新增 Bailing Moe V3 VL（Ling 3.0 Flash VL）支持：自定义 BailingMoeV3VLConfig/文本/视觉配置（含 layer_group_size 层类型生成、M-RoPE section 校验）、BailingMRotaryEmbedding（H/W 频率交替 + T 尾部 GPT-J 风格 M-RoPE，含 Triton 融合 kernel）、Qwen3 ViT 变体 + 参数无关 patch merger、TP 投影器、多模态 processor 的 prompt 展开（占位符换行合并）、模型注册与 SpeculativeConfig MTP draft 配置拆解；Ling3 推理 parser 修正截断 reasoning 仍归为 reasoning。新增模型，不影响既有实现。",
+      "tags": [
+        "feature",
+        "model",
+        "multimodal",
+        "medium-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Model] Add Bailing V3 VL support (#55921)\n\nSigned-off-by: zexplorerhj <zhjoneson@163.com>\nCo-authored-by: Codex <noreply@openai.com>\nCo-authored-by: mergify[bot] <37929162+mergify[bot]@users.noreply.github.com>"
+    },
+    {
+      "sha": "6ff479e1f798048829f884b4229f28c9b9b0c8d7",
+      "comment": "改进 ROCm 平台在 attention 后端选择失败时的错误信息：当没有任何有效后端时，列出支持该 kv cache dtype 的备选后端，提升可诊断性。纯错误提示变更，不影响运行逻辑，也不涉及 Ascend。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "platform"
+      ],
+      "message": "[ROCm] Add better kv dtype error discoverability (#55236)\n\nSigned-off-by: Giuseppe Grossi <ggrossi@amd.com>"
+    },
+    {
+      "sha": "b28c3e1568bfae930f61d4b24940e47528c85d4a",
+      "comment": "修复 EAGLE 场景下，当 prompt 长度是 block 对齐时，重发相同请求无法命中缓存的问题。原逻辑只保留一个 replay boundary（对齐位置下方一格），但相同请求重放（capped at num_tokens-1）和更长 sibling（匹配最后一个对齐 block）需要两个不同的边界。将 get_replay_boundary 改为 get_replay_boundaries 返回多个位置，并更新 cache_blocks 接口接受 replay_boundaries 序列。实现正确，但接口变更影响所有调用方（单类型 manager 及 Hybrid coordinator），需要同步更新。风险中等偏低，因行为更准确，但涉及 KV cache 核心保留逻辑，测试覆盖了关键场景。",
+      "tags": [
+        "bugfix",
+        "kv-cache",
+        "eagle",
+        "prefix-caching",
+        "medium-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。修改的是 vllm/v1/core 下 KV cache coordinator 和 SingleTypeKVCacheManager 的内部接口，vllm-ascend 不覆写这些类，也不直接调用 cache_blocks 的 replay_boundary 参数；Ascend 沿用 vLLM 默认 KV cache 管理器，仅随上游同步更新即可。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[BugFix] Retain both replay boundaries so an EAGLE resend of a block-aligned prompt still hits (#54713)\n\nSigned-off-by: tobymao <toby.mao@gmail.com>"
+    },
+    {
+      "sha": "1768273c13d8e083aa07d48f0fb79c05cec39df5",
+      "comment": "GLM-5.3-Flash 解码热路径优化：MLAAttention 中对 NoPE 模型（q_pe 维度为 0）且 ql_nope 连续时直接复用该张量避免无意义的 concat，同时为 FlashInfer 稀疏 MLA 增加 DCP 解码相关元数据；此外新增 GLM5Next 专用 kernel 与 CI 测试。行为向后兼容，性能优化为主；对 Ascend 共享 MLAAttention 层基本无影响，Ascend 有独立的 MLA 后端，不依赖 FlashInfer 路径。",
+      "tags": [
+        "performance",
+        "low-risk",
+        "attention"
+      ],
+      "message": "[Perf][GLM-5.3-Flash] Decode hot-path cleanups: strided KDA recurrent inputs, NoPE MQA query without concat, no duplicate router GEMM (#55736)\n\nSigned-off-by: Jared Wen <jaredwen@inferact.ai>\nCo-authored-by: Claude Fable 5.1 <noreply@anthropic.com>"
+    },
+    {
+      "sha": "b47b01cf3383d50a5fae8569cadcbd0736076234",
+      "comment": "为 DeepSeek-V4.1 提供完整的前后端支持，包括 Rust/Python 前端、tokenizer、parser、模型实现、多模态预处理、通用配置注册，并在 ModelConfig 中新增 deepseek_v41 tokenizer 模式。这是大型新特性，不修改现有接口，但新增的配置/架构分支会影响所有平台的模型加载路径。由于 Ascend 平台有自己的 DeepSeek 模型注册与实现，该提交不直接影响 vllm-ascend；未来若要支持 V4.1 模型需自行适配。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "model",
+        "tokenizer"
+      ],
+      "message": "[Model][Frontend] Support DeepSeek-V4.1-Flash in Rust and Python frontends (#56208)\n\nSigned-off-by: Bugen Zhao <i@bugenzhao.com>\nCo-authored-by: Isotr0py <Isotr0py@outlook.com>"
+    },
+    {
+      "sha": "9521c60bdc0ccd1264961c284c64f4873335aed1",
+      "comment": "重新合入 Kimi-K3 KDA 的 fused prefill kernel：新增 2346 行 HIP/C++ 内核、CMake 构建集成、torch bindings 与大量测试，并新增 --kda-prefill-backend=fused 选项。仅针对 ROCm gfx950，属于硬件专属性能优化；对 Ascend 无影响。",
+      "tags": [
+        "performance",
+        "low-risk",
+        "rocm-kernel"
+      ],
+      "message": "[ROCm][Perf] Kimi-K3 Fused kernels for KDA prefill reland (#54038)\n\nSigned-off-by: kliuae <kuanfu.liu@embeddedllm.com>\nSigned-off-by: tjtanaa <tunjian.tan@embeddedllm.com>\nSigned-off-by: kliuae <17350011+kliuae@users.noreply.github.com>\nCo-authored-by: Claude <noreply@anthropic.com>\nCo-authored-by: TJian <tunjian.tan@embeddedllm.com>"
+    },
+    {
+      "sha": "be1cb9834b3d74114f4d426068d2bce57c9912a0",
+      "message": "[Kernel] Optional Q-norm in fused DSv4 MLA epilogue; group_size=32 for packed FP8 quant (#56215)\n\nSigned-off-by: Yongye Zhu <zyy1102000@gmail.com>\nCo-authored-by: Claude Opus 5 (1M context) <noreply@anthropic.com>",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "chore"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "9e2570656013a90cb601b391723af4bf9b3207d4",
+      "comment": "容忍拼写错误的 DSML tool_calls 包装器：扩展 parser 的 terminal 定义支持一个 terminal 对应多种拼写（如 <toolcalls> 与 <tool>），新增 terminal_literal/terminal_literals 辅助属性并重构相关调用点。这是 parser 引擎内部的兼容性增强，平台无关；Ascend 未自定义 parser，也没有直接依赖，影响可以忽略。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "parser"
+      ],
+      "message": "[Bugfix] Tolerate misspelled DSML tool_calls wrapper (#56141)\n\nSigned-off-by: sfeng33 <4florafeng@gmail.com>"
+    },
+    {
+      "sha": "83990f5bcc0b5eb08b2f1fd1b109fa8a31b122f3",
+      "comment": "修复 MRV2 下 DCP 元数据在 batch 分区后初始化的 bug：避免使用分区前过期的 dcp_local_seq_lens；将 cp_utils.prepare_dcp_local_seq_lens 重命名为 maybe_prepare_dcp_local_seq_lens，修改签名并调整 GPUModelRunner、CUDAGraph 实用工具、PCP 管理器、DFlash 和 speculator 的调用点。该提交直接命中 vllm/v1/worker/gpu/model_runner.py 这一必然影响路径，NPUModelRunner 作为其子类，执行路径会受到直接影响；需要同步检查 vllm-ascend 的 worker 级补丁（如对 prepare_inputs/prepare_attn 的覆盖）是否兼容新时序和函数名。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "model-runner"
+      ],
+      "ascend_impact": {
+        "ascend_affected": true,
+        "functionality": "GPUModelRunner 的 DCP 元数据初始化时机从 prepare_inputs 延迟到 prepare_attn，并新增 maybe_prepare_dcp_local_seq_n lens 替代旧函数，直接影响所有继承 GPUModelRunner 的实现（包括 NPUModelRunner）在 decode context parallel 场景下的行为；重命名也要求 Ascend 侧检查是否引用了旧函数名。",
+        "testing": "需要回归验证 Ascend DCP/上下文并行路径在新时序下正常；vllm 的测试已更新，Ascend 应补充或调整其集成测试。",
+        "needs_test_update": true,
+        "suggested_test_areas": [
+          "vllm-ascend DCP 相关测试",
+          "NPUModelRunner 集成测试",
+          "worker 级 patch 回归测试"
+        ]
+      },
+      "message": "[Bugfix][MRV2] Initialize DCP metadata after batch partitioning (#55212)\n\nSigned-off-by: Raphael Rialland <raphael.rialland@mistral.ai>\nSigned-off-by: Ziyang Zhang <hafuhafu@qq.com>\nSigned-off-by: Sy03 <1370724210@qq.com>\nCo-authored-by: Raphael Rialland <raphael.rialland@mistral.ai>\nCo-authored-by: Ziyang Zhang <hafuhafu@qq.com>\nCo-authored-by: Codex <noreply@openai.com>\nCo-authored-by: mergify[bot] <37929162+mergify[bot]@users.noreply.github.com>",
+      "deep_analysis": {
+        "ascend_affected_confirmed": true,
+        "affected_interfaces": [
+          "vllm_ascend/worker/v2/model_runner.py::AscendGPUModelRunner.prepare_inputs — imports `prepare_dcp_local_seq_lens` (renamed in this commit) and computes DCP local seq lens pre-partition",
+          "vllm_ascend/worker/v2/pcp_manager.py::AscendPCPManager.partition_batch — FULL-graph DCP padding/zeroing that depends on `local_batch.dcp_local_seq_lens` being non-None during partitioning",
+          "vllm_ascend/worker/v2/model_states/default.py::AscendModelState.prepare_attn — consumes `input_batch.dcp_local_seq_lens` (now populated post-partition by upstream)",
+          "vllm_ascend/worker/v2/attn_utils.py::build_attn_metadata / AscendCommonAttentionMetadata — downstream consumer of dcp_local_seq_lens"
+        ],
+        "adaptation_effort": "medium",
+        "adaptation_guide": "Commit 83990f5bcc0b renames `vllm.v1.worker.gpu.cp_utils.prepare_dcp_local_seq_lens` to `maybe_prepare_dcp_local_seq_lens`, adds a keyword-only `num_reqs_padded` arg, changes the return to the padded view (or None when dcp_size==1), and moves DCP metadata initialization from `GPUModelRunner.prepare_inputs()`/`PCPManager.partition_batch()` to after batch partitioning (injected in `GPUModelRunner.execute_model` right before `model_state.prepare_attn`, using `self.pcp_manager.input_buffers` when PCP is active). Adaptations required in vllm-ascend:\n1. `vllm_ascend/worker/v2/model_runner.py:32` — replace `from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens` with `maybe_prepare_dcp_local_seq_lens` (the old symbol no longer exists; this import currently raises ImportError and blocks MRV2 startup).\n2. `vllm_ascend/worker/v2/model_runner.py:432-442` (inside the `prepare_inputs` override) — delete the pre-partition DCP computation and pass `dcp_local_seq_lens=None` into `AscendInputBatch`. Keep parity with the fix: DCP-local seq lens must be computed from the post-partition `input_batch.seq_lens`/`num_reqs`. Since ascend does not override `GPUModelRunner.execute_model`'s new block nor `prepare_attn`, the base runner now populates `input_batch.dcp_local_seq_lens` (from `pcp_manager.input_buffers.dcp_local_seq_lens`) after partitioning and before `AscendModelState.prepare_attn` runs — verify this value flows through `model_states/default.py:94` and `attn_utils.py:280` unchanged.\n3. `vllm_ascend/worker/v2/pcp_manager.py:284-290` (`AscendPCPManager.partition_batch`) — after the base `PCPManager.partition_batch` forces `dcp_local_seq_lens=None`, the `if local_batch.dcp_local_seq_lens is not None` guard becomes always-false, so the FULL-decode-graph zeroing of `input_buffers.dcp_local_seq_lens[actual_reqs:graph_num_reqs]` is skipped. `maybe_prepare_dcp_local_seq_lens` only writes the first `num_reqs` rows, so the padded rows `[num_reqs:num_reqs_after_padding]` would retain stale values on graph replay. Reconcile this: either recompute/zero the DCP buffer after the base partition (matching the new helper's padded-view semantics) or move the padding into ascend's post-partition path so replay reads valid zeros.\n4. Do NOT adapt `flashinfer.py`/`cp_utils` internals: the FlashInfer changes (dcp_query_start_loc masking, `cp_kv_cache_interleave_size` rename, num_blocks ordering) are CUDA-only and vllm-ascend already uses `cp_kv_cache_interleave_size`. The ubatch_utils change (per-microbatch `ubatch_dcp_local_seq_lens` via `_slice_input_batch`) is inherited from the base `UBatchRunner`, which ascend does not override; no changes needed unless ascend adds its own ubatch slicing.\n5. Keep the unit tests in `tests/v1/worker/test_gpu_input_batch_v2.py` / `test_gpu_ubatch_slicing.py` in sync with the pinned vllm version used by vllm-ascend CI.",
+        "risk": "medium — DCP is only active when `decode_context_parallel_size > 1` (NPU attention backends such as SFA/MLA-CP consume `dcp_local_seq_lens` for cross-rank KV reduction masking). The hard ImportError in `model_runner.py:32` breaks the entire MRV2 worker until fixed, not just DCP runs. Beyond the rename, the main functional risk is stale/mis-padded `dcp_local_seq_lens` during FULL decode-only CUDA-graph replay: if the ascend-specific zeroing in `AscendPCPManager.partition_batch` silently stops executing (base now returns None), graph padding rows between `num_reqs` and `num_reqs_after_padding` may hold old values, yielding incorrect attention masks and wrong outputs on multi-rank DCP. A regression test exercising PCP+DCP under FULL_DECODE_ONLY graphs is recommended.",
+        "modules": [
+          "vllm/v1/worker/gpu/model_runner.py",
+          "vllm/v1/worker/gpu/cp_utils.py",
+          "vllm/v1/worker/gpu/pcp_manager.py",
+          "vllm/v1/worker/gpu/ubatch_utils.py",
+          "vllm/v1/worker/gpu/cudagraph_utils.py",
+          "vllm/v1/worker/gpu/spec_decode/speculator.py",
+          "vllm/v1/worker/gpu/spec_decode/dflash/cudagraph.py",
+          "vllm/v1/attention/backends/flashinfer.py"
+        ]
+      }
+    },
+    {
+      "sha": "912d2e79fe8571ded2fcc6ec669d26429f814d7b",
+      "comment": "为 AudioResampler 增加 torchaudio 后端，并将默认 resample 方法从 pyav 改为 torchaudio；同时更新了多模态数据解析流程与单元测试。这是默认行为变更，对未安装 torchaudio 的环境需要兼容，但接口不变；Ascend 无破坏性影响。",
+      "tags": [
+        "feature",
+        "low-risk",
+        "multimodal"
+      ],
+      "message": "[multimodal][feat] add torchaudio backend to AudioResampler (#52598)\n\nSigned-off-by: JaredforReal <w13431838023@gmail.com>\nSigned-off-by: Isotr0py <Isotr0py@outlook.com>\nCo-authored-by: Isotr0py <Isotr0py@outlook.com>\nCo-authored-by: mergify[bot] <37929162+mergify[bot]@users.noreply.github.com>"
+    },
+    {
+      "sha": "7e917606504f48f22491eb9d04ce50c28618d45f",
+      "comment": "为 ROCm gfx950 上大型 DSV4 稀疏 prefill 增加 AITER OPUS 内核路由：新增 pa_sparse_prefill_opus 的 gating/fallback 逻辑及测试。纯 AMD 平台特定代码，不影响 Ascend。",
+      "tags": [
+        "performance",
+        "low-risk",
+        "rocm-kernel"
+      ],
+      "message": "[ROCm][Perf] Route large DSV4 sparse prefill to AITER OPUS (#54855)\n\nSigned-off-by: jiacao-amd <jiahui.cao@amd.com>\nCo-authored-by: OpenAI Codex <codex@openai.com>\nCo-authored-by: Claude <noreply@anthropic.com>\nCo-authored-by: mergify[bot] <37929162+mergify[bot]@users.noreply.github.com>"
+    },
+    {
+      "sha": "442d36031ce710aa2a777c353becb660c57ab2bd",
+      "comment": "为 MiniCPM-V 系列启用编码器 CUDA Graph，并将 SupportsEncoderCudaGraph 协议中的捕获输入方法新增可选 axis_keys 参数，使 EncoderCudaGraphManager 支持多维度捕获键（capture_axes 笛卡尔积）。对现有实现向后兼容；涉及多个模型源文件的方法签名更新。Ascend 若要在其支持的 MiniCPM-V 等模型上使用编码器图（ACL Graph）或实现该协议，需要同步适配该扩展接口。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "model",
+        "cuda-graph"
+      ],
+      "ascend_impact": {
+        "ascend_affected": true,
+        "functionality": "SupportsEncoderCudaGraph 的 get_encoder_cudagraph_capture_inputs/select_encoder_cudagraph_items 等方法新增可选 axis_keys 参数，并引入 EncoderCudaGraphConfig.capture_axes 配置；所有实现该协议的多模态模型（含 Ascend 侧潜在的对应模型）需要适配。新增参数带默认值，向后兼容。",
+        "testing": "vllm 已新增相关单元测试；Ascend 若支持 MiniCPM-V 类模型，应补充编码器图（ACL 图/静态图）相关测试。",
+        "needs_test_update": true,
+        "suggested_test_areas": [
+          "vllm-ascend 多模态编码器图/ACL Graph 测试",
+          "模型实现签名兼容性测试"
+        ]
+      },
+      "message": "[MM][CG] Enable encoder CUDA Graph for MiniCPM-V (#42785)\n\nSigned-off-by: YunzhuLu <lucia.yunzhu@gmail.com>\nSigned-off-by: Isotr0py <Isotr0py@outlook.com>\nCo-authored-by: Isotr0py <Isotr0py@outlook.com>",
+      "deep_analysis": {
+        "ascend_affected_confirmed": true,
+        "affected_interfaces": [
+          "vllm_ascend/worker/encoder_acl_graph.py::EncoderAclGraphManager._capture_budget_graph",
+          "vllm_ascend/worker/encoder_acl_graph.py::EncoderAclGraphManager._run_budget_graph",
+          "vllm_ascend/worker/encoder_acl_graph.py::EncoderAclGraphManager.capture",
+          "vllm_ascend/worker/encoder_acl_graph.py::EncoderGraphParams",
+          "vllm_ascend/worker/encoder_acl_graph.py::set_encoder_graph_params",
+          "vllm_ascend/worker/encoder_acl_graph.py::update_encoder_graph_workspace",
+          "vllm_ascend/worker/encoder_acl_graph.py::update_encoder_graph_params",
+          "vllm_ascend/worker/encoder_acl_graph.py::EncoderForwardContext / set_encoder_forward_context",
+          "vllm_ascend/ops/mm_encoder_attention.py::AscendMMEncoderAttention._forward_capture_fia",
+          "tests/ut/worker/test_encoder_acl_graph.py",
+          "tests/ut/ops/test_mm_encoder_attention.py"
+        ],
+        "adaptation_effort": "high",
+        "adaptation_guide": "This commit (encoder CUDA Graph for MiniCPM-V, #42785) hard-breaks the Ascend encoder ACL-graph path. vllm-ascend's EncoderAclGraphManager (vllm_ascend/worker/encoder_acl_graph.py) subclasses vllm.v1.worker.encoder_cudagraph.EncoderCudaGraphManager and overrides _capture_budget_graph / _run_budget_graph with the OLD signatures. The new base class now ALWAYS calls both with an axis_keys kwarg: capture() loops `for axis_keys in itertools.product(*self._capture_axes)` (yields `()` even when capture_axes is empty) and execute_budget() forwards axis_keys from _select_items(), which now returns a `(dict, CaptureAxisKeys)` tuple. Consequence: a hard `TypeError: ... unexpected keyword argument 'axis_keys'` on the first capture for EVERY encoder-CG model on NPU (Qwen2/2.5/3-VL, Gemma3, Idefics3, MiniCPM-V, ...), not just MiniCPM-V. Required changes:\n\n1. vllm_ascend/worker/encoder_acl_graph.py:\n   - Add `axis_keys: CaptureAxisKeys = ()` to both `_capture_budget_graph(self, token_budget, path='default', axis_keys=())` and `_run_budget_graph(self, mm_kwargs, token_budget, path='default', axis_keys=())`.\n   - Key the graph sets by the new BudgetGraphMapKey: store and look up `token_budget if not axis_keys else (token_budget, axis_keys)` (mirror the base class) instead of the bare int `token_budget`; otherwise MiniCPM-V lookups miss and fall back to eager.\n   - Make the FIA bookkeeping axis-aware. EncoderGraphParams/set_encoder_graph_params/update_encoder_graph_workspace/update_encoder_graph_params and EncoderForwardContext are keyed by token_budget only. MiniCPM-V sets EncoderCudaGraphConfig.capture_axes=(patch_grid_buckets,), so multiple graphs are captured per budget; per-budget events/handles/workspaces/attn_params lists will accumulate handles from different patch-grid captures, causing `RuntimeError: Encoder graph bookkeeping is inconsistent` or wrong FIA graph_task_update rebinding at replay. Key these by BudgetGraphMapKey (or (token_budget, axis_keys)) and thread axis_keys through set_encoder_forward_context.\n   - In `capture()`, derive the budgets/axes (e.g. `self._capture_axes`) when calling set_encoder_graph_params so the bookkeeping covers every (budget, axis) combination.\n\n2. vllm_ascend/ops/mm_encoder_attention.py: `_forward_capture_fia` appends to `params.attn_params[token_budget]`, `params.handles[token_budget]`, and calls update_encoder_graph_workspace(token_budget, ...). Use the axis-aware key derived from get_encoder_forward_context().\n\n3. Model-level compat: MiniCPM-V 2.5/2.6/4.0 are now SupportsEncoderCudaGraph models (new _MiniCPMVEncoderCudaGraphMixin). Its VPM is Idefics2VisionTransformer whose Idefics2VisionAttention uses MMEncoderAttention -> patched to AscendMMEncoderAttention (FIA) on NPU, and Resampler2_5 now calls torch.cuda.is_current_stream_capturing() (already aliased to torch.npu in model_runner_v1.py) and async_tensor_h2d. Verify MiniCPM-V capture/replay works inside torch.npu.NPUGraph capture on NPU; note the refactored Idefics2VisionEmbeddings.get_position_embedding removed the CPU-sync loop (positive on NPU) but the new vectorized bucketize path must be validated.\n\n4. Update tests/ut/worker/test_encoder_acl_graph.py (it calls mgr._capture_budget_graph(2048) directly and asserts graph_set[2048]) and tests/ut/ops/test_mm_encoder_attention.py for the new signatures, axis keys, and BudgetGraphMapKey indexing. Consider adding a MiniCPM-V encoder-CG e2e test mirroring tests/models/multimodal/generation/test_vit_cudagraph.py new minicpmv_25/26/40 cases.",
+        "risk": "High. (1) Hard runtime break: base capture()/execute_budget() unconditionally pass axis_keys, so the unmodified EncoderAclGraphManager raises TypeError for all encoder-CG models on Ascend. (2) MiniCPM-V capture_axes collide with the token_budget-only FIA bookkeeping, risking silent wrong attention rebinding or bookkeeping-inconsistency crashes; if only the signature is fixed but keys are not, MiniCPM-V silently degrades to eager (perf loss). (3) MiniCPM-V's new GPU capture path (flat pixel packing, patch-grid buckets, vectorized resampler, async_tensor_h2d) was only validated on CUDA; NPU graph-capture correctness needs verification. (4) The graph-count multiplication by capture axes increases capture memory/time on NPU and the default encoder_cudagraph_token_budgets through max_model_len can OOM (upstream tests force small budgets [64, 1024])."
+      }
+    },
+    {
+      "sha": "c3ccc0e957fbcb1f4b55fb10ff935cf0a114e880",
+      "comment": "新增 DeepSeek-V4 的 CPU 后端：包含大量 CPU 专属 sgl-kernels（compressor、flash_mla、mhc、store_cache、topk、indexer 等）kernel、模型实现与平台配置变更。纯 CPU 平台代码，不影响 Ascend；但新增的 block_size 默认值覆盖/权限校验逻辑改动仅作用于 CPU 平台。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "model",
+        "cpu"
+      ],
+      "message": "[Model] Add DeepSeek-V4 CPU backend (#55355)\n\nSigned-off-by: jiang1.li <jiang1.li@intel.com>"
+    },
+    {
+      "sha": "49632fb3ac8fa92de2b4626bb8f140ffcc4ab8d3",
+      "comment": "在 weight cache 加载器中增加平台支持检查：非 CUDA/ROCm 平台（含 Ascend）在尝试使用 IPC 权重缓存时抛出 UnsupportedPlatformForIPCError，避免原先的静默按值传递。这是对非受支持平台的显式错误处理改进，不影响接口；Ascend 用户若使用 IPC weight cache 会得到明确的错误提示，无需修改代码。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "model-loader"
+      ],
+      "message": "[CI][XPU] Reject CUDA-IPC weight cache on non-CUDA/ROCm platforms (#56010)\n\nSigned-off-by: mayuyuace <qiming1.zhang@intel.com>"
+    },
+    {
+      "sha": "588a813a60448f6f71dfa0e0ecd52cc0bacc7329",
+      "comment": "修复 AITER MXFP4 ASM GEMM 在未融合共享专家场景下的崩溃：对不满足 shape 约束（行 % 32 == 0、列 % 8 == 0）的 weight_scale 增加检查并回退到 Triton 路径。纯 ROCm/AITER 专属代码，Ascend 无影响。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "rocm-kernel"
+      ],
+      "message": "[ROCm] [BugFix] Fix AITER MXFP4 ASM-GEMM crash on unfused shared experts (#55213)\n\nSigned-off-by: Colin Zeng <Colin.Zeng@amd.com>"
+    },
+    {
+      "sha": "479611c0c6118f95d6028a337e69b4713c529843",
+      "comment": "将多模态元数据从 base64 序列化改为 JSON 数组，重构了 EPD 代理中元数据的编码与解析流程（_parse_metadata_array / _load_embeds_dict），并新增相关测试。前端/API 层重构，不涉及核心接口，Ascend 无影响。",
+      "tags": [
+        "refactor",
+        "low-risk",
+        "multimodal",
+        "frontend"
+      ],
+      "message": "[Frontend][EPD] Use JSON arrays for multimodal metadata (#56090)\n\nSigned-off-by: Tianyu Guo <guoty@inferact.ai>"
+    },
+    {
+      "sha": "2a02f6efe319c885e3ccbcecde402e0028f9ec1e",
+      "message": "[CI][ROCm][Disagg] Add GLM-5.2-FP8 to MoRIIO model catalog (#53885)\n\nSigned-off-by: avininjamay8 <avpaul@amd.com>\nCo-authored-by: avininjamay8 <avpaul@amd.com>\nCo-authored-by: lcskrishna <lollachaitanya@gmail.com>",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "feature",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "ea40bb9e905f8d552281dd1ec074f91865a0a242",
+      "comment": "新增水印生成与检测功能（Gumbel-max 算法）：引入 WatermarkConfig、GumbelWatermarker/Detector、GPUWatermarkSampler 及 PRF（Philox），并修改 SamplingParams 和 VllmConfig 增加水印相关字段。新增特性，不破坏现有接口；对 Ascend 的影响在于 V2 model runner（NPUModelRunner 继承者）会自动启用 GPUWatermarkSampler，且水印与自定义 sampler 不兼容（已显式禁止），需注意不要与 Ascend 的采样路径冲突。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "sampling",
+        "config"
+      ],
+      "message": "[feature] Watermarked generation and detection (Gumbel-max algorithm) (#54053)\n\nSigned-off-by: Raphael Rialland <raphael.rialland@mistral.ai>\nCo-authored-by: OpenAI Codex <codex@openai.com>\nCo-authored-by: mergify[bot] <37929162+mergify[bot]@users.noreply.github.com>"
+    },
+    {
+      "sha": "8c34a372323b3becc92c183257d195562882ef1a",
+      "comment": "将 --omni 委托逻辑提取为 maybe_run_omni() 并在 main() 开头调用，使得传入 --omni 时无需导入 vLLM CLI 相关模块，避免不必要的导入开销和潜在错误。纯重构，行为不变。",
+      "tags": [
+        "refactor",
+        "cli",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。仅涉及 vllm/entrypoints/cli/main.py 的入口逻辑，不触碰平台相关接口。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Refactor] Extract maybe_run_omni() and defer CLI imports past omni early-return (#56103)\n\nSigned-off-by: Jeff Zvier <zvier20@gmail.com>"
+    },
+    {
+      "sha": "6e1d051fc942cc83b72ee5a173786baf6666700a",
+      "message": "[CI][XPU] skip test_models_text on XPU (#56038)\n\nSigned-off-by: mayuyuace <qiming1.zhang@intel.com>",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "chore"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "5c0aeb5954be3384ea17ebdb8bb21719f538492a",
+      "message": "[CI][XPU] Disable model runner V2 for XPU quantization test for some partially  pre-quantized models (#56179)\n\nSigned-off-by: Chaojun Zhang <chaojun.zhang@intel.com>",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "chore"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "3735c2d5f5248259482b9045c34fb7a8a3892352",
+      "message": "[Security][Rust Frontend] Normalize HTTP method labels in metrics (#56058)\n\nCo-authored-by: Bugen Zhao <i@bugenzhao.com>\nCo-authored-by: OpenAI Codex <noreply@openai.com>\nSigned-off-by: Juan Pérez de Algaba <jperezde@redhat.com>\nSigned-off-by: Bugen Zhao <i@bugenzhao.com>",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "chore"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "41cffa9af0b7317d71838262004186b68e976773",
+      "message": "[Rust Frontend] Strongly type wire dtypes and multimodal modalities (#56174)\n\nCo-authored-by: Codex <noreply@openai.com>\nCo-authored-by: mergify[bot] <37929162+mergify[bot]@users.noreply.github.com>\nSigned-off-by: Bugen Zhao <i@bugenzhao.com>",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "chore"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "285cbce6bd0982f5936d729d3fa2ac310dfeca59",
+      "message": "[Rust Frontend] Resolve unified and split parser selections consistently (#56018)\n\nSigned-off-by: Bugen Zhao <i@bugenzhao.com>",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "chore"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "978c22f54b3076ccd98becc9318011104451fec7",
+      "message": "[XPU] update triton-xpu 3.8.0 shim layer (#56014)\n\nSigned-off-by: Yan Ma <yan.ma@intel.com>",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "chore"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "65f3fca5683b4c7d48906ff8b2fd44903ec5dba6",
+      "comment": "修复 Seed-OSS 解析器：为推理结束检测增加 turn-boundary tokens（<seed:bos>/<seed:eos>）。Seed-OSS 与 Qwen3 共享 XML 语法，但边界 token 不同，原先继承的 ChatML 边界 token 会使作用域检测失效。通过 TURN_BOUNDARIES 覆盖默认值，并补充历史 reasoning 回放、当前 turn 结束、thinking 开关等测试。实现依赖 Qwen3Parser 的后向扫描逻辑，正确区分多轮场景。",
+      "tags": [
+        "bugfix",
+        "parser",
+        "reasoning",
+        "seed-oss",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。vllm/parser 为平台无关文本解析层，不涉及 Ascend 接口。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Bugfix][Parser] Seed-OSS turn-boundary tokens + boundary-fallback tests (#54264)\n\nSigned-off-by: Mikhail Podvitskii <podvitskiymichael@gmail.com>\nCo-authored-by: Flora Feng <4florafeng@gmail.com>"
+    },
+    {
+      "sha": "4ebf61ebda8dc8bf090bd4ee14d2855f694111b0",
+      "comment": "为 Cohere Chat V2、Generative Scoring、Pooling Embed 请求的 priority 字段增加 MessagePack int64 范围校验（ge=-(2**63), le=2**63 - 1），防止值溢出导致序列化或下游错误。API 校验增强，不影响现有合法请求。",
+      "tags": [
+        "bugfix",
+        "api",
+        "validation",
+        "protocol",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。仅修改 entrypoints 层的请求模型字段约束，与平台无关。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Cohere] Bound remaining request priorities to the MessagePack int64 range (#56146)\n\nSigned-off-by: Taneem Ibrahim <taneem.ibrahim@gmail.com>"
+    },
+    {
+      "sha": "83252ea899c6538eaa0c1fb31f28a92c661bbffc",
+      "comment": "为 ROCm MiniMax-M3 稀疏注意力路径集成 AITER indexer 评分和 top-k kernel，使用 fp8 MFMA 加速并让 top-k 直接输出 attend 的 page table，从而支持多 KV head。新增 vllm/models/minimax_m3/amd/indexer_aiter.py，通过 aiter_indexer_unsupported_reason 做严格条件检查（gfx950、fp8 index cache、AITER sparse PA attend 等），否则回退 Triton。同时调整 amd/model.py 和 sparse_attention_msa.py 以传递 emitted table 并选择对应 backend。属于 ROCm 平台专属高性能优化。",
+      "tags": [
+        "performance",
+        "rocm",
+        "attention",
+        "minimax-m3",
+        "sparse-attention",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。所有改动位于 vllm/models/minimax_m3/amd/ 及 common 中平台分支，属于 ROCm 专属路径；Ascend 有独立的 MiniMaxM3 实现，且不参与 AITER/gfx950 逻辑。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Performance][ROCm]  Integrate aiter indexer scoring and top-k kernels into MiniMax-M3 sparse attention path (#52664)\n\nSigned-off-by: Yamini Preethi Kamisetty <YaminiPreethi.Kamisetty@amd.com>"
+    },
+    {
+      "sha": "6983a0883dc831d33ffa2713b955159894a350d7",
+      "message": "[ROCm][CI] Split MI300 Distributed Compile by graph partition mode (#53602)\n\nSigned-off-by: Aarushi Jain <142941703+aarushjain29@users.noreply.github.com>\nSigned-off-by: Aarushi Jain <aarushi.jain2@amd.com>",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "chore"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "dcd544486b7f4672b3c2e60ea289f19d86cf355c",
+      "comment": "修复 ROCm AITER attention 在共享 KV（kv_sharing）场景下 prefill/extend 的 KV 读取问题。通过 metadata builder 增加 AiterKVSharingMetadata 和 workspace，共享层 forward 时从目标 cache gather 新 KV 用于直接 prefill/extend kernel。测试覆盖了 prefill/extend/mixed 批次、shuffle 开关和 fp8。纯 ROCm AITER 专属，不影响其他平台。",
+      "tags": [
+        "bugfix",
+        "rocm",
+        "attention",
+        "kv-sharing",
+        "aiter",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。仅修改 vllm/v1/attention/backends/rocm_aiter_fa.py，属于 ROCm 专属后端，Ascend 不使用该路径。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[ROCm][Bugfix] Support shared KV prefill in AITER attention (#55887)\n\nSigned-off-by: Andreas Karatzas <Andreas.Karatzas@amd.com>"
+    },
+    {
+      "sha": "26fec6d183c3957ee4dc0022452c430e745dd20f",
+      "comment": "修复 Step3.5 推理解析器在结构化输出下结束检测不准确的问题。原实现需要 </think> 后再等一个 token 确认结束，这会使结构化输出约束的第一个 post-think token 无法被正确限制。现在检测到 </think> 立即返回结束，并移除对后置换行的剥离，将换行保留给 content。简化了流式逻辑，删除了 _end_token_pending 状态，同时更新测试断言。",
+      "tags": [
+        "bugfix",
+        "reasoning",
+        "parser",
+        "structured-output",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。vllm/reasoning 为平台无关的推理解析层，不涉及 Ascend 接口。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Bugfix] Fix Step-3.5 reasoning parser for structured outputs (#53174)\n\nSigned-off-by: Yifan Zong <yzong@redhat.com>"
+    },
+    {
+      "sha": "8c87c333b84c85908b1d11f0044457692277c6f3",
+      "comment": "修复 TRTLLM ragged prefill 性能回归：升级 FlashInfer 到 0.6.18.post1，并处理包含零长度 query 行的场景。当所有 query 行都不活跃时直接返回零输出，避免调用 kernel；混合活跃/空行则显式报错。同时为 MLA chunked context metadata 增加 all_rows_active 标志，并在 chunk 遍历时断言所有行活跃。解决了零上下文请求导致空 ragged attention 行的问题。",
+      "tags": [
+        "performance",
+        "bugfix",
+        "attention",
+        "mla",
+        "flashinfer",
+        "cuda",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。TRTLLM ragged 后端基于 FlashInfer，是 CUDA 专属路径；Ascend 不使用该后端。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Perf] Fix TRTLLM ragged prefill perf regression (#55499)\n\nSigned-off-by: wzhao18 <wzhao18.sz@gmail.com>\nCo-authored-by: OpenAI Codex <noreply@openai.com>"
+    },
+    {
+      "sha": "56d001faf0f53c72fcedbbdd77e5418f68fe7494",
+      "comment": "增强 chat template 内容格式检测：当模板将 message.content 通过宏参数传递（而非直接遍历 message['content']）时，也能正确识别 OpenAI 格式（list of dict）。通过分析 Jinja AST 中的 Macro 和 Call 节点，追踪 content 传给宏参数的情况，并避免误判普通名为 content 的字符串变量。新增多种宏模板测试及 MiMo-V2.5-Pro 模型用例。",
+      "tags": [
+        "bugfix",
+        "renderer",
+        "chat-template",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。vllm/renderers 为模板渲染层，平台无关。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Bugfix] Detect OpenAI content format when message.content is passed through macro parameters (#53824)\n\nSigned-off-by: wuhangxian <1391938827@qq.com>\nSigned-off-by: wuhangxian <wuhangxian@users.noreply.github.com>\nCo-authored-by: Claude Opus 4.8 <noreply@anthropic.com>\nCo-authored-by: wuhangxian <wuhangxian@users.noreply.github.com>\nCo-authored-by: mergify[bot] <37929162+mergify[bot]@users.noreply.github.com>"
+    },
+    {
+      "sha": "cce50657b742598a5b8874fc9fe3a94dc4344a14",
+      "message": "[ROCm][CI] Use a platform-independent GEMM in the merged-column fuser test (#56130)\n\nSigned-off-by: Djordje Ramic <djoramic@amd.com>",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "chore"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "e8064a96d02db70ebc1ca922bc9aba967a654483",
+      "comment": "修复 V2 PP draft 广播中 idx_mapping tensor 的 stream 记录。原实现只对 send tensor 调用 record_stream，但 idx_mapping 在 main stream 上分配，可能在 broadcast 异步执行时被释放。现在改为对 input_batch.idx_mapping 调用 record_stream，确保其在 broadcast stream 上的生命周期安全。",
+      "tags": [
+        "bugfix",
+        "pipeline-parallel",
+        "cuda",
+        "stream",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。vllm/v1/worker/gpu/pp_utils.py 是 CUDA 专属 PP 工具，Ascend 使用自有 PP 实现。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Bugfix][V2] record_stream idx_mapping in the PP draft broadcast (#55745)\n\nSigned-off-by: Chris Eastwood <chris.eastwood@pwn4g3.dev>\nSigned-off-by: Nick Hill <nickhill123@gmail.com>\nCo-authored-by: Nick Hill <nickhill123@gmail.com>"
+    },
+    {
+      "sha": "c69d5d72a6018db6ff55efc66097d377c25828cc",
+      "message": "[CI][ROCm] Increase timeout for AMD MI355 Language Models (Standard) (#56114)\n\nSigned-off-by: Aarushi Jain <aarushi.jain2@amd.com>",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "chore"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "3fb676bfad0f1c7099af6296983e739be3fe29cc",
+      "message": "[ROCm][CI] Fix moe layer tests for fp8 dtype compatibility (#56106)\n\nSigned-off-by: Divakar Verma <divakar.verma@amd.com>\nCo-authored-by: Andreas Karatzas <akaratza@amd.com>",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "bugfix",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "a207d7ce1d0cc33121726a7189080a0fa40ebb4d",
+      "comment": "LoRA 激活时如果 adapter 没有任何权重被应用，现在会记录一条 debug_once 日志，提示检查 --lora-target-modules，并说明在 pipeline/expert parallelism 下可能是正常情况。仅日志增强，无功能变化。",
+      "tags": [
+        "bugfix",
+        "lora",
+        "logging",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。仅增加日志，不改变 LoRA 接口或行为。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Bugfix][LoRA] Log when an adapter applies no weights (#55310)\n\nSigned-off-by: Guancheng Fu <110874468+gc-fu@users.noreply.github.com>"
+    },
+    {
+      "sha": "22d95d1adc24d5834ec45bb697170a76cf4c9a95",
+      "comment": "修复 mm_device_do_normalize 在 encoder cuda graph 下的安全性。将 input_norm 从模型外层调用移入 Qwen2VisionTransformer / Qwen2_5_VisionTransformer 内部，使用 FusedInputNorm.from_model_config 创建，DP 路径下保留归一化且可被 graph 捕获。非 DP 路径使用 identity 默认值保持行为不变。同时调整测试使用 mm_processor_kwargs。",
+      "tags": [
+        "bugfix",
+        "multimodal",
+        "model",
+        "cuda-graph",
+        "qwen2-vl",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。这是 Qwen2-VL/2.5-VL 通用模型内部重构，不改变外部接口；Ascend 直接复用该模型实现，ACL Graph 与 CUDA Graph 行为不同但归一化语义等价，无需适配。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Bugfix] Make `mm_device_do_normalize` encoder-cudagraph safe (#55370)\n\nSigned-off-by: cjackal <44624812+cjackal@users.noreply.github.com>\nCo-authored-by: mergify[bot] <37929162+mergify[bot]@users.noreply.github.com>\nCo-authored-by: Isotr0py <Isotr0py@outlook.com>"
+    },
+    {
+      "sha": "83fe99399ec0603b32393a14324b65c67ad04af2",
+      "comment": "为 DSpark 推测解码添加 NVFP4 量化权重的高效 gathered top-k projection：新增 Triton kernel _nvfp4_gathered_bias_kernel，直接对选定的 NVFP4 packed 行反量化并与 Markov embedding 点积，避免全词表反量化。ModelOptLinearMethod 在 retain_weight_for_gather 时保留原始打包权重与 scale，DSparkMarkovHead.apply_bias_gathered 根据平台和 dtype 选择快速 Triton 路径或通用反量化回退路径。显著提升 NVFP4 权重的 spec decode 性能。",
+      "tags": [
+        "performance",
+        "spec-decode",
+        "quantization",
+        "nvfp4",
+        "dspark",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。NVFP4 是 NVIDIA 专属量化格式，Triton kernel 仅面向 CUDA；Ascend 不使用该量化路径。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Spec Decode] Add NVFP4 DSpark gathered top-k projection (#55713)\n\nSigned-off-by: Andrii Skliar <askliar@nvidia.com>\nCo-authored-by: Andrii Skliar <askliar@nvidia.com>\nCo-authored-by: mergify[bot] <37929162+mergify[bot]@users.noreply.github.com>"
+    },
+    {
+      "sha": "af51d0ef03ecf62302b51e7ab3042b088449d6b5",
+      "comment": "Pooling 服务现在在响应中报告实际使用的 LoRA adapter 名称：在请求处理上下文中获取 lora_request，并将其传递给 models.model_name()，替代原来的默认模型名。确保多 LoRA 池化请求的响应正确标识适配器。",
+      "tags": [
+        "feature",
+        "pooling",
+        "lora",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。仅修改 entrypoints/pooling 响应构造逻辑，与平台无关。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Pooling] Report LoRA adapter names in responses (#56004)\n\nSigned-off-by: Taneem Ibrahim <taneem.ibrahim@gmail.com>"
+    },
+    {
+      "sha": "1454b7172796c00955ae32e3fe865b98b262855a",
+      "message": "Fix ROCm AITER FP8 KV test tolerances. (#53590)\n\nSigned-off-by: Aarushi Jain <aarushjain29@users.noreply.github.com>\nCo-authored-by: Aarushi Jain <aarushjain29@users.noreply.github.com>",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "bugfix",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "42d76ee35a2ad2352fa4f58e2781ea607d0c39bd",
+      "comment": "修复 SupportsMRoPE 协议 docstring 的缩进格式，使 griffe 文档生成器不再产生 indentation 警告。纯文档变更，无功能影响。",
+      "tags": [
+        "docs",
+        "docstring",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响。纯文档变更。",
+        "testing": "无影响。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Docs] Fix griffe docstring indentation warning in `SupportsMRoPE` (#56112)\n\nSigned-off-by: Harry Mellor <19981378+hmellor@users.noreply.github.com>\nCo-authored-by: Claude Opus 5 (1M context) <noreply@anthropic.com>"
+    },
+    {
+      "sha": "719284fe158f1be8a9dd92953295fc9d49015730",
+      "comment": "将 XD-RoPE 彻底并入 M-RoPE 的重构性变更。实现方式：(1) 删除独立的 XDRotaryEmbedding 类及其在 get_rope() 中的 'xdrope' scaling_type 分支，删除 SupportsXDRoPE 协议和 supports_xdrope()；(2) 在 vllm/transformers_utils/config.py 中新增 mrope_num_dims()，通过 _mrope_section() 同时识别 mrope_section 与 legacy xdrope_section（后者给出 deprecation warning），并处理嵌套 rope_parameters、interleaved 2-section（返回 max(len, 3)）等边界情况；(3) RopeState 移除 has_delta 概念（XD-RoPE 的 delta 恒为 0，统一写入 prefill_delta），get_rope_state() 对 uses_mrope 配置统一返回 num_dims=model_config.mrope_num_dims；(4) GPUModelRunner 的 mrope_positions buffer 从固定 3 行改为 mrope_num_dims 行，删除 _init_xdrope_positions/_calc_xdrope_positions 和 xdrope_positions buffer；(5) MultiModalMixin.get_mrope_input_positions 缓存 get_rope_index 的 kwargs 签名，只把模型接受的 grid 参数传入（值为 None 且模型不接受时丢弃），修复 HunYuan-VL 等 get_rope_index 不含 video_grid_thw 的模型会报错的问题；(6) strip_covered_mm_data 删除 uses_xdrope 参数，统一按 M-RoPE 语义保留 keep_on_cpu 字段。潜在风险：这是跨 config/rotary_embedding/interfaces/scheduler/model_runner/spec_decode/多模态的删除性重构，任何仍引用 uses_xdrope_dim、xdrope_positions、SupportsXDRoPE、has_delta 的下游代码（包括 OOT 平台适配层）会直接编译失败；但 xdrope_section 作为 legacy key 仍可被识别，迁移路径清晰。",
+      "tags": [
+        "refactor",
+        "medium-risk",
+        "model-runner",
+        "rotary-embedding",
+        "scheduler",
+        "spec-decode",
+        "multimodal",
+        "config"
+      ],
+      "ascend_impact": {
+        "ascend_affected": true,
+        "functionality": "命中必然影响路径 vllm/v1/worker/gpu_model_runner.py（GPUModelRunner，NPUModelRunner 直接继承）和 vllm/v1/core/sched/output.py（SchedulerOutput/NewRequestData），以及可能影响路径 vllm/config/model.py、vllm/transformers_utils/config.py、vllm/v1/worker/gpu/mm/rope.py、vllm/multimodal/utils.py、vllm/v1/spec_decode/llm_base_proposer.py。具体影响：1) ModelConfig.uses_xdrope_dim/uses_xdrope 属性被删除，改为 mrope_num_dims，vllm-ascend 的 NPUPlatform.check_and_update_config、AscendConfig 及模型适配代码若引用旧属性需迁移；2) XDRotaryEmbedding 类与 get_rope() 的 'xdrope' scaling_type 分支被删除，vllm-ascend 若直接导入该类或依赖该 rope_type 会 ImportError/ValueError；3) SupportsXDRoPE/supports_xdrope() 从 interfaces.py 删除，Ascend 专有模型若声明 supports_xdrope 需改为 SupportsMRoPE + get_mrope_input_positions；4) GPUModelRunner 删除 self.uses_xdrope_dim、self.xdrope_positions、_init_xdrope_positions()/calc_xdrope_positions()，mrope_positions buffer 形状由 (3, max_num_tokens+1) 变为 (mrope_num_dims, max_num_tokens+1)，NPUModelRunnerV2 继承该行为，Ascend worker 级 patch（vllm_ascend/patch/worker.py）不得再引用 xdrope 属性；5) RopeState 构造函数移除 has_delta 参数，get_rope_state 对 uses_mrope 配置返回 num_dims=mrope_num_dims，Ascend 若自定义 RopeState 或调用 get_rope_state 需同步；6) strip_covered_mm_data 移除 uses_xdrope 参数、NewRequestData.from_new_request 移除 uses_xdrope 参数，Ascend 自定义调度器（BalanceScheduler 等）及 mm 处理代码如果传入该 kwarg 会 TypeError；7) SpecDecodeBaseProposer 删除 xdrope_positions 分支，Ascend 的 spec_decode proposer 继承该类时需避免引用旧属性。正向影响：legacy xdrope_section 仍被 mrope_num_dims 识别并告警，HunYuan-VL 类模型可无感走统一 M-RoPE 路径，且 MultiModalMixin 对不接受 video_grid_thw 的模型兼容性更好。",
+        "testing": "vLLM 侧删除了 XDRotaryEmbedding 的 kernel 测试、xdrope 相关的 strip_covered_mm_data 测试，新增了 mrope_num_dims/uses_mrope 的 config 测试和 get_mrope_input_positions 可选 grid 参数测试。vllm-ascend 需要排查自身测试与代码中是否残留 xdrope 引用（如 HunYuan-VL 相关用例、RopeState 构造、proposer 位置计算），并将期望从 uses_xdrope_dim 更新为 mrope_num_dims。",
+        "needs_test_update": true,
+        "suggested_test_areas": [
+          "全局搜索 vllm_ascend 中 uses_xdrope_dim/uses_xdrope/XDRotaryEmbedding/SupportsXDRoPE/xdrope_positions 的残留引用并更新",
+          "多模态模型 M-RoPE 位置计算测试（覆盖 get_rope_index 不含 video_grid_thw 的 HunYuan-VL 风格模型）",
+          "vllm/v1/worker/gpu/mm/rope.py 的 RopeState num_dims 参数化测试（3/4 维）",
+          "spec_decode proposer 中 draft/target 模型的 mrope_num_dims 推导测试",
+          "worker model runner 的 mrope_positions buffer 形状（mrope_num_dims 行）相关测试"
+        ]
+      },
+      "message": "[Core][Model] Unify XD-RoPE into M-RoPE and derive the channel count (#56078)\n\nSigned-off-by: Harry Mellor <19981378+hmellor@users.noreply.github.com>\nCo-authored-by: Claude Opus 5 (1M context) <noreply@anthropic.com>",
+      "deep_analysis": {
+        "ascend_affected_confirmed": true,
+        "affected_interfaces": [
+          "NPUModelRunner (v1) — vllm_ascend/worker/model_runner_v1.py — subclasses upstream GPUModelRunner (vllm/v1/worker/gpu_model_runner.py) and reads removed attributes self.uses_xdrope_dim / self.xdrope_positions / self._calc_xdrope_positions",
+          "NPUModelRunner310 — vllm_ascend/_310p/model_runner_310p.py — subclasses NPUModelRunner(v1); same removed-attribute references",
+          "AscendSpecDecodeBaseProposer — vllm_ascend/spec_decode/llm_base_proposer.py — subclasses vllm.v1.spec_decode.llm_base_proposer.SpecDecodeBaseProposer; reads removed self.uses_xdrope_dim / self.draft_uses_xdrope_dim / self.xdrope_positions and re-allocates mrope_positions with hardcoded 3 dims",
+          "AscendSpecDecodeBaseProposer310 — vllm_ascend/_310p/spec_decode/llm_base_proposer_310.py — duplicates the removed 'target_positions = target_positions[0]' XD-RoPE special-case",
+          "Ascend310PRopeState / get_310p_rope_state — vllm_ascend/_310p/worker/v2/rope.py — hardcodes num_dims=3 instead of the new model_config.mrope_num_dims"
+        ],
+        "adaptation_effort": "medium",
+        "adaptation_guide": "The commit deletes XD-RoPE entirely: XDRotaryEmbedding (xdrope.py) and the 'xdrope' scaling_type branch in get_rope() are removed; ModelConfig.uses_xdrope_dim/uses_xdrope properties are replaced by ModelConfig.mrope_num_dims (backed by vllm.transformers_utils.config.mrope_num_dims, which treats xdrope_section as a legacy alias of mrope_section); SupportsXDRoPE/supports_xdrope are removed from vllm/model_executor/models/interfaces.py; and GPUModelRunner/SpecDecodeBaseProposer/RopeState/CachedRequestState/NewRequestData all drop their xdrope fields (RopeState.has_delta is also removed). vllm-ascend must update:\n\n1. vllm_ascend/worker/model_runner_v1.py: NPUModelRunner(v1) relies on the parent GPUModelRunner to set self.uses_xdrope_dim / self.xdrope_positions / self._calc_xdrope_positions. After this commit these no longer exist, so the 'elif self.uses_xdrope_dim > 0:' branches (lines ~1371-1377, 3853-3858) and the async-spec-decode branch (lines ~1529-1533) raise AttributeError for every non-M-RoPE model. Fold XD-RoPE handling into the unified M-RoPE path and use self.mrope_num_dims (set by the new parent init) instead of uses_xdrope_dim; drop self.xdrope_positions/self._calc_xdrope_positions entirely. Note the parent now sizes mrope_positions as [mrope_num_dims, ...], so 4-channel XD-RoPE models (e.g. HunYuan-VL checkpoints with xdrope_section, which now report uses_mrope=True and mrope_num_dims=4) flow through the M-RoPE path.\n\n2. vllm_ascend/_310p/model_runner_310p.py: same treatment for lines ~449-460 (elif self.uses_xdrope_dim > 0 / self._calc_xdrope_positions / self.xdrope_positions).\n\n3. vllm_ascend/spec_decode/llm_base_proposer.py: AscendSpecDecodeBaseProposer.__init__ (lines ~279-289) must no longer branch on self.uses_xdrope_dim/self.draft_uses_xdrope_dim (parent no longer sets them). Allocate self.mrope_positions with self.draft_model_config.mrope_num_dims dims instead of hardcoded 3, and remove the xdrope elif. Remove the XD-RoPE 'target_positions = target_positions[0]' special-case at line ~1658 (the unified parent _set_positions already converts 1D for text drafts).\n\n4. vllm_ascend/_310p/spec_decode/llm_base_proposer_310.py: remove the duplicated 'if self.uses_xdrope_dim > 0 and self.draft_uses_xdrope_dim == 0: target_positions = target_positions[0]' block (line ~103).\n\n5. vllm_ascend/_310p/worker/v2/rope.py: get_310p_rope_state returns Ascend310PRopeState(3, ...) unconditionally; use model_config.mrope_num_dims (max(len(mrope_section), 3)) for consistency with the unified upstream RopeState. The 310P standalone class does not subclass the upstream RopeState, so the has_delta removal does not break it directly.\n\n6. No other change needed for strip_covered_mm_data (its uses_xdrope kwarg was removed from upstream NewRequestData/Scheduler, but vllm-ascend's custom schedulers call NewRequestData.from_request with only positional req/block_ids, so they stay compatible).",
+        "risk": "High. This is a removal-based refactor: ModelConfig.uses_xdrope_dim, SpecDecodeBaseProposer.uses_xdrope_dim/draft_uses_xdrope_dim, GPUModelRunner.uses_xdrope_dim/xdrope_positions/_calc_xdrope_positions, SupportsXDRoPE and XDRotaryEmbedding are all deleted upstream. vllm-ascend's v1/310P runners and spec-decode proposers still dereference these in hot execution paths, so without adaptation every model served via the Ascend v1 runner (non-M-RoPE models included, because 'elif self.uses_xdrope_dim > 0:' is evaluated after 'if self.uses_mrope' is False) and every spec-decode path will crash with AttributeError at runtime, not at import/config time. XD-RoPE checkpoints (HunYuan-VL-style, xdrope_section) are now silently re-classified as M-RoPE with 4 channels, so correctness also depends on the runners/proposers switching to the unified M-RoPE path with the derived channel count."
+      }
+    }
+  ],
+  "architecture_based_on_sha": "7154856f3dcb1d3fdd5a136f7d2c5987f22244f5",
+  "architecture_generated_at": "2026-08-01T20:25:03.691327+08:00"
+}

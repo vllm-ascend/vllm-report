@@ -1,0 +1,595 @@
+{
+  "date": "2026-09-11",
+  "repo": "vllm-project/vllm-ascend",
+  "generated_at": "2026-09-12T05:24:51.020797+08:00",
+  "daily_summary": "当日变更方向多元且核心特性密集：新增 KV 层并行（KVPP）特性，通过按层分配 KV cache 并广播显著提升缓存容量；对 ACL Graph 的 host 端参数更新机制进行重大重构（UpdatableGraph），精简旧图参数管理逻辑；稀疏 Flash Attention 算子支持 NoPE 输入，适配 GLM-5.3-Flash；同时修复了 KV pool 设备绑定、外部缓存查找和 DP padding 回退等问题；算子层面包含 swiglu_group_quant 性能优化、scatter_nd_update_sk 核利用提升、inplace_partial_rotary_mul 负 sin 逻辑下沉等；CI/测试配置方面恢复了多节点 internal DP 拓扑、迁移 A3 nightly 用例、修复 A5 multi 资源；另有一批文档翻译更新。整体来看，功能开发与重构并存，对分布式、KV cache 和编译执行链路的稳定性提出了更高要求。",
+  "test_impact_summary": "当日测试看护压力较大：KVPP 和 UpdatableGraph 两大改动新增了大量单元测试与 e2e 测试（如 test_kvpp.py、test_kvpp_cache.py、test_acl_graph.py 等），同时也删除了旧的图参数更新测试，需要重点确保重构后 FIA/PA/推测解码在 MRV1/MRV2 上的图模式行为与旧实现一致。KV pool 的设备绑定修复、外部缓存查找守卫移除、DP padding 回退等均有针对性回归测试补充。算子层面（NoPE、swiglu group_index、negate_sin 下沉、vector core 调整）需要额外的数值验证和边界测试。CI 配置方面，多节点 internal DP 恢复和 A3 测试迁移需要通过 nightly/weekly 多节点任务实际跑通，避免配置变更导致测试覆盖遗漏。整体测试覆盖范围扩大，但核心路径重构带来的回归风险仍需持续关注。",
+  "commits": [
+    {
+      "sha": "c843f75aff45050fd4958dc4f24ac7e54a472df4",
+      "comment": "该 commit 为 A2/A3 上的稀疏 Flash Attention 增加了 NoPE（无 RoPE）支持，用于 GLM-5.3-Flash 模型。主要改动集中在 SFA 算子的 host tiling 和 arch22 kernel：tiling 数据新增 ropeHeadDim 字段；当 queryRope/keyRope 为 null 时，将 ropeHeadDim 置 0，并在 A5 上仍强制要求 RoPE 输入；kernel 端根据 ropeHeadDim 是否为 0 跳过 rope 缓冲区的设置和偏移计算，并新增 ComputeMm1NoRope 专门处理无 rope 的矩阵乘路径。改动保持了原有 RoPE 路径不变，但 A5 与 A2/A3 的行为出现分叉，需要留意 A5 上的回归。由于是底层算子修改，影响面集中在 SFA 注意力路径，但数值验证尚未完成，存在一定风险。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "ops",
+        "attention"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "新增 NoPE 输入路径，现有测试未覆盖 rope=0 的稀疏 MLA 场景；commit 说明也提到独立数值验证仍待完成。",
+        "suggested_test_areas": [
+          "csrc/attention/sparse_flash_attention 相关单测",
+          "tests/e2e 中 GLM-5.3-Flash 或 NoPE 稀疏注意力验证"
+        ]
+      },
+      "message": "[Feature][Ops] Support NoPE in sparse flash attention on A2/A3 (#16241)\n\n### What this PR does / why we need it?\n\nRefs #15665\n\nSupport sparse MLA attention without RoPE inputs on A2/A3, as used by\nGLM-5.3-Flash. Update host tiling and the cube/vector kernel paths to\nhandle a zero RoPE dimension, keeping the existing RoPE path available.\n\nThis PR contains only the sparse-flash-attention operator change: 5\nfiles, +309/-64 lines, one signed-off commit on main. Model integration\nand other pending PRs are excluded.\n\n### Does this PR introduce _any_ user-facing change?\n\nYes. The existing sparse flash attention operator accepts the NoPE\nquery/key layout on A2/A3. No serving configuration or\ndependency-version change is introduced.\n\n### How was this patch tested?\n\n- Python AST/Ruff, C++ clang-format, and `git diff --check` passed for\nthe relevant changes.\n- The operator changes were included in an integrated A3\nnative-extension build. This is not a standalone numerical validation of\nthis branch.\n- Added code comments only: the NoPE path is documented in English, no\nfunctional change beyond the operator update above.\n\nStandalone NPU numerical validation is still pending.\n\n- The A3 cache build failed during CMake's Torch import because backend\nautoload initialized torch_npu/Triton in the build container. The build\nenvironment issue and an A3 rebuild remain pending. A2 and 310P cache\nbuilds passed.\n\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/b2f685834a6456197e7033966fdef52a23f1abcd\n\nSigned-off-by: Li Jiahang <216526138+lijiahang226@users.noreply.github.com>"
+    },
+    {
+      "sha": "fb00c6be102f31e356bea4ab0f5a64e5091608c6",
+      "comment": "该 commit 回退了之前\"减少 mrv1 中需要 DP padding 的 case\"的改动（#15196）。恢复后的 `_sync_metadata_across_dp` 增加 `allow_dp_padding` 参数，默认只对 draft model 或显式要求时进行 padding，此前基于 MoE 通信方式和 fine-grained TP 的自动 padding 条件被移除。同时移除了 FinegrainedTPConfig 的 max_finegrained_tp_size 字段，并让各 spec_decode proposer 重新直接使用 `_sync_metadata_across_dp` 返回的 num_tokens。这很可能是因为原优化在部分场景下导致 DP 通信不一致或正确性问题，因此回退到更保守的 padding 策略。涉及模型运行器和推测解码多个模块，需要重新验证 DP 场景。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "model-runner",
+        "spec-decode",
+        "distributed"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "回退改变了 `_sync_metadata_across_dp` 的签名和 padding 行为，现有测试已同步调整，但需要继续覆盖各 spec decode proposer 和 DP 组通信场景。",
+        "suggested_test_areas": [
+          "tests/ut/worker/test_model_runner_v1.py",
+          "tests/ut/spec_decode/test_dspark_proposer.py",
+          "tests/ut/spec_decode/test_eagle_proposer.py",
+          "tests/ut/ops/test_token_dispatcher.py"
+        ]
+      },
+      "message": "[Revert] revert \"[feature] reduce cases that required DP padding in mrv1 (#15196)\" (#16331)\n\n### What this PR does / why we need it?\n\nrevert \"[feature] reduce cases that required DP padding in mrv1\n(#15196)\"\n\n### Does this PR introduce _any_ user-facing change?\n\nNone.\n\n### How was this patch tested?\n\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/b2f685834a6456197e7033966fdef52a23f1abcd\n\nSigned-off-by: zzzzwwjj <1183291235@qq.com>"
+    },
+    {
+      "sha": "0aad1056b00bcb68e1c67108bc403812c2ee340f",
+      "comment": "该 commit 优化了 W4A8 MXFP 量化路径中 `npu_swiglu_group_quant` 的调用。原先 SITU activation 单独走一条路径，现在统一先经 `npu_grouped_matmul` 计算，再根据 activation 类型决定是否调用 `situ_mx_quant`。同时为 `npu_swiglu_group_quant` 传入 group_index 参数：当 group_list_type 为 0（cumsum）时直接取 group_list 最后一个元素作为 token 总数，避免额外累积算子；其他类型则计算 cumsum。这个改动可以减少小算子开销，提升性能，但改变了算子输入参数，需要验证不同 group_list_type 下的数值正确性。",
+      "tags": [
+        "performance",
+        "medium-risk",
+        "quantization"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "算子调用参数和路径发生变化，现有测试可能只覆盖默认 group_list_type，需要补充不同 group_list_type 与 SITU/非 SITU activation 组合的测试。",
+        "suggested_test_areas": [
+          "tests/ut/quantization/ 相关 W4A8 MXFP 测试",
+          "vllm_ascend/quantization/methods/w4a8/w4a8_mxfp4.py 对应的单测"
+        ]
+      },
+      "message": "[Performance] add swiglu_group_quant groupindex input (#15488)\n\n### What does this PR do / why we need it?\n\nIn the W4A8 MXFP quantization path of `npu_grouped_matmul_swiglu_quant`\n  (`vllm_ascend/device/device_op.py`), the call to\n`torch.ops._C_ascend.npu_swiglu_group_quant` now passes a `group_index`\n  instead of `None`.\n\n`npu_swiglu_group_quant`'s `group_index` input currently only supports\nthe\n  `count` type, and internally the operator uses `group_index` only for\n  summation. We therefore pass the last value of the cumsum tensor\n  (`group_list[-1:]`, i.e. the total token count across groups) as the\n  `group_index`, which provides the operator with the count it needs.\n\n  ### Does this PR introduce any user-facing change?\n\n  No. \n\n  ### How was this patch tested?\n\n  Tested with DSv4 Flash\n\n\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/b2f685834a6456197e7033966fdef52a23f1abcd\n\n---------\n\nSigned-off-by: lcfenglinwan <lcfenglin@qq.com>"
+    },
+    {
+      "sha": "30d106b3ba3f0fc5f51136c40e9c86afbf230a9c",
+      "comment": "该 commit 仅修改多节点 internal_dp 的 nightly/weekly 测试部署配置。由于 vLLM 上游将 `--data-parallel-start-rank 0` 视为 hybrid LB，导致主节点被错误推断为 hybrid，远程节点需要 headless 才能配合。本 commit 从主节点移除显式的 `--data-parallel-start-rank 0`，并在远程节点恢复 `--headless`，恢复原先 internal LB 拓扑（主节点作为 API endpoint，调度所有 DP rank）。这是纯测试配置变更，但涉及 17 个 YAML，需要确保 CI 正确验证。",
+      "tags": [
+        "test",
+        "ci",
+        "low-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "修改了多节点测试部署配置，需要 CI 运行 nightly/weekly 多节点任务验证拓扑正确性；配置本身是测试的一部分。",
+        "suggested_test_areas": [
+          "tests/e2e/nightly/multi_node/internal_dp/config/*.yaml",
+          "tests/e2e/weekly/multi_node/internal_dp/config/*.yaml"
+        ]
+      },
+      "message": "[Test] Restore internal DP for multi-node tests (#16330)\n\n### What this PR does / why we need it?\n\nvLLM #47692 changed the hybrid DP load-balancing inference to treat an\nexplicit `--data-parallel-start-rank 0` as meaningful. As a result, the\nprimary node in these multi-node `internal_dp` configurations is now\ninferred as hybrid LB, while the remote node is intended to run headless\nfor internal LB.\n\nPRs #16133, #16186, and #16204 removed `--headless` from remote nodes to\nsatisfy the resulting handshake, but that changed the topology covered\nby the tests. The regular multi-node internal-DP runner sends benchmark\ntraffic only to the primary node. In disaggregated-prefill cases, the PD\nproxy was explicitly designed to exclude headless nodes and target one\nAPI endpoint per DP group. Switching these deployments to\nhybrid/external LB therefore changes the intended test coverage.\n\nRestore the intended internal-LB topology in all 17 affected nightly and\nweekly configurations:\n\n- remove `--data-parallel-start-rank 0` from the primary node of each DP\ngroup, allowing rank 0 to be inferred without enabling hybrid LB;\n- restore `--headless` on the remote node while retaining its non-zero\nDP rank offset.\n\nThis keeps one API endpoint on the primary node and lets it schedule\nrequests across all local and remote DP ranks.\n\n### Does this PR introduce _any_ user-facing change?\n\nNo. This only updates nightly test deployment configurations.\n\n### How was this patch tested?\n\n- `git diff --check`\n- Parsed all 17 modified YAML files with PyYAML and verified their\ninternal-DP node roles.\n- Multi-node NPU nightly and weekly jobs should validate the complete\ndeployments.\n\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/b2f685834a6456197e7033966fdef52a23f1abcd\n\n---------\n\nSigned-off-by: jiangkaiqiang <jiangkaiqiang@huawei.com>\nCo-authored-by: jiangkaiqiang <jiangkaiqiang@huawei.com>"
+    },
+    {
+      "sha": "1b1709b9227ad3e0db2d82b9231c4962919b86f5",
+      "comment": "该 commit 将 nightly 单节点 A3 测试用例迁移到新的 560T A3 机器，并更新了 baseline 结果。新增了多个模型测试（Minimax_m2.7_w8a8_A3, Qwen3_32b_w8a8_ml_A3, Deepseek_R1_W8A8_A3 等），移除了一些旧用例，并将部分用例分配到不同的机器标签上。这是 CI 配置调整，无产品代码变更，风险低，但需要确保新机器上所有用例能稳定运行并更新基线。",
+      "tags": [
+        "ci",
+        "low-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "仅 CI 配置变更，测试用例本身不变；但需要关注新机器上的 baseline 是否合理。",
+        "suggested_test_areas": [
+          ".github/workflows/configs/nightly_config.yaml"
+        ]
+      },
+      "message": "[CI][Misc]migrates the nightly single-node a3 test cases to the 560T A3 machine and obtains baseline results (#15083)\n\n### What this PR does / why we need it?\nThis PR migrates the nightly single-node a3 test cases to the 560T A3\nmachine and obtains baseline results\n\n### Does this PR introduce _any_ user-facing change?\nno\n\n### How was this patch tested?\nrun the cases nightly\n\n\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/b2f685834a6456197e7033966fdef52a23f1abcd\n\n---------\n\nSigned-off-by: guxin108 <1252896542@qq.com>"
+    },
+    {
+      "sha": "45b74a6904a2ea7b90c4f441da014003984099d2",
+      "comment": "该 commit 引入了 KV 层并行（KVPP）特性。核心思想是将 MLA/SFA 模型的逐层 KV cache 在 TP group 内按层分配给不同 rank 持久化，计算当前层前由 owner rank 通过 HCCL 广播完整 layer cache 到其他 rank，并使用两个 scratch buffer 实现一层提前预取。该特性默认关闭，通过 `additional_config.enable_kvpp` 开启，当前仅支持 eager 模式和非 hybrid MLA 模型，支持 TP/EP/PP、chunked prefill、prefix caching、异步调度和固定步 MTP，不支持 graph、PCP、DCP 和 PD 分离。实现涉及新增 KVPPConfig、KVPPPhysicalCachePlan、BroadcastKVPPTransport、KVPPRuntime/KVPPScheduler、KVPP cache 分配逻辑，并修改 MLA/SFA 注意力实现以插入 layerwise_kv_cache_hook 等待广播完成。这是一个高复杂度特性，对 KV cache 管理和分布式并行影响深远，虽默认关闭，但代码路径大量增加，需要充分测试看护。",
+      "tags": [
+        "feature",
+        "high-risk",
+        "kv-cache",
+        "distributed",
+        "model-runner",
+        "attention"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "新增大量单元测试和 e2e 测试（test_kvpp.py），并且修改了多个现有测试以适配 KVPP 配置字段；由于特性默认关闭，需确保默认路径无回归，同时为 KVPP 开启路径补充覆盖（PP、MTP、不同 cache layout 等）。",
+        "suggested_test_areas": [
+          "tests/ut/core/test_kvpp_cache_placement.py",
+          "tests/ut/distributed/test_kvpp.py",
+          "tests/ut/worker/test_kvpp.py",
+          "tests/ut/worker/test_kvpp_cache.py",
+          "tests/ut/worker/test_model_runner_v1.py",
+          "tests/ut/worker/test_model_runner_v2.py",
+          "tests/e2e/pull_request/two_card/test_kvpp.py"
+        ]
+      },
+      "message": "[Feature][KVPP] Add eager KV layer parallelism with full-layer broadcast (#16094)\n\n### What this PR does / why we need it?\n\nAdd KV layer parallelism (KVPP). Each target layer's KV cache is\npersisted on one TP rank, and its full contiguous memory buffer is\nbroadcast before computation. Two reusable scratch buffers enable\none-layer-ahead prefetch without adding a custom operator.\n\nSupported features:\n- Model Runner V1 and V2.\n- TP, EP, and PP with layer ownership assigned within each PP stage.\n- Chunked prefill, prefix caching, and asynchronous scheduling.\n- LI-C8 and SFA-C8 cache layouts.\n- Fixed-step MTP, with MTP layers excluded from KVPP partitioning.\n\nThis PR does not include graph mode, PCP, or DCP support. Prefill/decode\ndisaggregation is not supported yet; its integration will be submitted\nafter the Mooncake refactor is complete.\n\n### Does this PR introduce _any_ user-facing change?\n\nKVPP is disabled by default and can be enabled through `enable_kvpp` in\nthe additional configuration.\n\n### How was this patch tested?\n\nValidated multiple combinations of the features above, including prefix\ncache hits and cache-block reuse, PP layer partitioning, and MTP.\n\nGPQA accuracy evaluation is in progress. Accuracy:\n| Dataset | Correct | Incorrect | Accuracy |\n|---|---:|---:|---:|\n| GPQA Diamond (194 scored questions) | 169 | 29 | 85.35% |\n\nTest configuration: GLM-5.2 on Ascend A3 (16 dies), TP16 + EP + DSA-CP,\nchunked prefill with `max_num_batched_tokens=32768`.\n\n| Input length | KVPP disabled | Full-layer Broadcast | Overhead |\nIncrease |\n|---|---:|---:|---:|---:|\n| 64K | 8.41 s | 8.54 s | 0.13 s | 1.55% |\n| 128K | 17.20 s | 18.35 s | 1.15 s | 6.69% |\n\nConfiguration: GLM-5.2-W4A8C8, TP16 + EP, chunk size 16K, max model\nlength 32K, max sequences 32, MTP1, LI-C8/SFA-C8, prefix caching,\nFULL_DECODE_ONLY, GPU memory utilization 90%. Cache capacity was\nautomatically calculated without a block-count override.\n\n| Configuration | KV cache capacity (tokens) | Capacity multiplier |\n|---|---:|---:|\n| KVPP disabled | 505,472 | 1.00× |\n| Full-layer Broadcast | 4,131,968 | 8.17× |\n\nEquivalent KV memory reduction at the same token capacity: **87.77%**.\nThis is not a reduction in total device memory usage.\n\n### Performance on Ascend A5\n\nKV cache capacity with the same configuration as the pooling benchmark\nabove, using `gpu_memory_utilization=0.90`. Capacity was automatically\ncalculated without a block-count override.\n\n| Configuration | KV cache capacity (tokens) | Capacity multiplier |\n|---|---:|---:|\n| KVPP disabled | 235,008 | 1.00× |\n| Full-layer Broadcast | 1,467,904 | 6.25× |\n\nEquivalent KV memory reduction at the same token capacity, estimated\nfrom the capacity ratio: **83.99%**. This is not a reduction in total\ndevice memory usage.\n\nTest configuration: GLM-5.2-W4A8C8 on a single Ascend A5 node (8 dies),\nTP8 + EP + DSA-CP, chunked prefill, prefix caching, asynchronous\nscheduling, LI-C8, Model Runner V1, eager mode, and `max_num_seqs=12`.\nMTP, SFA-C8, and FlashComm1 were not enabled.\n\n#### TTFT\n\nInput lengths: 32K / 64K / 128K; output length: 1 token; prefix cache\nhit rate: 0%. Each result is the mean of 4 requests at client\nconcurrency 1.\n\n| Token budget | Input length | KVPP disabled | Full-layer Broadcast |\nOverhead | Increase |\n|---|---|---:|---:|---:|---:|\n| 16K | 32K | 2.650 s | 3.046 s | +0.395 s | +14.92% |\n| 16K | 64K | 5.371 s | 6.518 s | +1.147 s | +21.35% |\n| 16K | 128K | 11.017 s | 13.582 s | +2.565 s | +23.28% |\n| 32K | 32K | 2.623 s | 2.614 s | -0.009 s | -0.33% |\n| 32K | 64K | 5.295 s | 5.375 s | +0.080 s | +1.52% |\n| 32K | 128K | 10.901 s | 11.268 s | +0.367 s | +3.36% |\n\nOverhead and percentage changes are calculated from unrounded\nmeasurements. The 32K token budget achieved lower TTFT for both\nconfigurations and was used for the throughput tests.\n\n#### Prefill throughput\n\nConfiguration: `max_num_batched_tokens=32768`, `max_num_seqs=12`, client\nconcurrency 12, 40 requests, 128K input tokens and 1 output token per\nrequest. KV pooling was disabled.\n\n| Prefix cache hit rate | KVPP disabled (input tokens/s) | Full-layer\nBroadcast (input tokens/s) | Change |\n|---|---:|---:|---:|\n| 0% | 12,492.4 | 12,205.7 | -2.30% |\n| 90% | 116,516.2 | 110,224.8 | -5.40% |\n\nThroughput is calculated as total input tokens divided by benchmark\nduration, including cached input tokens. The measured cache hit rate in\nthe 90% scenario was 89.9414% for both configurations. All four\nthroughput runs completed 40/40 requests successfully, with zero\npreemptions.\n\nTest configuration: GLM-5.2-W4A8C8 on a single Ascend A5 node (8 dies),\nTP8 + EP + DSA-CP, chunked prefill, prefix caching, asynchronous\nscheduling, LI-C8, Model Runner V1, and eager mode.\n`max_num_batched_tokens=32768`, `max_num_seqs=12`.\n\nKV pooling was enabled in both configurations using\n`AscendStoreConnector` with the Memcache backend, `kv_role=kv_both`,\n`use_layerwise=false`, and `load_async=true`. CPU pool capacity was\nconfigured as 32 GB per die.\n\nTest scenario: prefill throughput with multiple reusable prefixes.\nSixteen independent prefix families were warmed before measurement,\nexceeding the HBM KV cache capacity in both configurations. The workload\ncontained 40 requests: eight frequently reused families with four\nrequests each, plus eight families with one request each. Each request\nhad 128K input tokens, approximately 90% shared prefix, and 1 output\ntoken, at client concurrency 12. Both configurations used identical\nrequest data and ordering, retaining HBM cache after warmup to compare\nHBM residency and CPU pool loading.\n\n| Prefix cache hit rate | Configuration | Throughput (input tokens/s) |\nHBM cache hit rate | CPU pool cache hit rate | Throughput change |\n|---|---|---:|---:|---:|---:|\n| 90% (multiple prefixes) | KVPP disabled | 66,362.5 | 8.46% | 81.48% |\n— |\n| 90% (multiple prefixes) | Full-layer Broadcast | 97,318.3 | 45.46% |\n44.48% | +46.65% |\n\nThroughput includes cached input tokens. Cache hit rates are relative to\ntotal input tokens; the combined hit rate was 89.94% in both\nconfigurations. Both runs completed 40/40 requests without preemption.\nThis benchmark measures prefill throughput with 1 output token per\nrequest.\n\n### Performance on Ascend A5 (dual-node PP)\n\nTest configuration: GLM-5.2-W8A8C8-mxfp8 on two Ascend A5 nodes (8 dies\nper node), TP8 + PP2 with a 38/40 layer split, EP, DSA-CP, chunked\nprefill, prefix caching, asynchronous scheduling, LI-C8, Model Runner\nV1, and eager mode. `max_num_batched_tokens=32768`, `max_num_seqs=12`,\nand `gpu_memory_utilization=0.90`. MTP, SFA-C8, and FlashComm1 were not\nenabled.\n\nBoth configurations used vllm-ascend `493ec2b` with the pooling\nrestriction removed, and vLLM `b2f6858`, matching the single-node\ncomparison baseline.\n\n#### TTFT\n\nInput lengths: 32K / 64K / 128K; output length: 1 token; prefix cache\nhit rate: 0%. Each result is the mean of 4 requests at client\nconcurrency 1.\n\n| Token budget | Input length | KVPP disabled | Full-layer Broadcast |\nOverhead | Increase |\n|---|---|---:|---:|---:|---:|\n| 32K | 32K | 2.900 s | 2.905 s | +0.006 s | +0.19% |\n| 32K | 64K | 4.503 s | 4.887 s | +0.384 s | +8.53% |\n| 32K | 128K | 7.805 s | 8.665 s | +0.859 s | +11.01% |\n\nOverhead and percentage changes are calculated from unrounded\nmeasurements.\n\n#### Prefill throughput\n\nConfiguration: client concurrency 12, 40 requests, 128K input tokens and\n1 output token per request. KV pooling was disabled.\n\n| Prefix cache hit rate | KVPP disabled (input tokens/s) | Full-layer\nBroadcast (input tokens/s) | Change |\n|---|---:|---:|---:|\n| 0% | 21,395.2 | 18,742.3 | -12.40% |\n| 90% | 177,375.4 | 154,717.3 | -12.77% |\n\nThroughput is calculated as total input tokens divided by benchmark\nduration, including cached input tokens. The measured cache hit rate in\nthe 90% scenario was 89.9414% for both configurations. All four\nthroughput runs completed 40/40 requests successfully, with zero\npreemptions.\n\n#### Pooled prefill throughput\n\nKV pooling was enabled in both configurations using\n`AscendStoreConnector` with the Memcache backend, `kv_role=kv_both`,\n`use_layerwise=false`, and `load_async=true`. CPU pool capacity was\nconfigured as 32 GB per device.\n\nTest scenario: prefill throughput with multiple reusable prefixes.\nThirty-two independent prefix families were warmed before measurement,\ntotaling 3,772,416 tokens and exceeding the HBM KV cache capacity in\nboth configurations. The measured workload contained 40 requests:\nsixteen frequently reused families with two requests each, plus eight\nfamilies with one request each. The remaining eight families were used\nonly during warmup.\n\nEach request had 128K input tokens, approximately 90% shared prefix, and\n1 output token, at client concurrency 12. Both configurations used\nidentical request data and ordering, retaining HBM cache after warmup to\ncompare HBM residency and CPU pool loading.\n\n| Prefix cache hit rate | Configuration | Throughput (input tokens/s) |\nHBM cache hit rate | CPU pool cache hit rate | Throughput change |\n|---|---|---:|---:|---:|---:|\n| 90% (multiple prefixes) | KVPP disabled | 86,438.8 | 0.59% | 89.35% |\n— |\n| 90% (multiple prefixes) | Full-layer Broadcast | 125,699.3 | 53.87% |\n36.07% | +45.42% |\n\nThroughput includes cached input tokens. Cache hit rates are relative to\ntotal input tokens; the combined hit rate was 89.94% in both\nconfigurations. Both runs completed 40/40 requests without preemption.\n\n#### KV cache capacity\n\nCapacity was obtained from the non-pooling service startup logs, using\n`gpu_memory_utilization=0.90`, without a block-count override.\n\n| Configuration | KV cache capacity (tokens) | Capacity multiplier |\n|---|---:|---:|\n| KVPP disabled | 555,392 | 1.00× |\n| Full-layer Broadcast | 2,972,416 | 5.35× |\n\nEquivalent KV memory reduction at the same token capacity, estimated\nfrom the capacity ratio: **81.32%**. This is not a reduction in total\ndevice memory usage.\n\nEnvironment note: a storage-link issue required temporary NFS forwarding\nthrough the second node. Both configurations used the same storage\nroute, and model loading and warmup completed before measurement.\n\n\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/b2f685834a6456197e7033966fdef52a23f1abcd\n\n---------\n\nSigned-off-by: chengruiqi (C) <c00913489@china.huawei.com>\nSigned-off-by: recky-c <ruiqicheng510@gmail.com>\nCo-authored-by: chengruiqi (C) <c00913489@china.huawei.com>"
+    },
+    {
+      "sha": "a8c78b22bd07974db0d79a03a21feb2a692ad0c0",
+      "comment": "该 commit 是自动翻译的中文文档更新，涉及 13 个 .po 文件，同步英文文档变更到中文翻译。无任何代码逻辑变更，风险极低。",
+      "tags": [
+        "docs",
+        "low-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "纯翻译变更，不影响代码和测试。",
+        "suggested_test_areas": []
+      },
+      "message": "[Doc] Translated Doc files 2026-09-10 (#16212)\n\n## Auto-Translation Summary\n\nTranslated **13** file(s):\n\n-\n<code>/home/runner/_work/vllm-ascend/vllm-ascend/docs/source/locale/zh_CN/LC_MESSAGES/community/slash-commands.po</code>\n-\n<code>/home/runner/_work/vllm-ascend/vllm-ascend/docs/source/locale/zh_CN/LC_MESSAGES/developer_guide/Design_Documents/context_parallel.po</code>\n-\n<code>/home/runner/_work/vllm-ascend/vllm-ascend/docs/source/locale/zh_CN/LC_MESSAGES/developer_guide/Design_Documents/quantization.po</code>\n-\n<code>/home/runner/_work/vllm-ascend/vllm-ascend/docs/source/locale/zh_CN/LC_MESSAGES/developer_guide/contribution/testing.po</code>\n-\n<code>/home/runner/_work/vllm-ascend/vllm-ascend/docs/source/locale/zh_CN/LC_MESSAGES/getting_started/installation/install_vllm_ascend.inc.po</code>\n-\n<code>/home/runner/_work/vllm-ascend/vllm-ascend/docs/source/locale/zh_CN/LC_MESSAGES/tutorials/features/pd_disaggregation_mooncake_multi_node.po</code>\n-\n<code>/home/runner/_work/vllm-ascend/vllm-ascend/docs/source/locale/zh_CN/LC_MESSAGES/tutorials/features/pd_disaggregation_mooncake_single_node.po</code>\n-\n<code>/home/runner/_work/vllm-ascend/vllm-ascend/docs/source/locale/zh_CN/LC_MESSAGES/tutorials/models/DeepSeek-V4-Pro.po</code>\n-\n<code>/home/runner/_work/vllm-ascend/vllm-ascend/docs/source/locale/zh_CN/LC_MESSAGES/user_guide/configuration/additional_config.po</code>\n-\n<code>/home/runner/_work/vllm-ascend/vllm-ascend/docs/source/locale/zh_CN/LC_MESSAGES/user_guide/feature_guide/batch_invariance.po</code>\n-\n<code>/home/runner/_work/vllm-ascend/vllm-ascend/docs/source/locale/zh_CN/LC_MESSAGES/user_guide/feature_guide/context_parallel.po</code>\n-\n<code>/home/runner/_work/vllm-ascend/vllm-ascend/docs/source/locale/zh_CN/LC_MESSAGES/user_guide/feature_guide/kv_pool.po</code>\n-\n<code>/home/runner/_work/vllm-ascend/vllm-ascend/docs/source/locale/zh_CN/LC_MESSAGES/user_guide/feature_guide/speculative_decoding.po</code>\n\n---\n\n[Workflow\nrun](https://github.com/vllm-project/vllm-ascend/actions/runs/34436986441)\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/b2f685834a6456197e7033966fdef52a23f1abcd\n\nSigned-off-by: wangxiyuan <wangxiyuan@users.noreply.github.com>\nCo-authored-by: wangxiyuan <wangxiyuan@users.noreply.github.com>"
+    },
+    {
+      "sha": "ecb1768c2feba8ee938dcdc984bb1cf7e4366c03",
+      "comment": "该 commit 修复了 KV pool 外部缓存查找的守卫逻辑。原代码在 `retention_interval` 存在且非 layerwise 模式下，如果 prompt 长度小于两个 retention interval 就提前返回 0（未命中），导致 5083 token 的 prompt 无法复用已有的 4096 token checkpoint。本 commit 移除了这个 early return，允许这类请求查询外部缓存，同时保留小于一个传输粒度的早退检查。MTP 行为与上游保持一致。这会增加空缓存时的查询开销，但提高了缓存命中率。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "kv-cache",
+        "kv-offload"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "行为变更需要回归测试覆盖 retention interval 边界、MTP 启用/禁用、缓存命中/未命中组合；commit 已新增相关单测。",
+        "suggested_test_areas": [
+          "tests/ut/distributed/ascend_store/test_pool_scheduler.py"
+        ]
+      },
+      "message": "[BugFix][KVCache] Allow external lookup below two retention intervals (#16317)\n\n### What this PR does / why we need it?\n\nAllow external cache lookup for prompts shorter than two retention\nintervals. With a retention interval and transfer granularity of 4096, a\n5083-token prompt can reuse an existing 4096-token checkpoint. The\ncurrent early return reports zero without querying the cache.\n\nThe production change only removes this seven-line retention-length\nguard. Existing checks for requests shorter than one transfer unit,\nactual cache availability, and MTP tail recomputation remain unchanged.\nRequests previously excluded by the guard can now incur a lookup even\nwhen the cache is empty.\n\nThe MTP implementation is identical to the upstream base, including its\naligned `final_block_start` calculation. MTP boundary tests confirm\nexisting behavior; they are not evidence of another newly fixed MTP bug.\n\n### Does this PR introduce _any_ user-facing change?\n\nYes. Requests shorter than two retention intervals can reuse valid\nexternal checkpoints instead of being forced to miss. No API or\nconfiguration changes.\n\n### How was this patch tested?\n\n- **Unit tests:** 50 passed in\n`tests/ut/distributed/ascend_store/test_pool_scheduler.py`. The\nretention regression covers MTP enabled/disabled, stored and missing\ncheckpoints, and the existing early return below one transfer unit.\nAdditional boundary coverage confirms the unchanged MTP behavior.\n- **Baseline control:** On the upstream base without this fix, the\nretention lookup regression fails (0 instead of 4096), while the added\nMTP boundary test already passes.\n- **Static checks:** Ruff check, Ruff format check, and `git diff\n--check` pass for the changed files. The full `bash format.sh ci` hook\nsuite could not run because the runtime lacks `pre-commit`.\n- **NPU experiments rerun with upstream MTP logic:**\nDeepSeek-V4-Flash-w8a8-mtp, TP4 × DP2, MTP=1, retention interval 4096.\nThe runtime uses the upstream MTP block verbatim and removes the\nretention guard. Five frozen AISBench inputs were replayed with four\nwarmup requests and four serial measured requests per length, one output\ntoken per request. Measured external hits/queries and outputs match both\nthe previous implementation and the previously measured\nlocal-prefix-only mode.\n\n| AISBench input_len | Actual prompt tokens/request | External\nhits/queries | Previously measured local prefix hits/queries | Hit rate\n|\n| --- | --- | --- | --- | --- |\n| 4096 | 4179 | 16384/16716 | 16384/16716 | 98.01% |\n| 5000 | 5083 | 16384/20332 | 16384/20332 | 80.58% |\n| 5004 | 5087 | 16384/20348 | 16384/20348 | 80.52% |\n| 8192 | 8275 | 32768/33100 | 32768/33100 | 99.00% |\n| 9000 | 9083 | 32768/36332 | 32768/36332 | 90.19% |\n\nThe chat template adds 83 tokens in this setup. Counts exclude warmup.\nDirect AISBench commands were also rerun for all five lengths, with four\nsuccessful requests and zero failures in both warmup and measured\nstages:\n\n```bash\npython3 aisbench_test.py --input_len 5000 --output_len 1 --data_num 4 \\\n  --concurrency 1 --request_rate 0 --dataset_type prefix_cache \\\n  --repeat_rate 1.0 --prefix_test --dp 4\n```\n\nToken-ID input tests reconfirmed that actual lengths 4096/5004/8192/9000\nreuse 0/4096/4096/8192 tokens per request. A separate 5083-token input\nproduced identical 64-token output for an external miss and subsequent\nhit.\n\n**Validation limitations:** Clean-checkout unit tests use the\ndirectory's existing `_mock_deps` stubs and\n`--confcutdir=tests/ut/distributed/ascend_store`; the runtime's parent\nconftest has an unavailable `vllm.v1.attention.ops.pcp` dependency. The\nNPU runtime is the existing `bdab8bde86aad5eba3b362f923a3ff03b2c0e772`\ndeployment with the upstream aligned MTP block and the retention guard\nremoved, retaining its existing memcache backend changes; it is not a\nfull deployment of the latest main. Cold concurrent warmup can differ\nbetween local and external caching due to publication timing and DP\ncache scope. These checks do not establish general model accuracy,\nlookahead KV safety for different continuations, graph-mode coverage, or\nstatistical performance equivalence. This PR leaves upstream MTP\nhandling unchanged.\n\n\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/b2f685834a6456197e7033966fdef52a23f1abcd\n\n---------\n\nSigned-off-by: zouyida2052 <zouyida2002@gmail.com>"
+    },
+    {
+      "sha": "c970e5892579e8fcde616b6f1d2dafccd04e41a2",
+      "comment": "该 commit 修复 KV pool 后端的 NPU 设备绑定问题。在 DP=2/TP=4 等场景下，worker 的 process-group local rank 与实际绑定的可见设备不一致，导致 KV pool client 在错误设备上创建 NPU context；同时 Memcache 的 metadata-only scheduler client 会创建不必要的 EngineCore NPU context。修复方式：新增 `get_scheduler_device_id()`/`set_scheduler_device()`，优先从 `assigned_physical_gpu_ids` 解析实际物理设备并映射到可见设备；MemcacheBackend 构造函数参数由 `local_rank` 改为 `device_id`，scheduler client 在 `init_bm=False` 时不再调用 set_device，避免创建上下文；MooncakeBackend 捕获构造时的当前设备并在 setup 时绑定。该修复避免了多进程环境下 NPU context 错乱和资源浪费。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "distributed",
+        "kv-cache"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "新增了设备绑定相关单测，覆盖 Memcache scheduler 不创建 context、设备解析、setup 绑定等场景；需要继续在真实多卡环境验证。",
+        "suggested_test_areas": [
+          "tests/ut/distributed/ascend_store/test_backend.py"
+        ]
+      },
+      "message": "[BugFix] Fix KV pool NPU device binding and avoid Memcache scheduler contexts (#16287)\n\n### What this PR does / why we need it?\n\nKV pool clients can create NPU contexts on the wrong device when a\nworker's process-group local rank differs from its bound visible device,\nsuch as DP=2 / TP=4. Memcache's metadata-only scheduler client can also\ncreate an unnecessary EngineCore NPU context.\n\nThis combines #15968 (head `393ba9455ace8b4cd3aa6182088460fa5e213472`,\nby @Pz1116) with the additional Memcache scheduler-context fix into one\ncommit, rebased onto main at `c5055c808`:\n\n- Capture the owning worker's current device for Memcache and Mooncake\ninitialization and transfer threads.\n- Resolve scheduler device mapping from assigned physical IDs. Memcache\npasses the resolved device explicitly and skips `set_device()` when\n`init_bm=False`; Mooncake retains explicit scheduler binding.\n- Preserve main's QoS configuration and batch-result validation, and\nupdate the affected constructor test.\n- Add regression coverage for device mapping, backend setup, and the\ncomplete Memcache scheduler factory path.\n\nOriginal author Pz1116 is credited with a `Co-authored-by` commit\ntrailer. The original PR is left unchanged.\n\n### Does this PR introduce _any_ user-facing change?\n\nFixes unintended NPU contexts in KV pooling without adding configuration\nflags. The internal MemcacheBackend constructor argument changes from\n`local_rank` to `device_id`.\n\nThe no-context scheduler path uses `assigned_physical_gpu_ids`; without\nassigned IDs, the existing `torch.npu.current_device()` fallback\nremains.\n\n### How was this patch tested?\n\nOn the final submitted source tree, in an isolated Linux ARM64 container\nwith a dedicated Python environment and the test suite's mocked heavy\ndependencies:\n\n```bash\npython -m pytest -q --confcutdir=tests/ut/distributed/ascend_store \\\n  tests/ut/distributed/ascend_store/test_backend.py\n```\n\n**102 passed.** The `--confcutdir` option isolates the self-contained\nbackend tests from the parent conftest that requires an installed vLLM\nruntime. All 3,858 source-file SHA256 hashes matched the local staged\nsource snapshot before testing.\n\nAlso passed: `git diff --check`, Ruff 0.14.0 lint and format checks for\nall five changed files, codespell, forbidden-import checks,\nboolean-context-manager checks, package `__init__.py` checks, and\nsymbolic-meta checks.\n\nFull `bash format.sh ci` was attempted. The archived script first\nrequired CRLF normalization for Bash; the equivalent normalized script\nthen stalled fetching the ruff-pre-commit hook repository from GitHub\nand was terminated. The complete pre-commit suite is therefore **not\nverified** locally and remains for CI.\n\nPrior hardware evidence (2026-09-08) applies specifically to #15968 at\n`393ba945` plus the original scheduler-context patch, before this\nrebase: A3 DP=2 / TP=4 startup completed, all eight workers appeared\nonly on their assigned physical NPUs 8-15, four duplicate 113 MiB worker\ncontexts disappeared, and neither EngineCore PID appeared in stable NPU\nprocess samples. This historical run was startup/context validation\nonly; no inference requests or benchmarks were run. Hardware startup was\nnot repeated on the rebased tree.\n\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/b2f685834a6456197e7033966fdef52a23f1abcd\n\nSigned-off-by: zouyida2052 <zouyida2002@gmail.com>\nCo-authored-by: Pz1116 <zpbzpb123123@gmail.com>\nCo-authored-by: Fanfive5 <wf337845818@gmail.com>"
+    },
+    {
+      "sha": "fed28d4ce692173954cb887284af45dfa2284a4d",
+      "comment": "该 commit 修复 CI 中 a5 multi nightly 的资源适配，在 workflow 中传递 `OPENLIBING_SECRET` 并让 lws.yaml.jinja2 支持通过 `npu_resource_name` 参数自定义 NPU 资源名，默认仍为 `huawei.com/ascend-1980`。使开发者可以运行 a5 multi nightly。纯 CI 配置变更，风险低。",
+      "tags": [
+        "ci",
+        "low-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "CI 配置变更，不影响现有测试逻辑。",
+        "suggested_test_areas": [
+          ".github/workflows/_e2e_nightly_multi_node.yaml",
+          "tests/e2e/nightly/multi_node/scripts/lws.yaml.jinja2"
+        ]
+      },
+      "message": "[CI] fix a5 multi resource (#16107)\n\n### What this PR does / why we need it?\nadapt resource got a5 multi nightly,add openlibing.secret parameter to\nenable a5 multi nightly run\n\n### Does this PR introduce _any_ user-facing change?\neable developer run a5 multi nightly\n\n### How was this patch tested?\n\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/b2f685834a6456197e7033966fdef52a23f1abcd\n\n---------\n\nSigned-off-by: xqchen7 <chenxueqing7@huawei.com>"
+    },
+    {
+      "sha": "4b90a7c49e320f40899553dd0afdf36e0f96c806",
+      "comment": "该 commit 是 cherry-pick，修复 `scatter_nd_update_sk` tiling 对 vector core 的利用率。原实现将 coreNum 限制为 `min(totalLength, indexRow)` 并对齐为偶数，导致小 workload 时核数不足。现改为直接使用全部可用 vector cores，由已有的 front/tail 块分配逻辑处理 coreNum 大于 workload 的情况。该修复可提升 MoE 权重更新算子的设备利用率，已合入 release 分支，风险较低。",
+      "tags": [
+        "bugfix",
+        "performance",
+        "low-risk",
+        "ops",
+        "moe"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "算子 tiling 行为变化，需要覆盖小 workload 和大 workload 场景验证正确性，尤其是 coreNum 大于 workload 时的边界。",
+        "suggested_test_areas": [
+          "csrc/moe/scatter_nd_update_sk 相关单测",
+          "tests/e2e 中 MoE 模型测试"
+        ]
+      },
+      "message": "[Cherry-pick][Bugfix]Use full vector cores in scatter_nd_update_sk tiling (#16127)\n\n### What this PR does / why we need it:\nCherry-pick of #15901 to main.\n\nThe previous tiling clamped `coreNum_` to `min(totalLength, indexRow)`\nand aligned it up to an even number, which under-utilized the device\nwhen the workload was small. This PR removes the clamping and alignment\nso the kernel is always scheduled with all available vector cores; the\nfront/tail block distribution logic already handles `coreNum_ >\nworkload` gracefully.\n\nBackport of #15901 (merged into releases/v0.26.0rc).\n\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/b2f685834a6456197e7033966fdef52a23f1abcd\n\nSigned-off-by: ZT-AIA <1028681969@qq.com>"
+    },
+    {
+      "sha": "10ce4df4f6bcf039c8caa26a32ad538f7f0c4d94",
+      "comment": "该 commit 是 cherry-pick，将 `GroupedMatmulSwigluQuant` 的 `limited` 参数从 double 改为 float，与算子 OpDef 的 Float attr 类型对齐。tiling 读取 attr 时先尝试 float 指针再回退 double，避免静态 kernel dump 和 L0 OP_ATTR 路径的类型不匹配。属于低风险类型对齐修复。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "ops",
+        "quantization"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "类型对齐修复，现有测试应能覆盖；可补充验证 swiglu_limit 传递正确性。",
+        "suggested_test_areas": [
+          "csrc/gmm/grouped_matmul_swiglu_quant 相关测试",
+          "vllm_ascend/quantization 相关测试"
+        ]
+      },
+      "message": "[Cherry-pick][Bugfix] Align swiglu limit attr type (#16128)\n\n### What this PR does / why we need it:\nCherry-pick of #15933 to main.\n\nCast `limited` to float before passing it into the L0 OP_ATTR path for\nGroupedMatmulSwigluQuant, matching the OpDef Float attr and\nstatic-kernel dump expectations. Also read the attr as float in tiling\nwith a double fallback.\n\nBackport of #15933 (merged into releases/v0.26.0rc).\n\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/b2f685834a6456197e7033966fdef52a23f1abcd\n\nSigned-off-by: ZT-AIA <1028681969@qq.com>"
+    },
+    {
+      "sha": "1ffadbc7a489ae4e2c975d45bfa075e74625b76b",
+      "comment": "该 commit 是 cherry-pick，将 `inplace_partial_rotary_mul` 的 sin 取负操作从 Python 端下沉到 kernel。通过在 op proto/def 新增 `negate_sin` 属性，tiling data 透传该标志，kernel 中通过切换 `InterleavedInversion` 的 mask（0x5555 与 0xAAAA）实现等价取负，不增加额外指令。所有调用点（DSA-CP、DSA v1）改为传原始 sin 并置 `negate_sin=True`。同时 Ascend950 上明确拒绝 `negate_sin=true`。该重构消除了 Python 侧的 `-sin` 临时张量，降低显存和带宽开销。由于是 cherry-pick 且经过 release 验证，风险可控。",
+      "tags": [
+        "refactor",
+        "medium-risk",
+        "ops",
+        "attention"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "kernel 行为新增负 sin 路径，commit 已添加单卡精度测试，覆盖正负 sin 和与 -sin 输入的位等价；建议纳入 DSA/DSA-CP 的回归。",
+        "suggested_test_areas": [
+          "tests/e2e/nightly/single_node/ops/singlecard_ops/test_inplace_partial_rotary_mul.py",
+          "vllm_ascend/attention/dsa_v1.py 相关测试"
+        ]
+      },
+      "message": "[Cherry-pick][Refactor] Move negate_sin of inplace_partial_rotary_mul down to kernel (#16134)\n\n### What this PR does / why we need it:\nCherry-pick of #15940 to main.\n\n- Add `negate_sin` attribute to op proto/def and pass it to kernel via\ntiling data (910B/910_93 path)\n- Negate sin in-kernel by switching the `InterleavedInversion` mask from\n0x5555 to 0xAAAA with zero extra instructions\n- Reject `negate_sin=true` on Ascend950 whose shared common path is not\nmodified\n- Remove the Python-side `at::neg(r2)` in torch_binding, all call sites\nnow pass the original sin tensor\n- Add single-card precision test covering both positive and negative\nsin, plus bit-wise equivalence between `negate_sin=true` and `-sin`\ninput\n\nBackport of #15940 (submitted to releases/v0.26.0rc).\n\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/b2f685834a6456197e7033966fdef52a23f1abcd\n\n---------\n\nSigned-off-by: ZT-AIA <1028681969@qq.com>"
+    },
+    {
+      "sha": "daa644121e1142821777e3ba60a49ab6dd354920",
+      "comment": "该 commit 是一次重大重构，实现了 `UpdatableGraph` 设计，替代旧的 host 端图参数更新机制。新方案中，`UpdatableGraph` 继承 `torch.npu.NPUGraph`，在 capture 阶段通过 `register_task` 注册注意力算子（FIA/PA）及其参数提供者（FIAParamProvider/FIAV2ParamProvider/PAParamProvider），并利用 `_ACTIVE_GRAPH` ContextVar 在非 capture 模式下保持原行为。replay 阶段通过 `resolve_tasks` 从当前 metadata（或 draft metadata）动态解析参数，然后在 `update_stream` 上执行 `graph_task_update_begin/end` 更新。旧代码中大量 `graph_params.attn_params/handles/events` 管理和 `update_graph_params` 分支被删除，attention_v1.py 大幅精简。同时重构了 MRV1/MRV2 中 FIA 和 Spec Decode（Eagle/MTP/DFlash）的图更新路径。该重构减少了 host 端参数更新的复杂性和重复代码，但涉及 ACL Graph 核心机制和多个 spec decode 路径，回归风险高。",
+      "tags": [
+        "feature",
+        "refactor",
+        "high-risk",
+        "compilation",
+        "attention",
+        "model-runner",
+        "spec-decode"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "重构移除了大量旧测试（如 update_graph_params 相关），并新增/调整了 UpdatableGraph 相关测试；需要确保完整图捕获/重放（FIA、PA、spec decode）在 MRV1/MRV2 上的行为与旧实现一致。",
+        "suggested_test_areas": [
+          "tests/ut/compilation/test_acl_graph.py",
+          "tests/ut/attention/test_attention_v1.py",
+          "tests/ut/spec_decode/test_eagle_proposer.py",
+          "tests/ut/spec_decode/test_dspark_proposer.py",
+          "vllm_ascend/worker/v2/aclgraph_utils.py 相关测试"
+        ]
+      },
+      "message": "[Feature][MRV1][MRV2] Refactor Host-Side Parameter Updates for ACL Graph Replay. (#15908)\n\n**What this PR does / why we need it?**\nImplements the `UpdatableGraph` design discussed in\nhttps://github.com/vllm-project/vllm-ascend/issues/13058.\nRefactors the `FIA` and `Speculative Decoding` to work with the new\n`UpdatableGraph` design.\n\nManually validated on A3 with the following scenarios:\n- FIA: Qwen3-0.6B with MRV1 and MRV2\n- MTP: Qwen3.5-27B with MRV1 and MRV2\n\nManually validated on A5 with the following scenarios:\n- FIA: Qwen3-0.6B with MRV1 and MRV2\n- MTP: Qwen3.5-9B with MRV1 and MRV2\n- PA: gemma4 with MRV1 and MRV2\n \n**Does this PR introduce any user-facing change?**\nNo.\n\n**How was this patch tested?**\nTemporarily validated on some model.\n\n\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/b2f685834a6456197e7033966fdef52a23f1abcd\n\n---------\n\nSigned-off-by: zhiyu-wa <1959864813@qq.com>"
+    },
+    {
+      "sha": "e0ee38e41abfd4250d09e2d54857edb3c47c7ed3",
+      "comment": "该 commit 扩展了 Ascend SoC 版本识别，将运行时 SoC ID 范围从 250-255 扩展到 250-256，使 ID 256 的设备被识别为 A3；同时将构建时的 SOC_VERSION `ascend910_9363` 映射到 A3。新增参数化测试验证边界（256 接受、257 拒绝）。这使新的 9363 NPU 设备能够被正确支持。改动小且集中，风险低。",
+      "tags": [
+        "feature",
+        "low-risk",
+        "device"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "新增了 device_type_from_runtime_soc 的边界测试，需要补充 build-time 映射和运行时 ID 的测试覆盖。",
+        "suggested_test_areas": [
+          "tests/ut/device/test_device_config.py"
+        ]
+      },
+      "message": "[Device][Feature] Support Ascend SoC version 256 (#16280)\n\n### What this PR does / why we need it?\n\nExtends A3 support for the new device identifiers reported by the\nAscend910 9363 SoC:\n\n- Expands the runtime SoC ID range from `250-255` to `250-256`, so\nruntime ID `256` is recognized as `AscendDeviceType.A3`.\n- Maps the build-time `SOC_VERSION` value `ascend910_9363` to\n`AscendDeviceType.A3`.\n\nAdds regression coverage for the build-time mapping and the runtime\nupper boundary, including that runtime SoC `257` remains unsupported.\n\nFixes #15569\n\n### Does this PR introduce _any_ user-facing change?\n\nYes. A3 devices with NPU name `9363` and runtime SoC ID `256` are now\nrecognized during both package build and runtime validation.\n\n### How was this patch tested?\n\n- Ruff lint passed for the changed files.\n- Ruff format check passed for the changed files.\n- Python syntax checks and direct boundary checks passed (`255`/`256`\nresolve to A3; `257` raises `RuntimeError`).\n- Added parameterized unit coverage for `ASCEND910_9363` and runtime SoC\nIDs `256`/`257`.\n- The repository's pytest suite was not run in this Windows environment\nbecause its test setup requires `torch` and `vllm`; CI should run the\nadded parameterized unit coverage.\n\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/b2f685834a6456197e7033966fdef52a23f1abcd\n\nSigned-off-by: zhangxuanbo <zhangxuanbo99@gmail.com>"
+    },
+    {
+      "sha": "6b9b83968f5ea81aa11750fc19ef4bd1eb383321",
+      "comment": "文档更新：将 DeepSeek-V4.1-Flash 部署指南中的临时 Atlas CI 镜像替换为正式发布的 vLLM Ascend 镜像，移除页面和导航中的 Experimental/实验性 标签，并将支持矩阵状态从 🔵 更新为 ✅。变更属性为纯文档/元数据，不涉及产品代码。",
+      "tags": [
+        "docs",
+        "low-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "纯文档变更，无产品代码逻辑变化，不涉及测试更新。",
+        "suggested_test_areas": []
+      },
+      "message": "[Doc][Model] Update DeepSeek V4.1 Flash release images (#16356)\n\n### What this PR does / why we need it?\n\nUpdates the DeepSeek-V4.1-Flash deployment guide after the model\ndocumentation was merged:\n\n- replaces the temporary Atlas CI images with the published vLLM Ascend\nimages;\n- uses `quay.io/ascend/vllm-ascend:deepseek-v4.1-flash-a3` for A3;\n- uses `quay.io/ascend/vllm-ascend:deepseek-v4.1-flash` for A2;\n- removes the Experimental/实验性 labels from the page title, navigation,\nand prose;\n- changes the supported-model matrix status from 🔵 to ✅.\n\n### Does this PR introduce _any_ user-facing change?\n\nYes. The guide now points to the release images and presents\nDeepSeek-V4.1-Flash as a supported model.\n\n### How was this patch tested?\n\n- `markdownlint-cli@0.45.0` passes for the changed Markdown files.\n- `git diff --check` passes.\n- `docs/hooks/nav_titles.py` passes Python syntax compilation.\n- Both Quay image tags are active.\n- The supported-model matrix row still has 20 columns.\n- No Experimental/实验性 wording remains in the DeepSeek-V4.1-Flash\ntutorial or navigation title.\n\nSigned-off-by: GDzhu01 <116337067+GDzhu01@users.noreply.github.com>\n\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/b2f685834a6456197e7033966fdef52a23f1abcd\n\n---------\n\nSigned-off-by: GDzhu01 <116337067+GDzhu01@users.noreply.github.com>"
+    },
+    {
+      "sha": "9e5fc3dcf4e1b1eb991944a0d50480ad2b3b3089",
+      "comment": "CI 重构：将 estimated_times 从 test_config.yaml 拆分为独立的 estimated_times.yaml，使仅调整测试耗时的 PR 不会触发全量 CI。更新了 select_tests.py 的加载逻辑（新增 --estimated-times 参数，缺失文件时返回空映射）、coverage.py 的读取来源、update_estimated_times.py 的更新目标，以及 schedule_e2e_test.yaml 的自动化流程。属于低风险配置拆分，但改变了测试选择策略的依赖关系。",
+      "tags": [
+        "ci",
+        "refactor",
+        "low-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "select_tests.py 和 coverage.py 的配置加载逻辑发生了变化，但仓库中没有针对这些 CI 脚本的单元测试，建议补充以覆盖新参数和独立文件加载路径。",
+        "suggested_test_areas": [
+          ".github/workflows/scripts/select_tests.py",
+          ".github/workflows/scripts/coverage.py"
+        ]
+      },
+      "message": "[CI] Split estimated times out of test_config.yaml (#16231)\n\nMove estimated_times into estimated_times.yaml so timing-only PRs keep\nready-precise, while routing changes in test_config.yaml still run the\nfull suite.\n\n### What this PR does / why we need it?\n\n### Does this PR introduce _any_ user-facing change?\n\n### How was this patch tested?\n\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/b2f685834a6456197e7033966fdef52a23f1abcd\n\n---------\n\nSigned-off-by: shiqiangA <shiqiang15@huawei.com>"
+    },
+    {
+      "sha": "9b2871baeaf2149f3f8126f5fd2bc9ff2fb0958a",
+      "comment": "功能实现：支持 Kimi K3 DSpark 与 Decode Context Parallelism (DCP) 组合。核心改动包括：Triton kernel 增加 DCP 感知的 DSpark query slot 映射（owner rank 判定、本地位置压缩、非 owner 置 -1）；DCPManager 新增 dummy run 元数据合成和 DSpark first-pass CP 元数据准备；GDN attention builder 在 DCP 下保留 prefill 语义；MLA DCP 元数据构建时切片 MTP 掩码并修复因果掩码；Mamba prefix-cache 查找排除 DCP KV sharding；临时在 SpeculativeConfig 校验阶段隐藏 DCP 以规避上游限制。跨 spec-decode、attention、worker、kernel 多个模块，是高风险复杂特性。",
+      "tags": [
+        "feature",
+        "high-risk",
+        "spec-decode",
+        "attention",
+        "kernel",
+        "distributed"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "已新增大量单元测试覆盖 DCPManager、MLA CP 掩码、DSpark proposer、Mamba 查找等路径，但缺少真实 NPU 多卡环境下 DSpark+DCP 的端到端测试，建议在 context_parallel E2E 目录补充覆盖。",
+        "suggested_test_areas": [
+          "tests/ut/attention/test_mla_cp.py",
+          "tests/ut/spec_decode/test_dspark_proposer.py",
+          "tests/ut/worker/test_dcp_manager.py",
+          "tests/e2e/pull_request/four_card/context_parallel/"
+        ]
+      },
+      "message": "[Feature] support Kimi K3 DSpark with DCP (#15855)\n\n### What this PR does / why we need it?\nThis PR adds support for running Kimi K3 DSpark with Decode Context\nParallelism (DCP) on Ascend.\n\nThe main changes include:\n\n- Add DCP-aware DSpark query slot mapping:\n- Map global KV positions to the owning DCP rank and compact local KV\npositions.\n  - Mark query slots as `-1` on non-owner ranks.\n  - Support configurable DCP size, rank, and KV-cache interleave size.\n\n- Add dedicated DCP metadata preparation for DSpark's parallel\nfirst-pass query block:\n  - Build local sequence lengths from the complete draft query width.\n  - Treat the DSpark draft query as decode metadata.\n  - Skip the autoregressive MTP DCP path for parallel drafting.\n\n- Align MLA and GDN metadata:\n  - Slice the DCP MTP attention mask to the decode sub-batch.\n  - Fix the DCP MTP causal mask before a rank's first local key.\n- Use `1 + num_speculative_tokens` as the target verification reorder\nthreshold.\n- Preserve prefill classification for spec-width prompt chunks under\nDCP.\n\n- Fix DCP dummy/FULL-graph metadata:\n- Synthesize isolated sequence and computed-token state for\nuniform-decode dummy runs.\n  - Avoid inheriting metadata from the previous real batch.\n- Require the full prompt to be computed before selecting a DCP\nuniform-decode graph.\n\n- Keep Mamba prefix-cache lookup on replicated state by excluding it\nfrom DCP KV sharding.\n\n### Does this PR introduce _any_ user-facing change?\nNo\n\n### How was this patch tested?\n\n\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/b2f685834a6456197e7033966fdef52a23f1abcd\n\n---------\n\nSigned-off-by: weiguihua2 <weiguihua2@huawei.com>"
+    },
+    {
+      "sha": "f0700b483b04a785dcd146b2ac6c766bdc6c05ec",
+      "comment": "BugFix：修复 test_selector.py 中 CodeChangeDetector 提取 changed line range 时过度捕获尾部行的问题。主要调整 end_line 计算（从 old_start+old_count-3 改为 -4），并在无新增行时不再额外递减 end_line；同时增加空白行过滤，避免覆盖数据将空行作为控制流节点导致误判。该修复提高 PR 测试选择的精确性，属于 CI 工具链路的关键修正。",
+      "tags": [
+        "bugfix",
+        "ci",
+        "low-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "diff 行号提取逻辑属于测试选择核心路径，当前没有直接测试覆盖，建议增加针对 hunk 解析规则（上下文行、边界条件、空行过滤）的单元测试。",
+        "suggested_test_areas": [
+          ".github/workflows/scripts/test_selector.py",
+          "tests/ut/ci/"
+        ]
+      },
+      "message": "[CI]Fix changed line range extraction by subtracting over-captured trailing lines (#16274)\n\n### What this PR does / why we need it?\nWhen obtaining the changed line number ranges from the diff, subtract\nthe extra trailing line numbers that were over-captured.\n\n### Does this PR introduce _any_ user-facing change?\nNo. This PR does not introduce any user-facing changes.\n\n### How was this patch tested?\nThis patch was tested through the following approaches:\nManual testing: Verified the following scenarios:\nDiff parsing: context lines are removed, and changed line number ranges\ncorrectly subtract over-captured trailing lines\n\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/b2f685834a6456197e7033966fdef52a23f1abcd\n\n---------\n\nSigned-off-by: shenhui-cli <shenhui85@126.com>"
+    },
+    {
+      "sha": "4c832029448365a2a14c6cccc043a7094bf8dd42",
+      "comment": "测试配置维护：更新 weekly 多节点外部 DP 测试配置。包括重命名 DeepSeek-V4-flash 配置为 DS-V4-flash 并更新性能基线；新增 DSv4-Flash-Memcache-PD-layerwise 配置（含 Memcache + Mooncake 双层 KV transfer、layerwise 传输）；清理 DeepSeek-V4-Flash-Memcache-PD-acc 中的过时环境和参数；将 dataset_path_local 标准化为 dataset_path 并更新 baselines；移除未使用的 Qwen3.5-397B 配置。这些变更使 weekly 测试与当前功能和硬件版本对齐。",
+      "tags": [
+        "test",
+        "chore",
+        "low-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "性能基线和测试配置已更新，但需要实际运行 weekly 多节点流水线验证新配置（如 DSv4-Flash-Memcache-PD-layerwise）的稳定性和新 baseline 的有效性。",
+        "suggested_test_areas": [
+          "tests/e2e/weekly/multi_node/external_dp/config/DS-V4-flash-w8a8-PD-prefix-weekly.yaml",
+          "tests/e2e/weekly/multi_node/external_dp/config/DSv4-Flash-Memcache-PD-layerwise.yaml",
+          "tests/e2e/weekly/multi_node/external_dp/config/DeepSeek-V4-Pro-w4a8-PD-no-prefix.yaml"
+        ]
+      },
+      "message": "[Test][BugFix] Fix weekly test case config and update baselines (#16143)\n\n### What this PR does / why we need it?\n\nThis PR updates and fixes the weekly test case configurations for\nmulti-node external data parallel (DP) setups. Specifically, it:\n- Renames `DeepSeek-V4-flash-w8a8-PD-prefix-weekly.yaml` to\n`DS-V4-flash-w8a8-PD-prefix-weekly.yaml` and updates its performance\nbaselines.\n- Cleans up and updates environment variables and configurations in\n`DeepSeek-V4-Flash-Memcache-PD-acc.yaml`, including setting\n`HCCL_EXEC_TIMEOUT`, moving `VLLM_PREFIX_CACHE_RETENTION_INTERVAL` to\nprefill env, removing obsolete flags (`enable_flashcomm1`,\n`enable_mlapo`), and updating `max-model-len` to `1048576`.\n- Standardizes dataset path parameters from `dataset_path_local` to\n`dataset_path` in `DeepSeek-V4-Pro-w4a8-PD-no-prefix.yaml` and updates\nperformance baselines.\n- Removes the unused configuration file\n`Qwen3.5-397B-w4a8-PD-no-mtp.yaml`.\n\n### Does this PR introduce _any_ user-facing change?\n\nNo. These are internal test configuration updates.\n\n### How was this patch tested?\n\nTested via weekly e2e multi-node external DP CI pipelines.\n\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/b2f685834a6456197e7033966fdef52a23f1abcd\n\n---------\n\nSigned-off-by: chen-commits <1636718796@qq.com>\nSigned-off-by: chen <1636718796@qq.com>"
+    },
+    {
+      "sha": "657f927b31470a5d3243996dc9ce36c00523690f",
+      "comment": "功能增强：支持 Profiling Chunk (CPP) 与 Short Request First (SRF) 调度组合。原先两者互斥，现允许在同步调度模式下同时启用，并在 ProfilingChunkScheduler 中按需安装 SRF 等待队列；异步调度组合仍被拒绝并给出明确错误。MRV1 的 profiling-chunk 计时从 sample_tokens 后置改到 model_forward 结束点，与 MRV2 路径统一，并通过 worker 共享路径附加计时结果。平台配置校验同步调整。同时将四卡 profiling-chunk 性能测试参数化为 MRV1/MRV2 × SRF 开关四种场景。",
+      "tags": [
+        "feature",
+        "scheduler",
+        "model-runner",
+        "medium-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "PR 已包含 scheduler SRF 队列和 platform 配置校验的单元测试，以及四卡性能测试参数化，但 MRV1 计时路径重构涉及 worker/model_runner 行为，建议持续关注相关回归。",
+        "suggested_test_areas": [
+          "tests/ut/core/test_profiling_chunk.py",
+          "tests/ut/test_platform.py",
+          "tests/ut/worker/test_model_runner_v1.py",
+          "tests/e2e/pull_request/four_card/test_profiling_chunk_performance.py"
+        ]
+      },
+      "message": "[Feature][MRV1][MRV2] Support CPP and SRF composition (#15464)\n\n### What this PR does / why we need it?\n\nThis PR enables Profiling Chunk (CPP) scheduling to work with Short\nRequest First (SRF) scheduling on both Model Runner V1 and Model Runner\nV2.\n\nPreviously, `short_request_first_config` and `profiling_chunk_config`\nwere treated as mutually exclusive. This prevented SRF from prioritizing\nshort requests while profiling-based chunk sizing was enabled.\n\nThis change:\n\n- allows SRF and profiling-chunk scheduling to be enabled together in\nsynchronous scheduling mode;\n- keeps the unsupported asynchronous combination rejected with an\nexplicit error;\n- installs the standard SRF waiting queue in `ProfilingChunkScheduler`\nwhen SRF is enabled;\n- aligns Model Runner V1 profiling-chunk timing with the Model Runner V2\ntiming path, measuring model-forward execution consistently and\nattaching the timing result through the shared worker path;\n- adds unit coverage for configuration validation, SRF queue\ninstallation, and short-request ordering;\n- extends the four-card profiling-chunk performance test to cover MRV1,\nMRV2, MRV1+SRF, and MRV2+SRF with otherwise identical runtime settings.\n\n### Does this PR introduce _any_ user-facing change?\n\nYes.\n\nUsers can enable `short_request_first_config.enabled=true` together with\n`profiling_chunk_config.enabled=true` when synchronous scheduling is\nused. No new configuration field is introduced, and existing behavior is\nunchanged when SRF is disabled.\n\nThe SRF + profiling-chunk combination remains unsupported with\n`async_scheduling=true`.\n\n### How was this patch tested?\n\nA complete E2E rerun on the rebased head was not completed; the targeted\nPR CI E2E should validate the rebased integration.\n\n## AI Assistance\n\nThis PR was prepared with AI assistance. The submitter reviewed the\nchanges, conflict resolution, and reported validation results.\n\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/b2f685834a6456197e7033966fdef52a23f1abcd\n\n---------\n\nSigned-off-by: dianWang325 <93850926+dianWang325@users.noreply.github.com>"
+    },
+    {
+      "sha": "7ab47e73d005756963e3c6dd0e491296401b1f19",
+      "comment": "功能实现：为 Ascend MRV1 后端添加 Super Kernel 优化支持。AscendCompilationConfig 新增 enable_super_kernel 字段，默认继承 enable_static_kernel 的值；ACL Graph 捕获期间使用 torch.npu.super_kernel_scope_begin/end 包裹模型 forward，并在捕获后调用 super_kernel_optimize；CompilerInterface 传递 super_kernel_optimize 选项；平台在禁用 npugraph_ex/static_kernel 时同步禁用 super kernel。注意默认行为变化：原有 static kernel 用户若不显式设置，将自动启用 super kernel，可能增加编译时间；super kernel 依赖 static kernel，配置校验会强制该依赖。",
+      "tags": [
+        "feature",
+        "compilation",
+        "config",
+        "medium-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "已添加 ACL Graph super kernel scope 的单元测试和配置默认值/非法组合校验测试，但真实 NPU 图捕获下 super kernel 编译产物和性能影响仍需验证。",
+        "suggested_test_areas": [
+          "tests/ut/compilation/test_acl_graph.py",
+          "tests/ut/test_ascend_config.py",
+          "tests/e2e/pull_request/one_card/compile/"
+        ]
+      },
+      "message": "[Feature][MRV1] Add Super Kernel optimization support for Ascend backend (#15059)\n\n### What this PR does / why we need it?\nThis is a part of\nhttps://github.com/vllm-project/vllm-ascend/issues/4715#issue-3694310762:\n\n1. Refactor the npugraph_ex config，modified the default configuration of\nthe super kernel, new default value of super kernel is false.\n2. Support online-infer with super kernel.\n3. Super kernel optimization follows `enable_static_kernel` by default.\nTo use static kernel without super kernel, set `enable_super_kernel` to\n`false` explicitly. Super kernel cannot be enabled when static kernel is\ndisabled.\n\nIncludes the function of adapting GLM5.2 to SK in #15164 by qigangc.\n\n### Does this PR introduce _any_ user-facing change?\nyes，the new config of npugraph_ex is as follow:\n```\nadditional_config={\n            \"ascend_compilation_config\": {\n                \"enable_npugraph_ex\": True,\n                \"enable_static_kernel\": True\n                \"enable_super_kernel\": True\n            }\n        }\n```\n\n### How was this patch tested?\n\n\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/b2f685834a6456197e7033966fdef52a23f1abcd\n\n---------\n\nSigned-off-by: lsh <854651606@qq.com>"
+    },
+    {
+      "sha": "a33b6fcb6e070de6f6b8e07535bb89b81e1758d7",
+      "comment": "BugFix：修复 GLM5.2 MTP index cache 在 Ascend 上失效的问题。根因是实际 indexer gate（skip_topk）和共享 top-k buffer 位于内层 MLA impl（非 nn.Module），上游 DeepSeekMultiTokenPredictor 的钩子无法通过 named_modules 访问。修复方式：在 AscendMultiHeadLatentAttention 上增加 skip_topk 和 topk_indices_buffer 属性转发到内层 impl；MTP/nextn 层初始化时强制 skip_topk=False；在 draft step 0 后调用新增的 compact_mtp_topk_indices 将 step-0 的 top-k 行压缩到请求对齐位置，DSA-CP 下通过 all_reduce 获取跨 rank 行。新增 spec_decode/mtp.py 模块和大量测试。",
+      "tags": [
+        "bugfix",
+        "spec-decode",
+        "attention",
+        "medium-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "PR 已包含属性转发、初始化一致性、compaction 逻辑的单元测试以及多卡 nightly E2E 测试，但 nightly 测试依赖真实多卡环境，需确保持续运行且覆盖 DSA-CP 场景。",
+        "suggested_test_areas": [
+          "tests/ut/ops/test_mla.py",
+          "tests/ut/spec_decode/test_eagle_proposer.py",
+          "tests/ut/spec_decode/test_mtp.py",
+          "tests/e2e/nightly/single_node/ops/multicard_ops_a3/test_mtp_index_cache.py"
+        ]
+      },
+      "message": "[BugFix] Fix GLM5.2 MTP index cache (#15754)\n\n﻿### What this PR does / why we need it?\n\nGLM5.2 MTP with shared index (`index_share_for_mtp_iteration`) was\nbroken on Ascend because the runtime index-cache state was not correctly\nexposed or initialized:\n\n1. The actual indexer gate (`skip_topk`) and shared top-k buffer\n(`topk_indices_buffer`) live in the inner MLA implementation\n(`AscendSFAImpl`), which is not an `nn.Module` and is invisible to\n`named_modules()`. Upstream `DeepSeekMultiTokenPredictor` hooks call\n`set_skip_topk` / `compact_topk_indices` on the module, so those calls\nnever reached the inner implementation on Ascend.\n2. MTP/nextn layers could be initialized with `skip_topk=True` from the\nbackbone skip pattern. They must never start in skip mode because they\ncompute their own indices at draft step 0 and toggle at runtime.\n3. After draft step 0, the shared top-k buffer rows were not compacted\nto request-aligned positions, so steps 1+ could read the wrong rows.\n\nThis PR fixes the Ascend MTP index-cache path by:\n\n- Adding `skip_topk` and `topk_indices_buffer` properties on\n`AscendMultiHeadLatentAttention` that forward to the inner MLA impl, so\nupstream proposer hooks keep working.\n- Masking the initial `skip_topk` with `not is_mtp_layer` in\n`_deepseek_v2_mla_attention_init`.\n- Calling `compact_topk_indices(token_indices_to_sample)` after draft\nstep 0 in `AscendSpecDecodeBaseProposer` when supported.\n\nFixes #15864\n\n### Does this PR introduce _any_ user-facing change?\n\nNo user-facing API or configuration change. This is an internal fix for\nGLM5.2 MTP index-cache sharing on Ascend.\n\n### How was this patch tested?\n\n- Unit tests: `pytest -sv tests/ut/ops/test_mla.py\ntests/ut/spec_decode/test_eagle_proposer.py`\n\n\n\n\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/b2f685834a6456197e7033966fdef52a23f1abcd\n\n---------\n\nSigned-off-by: Li Jiahang <216526138+lijiahang226@users.noreply.github.com>"
+    },
+    {
+      "sha": "be427041bf63a620e4a637b60f2656e87dcdf8f6",
+      "comment": "性能优化：重构 MRV2 slot-mapping Triton kernel，用有界连续窗口加载 block-table 行并通过 tl.gather 获取物理块号，替代原先整行 staging 或直接按 token 加载。窗口大小根据最小 kernel block size 和 TRITON_BLOCK_SIZE 计算，UB 占用与 block-table 行长度无关，解决超长行导致 UB 溢出的问题。同时区分 allocation block size 和 kernel block size，修正 DCP 下逻辑块交错映射，并将位置窄化为 INT32、用乘法减法替代取余。基准测试显示 10~87 倍加速。",
+      "tags": [
+        "performance",
+        "kernel",
+        "model-runner",
+        "medium-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "更新了 nightly 单算子测试以覆盖空请求、跨块/跨 tile、混合 kernel block size、CP4 逻辑块交错等场景，但该测试位于 nightly 目录，PR CI 不执行，建议在 PR 级增加轻量 sanity 验证。",
+        "suggested_test_areas": [
+          "tests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_compute_slot_mapping.py",
+          "vllm_ascend/worker/v2/block_table.py"
+        ]
+      },
+      "message": "[MRV2][Performance][Kernel] Use windowed block-table gather for V2 slot mappings (#16120)\n\n### What this PR does / why we need it?\n\nReplace full block-table row staging in the Ascend V2 slot-mapping\nTriton kernel with a bounded contiguous window load followed by\n`tl.gather`.\n\nThis bounds UB use independently of block-table row length. The window\nis sized from the smallest kernel block size, because the upstream\nV0.28.0 `block_sizes_tensor` used by slot mapping stores\n`kernel_block_sizes`.\n\nThe kernel preserves the upstream CP mapping behavior, narrows positions\nto INT32, and computes block offsets with multiply/subtract instead of\nremainder. The V2 operator documentation is moved under\n`ops/triton/docs/v2`.\n\n### Does this PR introduce _any_ user-facing change?\n\nNo.\n\n### How was this patch tested?\n\n- `bash format.sh` — passed.\n- `bash format.sh ci` — passed.\n- `SHELLCHECK_OPTS=\"--exclude=SC2046,SC2006,SC2086\" pre-commit run\n--all-files --hook-stage manual --show-diff-on-failure` — passed.\n- `python -m compileall -q\nvllm_ascend/ops/triton/v2/block_table/compute_slot_mappings.py\nvllm_ascend/worker/v2/block_table.py\ntests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_compute_slot_mapping.py`\n— passed.\n- NPU UT on `lab-worker-a3-01` passed on the preceding revision:\n  ```bash\npython -m pytest -sv\ntests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_compute_slot_mapping.py\n  ```\nResult: `4 passed, 14 warnings in 17.74s`. This covers CP=1/2/4, empty\nrequests, cross-block/cross-tile ranges, mixed kernel block sizes,\npadding, and the `out` interface. Re-run is pending after the\nreviewer-requested tile-size source deduplication; the change preserves\nthe configured value and kernel algorithm.\n- Per-case NPU `msprof op` comparison against the V0.28.0 upstream\nkernel. `Task Duration(us)`:\n\n  | Case | Grid | Upstream | Ascend | Speedup |\n  | --- | ---: | ---: | ---: | ---: |\n  | tile-1 | 1x2 | 114.598 | 3.680 | 31.14x |\n  | tile-64 | 1x65 | 229.255 | 6.680 | 34.32x |\n  | tile-1024 | 1x1025 | 2934.781 | 39.399 | 74.49x |\n  | long-1x8192 | 1x2 | 786.244 | 10.920 | 72.00x |\n  | long-64x8192 | 1x65 | 1573.109 | 20.960 | 75.05x |\n  | long-64x32768 | 1x65 | 6181.396 | 70.719 | 87.41x |\n  | cp2-tile-64-rank0 | 1x65 | 498.110 | 43.579 | 11.43x |\n  | cp4-tile-64-rank2 | 1x65 | 493.110 | 44.019 | 11.20x |\n\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/b2f685834a6456197e7033966fdef52a23f1abcd\n\nSigned-off-by: Liam <ml646@duke.edu>\nCo-authored-by: Liam <ml646@duke.edu>"
+    },
+    {
+      "sha": "26e1156f52e22f11550b351e779e3f7315b31656",
+      "comment": "BugFix：修复 V2 DSpark/DFlash speculator 在内存 profiling 阶段错误复用 target 模型的 DP token count 同步状态。当 draft 输入长度与 target 不同（如 profiling 批）时，复用状态会导致 DPMetadata 本地计数断言失败（如 384 vs 320）。修复方式：在 dummy_run 且 skip_attn_for_dummy_run 时，将 sync_state 置为 None，让 forward_context 协调实际 draft 计数，并保留正常推理和 graph warmup 的既有状态转发。这是针对当前 vLLM 基线（b2f685834a）的临时适配，上游 vLLM #54856 合入后应移除 guard。",
+      "tags": [
+        "bugfix",
+        "spec-decode",
+        "distributed",
+        "medium-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "新增 four_card MRV2 DP DSpark E2E 测试，但测试依赖特定模型权重路径（DEEPSEEK_V4_DSPARK_MODEL_PATH），且未覆盖 DFlash 和 profiling 分支的单元模拟，建议补充不依赖真实权重的隔离测试。",
+        "suggested_test_areas": [
+          "tests/e2e/pull_request/four_card/model_runner_v2/test_spec_decode_data_parallel.py",
+          "vllm_ascend/worker/v2/spec_decode/dspark/speculator.py",
+          "vllm_ascend/worker/v2/spec_decode/dflash/speculator.py"
+        ]
+      },
+      "message": "[BugFix][Spec Decode] Recompute draft DP counts during profiling (#16075)\n\n### What this PR does / why we need it?\n\nFix DP token-count reuse during the initial memory profiling pass of the\nV2 DSpark and DFlash speculators. A target-model DP synchronization\ndescribes the token counts of that particular forward pass. Reusing it\nfor a draft forward with a different input length causes engine\ninitialization to fail.\n\nUpstream vLLM already fixes the profiling argument in\n[#54856](https://github.com/vllm-project/vllm/pull/54856)\n(`facd9a74a1`). However, Ascend main currently pins\n`.github/vllm-main-verified.commit` to\n`b2f685834a6456197e7033966fdef52a23f1abcd`, which predates that fix and\nstill forwards the target counts. This adaptation covers the current\nverified baseline and older affected vLLM revisions. With the upstream\nfix present, the parent already ignores the profiling DP state.\n\n**TODO (main2main cleanup):** Once vLLM-Ascend's main2main integration\nand verified vLLM baseline include upstream\n[vllm-project/vllm#54856](https://github.com/vllm-project/vllm/pull/54856)\n(`facd9a74a1cd1b9fed324cdc2cceb8d54fdad3d0`), remove the temporary\nprofiling guards from both `AscendDSparkSpeculator.propose()` and\n`AscendDFlashSpeculator.propose()` and rely on the upstream profiling\npath.\n\nThe call chain is:\n\n1. `profile_run()` calls `_dummy_run(..., skip_attn=True,\nis_profile=True)`.\n2. The target forward coordinates its per-rank token counts and produces\n`dp_sync`.\n3. The runner passes this state to the draft `propose()` with\n`dummy_run=True` and `skip_attn_for_dummy_run=True`.\n4. The parallel drafter computes its own query length. DFlash uses\n`num_reqs * (K + 1)`; DSpark with `sample_from_anchor=True` uses\n`num_reqs * K`.\n5. The upstream profiling branch calls `_generate_draft()` with that\ndraft length but forwards `dp_sync.num_tokens_across_dp` from the\ntarget.\n6. `set_forward_context()` passes these inconsistent values to\n`DPMetadata.make()`, whose local token-count assertion fails.\n\nThis was observed on A5 with DP4 and DSpark: 64 requests and K=5\nproduced 320 draft tokens while the reused target count was 384,\nresulting in `AssertionError: 384 320`. DFlash can hit the same issue\neven though its query length is K+1: a 4096-token profiling batch with\n64 requests and K=5 has only 384 draft query tokens. Matching lengths in\na uniform decode batch do not guarantee matching lengths during memory\nprofiling.\n\nBoth Ascend wrappers now pass `None` as the synchronization state only\nwhen `dummy_run and skip_attn_for_dummy_run`. This lets\n`set_forward_context()` coordinate the actual draft token counts across\nDP ranks. It does not disable DP synchronization or mutate the target\nstate. Normal inference and graph warmup keep their existing state\nforwarding.\n\nEagle3 and MTP do not need this adjustment: their shared autoregressive\npath preserves the target batch shape for the first draft step and\nperforms a fresh DP synchronization for the later one-token decode\nsteps. This change does not address graph-padding index handling.\n\n### Does this PR introduce _any_ user-facing change?\n\nV2 DSpark/DFlash DP deployments can complete memory profiling when the\ntarget and draft input lengths differ. No CLI or configuration changes\nare required.\n\n### How was this patch tested?\n\n- Reproduced the DSpark `384 320` assertion on A5, then verified that\nthe profiling guard allows startup to proceed. The local\nDeepSeek-V4-Flash-DSpark V2 DP4/EP deployment subsequently completed a\nreal chat request and all 1319 GSM8K requests with zero failed requests.\nThat runtime checkout also contained separate FP8 operator compatibility\nfixes; those are outside this PR.\n- Executed the upstream DFlash and autoregressive `propose()` functions\nin an isolated CPU check with model kernels and collectives mocked. With\n64 requests and K=5, a 4096-token target forwarded stale counts to\nDFlash's 384-token draft; Eagle3/MTP reused counts only for their\nshape-preserving first step and synchronized the later step\nindependently. This is not a DFlash end-to-end NPU test.\n- No test files are included in this PR.\n\nLocal runtime validation used vLLM\n`e6bfe03ad73a3330cb427885aa90d97a12e1c704`.\n\nLocal guard/existing DSpark checks: **26 passed** on Ascend `3d27bd866`\nwith its verified vLLM revision\n`b2f685834a6456197e7033966fdef52a23f1abcd`. These checks cover both\nwrappers, target counts 384/4096, with/without DP state, and profiling\nversus ordinary/graph-warmup calls. They were run locally and are not\npart of the PR. The isolated test environment used the image's NPU\nTriton import compatibility shim.\n\nThe two changed files pass Ruff lint and formatting checks. Full\nrepository hook validation remains incomplete locally because the\nactionlint environment is still downloading its Go toolchain; this is\nseparate from the Python checks above.\n\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/b2f685834a6456197e7033966fdef52a23f1abcd\n\n---------\n\nSigned-off-by: jiajinzhu2 <jiajinzhu@huawei.com>"
+    },
+    {
+      "sha": "5efb85fd8bc501826533bd75e87ff478eba4844e",
+      "comment": "测试缓解：临时跳过 test_deepseek_v4_dsa_pcp_dspark E2E 测试，原因是 DSpark acceptance 问题正在调查中。MTP 相关的 E2E 测试保持启用。该 commit 仅添加 pytest.mark.skip 装饰器，不涉及产品代码。",
+      "tags": [
+        "test",
+        "ci",
+        "low-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "测试被跳过导致 DSpark+PCP 场景覆盖缺失，需要在问题修复后取消 skip 并验证测试通过。",
+        "suggested_test_areas": [
+          "tests/e2e/pull_request/four_card/context_parallel/test_deepseek_v4.py"
+        ]
+      },
+      "message": "[Test] Temporarily skip DeepSeek-V4 DSpark E2E test (#16306)\n\n### What this PR does / why we need it?\n\nTemporarily skip `test_deepseek_v4_dsa_pcp_dspark` while the DSpark\nacceptance issue is being investigated. The MTP test remains enabled.\n\n### Does this PR introduce _any_ user-facing change?\n\nNo. This only skips the affected E2E test.\n\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/b2f685834a6456197e7033966fdef52a23f1abcd\n\nSigned-off-by: leolee <yihao.li@huawei.com>"
+    },
+    {
+      "sha": "fa9f8a7f3d57d28122109dd51a50d91d9f53a805",
+      "comment": "CI 运维：将过渡性的通用 A3 runner 标签（linux-aarch64-a3-N-）规范化为稳定标签（linux-aarch64-a3-N），同步更新 actionlint 白名单、runner_label.json、select_tests.py 中的 560T 标签映射和 test_config.yaml 分区配置，并调整 a3-2/a3-4 分区 load-balanced group 数量为 4。纯 CI 基础设施变更，不影响产品逻辑。",
+      "tags": [
+        "ci",
+        "chore",
+        "low-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "runner 标签变化不改变测试内容，只需 CI 实际运行确认路由正确，无需更新测试用例。",
+        "suggested_test_areas": [
+          ".github/workflows/scripts/select_tests.py",
+          ".github/workflows/scripts/runner_label.json"
+        ]
+      },
+      "message": "[CI] Normalize generic A3 runner labels (#16138)\n\n### What this PR does / why we need it?\n\nReplace the transitional generic A3 runner labels with their stable\nequivalents:\n\n- `linux-aarch64-a3-2-` -> `linux-aarch64-a3-2`\n- `linux-aarch64-a3-4-` -> `linux-aarch64-a3-4`\n- `linux-aarch64-a3-8-` -> `linux-aarch64-a3-8`\n\nKeep the actionlint label inventory, runner metadata, test partitions,\nand accuracy-test rerouting map consistent. Dedicated `800i`/`800t`\nlabels and `*-cn12-001` labels are unchanged.\n\n### Does this PR introduce _any_ user-facing change?\n\nNo. This only updates CI runner label routing.\n\n### How was this patch tested?\n\nCI:\nhttps://github.com/vllm-project/vllm-ascend/actions/runs/34432115245/job/102783061705?pr=16138#step:1:2\nResult:\n<img width=\"1363\" height=\"581\" alt=\"image\"\nsrc=\"https://github.com/user-attachments/assets/0083e3d0-d214-4163-9c7f-5a3755b384c6\"\n/>\n\n\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/b2f685834a6456197e7033966fdef52a23f1abcd\n\n---------\n\nSigned-off-by: MrZ20 <2609716663@qq.com>"
+    },
+    {
+      "sha": "f4b6bd05f05717e10e4521a78f4b3beba5bb5a99",
+      "comment": "文档更新：大幅扩展 MiniMax-M3 部署指南，新增 Prefill-Decode 分离（1P1D）多节点部署章节，涵盖 A3（DP2 TP4 PP2 → DP4 TP4 PP1）和 950DT MXFP8（DP2 TP4 PP1 → DP2 TP4 PP1）两套拓扑，包含 launch_online_dp.py 启动器、run_dp_template.sh 模板、Mooncake KV transfer 配置、代理转发脚本和关键参数说明。同时更新支持矩阵：MiniMax-M3 状态从 🔵 转为 ✅，新增 950DT MXFP8 行；修正中文术语“升腾”为“昇腾”。纯文档，但包含大量需验证的部署命令。",
+      "tags": [
+        "docs",
+        "low-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "纯文档变更，无产品代码修改，不涉及测试用例更新。",
+        "suggested_test_areas": []
+      },
+      "message": "[Doc] add PD disaggregation deployment for MiniMax-M3 (#15795)\n\nAdd multi-node 1P1D disaggregation deployment guide with Mooncake\nconnector configuration, including Prefiller (PP=2/TP=4/DP=2) and\nDecoder (TP=4/DP=4) scripts, proxy setup, and verification steps.\n\n### What this PR does / why we need it?\n\n### Does this PR introduce _any_ user-facing change?\n\n### How was this patch tested?\n\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/b2f685834a6456197e7033966fdef52a23f1abcd\n\n---------\n\nSigned-off-by: zonghaoxin <z00946994@china.huawei.com>\nSigned-off-by: y30084614 <yuanjie68@h-partners.com>\nCo-authored-by: zonghaoxin <z00946994@china.huawei.com>\nCo-authored-by: y30084614 <yuanjie68@h-partners.com>"
+    },
+    {
+      "sha": "0e6cc29cb769442416f2c2a4b5ffa898459b329b",
+      "comment": "BugFix+性能：修复 layerwise KV pool 传输路径存储了所有 KV block（包括不可达的 SWA/compressor state cache）导致 pool DRAM 和互联带宽被大量浪费的问题。现在通过 AscendStoreCoordinator 统一的可达性掩码，仅存储 KV cache manager 认为可达的 block（segment-tail 窗口），与 non-layerwise 路径语义对齐。改动包括：coordinator 新增 find_reachable_hit_tokens 共享查找；scheduler/worker 在 save/load 路径按 mask 过滤 block 和生成 key；metadata 新增 masked_block_runs 和 ReqMeta.store_masks/load_masks；partial block 搭最后一趟传输；memcache backend batch_alloc 增加 lease TTL 参数。同时包含 #15830 的两个 commit（lease TTL、MTP final-block trim）。实测 131072-token 请求 pool DRAM 从 ~45.6GB 降至 ~1.4GB，但属于深层语义变更，风险高。",
+      "tags": [
+        "bugfix",
+        "performance",
+        "kv-pool",
+        "distributed",
+        "high-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "已新增大量 UT 覆盖 reachability mask、masked_block_runs、pool_worker 保存/加载过滤、scheduler 命中推导等，但需要 NPU E2E 验证 DSV4-Flash layerwise 部署的实际内存下降和长上下文命中率不回归。",
+        "suggested_test_areas": [
+          "tests/ut/distributed/ascend_store/",
+          "tests/e2e/weekly/multi_node/external_dp/config/DSv4-Flash-Memcache-PD-layerwise.yaml"
+        ]
+      },
+      "message": "[BugFix][KV Pool] Store only reachable blocks in layerwise KV pool transfer (#15854)\n\n## What this PR does / why we need it?\n\nThe layerwise KV pool transfer path stores **every** KV block of\nreachability-limited groups (sliding-window raw KV and compressor-state\ncaches) to the external pool, while the non-layerwise path only stores\nblocks the KV cache managers consider reachable (segment-tail windows).\nFor DeepSeek-V4-Flash (block_size=32, 43+1 layers, 6 KV cache groups) on\n910C, a single 131072-token request allocates **91,168 pool keys (~45.6\nGB DRAM)**, 98% of which sits in state/SWA groups whose reachable subset\nis only ~1.4 GB — a ~32x redundancy that floods the pool and the\ninterconnect (~1.8 GB/s of writes during prefill).\n\nThis PR aligns the layerwise path with the non-layerwise reachable-store\nsemantics on all three sides, reusing the existing\n`AscendStoreCoordinator` masks:\n\n- **Save** (`_alloc_gvas_for_save` / `_process_save_for_layer_batch`):\nper-group store masks are computed once per scheduler step; keys are\nallocated and transfer ranges generated only for reachable blocks (the\ntrailing partial block rides the last mask-allowed run).\n- **Hit check** (`_get_layerwise_hit_tokens`): only reachable blocks are\nqueried per group, and the hit length is derived via\n`coordinator.find_longest_cache_hit`, so sparse storage still yields\ncorrect prefix hits (a contiguous walk would report 0 hits).\n- **Load** (`_prepare_load_gvas` / `_process_load_for_layer_batch`): key\ninfo is fetched only for the load-mask subset, so blocks that are\ndeliberately not pooled no longer trigger the multi-group load failure\npath; GVA positions are filled per queried block index.\n\nFull-attention groups (mask=None), the trailing partial block, and the\nnon-hybrid / single-group fallbacks keep their previous behavior.\nMeasured effect: a 131072-token request drops from ~45.6 GB to ~1.4 GB\nof pool DRAM with identical hit semantics.\n\n**Note**: this PR also includes the two commits from #15830\n(`feat(kv_pool): pass lease TTL to memcache batch_alloc` and\n`fix(kv_pool): align MTP final-block trim to lcm block boundary`); it\nsupersedes both #15830 and the closed #15672, so a single review covers\nall three changes.\n\n## Does this PR introduce _any_ user-facing change?\n\nYes: layerwise mode with a hybrid KV cache layout (e.g. DSV4 compressed\n+ SWA groups) now persists only reachable blocks to the external KV\npool, drastically reducing pool memory usage and write bandwidth.\nCache-hit behavior is unchanged.\n\n## How was this patch tested?\n\n- Unit tests added/updated (all pass; 3 pre-existing environment\nfailures on a no-vllm/no-npu Windows box are unrelated — verified\nfailing on a pristine tree):\n- `tests/ut/distributed/ascend_store/test_metadata.py`:\n`masked_block_runs` helper (sparse/None/empty/out-of-range masks)\n- `tests/ut/distributed/ascend_store/test_pool_worker.py`: mask-driven\nkey allocation, multi-run transfer ranges, partial-block riding the last\nrun, load-mask key queries, load range splitting\n- `tests/ut/distributed/ascend_store/test_pool_scheduler.py`:\nreachability-aware hit check (sparse SWA storage still yields full hits,\nhit stops where a stored tail is missing, no-pool → 0, non-hybrid\nfallback unchanged)\n- Command: `python -m pytest -sv tests/ut/distributed/ascend_store/`\n- NPU e2e validation is in progress on an Ascend cluster (draft until\nverified): plan is to re-run the DSV4-Flash layerwise deployment and\ncompare the `alloc_gvas` key counts per group against the reachable\nsubset (expected drop: group-4 state cache 65536 → ~128 keys per\n131072-token request), plus long-context hit-rate and accuracy checks.\n\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/b2f685834a6456197e7033966fdef52a23f1abcd\n\n---------\n\nSigned-off-by: tyy0829 <1455207791@qq.com>\nSigned-off-by: tyy0829 <87685049+tyy0829@users.noreply.github.com>"
+    },
+    {
+      "sha": "7a5b24735d92d28dbe9f99c5f17ead4c5913afeb",
+      "comment": "文档新增：添加 DeepSeek-V4.1-Flash 部署指南（实验性），包括模型特性（CSA2、FP4 KV cache、DSpark、Engram）、硬件要求（两节点 A3 或四节点 A2）、Docker/源码安装、DP4/TP8/EP32 W8A8 共置部署命令、健康检查和文本/图像验证、准确性和性能评估、FAQ 和局限说明。同步在支持矩阵添加对应行，并在 mkdocs.yml 注册导航。指南中 Ascend W8A8 检查点使用占位符，并明确 PD 分离、PP、MRV2 暂不支持。纯文档。",
+      "tags": [
+        "docs",
+        "low-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "纯文档变更，不涉及代码和测试。",
+        "suggested_test_areas": []
+      },
+      "message": "[Doc][Model] Add DeepSeek V4.1 Flash deployment guide (#16294)\n\n### What this PR does / why we need it?\n\nAdds an experimental deployment tutorial and supported-model matrix\nentry for `DeepSeek-V4.1-Flash`.\n\nThe tutorial follows the official model release and the current vLLM\nAscend adaptation work. It documents:\n\n- the released model name and public Hugging Face/ModelScope\ncheckpoints;\n- the two-node Atlas 800 A3 and four-node Atlas 800 A2 W8A8 topologies\n(TP8/DP4/EP32);\n- INT8 Engram storage, DSpark speculative decoding, and\n`FULL_DECODE_ONLY` ACL Graph;\n- Docker, source-build, multi-node launch, health, text, and image\nverification commands;\n- explicit accuracy, performance, context-length, and deployment\nlimitations.\n\nThe pre-release `Aurora` name and internal checkpoint paths are\nintentionally omitted. The guide uses placeholders for the\nAscend-quantized checkpoint path and keeps the documented claims within\nthe current validation boundary.\n\nRelated adaptation work:\nhttps://github.com/GDzhu01/vllm-ascend-v41-private\n\n### Does this PR introduce _any_ user-facing change?\n\nYes. It adds an experimental DeepSeek-V4.1-Flash deployment guide and\nadvertises the documented support boundary in the model support matrix.\n\n### How was this patch tested?\n\n- `markdownlint-cli@0.45.0` passes for both changed Markdown files.\n- `git diff --check` passes.\n- `docs/hooks/nav_titles.py` passes Python syntax compilation.\n- The new supported-model matrix row has the same 20 columns as its\nheader.\n- The tutorial is registered exactly once in `mkdocs.yml` and has\nmatching English and Chinese navigation titles.\n- The Hugging Face, ModelScope, ModelSlim, and vLLM benchmark links\nreturn HTTP 200.\n- The branch contains one documentation-only commit and changes only\nfour documentation/navigation files.\n\nSigned-off-by: GDzhu01 <116337067+GDzhu01@users.noreply.github.com>\n\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/b2f685834a6456197e7033966fdef52a23f1abcd\n\n---------\n\nSigned-off-by: GDzhu01 <116337067+GDzhu01@users.noreply.github.com>"
+    },
+    {
+      "sha": "84d6dc83a9b0016c1dcc7d3ed059acb829b61091",
+      "comment": "该 commit 将 main2main 定时调度工作流从 a2 池切换到 a3-16 池，涉及 CI 运行环境、测试用例选择和工作流步骤的多项调整。主要变更包括：(1) runner 从 linux-aarch64-a2b1-8 改为 linux-aarch64-a3-16-sh-001，容器镜像从 CANN 9.1.0-910b 改为 9.1.0-a3，并新增 a3 特有的环境变量 MAIN2MAIN_PAIR_ALIGNED_DEVICES（die-pair 对齐分配）、MAIN2MAIN_TEST_TIMEOUT、SOC_VERSION=ascend910_9391 和 MAX_JOBS=184；(2) main2main_tests.json 从原先 6 个用例调整为 15 个覆盖更广的用例，包括 sampler、VLM、RLHF 状态转换、model_runner_v2 的多种 spec decoding 场景、多卡 MoE、prefix caching、disaggregated encoder、HCCL 权重传输、数据并行与流水线并行等；(3) resolve-source 阶段增强了上游 fetch 和 baseline ref 获取的容错能力，区分了 fresh mode（正常首次运行）与传输错误，并对传输错误进行重试，避免因临时网络故障丢失增量适配状态；(4) 移除了 CPU csrc cache 依赖，改为在 a3 NPU runner 上直接编译 csrc，并新增缓存保存步骤供下次复用；(5) 合并/重命名了若干步骤（如 Prepare ascend workspace），移除了 Create manual review issue 和 Chain next run 步骤，简化了失败处理和自动触发链路。整体上这是一次面向新硬件 a3 的 CI 基础设施升级和测试范围重新收敛。潜在风险在于：新硬件和镜像下 15 个用例的稳定性尚未经过长期验证；移除 manual review issue 后，自动化流程中途失败时可能缺少人工介入入口；baseline ref 获取在非预期错误下回退 fresh mode 可能导致增量状态丢失，虽然有 warning 但需关注。",
+      "tags": [
+        "ci",
+        "test",
+        "medium-risk"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "main2main_tests.json 中的用例列表被替换为 15 个覆盖更广的用例，需要确保这些用例在 a3-16 新 runner 和 CANN 9.1.0-a3 镜像上稳定通过；同时 a3 特有的环境变量（pair-aligned 分配、SOC_VERSION）可能影响测试执行方式和结果，需要重点看护新用例在 a3 上的稳定性与超时表现。",
+        "suggested_test_areas": [
+          ".github/workflows/scripts/main2main_tests.json",
+          "tests/e2e/pull_request/one_card/test_sampler.py",
+          "tests/e2e/pull_request/one_card/model_runner_v2/test_basic.py",
+          "tests/e2e/pull_request/two_card/test_prefix_caching.py",
+          "tests/e2e/pull_request/four_card/test_data_parallel_tp2.py",
+          "tests/e2e/pull_request/four_card/test_pipeline_parallel.py"
+        ]
+      },
+      "message": "[CI] Switch main2main scheduled run to the a3-16 pool (#16054)\n\nSwitch the scheduled main2main workflow from the a2 pool to the a3-16\npool:\n- run on `linux-aarch64-a3-16-sh-001` with container\n`cann:9.1.0-a3-ubuntu22.04-py3.12`\n- `main2main_tests.json` now holds the reviewed 15-case selection \n\n<img width=\"2044\" height=\"1811\" alt=\"workflow\"\nsrc=\"https://github.com/user-attachments/assets/03e8123c-bf10-44a3-8479-af876ed358b4\"\n/>\n\n\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/b2f685834a6456197e7033966fdef52a23f1abcd\n\nSigned-off-by: wjunLu <wjunlu217@gmail.com>"
+    }
+  ],
+  "architecture_based_on_sha": "e04f251a5895969d1c1f4ac9a3807177a0c4769c",
+  "architecture_generated_at": "2026-08-01T20:25:03.693997+08:00"
+}

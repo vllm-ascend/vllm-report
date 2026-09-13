@@ -1,0 +1,712 @@
+{
+  "date": "2026-09-13",
+  "repo": "vllm-project/vllm",
+  "generated_at": "2026-09-14T04:27:48.875284+08:00",
+  "daily_summary": "当日 vLLM 变更聚焦六个方面：(1) 注意力子系统：新增 Triton/FlashAttention（Hopper）与 Triton/FlashInfer（Blackwell）组合后端，将多模态 prefix 的图像双向注意力路由到 Triton、因果 prefill/decode 路由到高性能后端，并扩展 AttentionBackend 抽象（supports_rswa、get_impl_variants、use_rswa 参数）；(2) 稳定性修复：NVFP4 权重 scale 未加载的 NaN 哨兵检测、混合 KV cache 加载失败恢复、KV offload 无 forward 步的 CPU store 提交、Gemma4 视频预处理隔离、多模态 UUID 保留、pooling 实际 token 统计；(3) DeepSeek V4.1 Engram 增强：DP 共享内存表、异步预取、engram DP 通信组、默认 CPU offload，并修复 dummy 权重重复初始化、支持 dummy_weight_value 常量填充；(4) 性能：DSA sparse indexer 集成 DeepSelect TopK 并抽象可配置的 top-k 后端；(5) 回退显式 Triton JIT warmup 迁移（MRV2）；(6) 其他：benchmark 流式延迟统计一致性修复、ROCm 默认启用 DeepSeek V4.1 breakable CUDA graphs、DeepSeek-V4 Flash Vision LoRA 支持。",
+  "ascend_impact_summary": "当日变更对 vllm-ascend 的影响主要落在注意力后端抽象与 GPUModelRunner 继承链上：AttentionBackend 新增 supports_rswa/get_impl_variants 及 validate_configuration 的 use_rswa 参数（向后兼容扩展，但 Ascend 注意力后端需确认签名兼容）；GPUModelRunner 的 pooling 断言放宽与 JitWarmupRegistry 回退直接影响继承它的 NPUModelRunner；Scheduler 混合 KV cache 失败恢复修复惠及使用混合 KV cache 的 Ascend 调度路径；DSA sparse indexer 的 top-k 重构对 Ascend 保持 per_row 回退；DummyModelLoader 变更影响所有平台的 dummy 权重加载。DeepSelect（CUDA SM100）、Engram（CUDA 门控）、simple_kv_offload（CUDA）、Gemma4、ROCm 配置、benchmark 与 serving 层变更均不影响 Ascend。",
+  "commits": [
+    {
+      "sha": "b7e0cdac5d11e3a1b32745079cf5591a685aa721",
+      "comment": "该 bugfix 针对 NVFP4 (modelopt) 量化路径：将 weight_scale 参数初始化为 NaN 哨兵值（而非 torch.empty 的未定义垃圾值），并在 process() 阶段检测仍为 NaN 的 weight_scale，抛出带修复建议的 RuntimeError。这样当 checkpoint 将某层保存为 BF16 而 weight loader 静默跳过 FP4 权重加载时，能被明确识别而非产生未定义行为。变更局限在 vllm/model_executor/layers/quantization/modelopt.py 的 KNvfp4Static 类中，是 NVIDIA FP4 量化特有的保护逻辑。",
+      "tags": [
+        "bugfix",
+        "quantization",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Bugfix] Detect unloaded NVFP4 weight scales with a NaN sentinel (#52501)\n\nSigned-off-by: pavelzak <pavel.zakharov@gmail.com>\nCo-authored-by: Claude Sonnet 5 <noreply@anthropic.com>\nCo-authored-by: OpenAI Codex <codex@openai.com>"
+    },
+    {
+      "sha": "82a85dc1d2d5b3ad4453eaa1bd7596de888a66b3",
+      "comment": "大型功能变更，为多模态 prefix attention 引入可复用的组合注意力后端机制。核心是新增 vllm/v1/attention/backends/composite.py，提供 create_composite_attention_backend 工厂和 MMPrefixAttentionRouting 路由策略，将双向图像注意力路由到 Triton、因果文本 prefill/decode 路由到 FlashAttention (Hopper, TRITON_FLASH_ATTN) 或 FlashInfer (Blackwell, TRITON_FLASHINFER)。同时在 AttentionBackend 抽象上新增 supports_rswa() 类方法和 AttentionImplBase.get_impl_variants()（默认返回 (self,)），validate_configuration 增加 use_rswa 参数，AttentionSelectorConfig 增加 use_rswa 字段；CudaPlatform._get_backend_priorities 在 use_mm_prefix 时把组合后端插入优先级列表。风险点：AttentionBackend 接口签名扩展影响所有后端实现（虽然均带默认值，向后兼容）；组合后端要求两个子后端 KV cache spec 完全一致，且支持特性受限（无 DCP/PCP/R-SWA 等）。",
+      "tags": [
+        "feature",
+        "attention",
+        "high-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "vllm/v1/attention/backend.py 是必然影响路径。AttentionBackend 新增 supports_rswa() 类方法（默认 False）、AttentionImplBase 新增 get_impl_variants()（默认返回 (self,)）、validate_configuration 新增 use_rswa 关键字参数，AttentionSelectorConfig 新增 use_rswa 字段，均向后兼容。但 Ascend 注意力后端若覆写 validate_configuration 且未接受 use_rswa 参数，在带 R-SWA 的模型（如 DeepSeek V4.1）选择后端时会因传参不匹配失败；get_attn_backend 现在会把 model_config.rswa_window 传入 selector，NPUPlatform.get_attn_backend_cls 需要能处理新增字段（NamedTuple 尾部带默认值，属性访问兼容）。Triton/FlashAttn/FlashInfer 组合后端本身是 CUDA 特性，与 Ascend 无关。",
+        "testing": "上游新增 attention selector 与 mm_prefix 组合后端测试（CUDA 门控）。Ascend 无需运行这些 CUDA 用例，但需验证现有注意力后端在新增接口参数下选择/校验路径正常。",
+        "needs_test_update": true,
+        "suggested_test_areas": [
+          "vllm_ascend/attention/ 各后端 validate_configuration 对 use_rswa 参数的兼容性",
+          "R-SWA 配置下 Ascend 注意力后端选择"
+        ]
+      },
+      "message": "[Attention] Add Triton/FlashInfer composite for multimodal prefix attention (#56305)\n\nSigned-off-by: Matthew Bonanni <mbonanni@redhat.com>\nSigned-off-by: Lucas Wilkinson <lwilkins@redhat.com>\nCo-authored-by: Codex <noreply@openai.com>\nCo-authored-by: Lucas Wilkinson <LucasWilkinson@users.noreply.github.com>\nCo-authored-by: Lucas Wilkinson <lwilkins@redhat.com>\nCo-authored-by: OpenAI Codex <codex@openai.com>",
+      "deep_analysis": {
+        "ascend_affected_confirmed": false,
+        "affected_interfaces": [],
+        "adaptation_effort": "low",
+        "adaptation_guide": "",
+        "risk": ""
+      }
+    },
+    {
+      "sha": "8cf9de9080ea5cded1c93e3d9a5ac531da0c93b6",
+      "message": "[Test][Determinism] Cover VLM batch invariance in default execution mode (#56528)\n\nSigned-off-by: Shenglei Fu <sfu@confluent.io>\nCo-authored-by: Claude Sonnet 5 <noreply@anthropic.com>",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "chore"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "dd4c8410707bdb833b155ff3258ce5271c0f476e",
+      "comment": "为 DeepSeek-V4 Flash Vision (DeepseekV4ForConditionalGeneration) 添加 LoRA 支持：模型类声明 SupportsLoRA，定义 packed_modules_mapping（含 gate_up_proj/fused_wqa_wkv/fused_wkv_wgate/wqkv/w1），实现 get_mm_mapping（language_model/aligner/vision）和 get_mm_lora_token_counts（根据 patches tensor 计算 tower token 数）。同时将 lora_shrink_op 中的 assert inputs.is_contiguous() 改为 inputs = inputs.contiguous()，放宽对非连续输入的要求，提升健壮性。文档同步更新支持矩阵。",
+      "tags": [
+        "feature",
+        "lora",
+        "model",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[LoRA] Add LoRA support for DeepSeek-V4 Flash Vision (#55897)\n\nSigned-off-by: linitra24 <renshuang.zhou@daocloud.io>"
+    },
+    {
+      "sha": "de500290ffffeb7bd834872c0dea5331590dd40d",
+      "message": "[XPU][CI] fix jit_warmup_triton_launcher (#56670)\n\nSigned-off-by: zhenwei-intel <zhenwei.liu@intel.com>",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "bugfix",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "2e9f7bb45475c7e461079284a73ec9c53761c6b5",
+      "comment": "修复 scoring API 的 token 用量统计。此前 ServingScores 从最终输出的 prompt_token_ids 累加 prompt_tokens（可能包含后处理加入的特殊 token），现在改为从 ctx.engine_inputs 的 prompts 中提取原始 prompt 长度。测试期望值相应 -1（285→284 等），说明修正后统计的是实际输入 token 数而非处理后的 token id 数。纯 serving 层变更，平台无关。",
+      "tags": [
+        "bugfix",
+        "pooling",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Pooling] Report actual input token usage for scoring APIs (#56573)\n\nSigned-off-by: Taneem Ibrahim <taneem.ibrahim@gmail.com>"
+    },
+    {
+      "sha": "c351fd3c649569d8a585eb22cfaf2ee728e5fc22",
+      "comment": "修复混合 KV cache 下 KV 加载失败（invalid block）时 Scheduler 的 ValueError。原实现假设每个 request 只有一个 block id 列表（单 KV group），混合模型（full attention + Mamba、DeepSeek-V4 的五 group 布局）各 group block size 不同，同一 block index 在不同 group 中对应不同 token 位置，无法找到统一截断点。修复策略：多 group 请求直接整体重算（num_computed_tokens 置 0），并放入 WAITING_FOR_REMOTE_KVS；同时将各请求共享的 null block 排除在失效判定与 eviction 之外。新增大量单测覆盖 hybrid 与 DeepSeek-V4 场景的 recompute/fail 两种策略。",
+      "tags": [
+        "bugfix",
+        "scheduler",
+        "kv-cache",
+        "medium-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "vllm/v1/core/sched/scheduler.py 是 Ascend 调度路径（vllm-ascend 的 AscendScheduler 或直接用基类 Scheduler）的核心文件。变更让 invalid-block 扫描支持多 KV cache group：混合 KV cache（不同 group block size 不同）下不再尝试找统一截断点，而是整请求重算；并排除所有请求共享的 null block，避免误触发重算或 eviction。使用混合 KV cache（如 MLA+SWA+Mamba 多 group）和 KV connector 的 Ascend 场景继承此修复；若 vllm-ascend 自定义调度器覆写了该扫描方法，需同步实现多 group 与 null block 处理。",
+        "testing": "上游新增 hybrid 与 DeepSeek-V4 五 group KV cache 的失败恢复单测。vllm-ascend 如有自定义调度器，可参考补充多 group 失效块场景测试，但非强制。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Core] Fix ValueError on KV load failure with a hybrid KV cache (#50388)\n\nSigned-off-by: Kebe <mail@kebe7jun.com>",
+      "deep_analysis": {
+        "ascend_affected_confirmed": false,
+        "affected_interfaces": [],
+        "adaptation_effort": "low",
+        "adaptation_guide": "",
+        "risk": ""
+      }
+    },
+    {
+      "sha": "fa1b3b1922ccb2d7a597925765c4bec7f358d748",
+      "comment": "修复当 prefix caching 和 mm processor cache 都关闭时，用户显式提供的多模态 UUID 被全部覆盖为请求本地 ID 的问题。原逻辑认为两个 cache 都禁用时不再需要内容哈希，直接整体重写；但显式 UUID 还被用于跨 EC 实例识别 embeddings，必须保留。新逻辑只对缺失（None）的 UUID 生成 `<req_id>-<modality>-<index>` 形式的后备 ID。测试从单一场景扩展为参数化用例。",
+      "tags": [
+        "bugfix",
+        "multimodal",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Bugfix][EPD] Preserve explicit multimodal UUIDs with caches disabled (#56432)\n\nSigned-off-by: Tianyu Guo <guoty@inferact.ai>"
+    },
+    {
+      "sha": "d2d649e674c75425d2d6975c87eb89fd4d55fff8",
+      "comment": "大型功能变更，为 DeepSeek V4.1 的 Engram n-gram embedding 增加两大能力：(1) DP 共享内存（dp_shared_memory）：node 内 co-located DP replica 通过 /dev/shm mmap + cudaHostRegister 共享一份 CPU-offload 的 embedding 表，按 TP 切片映射，避免每 replica 独立副本和每步 DP collective；(2) 异步预取：CPU offload 模式下在专用 CUDA side stream 上提前发起 UVA lookup，并通过 eager_break_during_capture 配合 breakable CUDA graph。此外引入 engram DP 通信组（parallel_state 新增 _ENGRAM_DP）、gather_engram_hashes DP padding、dummy_hashes 用于无 hash 元数据的 replica 参与 collective；VLLM_PLE_CPU_OFFLOAD 默认改为 1；VllmConfig 对 DeepSeekV41 + DBO/microbatching 报错。NVIDIA 实现（nvidia/engram.py）使用 CUDA 特有 API（cudaHostRegister/UVA），公共部分（config/parallel_state/common engram）用 is_cuda() 门控。变更量大且涉及分布式组初始化、共享内存生命周期（finalizer 反注册）、多线程 weight loader 同步等，风险较高。",
+      "tags": [
+        "feature",
+        "distributed",
+        "model",
+        "high-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[DS V4.1][Engram] Support async prefetch for offloaded engram lookups and engram DP sharding (#56512)\n\nSigned-off-by: Juntian Liu <Juntianl777@gmail.com>\nSigned-off-by: Woosuk Kwon <woosuk@inferact.ai>\nCo-authored-by: Roger Wang <hey@rogerw.io>\nCo-authored-by: ywang96 <>\nCo-authored-by: Woosuk Kwon <woosuk@inferact.ai>\nCo-authored-by: Codex <noreply@openai.com>"
+    },
+    {
+      "sha": "e7a3963339654aa18b713f9ff233f129af9c7c8b",
+      "comment": "修复 dummy 权重初始化中的两个问题：(1) DummyModelLoader 原先对每个 layer 调用 initialize_dummy_weights(layer) 递归初始化所有子孙模块，导致被 model.modules() 多次访问的模块被重复随机初始化；现在改用 get_layer_tensors(layer) 只初始化当前层的直接 tensor（排除 non-persistent buffer），与 state_dict 语义对齐。(2) initialize_single_dummy_weight 新增对参数上 dummy_weight_value 属性的支持，命中时用常量填充而非随机数。Engram CPU offload 表据此设置 dummy 值（weight=1.0, scale=127），避免对巨大的 CPU 查找表做随机初始化。行为变更影响所有平台的 dummy 加载路径（profile/warmup）。",
+      "tags": [
+        "bugfix",
+        "model-loader",
+        "medium-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "vllm/model_executor/model_loader/ 在可能影响路径。DummyModelLoader 从递归初始化全部子孙模块改为只初始化当前层直接 tensor（与 state_dict 对齐，排除 non-persistent buffer），initialize_single_dummy_weight 新增 dummy_weight_value 常量填充支持。所有平台（含 Ascend）在 profile_run/dummy 权重加载时的初始化行为发生变化：避免重复随机初始化，且带 dummy_weight_value 的参数会用常量填充（当前仅 Engram CPU offload 表使用，CUDA 相关）。对 Ascend 的 NPUWorker.load_model 是兼容性 bugfix，不破坏现有接口。",
+        "testing": "上游未新增专门测试（依赖现有 dummy 加载测试）。vllm-ascend 无强制测试变更。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Bugfix] Avoid repeated dummy initialization and random CPU Engram fills (#56682)\n\nSigned-off-by: Woosuk Kwon <woosuk@inferact.ai>",
+      "deep_analysis": {
+        "ascend_affected_confirmed": false,
+        "affected_interfaces": [],
+        "adaptation_effort": "low",
+        "adaptation_guide": "",
+        "risk": ""
+      }
+    },
+    {
+      "sha": "a987777755c83863b5d563c15630dd324033d53f",
+      "comment": "修复 Gemma4 多模态处理中视频预处理被图像 kwargs 污染的问题。Gemma4MultiModalProcessor 处理视频帧时，将 hf_processor_mm_kwargs 中的 images_kwargs 显式覆盖为 {}，避免用户配置的图像参数（如 rescale_factor、max_soft_tokens）影响视频帧的预处理；同时 max_soft_tokens 固定为 _VIDEO_MAX_SOFT_TOKENS。测试验证了 images_kwargs 在 init 或 request 级传入时，视频帧像素、视频哈希均不受影响，而图像像素会随参数变化。",
+      "tags": [
+        "bugfix",
+        "multimodal",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Bugfix][Gemma4] Keep image kwargs out of video preprocessing (#56652)\n\nSigned-off-by: Ylean <61880605+Woolgathererer@users.noreply.github.com>\nCo-authored-by: Codex <noreply@openai.com>"
+    },
+    {
+      "sha": "fa008bdccf10f2f31f84553112a227cf1b8947d7",
+      "comment": "为 DSA sparse indexer 的 decode top-k 阶段集成 DeepSelect kernel（SM100a/SM103a 专用，CUDA 12.9+），并把 top-k 后端选择抽象为可配置项。核心变更：新增 vllm/model_executor/layers/indexer_topk.py 的 SparseIndexerTopk 模块（backend 解析 + 分发，支持 auto/deep_select/cooperative/persistent/per_row/flashinfer/torch），KernelConfig 新增 sparse_indexer_topk_backend 字段与 --sparse-indexer-topk-backend CLI 参数，sparse_attn_indexer.py 的内联选择逻辑被替换为对 SparseIndexerTopk 的调用（SparseAttnIndexer 构造时读取配置）。\"auto\" 保持原有优先级链（cooperative→persistent→per_row），deep_select/flashinfer/torch 为显式 opt-in；显式指定不满足约束时报 RuntimeError。构建侧新增 cmake/external_projects/deepselect.cmake（FetchContent 拉取 DeepSelect 仓库、仅 CUDA arch 10.0f 编译）。对非 CUDA 平台，auto 链解析回退到 per_row，与旧行为一致。",
+      "tags": [
+        "performance",
+        "kernel",
+        "attention",
+        "medium-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "vllm/model_executor/layers/sparse_attn_indexer.py 是 Ascend DSA 稀疏注意力后端（AscendDSABackend）共用的 indexer 路径。此 commit 将 decode top-k 内联选择重构为 SparseIndexerTopk 分发器，并新增 kernel_config.sparse_indexer_topk_backend 配置（默认 auto）。上游 auto 链在非 CUDA 平台解析为 per_row，与 Ascend 旧行为一致；DeepSelect/cooperative/persistent/flashinfer 均为 CUDA opt-in，不影响 Ascend。KernelConfig 新字段带默认值，不破坏 vllm-ascend 现有配置。SparseIndexerTopk 构造时调用 current_platform.is_device_capability_family(120)/has_device_capability(90)/is_cuda()，这些方法旧代码已在相同路径使用，不引入新的平台方法依赖。",
+        "testing": "上游新增 sparse indexer topk 后端解析与各后端正确性测试（CUDA 门控）。Ascend 可补充 DSA 解码在 auto→per_row 路径下的回归测试，但非强制。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Perf][Kernel] Integrate DeepSelect TopK for the DSA sparse indexer (#56464)\n\nSigned-off-by: zjy0516 <riverclouds.zhu@qq.com>\nSigned-off-by: Roger Wang <hey@rogerw.io>\nCo-authored-by: Kimi Code <noreply@moonshot.ai>\nCo-authored-by: Roger Wang <hey@rogerw.io>",
+      "deep_analysis": {
+        "ascend_affected_confirmed": false,
+        "affected_interfaces": [],
+        "adaptation_effort": "low",
+        "adaptation_guide": "",
+        "risk": ""
+      }
+    },
+    {
+      "sha": "1cfd9728166c73747acdb423e7a49b23f27cdc44",
+      "message": "[CI] Fix NIXL transfer-rank geometry fixture (#56672)\n\nSigned-off-by: Lucas Wilkinson <lwilkins@redhat.com>",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "bugfix",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "410f6da5c4bb62010728502035bee1b5f0eab2ac",
+      "comment": "修复 simple KV offload 中\"无 forward 步骤\"（如请求完成后的空 step）时 CPU store 未提交的问题。SimpleCPUOffloadWorker 增加 _store_submitted 标志，wait_for_save() 仅在首次调用时提交拷贝；clear_connector_metadata() 在清空 metadata 前先调用 wait_for_save()，确保 no-forward 路径也会排空 pending store。测试覆盖 v1/v2 两条 no-forward 路径（KVConnectorModelRunnerMixin.kv_connector_no_forward 与 ActiveKVConnector.no_forward）以及 draft forward 延迟提交的场景。该模块属于 CUDA/ROCm 特定的 simple KV offload 实现。",
+      "tags": [
+        "bugfix",
+        "kv-offload",
+        "medium-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Bugfix][KV Offload] Submit CPU stores on no-forward steps (#56621)\n\nSigned-off-by: Lucas Wilkinson <lwilkins@redhat.com>"
+    },
+    {
+      "sha": "0cf266a469bd6f06e90fa267d466bbfe5b11dce5",
+      "comment": "支持 MRV2 decoder pooling 的 prompt embedding 任务：移除 GPUModelRunner 添加 pooling request 时 prompt_token_ids 非空的断言，PoolingRunner.add_request 的 prompt_token_ids 参数类型改为 list[int] | None，仅在 pooling task 实际需要 token ids（requires_token_ids）时断言。这样不依赖 prompt token ids 的 pooling 任务（如 prompt embedding）可以正常走 decoder pooling。变更极小且是放宽约束，向后兼容。",
+      "tags": [
+        "feature",
+        "pooling",
+        "model-runner",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "vllm/v1/worker/gpu/model_runner.py 是必然影响路径（NPUModelRunner v2 直接继承 GPUModelRunner）。变更移除了 pooling request 的 prompt_token_ids 非空断言，PoolingRunner.add_request 的 prompt_token_ids 变为 Optional 并仅在 requires_token_ids 时断言。NPUModelRunner 继承此行为后自动支持不携带 prompt_token_ids 的 pooling 请求（prompt embedding 类任务）；AscendModelRunnerV1 若自行实现 pooling 注册逻辑需同步放宽该约束。",
+        "testing": "上游 pooling 相关测试未直接变更。vllm-ascend 无强制测试变更。",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Pooling] Support prompt embeddings in MRV2 decoder pooling (#56639)\n\nSigned-off-by: Taneem Ibrahim <taneem.ibrahim@gmail.com>",
+      "deep_analysis": {
+        "ascend_affected_confirmed": false,
+        "affected_interfaces": [],
+        "adaptation_effort": "low",
+        "adaptation_guide": "",
+        "risk": ""
+      }
+    },
+    {
+      "sha": "93e051e290d8a87ff7dab5c5ab2e5a3d4a53e760",
+      "comment": "修复流式 benchmark 中 TTFT/E2E 延迟统计不一致的问题。核心改动：TTFT 统一用 chunk 到达时间戳 timestamp - st 计算（tgi/completions 之前混用 perf_counter 与 timestamp）；chat/audio 端点只有携带 token 的 chunk 才推进 most_recent_timestamp（记录请求结束），尾部 usage chunk 不再拉长 latency；只有至少收到一个 token chunk 才标记 success，纯 usage 流报错。这保证 serve.py 推导 TPOT 时（latency - ttft）== sum(itl) 的恒等式成立。新增基于脚本化时钟和假 SSE session 的精确计时测试（含 legacy backend_request_func.py）。",
+      "tags": [
+        "bugfix",
+        "benchmark",
+        "test",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Bugfix][Benchmark] Make streaming TTFT/E2E latency accounting consistent across endpoints (#55508)\n\nSigned-off-by: surajm20061998 <surajm20061998@gmail.com>\nCo-authored-by: Claude Opus 5 <noreply@anthropic.com>"
+    },
+    {
+      "sha": "2671fedfc7ae604761990603fc736c0c4f21de57",
+      "comment": "回退显式 Triton JIT warmup 迁移（MRV2）。主要变化：(1) GPUModelRunner.__init__ 移除 @JitWarmupRegistry.capture 装饰器，jit_warmup_registry 改为普通实例属性，加载模型/初始化 sampler/KV cache 处的 activate() 调用保留但不再依赖装饰器注入；(2) 移除 _dummy_run 中对 rejection_sampler 的预热；(3) SamplingStates 不再调用 register_top_k_top_p_warmups；(4) DFlash/MultiModuleMTP speculator 的 triton_kernel_dispatcher_with_warmup 包装全部移除，改为在调用处直接 launch kernel（prepare_dflash_inputs 等函数返回值从 DispatchSpec 变为 None）；测试将 idx_mapping dtype 从 int64 改为 int32。回退后 Triton kernel 依靠实际运行时参数 JIT 编译而非显式 warmup spec，降低框架复杂度但可能影响首次调用的编译延迟。",
+      "tags": [
+        "refactor",
+        "spec-decode",
+        "model-runner",
+        "medium-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "vllm/v1/worker/gpu/model_runner.py 是必然影响路径。回退后 jit_warmup_registry 从装饰器注入变为普通实例属性（GPUModelRunner.__init__ 中直接创建），NPUModelRunner 继承后初始化流程兼容；移除 _dummy_run 中 rejection_sampler 预热与 SamplingStates 的 register_top_k_top_p_warmups，spec decode 的 Triton warmup 方式改变。DFlash/MultiModuleMTP speculator 的 kernel 从带 warmup 的 dispatcher 改回直接 launch，prepare_dflash_inputs/_shift_input_ids/_shift_input_embeds 的返回值签名变化（DispatchSpec→None），且 idx_mapping dtype 预期为 int32。vllm-ascend 的 spec_decode 目录包含 DFlash 实现，若其继承上游 DFlashSpeculator 或直接调用 prepare_dflash_inputs，需适配新的直接 launch 语义与 idx_mapping dtype。",
+        "testing": "上游更新 dflash prepare inputs 测试（idx_mapping int64→int32）与 speculator mock。vllm-ascend 若有 DFlash/MTP 用例，建议同步验证 idx_mapping dtype 与 kernel 启动路径。",
+        "needs_test_update": true,
+        "suggested_test_areas": [
+          "vllm_ascend/spec_decode/dflash/（prepare_dflash_inputs 直接 launch、idx_mapping int32）",
+          "vllm_ascend/spec_decode 中 MTP/DFlash 的 Triton kernel 预热回归"
+        ]
+      },
+      "message": "[MRV2] Revert explicit Triton JIT warmup migration (#56654)\n\nSigned-off-by: Woosuk Kwon <woosuk@inferact.ai>\nCo-authored-by: OpenAI Codex <codex@openai.com>",
+      "deep_analysis": {
+        "ascend_affected_confirmed": false,
+        "affected_interfaces": [],
+        "adaptation_effort": "low",
+        "adaptation_guide": "",
+        "risk": ""
+      }
+    },
+    {
+      "sha": "c711f740b7c7540c8c4d7f2c26ff6960b427a4cc",
+      "comment": "ROCm 平台默认启用 DeepseekV41ForCausalLM 的 breakable CUDA graphs。原 ROCm 分支返回空 frozenset（因为 breakable CUDA graphs 在 ROCm 上通常有性能回退），但 DeepSeek V4.1 无法 torch.compile，且 ROCm sparse SWA 后端只支持 uniform-batch CUDA graphs，默认 FULL_AND_PIECEWISE 服务路径在 capture 阶段会失败。因此在 ROCm 分支中单独把 DeepseekV41ForCausalLM 加入默认 breakable 架构集合，其他架构仍保持不默认启用。纯 ROCm 配置分支变更，不影响其他平台。",
+      "tags": [
+        "feature",
+        "rocm",
+        "config",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[ROCm] Auto-enable breakable CUDA graphs for DeepseekV41ForCausalLM (#56349)\n\nSigned-off-by: Markus Hartikainen <markus.hartikainen@amd.com>\nCo-authored-by: Jee Jee Li <pandaleefree@gmail.com>"
+    },
+    {
+      "sha": "c2ea9f1a5f10caec36eac91c461fcec6564f5394",
+      "message": "[Kernel][Perf][Quantization] Fix odd-row performance cliff in per-token-group quantization (#56478)\n\nSigned-off-by: Ayushman Singh <ayush1399@users.noreply.github.com>\nCo-authored-by: Ayushman Singh <ayush1399@users.noreply.github.com>",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "bugfix",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "533dbe424b9bdde6a7ffe100d507a69a24dfee1a",
+      "comment": "重构 fast loader daemon 的量化验证方式：新增 BaseModelLoader.create_model() 封装模型创建与日志；check_ipc_quant_support 从基于配置的 allowlist 改为基于实际模型的 supports_pre_processed_weights 属性检查；daemon 先建模型再校验量化，使不支持的量化方法能快速失败。cache_dtype 的显式检查被移除，可能需要在引擎侧重新验证。",
+      "tags": [
+        "refactor",
+        "low-risk",
+        "model-loader",
+        "weight-cache"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Misc] Clean up fast loader daemon quant method verification (#55656)\n\nSigned-off-by: Isotr0py <Isotr0py@outlook.com>"
+    },
+    {
+      "sha": "e52be1a62d3879b1202f4f355d3c3472b560c6f2",
+      "comment": "将 DSv4/GLM5Next 的 mHC TileLang kernels 迁移到新的 JIT warmup 框架：在 tilelang_kernels.py 中为每个 kernel 定义带 CompileKey/dispatch/warmup_inputs 的类，模型构造时通过 register_warmup 注册；删除旧的 deepseek_v4_mhc_warmup 模块；tilelang.py 改用统一的 kernel 单例。属于 warmup 系列重构的第 9 个 commit。",
+      "tags": [
+        "refactor",
+        "performance",
+        "medium-risk",
+        "warmup",
+        "tilelang",
+        "deepseek-v4"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[9/N][warmup][DSv4] Migrate MHC TileLang kernels (#50178)\n\nSigned-off-by: LopezCastroRoberto <rocastro@redhat.com>\nSigned-off-by: Roberto L. Castro <38211239+LopezCastroRoberto@users.noreply.github.com>\nCo-authored-by: Codex <codex@openai.com>"
+    },
+    {
+      "sha": "aed894c190aa3db74c502d521b3bc3935ad85de1",
+      "comment": "继续 warmup 迁移：为采样（topk_topp）、rejection sampler、Eagle/DFlash 输入准备 kernel 引入 triton_kernel_dispatcher_with_warmup 装饰器；GPUModelRunner 的 __init__ 使用 @JitWarmupRegistry.capture 自动创建注册表，并在模型、sampler、KV cache 初始化阶段激活；扩展 jit_warmup AST 支持 WarmupChoices/_when/lambda；移除 spec_decode_rejection_warmup（后续 commit 会重新加入）。改动面大，涉及采样、推测解码和 model runner，风险较高。",
+      "tags": [
+        "refactor",
+        "performance",
+        "high-risk",
+        "warmup",
+        "sampling",
+        "spec-decode",
+        "model-runner"
+      ],
+      "ascend_impact": {
+        "ascend_affected": true,
+        "functionality": "GPUModelRunner.__init__ 增加 @JitWarmupRegistry.capture 装饰器，registry 通过装饰器挂到实例上；NPUModelRunner（v1/v2）如果覆写 __init__ 且未调用父类 init，则缺少 jit_warmup_registry 属性，kernel_warmup 会失败。采样/推测解码 kernel 改用 triton_kernel_dispatcher_with_warmup，Ascend 若复用这些 Triton kernel，需要适配新的启动/注册接口；否则需保证自研 kernel 的 warmup 注册方式一致。",
+        "testing": "需要验证 NPUModelRunner 初始化后在 enable_jit_warmup 下能正常执行 registry.warmup()；topk_topp/rejection/spec-decode warmup 相关测试需要在新接口下通过。",
+        "needs_test_update": true,
+        "suggested_test_areas": [
+          "vllm_ascend/worker/model_runner_v1.py",
+          "vllm_ascend/worker/v2/model_runner.py",
+          "vllm_ascend/patch/worker.py",
+          "JIT warmup registry 相关测试"
+        ]
+      },
+      "message": "[6/N][warmup][DSv4] Migrate sampling, and DFlash JIT kernels (#56323)\n\nSigned-off-by: Lucas Wilkinson <lwilkins@redhat.com>\nSigned-off-by: LopezCastroRoberto <rocastro@redhat.com>\nCo-authored-by: Lucas Wilkinson <lwilkins@redhat.com>\nCo-authored-by: OpenAI Codex <codex@openai.com>",
+      "deep_analysis": {
+        "ascend_affected_confirmed": true,
+        "affected_interfaces": [
+          "vllm_ascend/patch/worker/patch_v2/patch_triton.py:45",
+          "vllm_ascend/worker/v2/spec_decode/dflash/speculator.py",
+          "vllm_ascend/worker/v2/model_runner.py",
+          "vllm_ascend/sample/sampler.py",
+          "vllm_ascend/sample/rejection_sampler.py",
+          "vllm_ascend/patch/worker/patch_triton.py",
+          "vllm_ascend/model_executor/warmup/kernel_warmup.py"
+        ],
+        "adaptation_effort": "medium",
+        "adaptation_guide": "This commit (part of the [N/N][warmup][DSv4] series) migrates sampling (topk_topp, rejection sampler) and DFlash Triton JIT kernels to the new `triton_kernel_dispatcher_with_warmup` + `register_warmup()` infrastructure, and makes GPUModelRunner.__init__ (both v1 `vllm/v1/worker/gpu_model_runner.py` and v2 `vllm/v1/worker/gpu/model_runner.py`) a `@JitWarmupRegistry.capture` context. Required vllm-ascend adaptations:\n\n1. **CRITICAL - DFlash kernel patch is silently broken.** Upstream `prepare_dflash_inputs` in `vllm/v1/worker/gpu/spec_decode/dflash/speculator.py` is now a `_DecoratedTritonJitKernel` that captures the module-level `_prepare_dflash_inputs_kernel` at import time. The Ascend patch `dflash_speculator._prepare_dflash_inputs_kernel = _prepare_dflash_inputs_kernel_ascend` (patch_v2/patch_triton.py:45) therefore no longer affects runtime launches: the wrapper's `launch()` always uses `self.kernel` (the upstream kernel). `AscendDFlashSpeculator.propose()` -> upstream `DFlashSpeculator.propose()` -> `prepare_dflash_inputs(...)`, so the Ascend-specific NPU kernel (per-request padding to max_num_reqs, `block_idx>0` early return, PAD_SLOT_ID CG safety) is silently replaced by the upstream kernel, which now does block-tiling + DCP `cp_local_slot` + null-block handling. Fix: follow the new patching pattern used by upstream's own CPUModelRunner (`vllm/v1/worker/cpu_model_runner.py` now sets `spec_decode_utils._eagle_prepare_inputs_padded.kernel = ...`): replace line 45 with `dflash_speculator.prepare_dflash_inputs.kernel = _prepare_dflash_inputs_kernel_ascend` and confirm the main2main variant of `_prepare_dflash_inputs_kernel_ascend` still binds via the new dispatch spec (`cp_rank`/`SAMPLE_FROM_ANCHOR`/`CP_SIZE`/`CP_INTERLEAVE` are filled by `_prepare_launch_kwargs` name-based binding; `PAD_SLOT_ID`/`BLOCK_SIZE` come from the dispatch dict). Validate ACL-graph capture on NPU after rebinding.\n\n2. **JIT warmup registrations become active on the v2 model runner.** Because the v2 `GPUModelRunner.__init__` is now `@JitWarmupRegistry.capture` (NPUModelRunner calls `super().__init__`), `register_top_k_top_p_warmups()` (from `TopKTopPSampler.__init__` and `SamplingStates.__init__`), `RejectionSampler.__init__`'s `_rejection_*`/`_expand`/`_sample_recovered_tokens.register_warmup(...)`, `SpecDecodeBaseProposer.__init__`'s eagle warmups, and `DFlashSpeculator.__init__`'s `prepare_dflash_inputs.register_warmup(speculator=self)` all register during Ascend init. These are inert today only because `vllm_ascend/model_executor/warmup/kernel_warmup.py` never calls `model_runner.jit_warmup_registry.warmup()`. Confirm no plan to enable it (the warmup providers reference upstream CUDA-oriented kernels and `_triton_key_deriver` Triton internals that may not work on the triton-ascend backend); if parity with upstream warmup is desired, gate it per-platform or keep it disabled for NPU.\n\n3. **`_dummy_sampler_run` now invokes the rejection sampler.** Upstream `_dummy_run` (inherited by NPUModelRunner, which calls `super()._dummy_run`) now calls `self.rejection_sampler(logits, dummy_input_batch, self.speculator.draft_logits)` during warmup on spec-decode runs. Verify this path works with the upstream/`AscendRejectionSampler` on NPU (dummy InputBatch, draft logits dtype) — especially under lmhead-TP and ACL-graph warmup on the v2 path.\n\n4. **scatter_states is now a decorated wrapper** (`vllm/model_executor/layers/mamba/ops/scatter_states.py`). The existing Ascend sweep in `vllm_ascend/patch/worker/patch_triton.py` (replaces `scatter_states` with `_npu_scatter_states` on the source module and all loaded modules) still works because it rebinds the module attribute and late `from ... import` gets the npu function; but the sweep runs at patch time, so verify `vllm_ascend/models/glm5next/kda.py` is loaded before/after the sweep and that it always ends up calling the npu function (the decorated object's `__call__` would launch the upstream kernel using `tl.extra.cuda.gdc_wait`, which is NPU-unsupported). The upstream `register_warmup()` call added in `vllm/models/glm5next/nvidia/kda.py` is NVIDIA-only and not reached on Ascend.\n\n5. **No changes needed for**: Ascend v1 spec-decode (`vllm_ascend/spec_decode/*`, uses its own `copy_and_expand_dflash_and_dspark_inputs_kernel`, `npu_copy_and_expand_eagle_inputs`, and the plain-function module replacements in `patch_rejection_sampler.py` / `patch_triton.py` for `apply_top_k_top_p_triton`, `rejection_sample`, `expand_batch_to_tokens` — all still plain functions post-commit); MTP speculator (`_shift_input_*` wrappers, ascend doesn't use `multi_module_mtp`).",
+        "risk": "Medium-high. (1) The DFlash `_prepare_dflash_inputs_kernel` substitution in patch_v2/patch_triton.py:45 is a silent no-op after this commit, so the upstream kernel (block-tiled, DCP-aware, no Ascend max_num_reqs padding) is used on NPU for DFlash v2 spec decode; this can break ACL-graph capture/accuracy or change slot-mapping behavior on Ascend and requires immediate patch rewrite plus on-hardware validation. (2) If vllm-ascend ever enables `jit_warmup_registry.warmup()`, the newly registered sampling/DFlash warmup providers would compile upstream kernels on NPU (wasteful/possibly unsupported on the triton-ascend backend); today they are inert but add registrations during init. (3) The new rejection-sampler call inside `_dummy_sampler_run` changes warmup behavior for spec-decode runs on NPU. (4) scatter_states sweep timing vs. decorated wrapper remains an ordering-sensitive patch that should be regression-tested."
+      }
+    },
+    {
+      "sha": "e19a3e172ecc1d1ece8ecce9dfd91bf811a814a0",
+      "comment": "为 HiSparse host cache 增加 TP 共享模式：通过 SharedOffloadRegion (mmap) 在单机 MP TP rank 间共享一个物理 host pool，由 rank 0 填充并注册 CUDA 锁页内存，其他 rank 等待 barrier 后只读；KVCacheConfig 增加 hisparse_host_block_stride/hisparse_shared_host_pool 字段；shared_offload_region 支持仅创建者填充、分段 cudaHostRegister 及清理。仅 CUDA/ROCm 场景使用。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "hisparse",
+        "kv-cache",
+        "distributed",
+        "tp"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[5/N] Share HiSparse host cache across TP ranks (reopens #52760) (#56629)\n\nSigned-off-by: Matthew Bonanni <mbonanni@redhat.com>\nSigned-off-by: Chao Lei <leichao139636@163.com>\nSigned-off-by: Lucas Wilkinson <lwilkinson@neuralmagic.com>\nSigned-off-by: Lucas Wilkinson <lwilkins@redhat.com>\nCo-authored-by: Chao Lei <leichao139636@163.com>\nCo-authored-by: Claude Fable 5 <noreply@anthropic.com>\nCo-authored-by: Matthew Bonanni <mbonanni@redhat.com>\nCo-authored-by: OpenAI Codex <codex@openai.com>\nCo-authored-by: OpenAI Codex <noreply@openai.com>"
+    },
+    {
+      "sha": "ebe1dec2da16ac559e40446a4c6e06a73c9efe00",
+      "comment": "为稀疏 MLA 模型启用 PCP+DCP 组合：CommonAttentionMetadata 将 dcp_local_seq_lens_cpu 重命名为 dcp_local_seq_lens_cpu_upper_bound 并新增 req_idx；PCPManager 在 DCP>1 时对过短的 prefill 改为复制，并生成一致的 rank rows；sparse indexer 和 FlashMLA Sparse 后端增加 DCP KV all-gather/deinterleave；MLAAttention 增加 supports_pcp_dcp 类变量拦截不支持的后端；新增大量 PCP/DCP 规划测试。对 attention 元数据结构和构建流程有破坏性变更。",
+      "tags": [
+        "feature",
+        "high-risk",
+        "attention",
+        "pcp",
+        "dcp",
+        "sparse-mla"
+      ],
+      "ascend_impact": {
+        "ascend_affected": true,
+        "functionality": "CommonAttentionMetadata.dcp_local_seq_lens_cpu 字段被重命名为 dcp_local_seq_lens_cpu_upper_bound，并新增 req_idx 字段。Ascend 的 AttentionMetadataBuilder/Backend 及 InputBatch 相关代码如果读取旧字段名会直接 AttributeError；PCP+DCP 逻辑本身是 CUDA sparse-MLA 专用，但公共元数据结构变更会影响所有平台。",
+        "testing": "需要更新 Ascend attention 元数据构建/解析的单元测试，使用新字段名；并检查 AscendInputBatch 是否传递 dcp_local_seq_lens_cpu_upper_bound。",
+        "needs_test_update": true,
+        "suggested_test_areas": [
+          "vllm_ascend attention metadata builder/backend 测试",
+          "vllm_ascend/worker/input_batch 适配层",
+          "AscendInputBatch 相关测试"
+        ]
+      },
+      "message": "[PCP][DCP] Enable PCP+DCP on sparse-MLA models (#56157)\n\nSigned-off-by: patryk.saffer <patryk.saffer@blc-login-1.blc1.mistralcompute.ai>\nSigned-off-by: patryk.saffer <patryk.saffer@blc-login-0.blc1.mistralcompute.ai>\nSigned-off-by: PatrykSaffer <patryk.saffer@mistral.ai>\nSigned-off-by: Lucas Wilkinson <lwilkins@redhat.com>\nCo-authored-by: patryk.saffer <patryk.saffer@blc-login-1.blc1.mistralcompute.ai>\nCo-authored-by: patryk.saffer <patryk.saffer@blc-login-0.blc1.mistralcompute.ai>\nCo-authored-by: Lucas Wilkinson <lwilkins@redhat.com>\nCo-authored-by: Patryk Saffer <PatrykSaffer@users.noreply.github.com>\nCo-authored-by: Claude Fable 5.1 <noreply@anthropic.com>",
+      "deep_analysis": {
+        "ascend_affected_confirmed": true,
+        "affected_interfaces": [
+          "AscendCommonAttentionMetadata.unpadded() (vllm_ascend/attention/utils.py:373) - references self.dcp_local_seq_lens_cpu, a CommonAttentionMetadata dataclass field renamed by this commit to dcp_local_seq_lens_cpu_upper_bound; will raise AttributeError on the spec-decode path (called from model_runner_v1.py:3636)",
+          "AscendPCPManager (vllm_ascend/worker/v2/pcp_manager.py) - subclasses upstream PCPManager, which this commit changes internally: _reorder_segments/_iter_rank_chunks/_get_rank_segments/_build_batch_layout signatures and PCP+DCP chunk-replication semantics changed, new replicated_requests() added, and partition_batch() now injects dcp_local_seq_lens_cpu_upper_bound into the local batch",
+          "AscendModelState.prepare_attn / build_attn_metadata (vllm_ascend/worker/v2/model_states/default.py, vllm_ascend/worker/v2/attn_utils.py) - must propagate the new dcp_local_seq_lens_cpu_upper_bound and req_idx CommonAttentionMetadata fields for DCP/PCP+DCP sparse paths",
+          "SFA/DSA DCP context-parallel backends (vllm_ascend/attention/context_parallel/sfa_cp.py, dsa_cp.py) - consume dcp_local_seq_lens and PCP context; the field semantics changed from exact local DCP lengths to an upper bound (largest shard over the whole request, identical on every PCP rank) plus the new req_idx row-to-request grouping",
+          "Sparse-MLA model classes built on upstream MLAAttention subclasses - new supports_pcp_dcp ClassVar (default False) plus a fail-closed NotImplementedError in MLAAttention.__init__ for use_pcp + dcp_world_size>1 requires opting in"
+        ],
+        "adaptation_effort": "medium",
+        "adaptation_guide": "1) HARD FIX (breaking): in vllm_ascend/attention/utils.py:373, replace dcp_local_seq_lens_cpu=_slice_reqs(self.dcp_local_seq_lens_cpu) with dcp_local_seq_lens_cpu_upper_bound=_slice_reqs(self.dcp_local_seq_lens_cpu_upper_bound), and add req_idx=_slice_reqs(self.req_idx) (both fields renamed/added in vllm/v1/attention/backend.py CommonAttentionMetadata). 2) PCPManager inheritance: re-validate AscendPCPManager (vllm_ascend/worker/v2/pcp_manager.py) against the new upstream PCPManager.partition_batch/_build_batch_layout/_reorder_segments/_iter_rank_chunks and replicated_requests(); the upstream _reorder_segments no longer takes num_computed_tokens/query_start_loc_np and now sorts decodes-first-then-prefills with short-prefill replication under DCP. Update AscendPCPManager.validate_config to mirror the new upstream guards (PCP+DCP restricted to sparse MLA only, dcp_comm_backend='ag_rs' required, CUDA/ACL graphs disallowed for sparse-MLA PCP when DCP==1). 3) Metadata plumbing: in vllm_ascend/worker/v2/attn_utils.py build_attn_metadata and AscendModelState.prepare_attn, forward input_batch.dcp_local_seq_lens_cpu_upper_bound and input_batch.idx_mapping_np into AscendCommonAttentionMetadata so the DSA/SFA CP builders (sfa_cp.py/dsa_cp.py) can size their KV gather (PCP+DCP all-gather + de-interleave of the KV shards, see the new dcp_gather_kv_rows/PCPGlobalChunkPlan logic). 4) Model layer: if any Ascend sparse-MLA model runs PCP+DCP through an upstream MLAAttention subclass, set supports_pcp_dcp=True and provide a forward that merges the LSE only over decode rows (partial-row dcp_manager.combine); otherwise the new NotImplementedError in mla_attention.py fails the run.",
+        "risk": "medium"
+      }
+    },
+    {
+      "sha": "72d4d8315749c146cf19f047fecfec491911770d",
+      "comment": "修复 ROCm 上 elastic EP 扩缩容时的死锁：新增 defer_comm_warmup_on_rocm 上下文，在创建 standby DP/EP/EPLB 组及加入集群时跳过 NCCL 通信器 warmup，延迟到引擎安静时（commit 阶段）进行；parallel_state 也通过 _elastic_join_warmup_ctx 包裹 elastic EP 组创建。该逻辑仅对 ROCm 生效，CUDA 行为不变。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "rocm",
+        "distributed",
+        "elastic-ep"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[ROCm][Bugfix] Fix elastic EP scaling deadlock (#56610)\n\nSigned-off-by: Matthew Wong <Matthew.Wong2@amd.com>\nCo-authored-by: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
+    },
+    {
+      "sha": "7ee8a6dd013819838da8012ca549d724bee7c6c6",
+      "comment": "新增 dual-key gumbel-max 水印算法并支持推测解码：WatermarkConfig 扩展 alpha/deduplicate_contexts/deduplicate_contexts_max_history/allow_target_only_watermarking；实现 DualKeyGumbelWatermarker/Detector、DraftWatermarker、watermarked_rejection_sample；rejection sampler kernel 增加 watermark 分支；GPUWatermarkSampler 支持 skip_mask 与 repeated context 检测；GPUModelRunner/RejectionSampler/Speculator 串联 watermark 参数；新增大量水印与推测解码组合测试。功能量大，涉及采样协议和 kernel 变更，风险高。",
+      "tags": [
+        "feature",
+        "high-risk",
+        "watermarking",
+        "speculative-decoding",
+        "sampling"
+      ],
+      "ascend_impact": {
+        "ascend_affected": true,
+        "functionality": "GPUModelRunner 构造 sampler/rejection_sampler 时新增 watermark 参数和 watermark_key 传递；RejectionSampler 构造函数新增 keyword-only watermark_key 参数。NPUModelRunner 如果直接实例化 RejectionSampler 或依赖上游构造逻辑，需要适配新签名；spec_decode_rejection_warmup 中 draft_sampled 改为 int32、idx_mapping 改为 int64，可能影响 Ascend 复用 rejection_sample Triton kernel 的特化。watermark 本身走 CUDA kernel，Ascend 在非 CUDA 设备上使用 torch fallback，不受核心 kernel 影响。",
+        "testing": "需要更新 model runner 初始化和 rejection sampler 相关测试，以覆盖新构造函数参数和 dtype 变更；增加 watermark 配置下 NPU worker 启动的冒烟测试。",
+        "needs_test_update": true,
+        "suggested_test_areas": [
+          "vllm_ascend/worker/worker.py",
+          "vllm_ascend/worker/v2/model_runner.py",
+          "vllm_ascend spec decode 测试",
+          "watermark 配置与 NPU worker 启动测试"
+        ]
+      },
+      "message": "[watermarking] Dual-key gumbel-max watermarking for speculative decoding support (#56122)\n\nSigned-off-by: Raphael Rialland <raphael.rialland@mistral.ai>\nSigned-off-by: Simon Veitner <sveitner@redhat.com>\nSigned-off-by: Tomas Ruiz <tomas.ruiz.te@gmail.com>\nCo-authored-by: OpenAI Codex <codex@openai.com>\nCo-authored-by: Simon Veitner <sveitner@redhat.com>\nCo-authored-by: Tomas Ruiz <tomas.ruiz.te@gmail.com>",
+      "deep_analysis": {
+        "ascend_affected_confirmed": true,
+        "affected_interfaces": [
+          "vllm_ascend/worker/v2/spec_decode/rejection_sampler_utils.py::rejection_sample (npu_rejection_sample) — the monkey-patched replacement for vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils.rejection_sample, whose signature is extended by this commit with new keyword-only params contexts, watermarking, watermark_key",
+          "vllm_ascend/patch/worker/patch_v2/patch_triton.py — binds rejection_sampler_utils.rejection_sample and rejection_sampler.rejection_sample to npu_rejection_sample; these bindings now receive the new watermark kwargs when watermarking + spec decode is enabled",
+          "vllm_ascend/worker/v2/sample/gumbel.py::gumbel_sample / apply_temperature — Ascend-patched replacements now consumed by the new RandomSampler dataclass and GPUWatermarkSampler path in vllm/v1/watermarking/watermarker.py and gpu_sampler.py",
+          "vllm_ascend/worker/v2/spec_decode/dspark/speculator.py::AscendDSparkSpeculator and vllm_ascend/worker/v2/spec_decode/dflash/speculator.py::AscendDFlashSpeculator — subclasses of DraftModelSpeculator/DFlashSpeculator/DSparkSpeculator which now carry the new draft_watermarker attribute, prepare_watermarking() method, and watermarker.sample() integration in _sample_parallel/_sample_sequential",
+          "vllm_ascend/worker/v2/model_runner.py::NPUModelRunner — inherits GPUModelRunner, which now builds GPUWatermarkSampler and calls self.speculator.prepare_watermarking(...) when watermarking is configured"
+        ],
+        "adaptation_effort": "medium",
+        "adaptation_guide": "1) rejection_sampler_utils (mandatory, low-effort): extend npu_rejection_sample in vllm_ascend/worker/v2/spec_decode/rejection_sampler_utils.py with the new keyword-only params contexts: torch.Tensor | None = None, watermarking: torch.Tensor | None = None, watermark_key: int | None = None. Keep them None in the default path; if any is set, either raise NotImplementedError (NPU has no watermarked resample kernel) or implement the keyed-recovery resample. Update the npu_rejection_sample bindings in vllm_ascend/patch/worker/patch_v2/patch_triton.py accordingly (the patch is unconditional, so this commit makes the mismatch reachable now that _check_watermarking_unsupported allows dual_key_gumbel + dspark/eagle/eagle3/mtp). 2) gumbel.py: verify the Ascend gumbel_sample/apply_temperature remain signature-compatible with the new RandomSampler.__call__ and GPUWatermarkSampler (they are; note use_fp64 already raises NotImplementedError on NPU). 3) Speculators: no change is required for the default (draft_watermarker=None) path, since Ascend specs do not override _sample_parallel/_sample_sequential and prepare_watermarking() is a no-op; if NPU watermarking is to be supported, ensure AscendDSparkSpeculator/AscendDFlashSpeculator honor the upstream draft/target role keying. 4) NPU watermarking enablement (optional, medium/high): if dual_key_gumbel is supported on NPU, the GumbelWatermarker already falls back to the torch path (device.type != 'cuda'), but repeated_context_mask() (default deduplicate_contexts='single_turn') launches the new _repeated_context_mask_kernel Triton kernel on any non-CPU device — its tl.int64/uint32/loops need triton-ascend validation or a CPU/Ascend fallback. Otherwise, add explicit config validation in vllm_ascend/ascend_config.py (or NPUPlatform.check_and_update_config) to reject --watermark on NPU with a clear error instead of crashing.",
+        "risk": "Low for existing functionality: all new paths (GPUWatermarkSampler construction, prepare_watermarking calls in model_runner, draft_watermarker in speculators, WatermarkConfig fields, _check_watermarking_unsupported validation) are guarded so the default non-watermark path on NPU is fully backward compatible. Medium for watermarking+spec-decode on NPU, which this commit makes reachable (dual_key_gumbel is now explicitly allowed with dspark/eagle/eagle3/mtp, and previously gumbel+spec-decode was rejected): vllm-ascend's patched npu_rejection_sample would raise TypeError on the unexpected contexts/watermarking/watermark_key kwargs, and the repeated_context_mask Triton kernel may be unsupported by triton-ascend. Also note the watermarked rejection path is a new behavioral change to the shared rejection_sample interface that must not be silently dropped by the NPU patch."
+      }
+    },
+    {
+      "sha": "1ee4be4dbc576f2158913a89598ccfa9dec9391e",
+      "message": "[CI] Update DeepSeek V4.1 MegaMoE routing test (#56599)\n\nSigned-off-by: Kevin Luu <51931015+khluu@users.noreply.github.com>\nCo-authored-by: OpenAI Codex <codex@openai.com>",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "chore"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "fd7cd4b883e7720fbbfbc0ca6aa9404bf2f8e3f1",
+      "message": "[CI] Fix Qwen3 Omni DSpark load test config (#56600)\n\nSigned-off-by: Kevin Luu <51931015+khluu@users.noreply.github.com>\nCo-authored-by: OpenAI Codex <codex@openai.com>",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "bugfix",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "7bcca16729b71294bd1b67ecde9aca584618234d",
+      "comment": "修复 DeepGEMM FP8 线性层 warmup 覆盖问题：FP8BlockParams 提取 block_scale_attr/block_scale 属性统一 weight_scale/weight_scale_inv 两种命名；DeepGemmFp8BlockScaledMMKernel 在 process_weights_after_loading 时给非 bmm 层打上 deep_gemm_warmup_provider 标记，warmup 时直接读取 provider 获取权重，不再依赖 quant_method 类型和名称假设；同时支持 N%64==0 的 shape。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "deepgemm",
+        "fp8",
+        "warmup"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Bugfix] Fix DeepGEMM FP8 warmup coverage (#56452)\n\nSigned-off-by: Ayushman Singh <40520701+ayush1399@users.noreply.github.com>\nCo-authored-by: mergify[bot] <37929162+mergify[bot]@users.noreply.github.com>"
+    },
+    {
+      "sha": "29332cf93628a67c49252ef7c89a8aa3185def4b",
+      "comment": "为 HiSparse cache 增加 KV connector 统计/metrics：C++ hisparse_resolve_residency kernel 增加 stats [hits,misses] 输出参数；HiSparseIndexGroup 增加 swap_stats 设备/主机缓冲；worker 按固定间隔将计数快照拷贝到 CPU 并通过 get_kv_connector_stats 返回；新增 HiSparseKVConnectorStats/HiSparsePromMetrics 聚合类。",
+      "tags": [
+        "feature",
+        "low-risk",
+        "hisparse",
+        "metrics",
+        "kv-connector"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[4/N] Expose HiSparse cache metrics via KV connector stats (#56061)\n\nSigned-off-by: NickLucche <nicolo.lucchesi@mistral.ai>\nSigned-off-by: Lucas Wilkinson <lwilkins@redhat.com>\nCo-authored-by: Lucas Wilkinson <lwilkins@redhat.com>\nCo-authored-by: OpenAI Codex <codex@openai.com>"
+    },
+    {
+      "sha": "dff76bc3e8d702901e6dda5971f9506a6c1bc00f",
+      "message": "[Bugfix][CI] skip conftest for NPU compatibility test (#55799)\n\nSigned-off-by: yangzeyu <532183776@qq.com>",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "bugfix",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "3bb23e2def9527d941be57c5a7d47401a8dbaedc",
+      "message": "[CI/Build] Add DSv4.1 auto-label rules and narrow DSv4 (#56332)\n\nSigned-off-by: Joe Cotant <joe@inferact.ai>\nCo-authored-by: Claude <noreply@anthropic.com>",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "feature",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "9d3e991ece7f54c173c0cc9261ab5969b1dbeb4c",
+      "message": "Add @arpera to CODEOWNERS of Structured Output (#56501)\n\nSigned-off-by: Artem Perevedentsev <aperevedents@nvidia.com>",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "feature",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "c377114636db645e13594e66a6c4f4f0084adac2",
+      "comment": "更新 CuTeDSL indexer Q sentinel 测试以适配已迁移的 kernel wrapper：测试改为调用 _INDEXER_Q_MXFP4_KERNEL/_INDEXER_Q_FP8_KERNEL 关键字参数形式；同时修正 fused_indexer_q_fp8 中 q_fp8 转为 uint8 再传入 kernel。",
+      "tags": [
+        "test",
+        "low-risk",
+        "cutedsl",
+        "deepseek-v4"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Bugfix][CI] Update CuTeDSL indexer Q sentinel test for migrated wrappers (#56594)\n\nSigned-off-by: LopezCastroRoberto <rocastro@redhat.com>"
+    }
+  ],
+  "architecture_based_on_sha": "7154856f3dcb1d3fdd5a136f7d2c5987f22244f5",
+  "architecture_generated_at": "2026-08-01T20:25:03.691327+08:00"
+}

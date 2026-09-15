@@ -904,32 +904,66 @@ def _persist_lesson_to_remote() -> str:
     """
     repo_root = os.path.dirname(os.path.abspath(data_dir))
 
+    # The fresh clone has no git identity — this must cover the rebase too,
+    # not just the commit: once a push fails, the stranded commits make the
+    # next submit's `git rebase` fail with "Committer identity unknown"
+    # (runs 34500061924/34706495765), so a transient outage poisoned every
+    # later submit of the run.
+    identity_env = dict(
+        os.environ,
+        GIT_AUTHOR_NAME="vllm-report-bot",
+        GIT_AUTHOR_EMAIL="vllm-report-bot@users.noreply.github.com",
+        GIT_COMMITTER_NAME="vllm-report-bot",
+        GIT_COMMITTER_EMAIL="vllm-report-bot@users.noreply.github.com",
+    )
+
     def _run(*args: str) -> subprocess.CompletedProcess:
-        return subprocess.run(["git", *args], cwd=repo_root,
+        return subprocess.run(["git", *args], cwd=repo_root, env=identity_env,
                               capture_output=True, text=True)
 
     try:
         r = _run("status", "--short")
         if r.returncode != 0 or not r.stdout.strip():
             return ""  # nothing to commit
-        identity = ("-c", "user.name=vllm-report-bot",
-                    "-c", "user.email=vllm-report-bot@users.noreply.github.com")
         r = _run("add", "-A")
         if r.returncode != 0:
             return f"git add failed: {r.stderr.strip()[:200]}"
         msg = f"lessons: {datetime.now(TZ_CN).strftime('%Y-%m-%d %H:%M')} auto-recorded"
-        r = _run(*identity, "commit", "-m", msg)
+        r = _run("commit", "-m", msg)
         if r.returncode != 0:
             return f"git commit failed: {r.stderr.strip()[:200]}"
         token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN") or ""
+        repo_url = "https://github.com/vllm-ascend/vllm-report.git"
         targets: list[str] = []
         if token:
+            # 1. The runner's own github rewrite (``url.*.insteadOf``, e.g.
+            #    an in-cluster git-cdn service) with the token embedded —
+            #    reachable wherever the clone's fetch worked, and the route
+            #    that does not traverse gh-proxy's public WAF (the pattern
+            #    proven by push_to_github._push_via_proxy).
+            cfg = _run("config", "--get-regexp", r"^url\..*\.insteadof$")
+            for line in cfg.stdout.splitlines():
+                key, _, value = line.partition(" ")
+                # Build the push URL exactly as git would rewrite it
+                # (base + original minus the matched prefix), then embed the
+                # token after the scheme.  Splicing base and repo_url
+                # together double-prefixes when the rewrite base itself ends
+                # with the value (a3-16 git-cdn: ".../https://github.com/").
+                if not value or not repo_url.startswith(value):
+                    continue
+                base = key[len("url."):-len(".insteadof")]
+                rewritten = base + repo_url[len(value):]
+                scheme, _, remainder = rewritten.partition("://")
+                if scheme and remainder:
+                    targets.append(
+                        f"{scheme}://x-access-token:{token}@{remainder}")
+                    break
+            # 2. The CI push proxy used by push_to_github._push_via_proxy.
             targets.append(
-                "https://x-access-token:{token}@gh-proxy.test.osinfra.cn/"
-                "https://github.com/vllm-ascend/vllm-report.git".format(token=token))
-            targets.append(
-                "https://x-access-token:{token}@github.com/"
-                "vllm-ascend/vllm-report.git".format(token=token))
+                f"https://x-access-token:{token}@gh-proxy.test.osinfra.cn/"
+                f"{repo_url}")
+            # 3. Direct github.com (non-proxy runners).
+            targets.append(f"https://x-access-token:{token}@{repo_url[8:]}")
         targets.append("origin")
         # Rebase onto the remote before pushing: the daily data-update bot
         # commits to main between our clone and this submit, so a bare push
@@ -944,13 +978,17 @@ def _persist_lesson_to_remote() -> str:
             _run("rebase", "--abort")
             return (f"git rebase onto remote failed: "
                     f"{r.stderr.strip()[:200]}")
-        last_err = ""
+        # Report EVERY route's error, not just the last one: the routes fail
+        # for different reasons (WAF rejection, firewall, anonymous-rewrite
+        # auth) and the last one alone misdirected the 09-12~09-15 diagnosis.
+        errors: list[str] = []
         for target in targets:
             r = _run("push", target, "main")
             if r.returncode == 0:
                 return ""
-            last_err = r.stderr.strip()[:300]
-        return f"git push failed: {last_err}"
+            label = "origin" if target == "origin" else target.split("@")[-1]
+            errors.append(f"{label}: {r.stderr.strip()[:200]}")
+        return "git push failed (all routes) — " + " | ".join(errors)
     except FileNotFoundError:
         return "git not available"
 

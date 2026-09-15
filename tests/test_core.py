@@ -3,6 +3,7 @@ import os
 import sys
 import tempfile
 import unittest
+import unittest.mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
 
@@ -153,7 +154,15 @@ class TestSourceRepo(unittest.TestCase):
 
 class TestCleanStaleData(unittest.TestCase):
     def test_clean_stale_no_analysis_dir(self):
-        from data.clean_stale_data import clean_stale_data
+        # clean_stale_data lives in .github/scripts, not src/data
+        import importlib.util
+        script = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            ".github", "scripts", "clean_stale_data.py")
+        spec = importlib.util.spec_from_file_location("clean_stale_data", script)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        clean_stale_data = mod.clean_stale_data
 
         tmpdir = tempfile.mkdtemp()
         repo_dir = os.path.join(tmpdir, "vllm")
@@ -175,3 +184,80 @@ class TestRepoDirName(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class TestPersistLessonToRemote(unittest.TestCase):
+    """Route rotation + rebase identity for lesson persistence.
+
+    The a3-16-runner outage (09-12~09-15, zero lessons recorded) had three
+    stacked causes this must prevent: the insteadOf-derived in-cluster route
+    was missing (only gh-proxy/direct/anonymous-origin were tried), the
+    rebase after a stranded commit died on "Committer identity unknown", and
+    only the LAST route's error was reported.
+    """
+
+    def setUp(self):
+        import mcp_server_app
+        self.mcp = mcp_server_app
+        self.tmpdir = tempfile.mkdtemp()
+        self.data_dir = os.path.join(self.tmpdir, "data")
+        os.makedirs(self.data_dir)
+        self.mcp.data_dir = self.data_dir
+        self.calls = []
+
+        class _R:
+            returncode, stdout, stderr = 0, "", ""
+
+            def __init__(self, returncode=0, stdout="", stderr=""):
+                self.returncode, self.stdout, self.stderr = (
+                    returncode, stdout, stderr)
+
+        self._R = _R
+
+        def fake_run(cmd, cwd=None, env=None, capture_output=False, text=False):
+            self.calls.append((list(cmd), env))
+            if cmd[:2] == ["git", "status"]:
+                return _R(stdout=" M vllm-ascend/lessons/x.json")
+            if cmd[:2] == ["git", "config"]:
+                return _R(stdout="url.http://git-cdn:8000/https://github.com/"
+                                 ".insteadof https://github.com/\n")
+            if cmd[:2] == ["git", "push"]:
+                return _R(returncode=self.push_rc,
+                          stderr=self.push_stderr)
+            return _R()
+
+        self._orig_run = self.mcp.subprocess.run
+        self.mcp.subprocess.run = fake_run
+        self.push_rc, self.push_stderr = 0, ""
+
+    def tearDown(self):
+        self.mcp.subprocess.run = self._orig_run
+
+    def test_gitcdn_route_first_and_rebase_identity(self):
+        with unittest.mock.patch.dict(os.environ, {"GH_TOKEN": "TESTTOKEN"}):
+            result = self.mcp._persist_lesson_to_remote()
+        self.assertEqual(result, "")
+        push = self.calls[-1][0]
+        self.assertEqual(push[:2], ["git", "push"])
+        # insteadOf-derived route (in-cluster, no WAF) comes first
+        self.assertEqual(
+            push[2], "http://x-access-token:TESTTOKEN@git-cdn:8000/"
+                     "https://github.com/vllm-ascend/vllm-report.git")
+        rebases = [c for c in self.calls if c[0][:2] == ["git", "rebase"]
+                   and "--abort" not in c[0]]
+        self.assertTrue(rebases)
+        env = rebases[0][1]
+        self.assertEqual(env["GIT_AUTHOR_NAME"], "vllm-report-bot")
+        self.assertEqual(env["GIT_COMMITTER_NAME"], "vllm-report-bot")
+
+    def test_all_route_errors_reported_without_token(self):
+        self.push_rc = 128
+        self.push_stderr = ("fatal: could not read Username for "
+                            "'http://git-cdn': No such device or address")
+        with unittest.mock.patch.dict(os.environ, {"GH_TOKEN": "TESTTOKEN"}):
+            result = self.mcp._persist_lesson_to_remote()
+        self.assertIn("all routes", result)
+        self.assertIn("gh-proxy.test.osinfra.cn", result)
+        self.assertIn("origin", result)
+        self.assertNotIn("TESTTOKEN", result)
+        pushes = [c for c in self.calls if c[0][:2] == ["git", "push"]]
+        self.assertEqual(len(pushes), 4)  # gitcdn, gh-proxy, direct, origin

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Phase 1: 调用 DeepSeek 批量分析 commit，标记 ascend_affected。
+Phase 1: 调用 GLM 批量分析 commit，标记 ascend_affected。
 
 用法：
   python src/data/analyze_commits.py \
@@ -12,7 +12,7 @@ Phase 1: 调用 DeepSeek 批量分析 commit，标记 ascend_affected。
 执行流程：
   1. 加载指定日期的 commit 数据和架构上下文
   2. 路径预过滤：自动跳过 tests/docs/CI/平台特化代码的 commit
-  3. 分批调用 DeepSeek（每批最多 15 个 commit，自动重试缺失的）
+  3. 分批调用 GLM（每批最多 15 个 commit，自动重试缺失的）
   4. 合并自动判定 + LLM 分析结果
   5. 记录 ascend_affected 的 commit 到 arch_deltas.json
   6. 保存分析结果到 data/{repo}/analysis/{date}.json
@@ -547,7 +547,7 @@ def build_prompt(repo, date, commits_data, data_dir, local_repo=None, commit_sub
     return prompt
 
 
-DEFAULT_API_BASE = "https://ark.cn-beijing.volces.com/api/coding/v3"
+DEFAULT_API_BASE = "https://open.bigmodel.cn/api/paas/v4"
 
 
 def call_llm(prompt):
@@ -560,7 +560,7 @@ def call_llm(prompt):
         return None
 
     api_base = os.environ.get("LLM_API_BASE", DEFAULT_API_BASE).rstrip("/")
-    api_model = os.environ.get("LLM_MODEL", "deepseek-v4-flash")
+    api_model = os.environ.get("LLM_MODEL", "zhipu/glm-5.3-flash").split("/", 1)[-1]
 
     endpoint = f"{api_base}/chat/completions"
     body = json.dumps({

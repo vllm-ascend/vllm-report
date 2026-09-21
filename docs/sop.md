@@ -7,7 +7,7 @@ data/
 ├── README.json                          # 项目入口引导文件
 ├── vllm/
 │   ├── commits/{date}.json              # 原始 commit 数据（含 diff/patch）
-│   ├── analysis/{date}.json             # Phase 1 DeepSeek 分析结果
+│   ├── analysis/{date}.json             # Phase 1 GLM 分析结果
 │   ├── _deep_analysis_cache/            # Phase 2 深分析的源码上下文缓存（AST 提取）
 │   ├── context/
 │   │   ├── architecture.json            # vllm 架构基线知识库
@@ -140,7 +140,7 @@ python3 src/data/fetch_commits.py \
   --local-repo ~/code/vllm \
   --date 2026-07-27
 
-# Phase 1: DeepSeek 分析
+# Phase 1: GLM 分析
 python3 src/data/analyze_commits.py \
   --repo vllm-project/vllm \
   --date 2026-07-27 \
@@ -233,7 +233,7 @@ python3 src/data/fetch_commits.py \
   --local-repo ~/code/vllm \
   --date $DATE
 
-# Phase 1: DeepSeek 分析
+# Phase 1: GLM 分析
 python3 src/data/analyze_commits.py \
   --repo vllm-project/vllm \
   --date $DATE \
@@ -368,7 +368,7 @@ print(f'deltas 已清空: {len(d[\"deltas\"])}')  # 应该为 0
 | 脚本 | 作用 | 调用频率 | 自动 git 操作 |
 |------|------|----------|--------------|
 | `fetch_commits.py` | 从本地 git 获取某天的 commit 数据（含 diff/patch） | 每日 | pull |
-| `analyze_commits.py` | Phase 1: DeepSeek 批量分析 commit | 每日 | 无 |
+| `analyze_commits.py` | Phase 1: GLM 批量分析 commit | 每日 | 无 |
 | `deep_analyze_commits.py` | Phase 2: opencode 深度分析 ascend_affected commit | 每日（仅当有 ascend_affected 时） | checkout 到父 commit 再恢复 |
 | `generate_context.py` | 生成/刷新架构知识库 + 交叉引用 | 初始化时 / 用户主动刷新 | pull（--checkout 时）+ checkout 再恢复 |
 | `build_index.py` | 构建检索索引 | 每次数据更新后 | 无 |

@@ -6,7 +6,7 @@ Daily commit monitor and AI analysis for [vllm](https://github.com/vllm-project/
 
 - **Daily Commit Fetching** — Automatically fetches new commits (with full diff) via GitHub Actions daily at 02:00 CST
 - **Two-Phase AI Analysis** —
-  - **Phase 1**: Bulk analysis via DeepSeek API (intent, risk, ascend impact, test impact) with path-based triage that auto-skips non-ascend-relevant commits (tests/docs/CI/platform-specific code), reducing LLM API costs
+  - **Phase 1**: Bulk analysis via GLM API (intent, risk, ascend impact, test impact) with path-based triage that auto-skips non-ascend-relevant commits (tests/docs/CI/platform-specific code), reducing LLM API costs
   - **Phase 2**: Deep analysis via opencode agent for ascend_affected commits — identifies specific affected interfaces, adaptation effort, and adaptation guide by reading actual source files (using the AST-extracted source context cache)
 - **Diff-Aware Architecture Impact** — Commits modifying key interface files get `architecture_impact` markers (affected_interfaces, recommend_refresh), detected automatically from file paths against cross-project relationship rules
 - **Architecture Context Cache** — Auto-generated project architecture summaries via opencode agent (on demand or via the `refresh-context.yml` workflow), injected into AI analysis prompts for precise impact judgment
@@ -109,14 +109,14 @@ python src/data/fetch_commits.py --repo vllm-project/vllm --local-repo ~/code/vl
 `analyze_commits.py` Phase 1 calls an OpenAI-compatible `/chat/completions` endpoint, configured via environment variables:
 
 ```bash
-# Required: DeepSeek / compatible API key for Phase 1 bulk analysis
-export LLM_API_KEY="sk-your-deepseek-key"
+# Required: GLM / compatible API key for Phase 1 bulk analysis
+export LLM_API_KEY="sk-your-glm-key"
 
 # Optional: override the API base URL (default: Volcengine ARK coding endpoint)
-# export LLM_API_BASE="https://ark.cn-beijing.volces.com/api/coding/v3"
+# export LLM_API_BASE="https://open.bigmodel.cn/api/paas/v4"
 
-# Optional: override the model id (default: deepseek-v4-flash)
-# export LLM_MODEL="deepseek-v4-flash"
+# Optional: override the model id (default: glm-5.3-flash)
+# export LLM_MODEL="glm-5.3-flash"
 ```
 
 The opencode-driven steps (Phase 2 deep analysis, `generate_context.py`) are configured via `OPENCODE_*` / provider config:
@@ -166,7 +166,7 @@ python src/data/analyze_commits.py --repo vllm-project/vllm --catch-up
 ```
 
 The analysis runs in two phases:
-1. **Phase 1**: DeepSeek batch analysis for all commits. Includes path-based triage — commits modifying only tests/docs/CI/platform-specific code are auto-skipped (no LLM cost), using the `not_used_by_ascend` path list from architecture.json (refreshed on-demand).
+1. **Phase 1**: GLM batch analysis for all commits. Includes path-based triage — commits modifying only tests/docs/CI/platform-specific code are auto-skipped (no LLM cost), using the `not_used_by_ascend` path list from architecture.json (refreshed on-demand).
 2. **Phase 2**: opencode agent deep analysis for ascend_affected commits (identifies specific interfaces, adaptation effort, and guide).
 
 ### 5. Build Search Index
@@ -282,15 +282,17 @@ See [docs/mcp-usage-guide.md](docs/mcp-usage-guide.md) for detailed usage scenar
 
 | Secret | Description |
 |--------|-------------|
-| `DEEPSEEK_API_KEY` | API key for DeepSeek (Phase 1 bulk analysis) |
+| Secret `LLM_API_KEY` | GLM API key (shared by Phase 1 and Phase 2 opencode) |
+| Variable `LLM_API_BASE` | optional, endpoint override (default `https://open.bigmodel.cn/api/paas/v4`) |
+| Variable `LLM_MODEL` | optional, `provider/model` form (default `zhipu/glm-5.3-flash`) |
 | `OPENCODE_AUTH_TOKEN` | OpenAI-compatible API key used by opencode (Phase 2 deep analysis + architecture generation) |
 | `GH_TOKEN` (or `GITHUB_TOKEN`) | Optional — GitHub token used by the MCP server to push recorded lessons and by `get_commit_diff` for the GitHub API fallback |
 
-> The opencode model is configured in a `~/.config/opencode/opencode.json` block written by the workflows, or overridden via the `OPENCODE_MODEL` env var. The current default is `deepseek/deepseek-v4-flash` pointed at the Volcengine ARK base URL (`https://ark.cn-beijing.volces.com/api/coding/v3`, model `deepseek-chat`). To change providers, edit the opencode config JSON block or set `OPENCODE_MODEL`.
+> The opencode model is configured in a `~/.config/opencode/opencode.json` block written by the workflows, or overridden via the `OPENCODE_MODEL` env var. The current default is `zhipu/glm-5.3-flash` pointed at the Zhipu base URL (`https://open.bigmodel.cn/api/paas/v4`, model `glm-5.3`). To change providers, edit the opencode config JSON block or set `OPENCODE_MODEL`.
 
 ### Workflows
 
-- **`daily-commit.yml`** — Runs daily at 02:00 CST (or via manual `workflow_dispatch` with an optional date input): fetch → Phase 1 DeepSeek analysis → Phase 2 opencode analysis → build index → track adaptation → clean stale data → deploy. Runs for both vllm and vllm-ascend, checking out their sources into `repos/`.
+- **`daily-commit.yml`** — Runs daily at 02:00 CST (or via manual `workflow_dispatch` with an optional date input): fetch → Phase 1 GLM analysis → Phase 2 opencode analysis → build index → track adaptation → clean stale data → deploy. Runs for both vllm and vllm-ascend, checking out their sources into `repos/`.
 - **`refresh-context.yml`** — Run on-demand (`workflow_dispatch`): checkout vllm/vllm-ascend source → generate architecture via opencode → cross-reference → rebuild index → track adaptation. (This replaced the old scheduled `weekly-context.yml`.)
 - **`pages.yml`** — Deploys GitHub Pages on push to `site/` or `data/`
 

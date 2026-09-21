@@ -6,7 +6,7 @@
 
 - **每日 Commit 抓取** — 每天北京时间 02:00 自动通过 GitHub Actions 抓取新 commit（含完整 diff）
 - **双阶段 AI 分析** —
-  - **Phase 1**：DeepSeek API 批量分析（意图、风险、ascend 影响、测试影响），附带路径预筛选（path-based triage）自动跳过非 ascend 相关 commit（tests/docs/CI/平台特化代码），降低 LLM API 成本
+  - **Phase 1**：GLM API 批量分析（意图、风险、ascend 影响、测试影响），附带路径预筛选（path-based triage）自动跳过非 ascend 相关 commit（tests/docs/CI/平台特化代码），降低 LLM API 成本
   - **Phase 2**：opencode Agent 深度分析 ascend_affected 的 commit——通过读取实际源码识别具体影响接口、适配工作量和适配指南（使用 AST 提取的源码上下文缓存）
 - **Diff 感知的架构影响标记** — 修改关键接口文件的 commit 自动获得 `architecture_impact` 标记（affected_interfaces、recommend_refresh），根据跨项目关系规则的文件路径匹配检测
 - **架构上下文缓存** — 按需（`refresh-context.yml` 工作流）通过 opencode Agent 自动生成项目架构摘要，注入 AI 分析 prompt 以提高影响判断的准确性
@@ -109,14 +109,14 @@ python src/data/fetch_commits.py --repo vllm-project/vllm --local-repo ~/code/vl
 `analyze_commits.py` 的 Phase 1 会调用 OpenAI 兼容的 `/chat/completions` 接口，通过环境变量配置：
 
 ```bash
-# 必填：DeepSeek / 兼容 API Key，用于 Phase 1 批量分析
-export LLM_API_KEY="sk-your-deepseek-key"
+# 必填：GLM / 兼容 API Key，用于 Phase 1 批量分析
+export LLM_API_KEY="sk-your-glm-key"
 
 # 可选：覆盖 API base URL（默认：火山方舟 ARK coding 端点）
-# export LLM_API_BASE="https://ark.cn-beijing.volces.com/api/coding/v3"
+# export LLM_API_BASE="https://open.bigmodel.cn/api/paas/v4"
 
-# 可选：覆盖模型名（默认：deepseek-v4-flash）
-# export LLM_MODEL="deepseek-v4-flash"
+# 可选：覆盖模型名（默认：glm-5.3-flash）
+# export LLM_MODEL="glm-5.3-flash"
 ```
 
 opencode 相关步骤（Phase 2 深分析、`generate_context.py`）通过 `OPENCODE_*` 环境变量配置：
@@ -166,7 +166,7 @@ python src/data/analyze_commits.py --repo vllm-project/vllm --catch-up
 ```
 
 分析分两阶段：
-1. **Phase 1**：DeepSeek 批量分析所有 commit。包含路径预筛选（path-based triage）——仅修改 tests/docs/CI/平台特化代码的 commit 自动跳过（无 LLM 成本），使用 architecture.json 中的 `not_used_by_ascend` 路径列表（按需刷新）
+1. **Phase 1**：GLM 批量分析所有 commit。包含路径预筛选（path-based triage）——仅修改 tests/docs/CI/平台特化代码的 commit 自动跳过（无 LLM 成本），使用 architecture.json 中的 `not_used_by_ascend` 路径列表（按需刷新）
 2. **Phase 2**：opencode Agent 深度分析 ascend_affected 的 commit（识别具体影响接口、适配工作量、适配指南）
 
 ### 5. 构建检索索引
@@ -282,15 +282,17 @@ python serve.py
 
 | Secret | 说明 |
 |--------|------|
-| `DEEPSEEK_API_KEY` | DeepSeek API Key（Phase 1 批量分析） |
+| Secret `LLM_API_KEY` | GLM API Key（Phase 1 + Phase 2 opencode 共用） |
+| Variable `LLM_API_BASE` | 可选，覆盖端点（默认 `https://open.bigmodel.cn/api/paas/v4`） |
+| Variable `LLM_MODEL` | 可选，`provider/model` 形式（默认 `zhipu/glm-5.3-flash`） |
 | `OPENCODE_AUTH_TOKEN` | opencode 使用的 OpenAI 兼容 API Key（Phase 2 深度分析 + 架构生成） |
 | `GH_TOKEN`（或 `GITHUB_TOKEN`） | 可选 — MCP Server 推送存档经验、以及 `get_commit_diff` 的 GitHub API 回退时使用的 token |
 
-> opencode 模型在工作流写入的 `~/.config/opencode/opencode.json` 中配置，也可用 `OPENCODE_MODEL` 环境变量覆盖。目前默认使用 `deepseek/deepseek-v4-flash`，base URL 指向火山方舟 ARK（`https://ark.cn-beijing.volces.com/api/coding/v3`，模型 `deepseek-chat`）。如需切换服务商，修改工作流里的 opencode 配置或设置 `OPENCODE_MODEL`。
+> opencode 模型在工作流写入的 `~/.config/opencode/opencode.json` 中配置，也可用 `OPENCODE_MODEL` 环境变量覆盖。目前默认使用 `zhipu/glm-5.3-flash`，base URL 指向智谱（`https://open.bigmodel.cn/api/paas/v4`，模型 `glm-5.3`）。如需切换服务商，修改工作流里的 opencode 配置或设置 `OPENCODE_MODEL`。
 
 ### 工作流
 
-- **`daily-commit.yml`** — 每天 02:00 CST 运行（或手动 `workflow_dispatch` 指定日期）：抓取 → Phase 1 DeepSeek 分析 → Phase 2 opencode 分析 → 构建索引 → 跟踪适配 → 清理过期数据 → 部署。同时处理 vllm 和 vllm-ascend，将源码检出到 `repos/`。
+- **`daily-commit.yml`** — 每天 02:00 CST 运行（或手动 `workflow_dispatch` 指定日期）：抓取 → Phase 1 GLM 分析 → Phase 2 opencode 分析 → 构建索引 → 跟踪适配 → 清理过期数据 → 部署。同时处理 vllm 和 vllm-ascend，将源码检出到 `repos/`。
 - **`refresh-context.yml`** — 按需（`workflow_dispatch`）：检出 vllm/vllm-ascend 源码 → 通过 opencode 生成架构 → 交叉分析 → 重建索引 → 跟踪适配。（取代了原定时 `weekly-context.yml`。）
 - **`pages.yml`** — 推送 `site/` 或 `data/` 时部署 GitHub Pages
 

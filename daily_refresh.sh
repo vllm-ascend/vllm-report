@@ -58,7 +58,7 @@ usage() {
   -h, --help               显示此帮助信息
 
 环境变量:
-  LLM_API_KEY               DeepSeek API Key（Phase 1 必需）
+  LLM_API_KEY               GLM API Key（Phase 1 必需）
   OPENCODE_AUTH_TOKEN       OpenAI 兼容 API Key（仅当 opencode 配置未内置时使用）
 
 示例:
@@ -161,7 +161,7 @@ ok "依赖检查完成"
 # 检查 LLM_API_KEY
 if [ "$SKIP_ANALYZE" = "false" ]; then
     if [ -z "${LLM_API_KEY:-}" ]; then
-        err "LLM_API_KEY 环境变量未设置。Phase 1 分析需要 DeepSeek API Key。"
+        err "LLM_API_KEY 环境变量未设置。Phase 1 分析需要 GLM API Key。"
         err "设置方式: export LLM_API_KEY=sk-xxx"
         exit 1
     fi

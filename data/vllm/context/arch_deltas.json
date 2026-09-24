@@ -4729,6 +4729,162 @@
       "interface_changes": "Fast Start 的 weight cache daemon 支持数据并行：daemon 的 world group 由 TP-only 扩展为 dp_size*tp_size，全局 rank 统一为 dp_rank*tp_size + tp_rank；新增 plan_local_ranks 计算每个 launcher 服务的 (local_rank, dp_rank, tp_rank)，支持 --nnodes 均分全局 rank 块以及单机 DP 的 --data-parallel-start-rank；_reject_unsupported_parallelism 改为只拒绝流水线并行，并校验 nnodes 整除 world size、DP 起止 rank 不越界；WeightCacheKey 新增 dp_size/dp_rank 字段使不同 DP rank 的缓存互相区分，IpcModelLoader 通过 get_dp_group() 获取 DP rank/size；daemon 按 dp_rank 覆盖 parallel_config 的 data_parallel_ra",
       "change_summary": "[Fast Start] Support data parallelism in the weight cache daemon  (#57386)",
       "ascend_impact": false
+    },
+    "09fe178dba08e6de4448ade1e37d14ae1dab3acf": {
+      "date": "2026-09-24",
+      "affected_modules": [
+        "ascend_affected"
+      ],
+      "affected_interfaces": [
+        "ascend_affected"
+      ],
+      "interface_changes": "回滚 #56956（[DSpark] 在聚合式服务中支持流水线并行目标），共 11 个文件、-629 行。回滚内容分三块：(1) PP 侧把 last rank 的采样结果/draft token 广播给前序 rank 的机制——PPHandler 去掉 disabled/set_disabled()、恢复旧版 broadcast_drafts()（在 main stream 上 gather `draft_tokens[input_batch.idx_mapping]`）、删除 `_alloc_combined()` 的 16 字节对齐 combined 缓冲、`_post_update_kernel`/`post_update()` 去掉 broadcast_drafts/draft_tokens_out 参数、删除 `GPUModelRunner.warmup_pp_decode_update()` 及 GPUWorker 中 warmup 期间的 set_disabled 开合；(2) DFlash 的 padding 机制——`prepare_dflash_inputs`/`",
+      "change_summary": "Revert \"[DSpark] Support pipeline-parallel targets in aggregated serving (#56956)\" (#58484)",
+      "ascend_impact": false
+    },
+    "c0c35ddd8e9c6dadd53a8f92e20e9a03a210da15": {
+      "date": "2026-09-24",
+      "affected_modules": [
+        "ascend_affected"
+      ],
+      "affected_interfaces": [
+        "ascend_affected"
+      ],
+      "interface_changes": "两处改动：(1) 测试稳定性——test_sharded_sampling 的两个用例（general 与 spec_decode）通过注入 VLLM_ENABLE_V1_MULTIPROCESSING=0 让所有请求在首个 step 前入队，使 replicated 与 batch-sharded 两种采样模式调度出完全相同的 batch shape，从而把原来基于容差的比较（LOGPROB_TOL / MAX_DIVERGENT_PROMPTS / 允许 <=2 个 prompt 发散）收紧为逐 token 严格一致；同时重写 _assert_logprob_dicts_close，先用 rank 过滤出“用户请求的 top-k”（排除额外的 sampled/prompt token，含 rank=k+1 的边界情形）再比较，避免把发散额度浪费在额外条目上，并补充多组 CPU 单测覆盖边界、gap、rank 缺失等。这本质上是把原先掩盖 boot-state 噪声的宽松断言，替换为“批形状受控 + 严格比较”的正确判据。(2) 引擎回收——InprocClient 新增 weakr",
+      "change_summary": "[Bugfix][CI] Fix the flaky sharded-sampling tests, and the engine teardown need (#58342)",
+      "ascend_impact": false
+    },
+    "bbc4ddeca9ece9851aad26f03afc4bab37c6e8df": {
+      "date": "2026-09-24",
+      "affected_modules": [
+        "ascend_affected"
+      ],
+      "affected_interfaces": [
+        "ascend_affected"
+      ],
+      "interface_changes": "修复 encoder cache 以 multimodal identifier（客户端 UUID）为键复用时的嵌入数量不匹配问题：不同内容的图片/输入若复用同一 UUID，会命中数量不符的缓存条目并错位使用 encoder embeddings。实现上 EncoderCacheManager 新增 num_embeds_by_hash（mm_hash -> 嵌入数）与 get_cached_num_encoder_embeds()，在 reset/evict/free 中同步维护与清理，allocate 时用 setdefault 做一致性断言，free 时改用记录值而非重新向 request 查询（避免 request 状态变化导致记账漂移）。Scheduler 侧新增 encoder_cache_mismatch_reqs 集合与 _reject_on_encoder_cache_embed_mismatch()：在 _try_schedule_encoder_inputs 中把 mm_hashes_to_schedule 从 set 改为 dict[identifier, nu",
+      "change_summary": "[Bugfix][V1] Reject encoder-cache hits with mismatched embedding counts (#57696)",
+      "ascend_impact": true
+    },
+    "00b7847c8036b667742b4efb21aab1de51fd4721": {
+      "date": "2026-09-24",
+      "affected_modules": [
+        "ascend_affected"
+      ],
+      "affected_interfaces": [
+        "ascend_affected"
+      ],
+      "interface_changes": "性能优化：MiniMax M3 的 MiniMaxVLPatchEmbed 把 nn.Conv3d 替换为 vllm.model_executor.layers.conv.Conv3dLayer，使 patch embedding 能走 vLLM 统一的卷积层实现（支持 enable_linear 等平台/量化友好路径），kernel_size/stride/bias/params_dtype 参数保持不变。新增 tests/model_executor/layers/test_conv.py，用 nn.Conv3d 作为参考，覆盖 minimax_m3、qwen2_vl、qwen3_vl、glm_vl 及“多 patch”共 5 组形状组合，验证 Conv3dLayer 与参考实现数值一致（bf16 atol/rtol 0.02，fp32 1e-5）且 enable_linear 为真。风险低：默认仍等价于 Conv3d，仅当平台提供优化实现时才产生差异，但需确认各平台 dtype 转换/权重加载路径（params_dtype）一致。",
+      "change_summary": "[Perf] Use Conv3dLayer for MiniMax M3 patch embedding (#58512)",
+      "ascend_impact": false
+    },
+    "1291bdb85edc3cf0a1232be408b7e866b9d3f10a": {
+      "date": "2026-09-24",
+      "affected_modules": [
+        "ascend_affected"
+      ],
+      "affected_interfaces": [
+        "ascend_affected"
+      ],
+      "interface_changes": "为 --mm-encoder-only（EPD 编码器独立部署）增加按 safetensors 分片跳过纯语言模型权重的能力，减少磁盘/DRAM 读取。实现要点：(1) resolve_mm_encoder_only_lm_prefixes 从模型的 _language_model_names 推导 LM 模块前缀，缺失/为空时返回 None（fail-closed）；并借助 WeightsMapper.orig_to_new_prefix 检测“LM 模块前缀同时是非 LM 权重的 HF 根”（Molmo/Phi-4-MM/Muse 形态），命中则放弃过滤以避免误删视觉分片。(2) filter_mm_encoder_only_safetensors_files 读取 HF index 的 weight_map，按文件聚合并通过 weights_mapper.map_name 把 HF key 映射成 vLLM 名后判断是否纯 LM，纯 LM 分片被剔除，无 index 文件则原样返回。(3) DefaultModelLoader：_prepare_weights 返回值由 (fol",
+      "change_summary": "[EPD][Model Loader] Skip language-model checkpoint shards for `--mm-encoder-only` (#58086)",
+      "ascend_impact": false
+    },
+    "153f2ba1b986fb461d84ae7b4f9644a608f36bc8": {
+      "date": "2026-09-24",
+      "affected_modules": [
+        "ascend_affected"
+      ],
+      "affected_interfaces": [
+        "ascend_affected"
+      ],
+      "interface_changes": "编译缓存修复：InductorAdaptor.initialize_cache 之前无条件把 TRITON_CACHE_DIR 重定向到 <base_cache_dir>/triton_cache，覆盖了调用方（如 CI 或用户）显式设置的 Triton 缓存目录。现在引入模块级 _last_inductor_triton_cache_dir，只有当 TRITON_CACHE_DIR 未设置、或它的值恰好等于上一次本适配器自己设置的目录时才重定向到模型本地 triton_cache，否则保留调用方显式指定的目录；注释也更新说明 Inductor 与 Triton 缓存可分离、复制缓存时需一起复制。文档补充了这一语义。同时把 MI300 Model Executor 的 Buildkite 超时从 60 提到 75 分钟（两处 yaml）。风险中等：模块级全局记录“上次由谁设置”，在同一进程内连续初始化多个 adaptor/模型时依赖调用顺序，若调用方设置的目录恰好与上次自动设置的目录字符串相同仍会被视为自动设置而覆盖（边界情形），但整体是让显式配置优先，方向正确。",
+      "change_summary": "[Compile][CI] Honor Triton cache overrides and add AMD timeout headroom (#58474)",
+      "ascend_impact": false
+    },
+    "ee2f3cdf127e999c2f5531b4e9d2399b08a21433": {
+      "date": "2026-09-24",
+      "affected_modules": [
+        "ascend_affected"
+      ],
+      "affected_interfaces": [
+        "ascend_affected"
+      ],
+      "interface_changes": "修复 SpeculativeConfig 中 DSpark 并行宽度与 MTP stage 数被混用的校验问题。之前 V4.1 的 DSpark 路径会把 draft hf_config.n_predict 改写成 dspark_block_size（或 block_size），使得 num_speculative_tokens 的整除校验基于改写过后的值；同时为 Gemma4DSpark 形态补 n_predict 的逻辑也把 block_size 塞进 n_predict。现在改为职责分离：hf_config_override 不再为 DSpark 改写 n_predict，也不再由 block_size 回填 n_predict；在最终校验处新增分支——若 use_dspark() 且 num_speculative_tokens 为 None，则从 block_size（缺失则 dspark_block_size）推导并行宽度；非 DSpark（如 mtp）才走原有的 n_predict 整除校验（n_predict 仍是 MTP stage 数，要求 num_speculat",
+      "change_summary": "[Bugfix][Spec Decode] Separate DSpark width from MTP stage validation (#54631)",
+      "ascend_impact": true
+    },
+    "4fb767ff0a0e0aae9dd2720c47245d0202136dfd": {
+      "date": "2026-09-24",
+      "affected_modules": [
+        "ascend_affected"
+      ],
+      "affected_interfaces": [
+        "ascend_affected"
+      ],
+      "interface_changes": "针对 Gemma4 在 SM90 + FP8 KV cache + head_dim=512 场景的 attention 后端选择重构（重提交 PR 48666）。核心矛盾：FA3 无法处理 head_dim>256，原先 Gemma4Config 在 FA4 可用时一律强制全层 FA4；但 SM90 上 FA4 存在一条原生 FP8-KV dequant 路径（TMA tile 为 64 token），可以只对支持的层用 FA3、对 head_dim=512 的层升级到 FA4。为实现按 KV cache spec 逐层决定 kernel block size，把 AttentionBackend.get_supported_kernel_block_sizes() 扩展为接受可选参数 kv_cache_spec，并同步更新全部后端实现（FlashAttention/FlashInfer/Triton/CPU/ROCm/各 MLA 与模型专用后端）以及 composite 后端的 _intersect_kernel_block_sizes；_largest_kernel_block_",
+      "change_summary": "[Kernel] Resubmit PR 48666 - Gemma4 FP8 KV FA4 head dim 512 backend selection (#53175)",
+      "ascend_impact": true
+    },
+    "e6dc16cebd57cabc55c1b3503ce16faaf6717d21": {
+      "date": "2026-09-24",
+      "affected_modules": [
+        "ascend_affected"
+      ],
+      "affected_interfaces": [
+        "ascend_affected"
+      ],
+      "interface_changes": "支持 PCP（prefill context parallelism）与 DP（data parallelism）组合，由华为侧贡献并移除 CUDA/ROCm 上原有的『PCP + DP 不支持』硬校验。改动链条：DPMetadata._compute_sp_num_tokens 新增 pcp_size/use_ep 参数——pcp_size>1 时先按 use_ep 决定 repeat_interleave（EP 路径）还是整体乘以 pcp_size，再做 SP chunk 切分；sp_local_sizes 上下文管理器新增 pcp_size/use_ep 形参并下传给 MoERunner 的 moe_config（moe_runner.py 调用处同步）；AgRsAll2AllManager.__init__ 缓存 parallel_config.enable_expert_parallel 为 self.use_ep，_get_comm_group 在 dp_world_size>1 且 use_ep 且 pcp_world_size>1 时断言 tp_group.world_",
+      "change_summary": "[PCP] Support prefill context parallelism with data parallelism (#57075)",
+      "ascend_impact": true
+    },
+    "310f15d3548aef7c80d3a43ffd7899ea076006ea": {
+      "date": "2026-09-24",
+      "affected_modules": [
+        "ascend_affected"
+      ],
+      "affected_interfaces": [
+        "ascend_affected"
+      ],
+      "interface_changes": "MRV2（Model Runner V2）中 InputBatch.make_dummy 的 idx_mapping dtype 对齐。make_dummy 用于 CUDA graph capture / dummy run，原先 idx_mapping 用 torch.int64，而真实输入路径的 idx_mapping 是 int32，dtype 不一致会导致每次 dummy 与真实 batch 交替时触发运行时 JIT 重新编译（TorchDynamo 按 dtype 特化）。改为 torch.int32 后与 expanded_idx_mapping 及真实路径一致。改动仅一行，但属于会显著影响编译/捕获稳定性的对齐修复。风险低。",
+      "change_summary": "[Bugfix][MRV2] Align dummy idx_mapping dtype to avoid runtime jit (#58462)",
+      "ascend_impact": true
+    },
+    "21ee743f474a35a056e8d5ade2c9aa744e726e6e": {
+      "date": "2026-09-24",
+      "affected_modules": [
+        "ascend_affected"
+      ],
+      "affected_interfaces": [
+        "ascend_affected"
+      ],
+      "interface_changes": "把 MRV2 中 top-k/top-p sampler 的 JIT warmup 注册收窄到仅 ROCm。GPUModelRunner.__init__ 在 last pp rank 且非 pooling 模型时，原先无条件（CUDA 与 ROCm 都）调用 register_top_k_top_p_warmups()，而该注册会给每次 engine 启动在 CUDA 上带来约 2 分钟开销；实际上 V2 已绕过 TopKTopPSampler，只有 ROCm 的 native 路径仍需这些 warmup。改动新增 from vllm.platforms import current_platform 并把注册包进 if current_platform.is_rocm()，同时把 import 移入分支避免无谓导入。风险低，但改变了非 ROCm 平台上的 JIT warmup 行为。",
+      "change_summary": "[CI][Bugfix] Limit MRV2 sampler JIT warmup registration to ROCm (#58465)",
+      "ascend_impact": false
+    },
+    "e26547adfb4970f3e3958695256a84566683a683": {
+      "date": "2026-09-24",
+      "affected_modules": [
+        "ascend_affected"
+      ],
+      "affected_interfaces": [
+        "ascend_affected"
+      ],
+      "interface_changes": "修复 KV block size 只按『第一个非 SSM 后端』选取导致的问题：当模型混合多个 attention 后端（如 sparse MLA 主后端 + indexer，或不同层偏好互斥的 size）时，用第一个后端的 get_preferred_block_size 选出的 size 可能在后续 select_common_block_size() 中被其他后端拒绝。改动把 Platform._find_non_ssm_backend 重命名为 _find_non_ssm_backends 并返回按层顺序去重的 list；新增 Platform._preferred_block_size_for_backends：单后端时沿用其 get_preferred_block_size，多后端时先看 default_block_size 是否被所有 supports_block_size 接受，否则把每个后端 get_supported_kernel_block_sizes()（MultipleOf 取其 base，空列表按 1 处理）做笛卡尔积求 LCM 得到候选集，从小到大取第一个",
+      "change_summary": "[Bugfix] Pick a KV block size supported by every attention backend (#49845)",
+      "ascend_impact": false
+    },
+    "b715699df45f091325b307c0f5ac874010fbb23e": {
+      "date": "2026-09-24",
+      "affected_modules": [
+        "ascend_affected"
+      ],
+      "affected_interfaces": [
+        "ascend_affected"
+      ],
+      "interface_changes": "该 commit 将 ROCm AITER 的 QK-norm+RoPE+KV-cache 融合 pass 扩展到 MRoPE，是一个性能特性 + 接口扩展的混合变更，规模较大（11 文件，+1314/-118）。核心实现：(1) vllm/model_executor/layers/rotary_embedding/mrope.py 通过 direct_register_custom_op 注册新算子 torch.ops.vllm.mrope（mutates_args=[\"query\",\"key\"]），新增 _mrope_apply 走 triton_mrope，并在 MRotaryEmbedding.forward_hip 中当 positions.ndim==2 时调用该算子、否则回退 super().forward_hip——这为融合 pass 提供了可匹配的稳定 op。(2) vllm/compilation/passes/fusion/matcher_utils.py 新增 MROPE_OP 常量与 MatcherMRotaryEmbedding，用于在 FX graph ",
+      "change_summary": "[ROCm][Perf] Extend QK-norm/RoPE/KV-cache fusion to MRoPE (#50212)",
+      "ascend_impact": false
     }
   }
 }

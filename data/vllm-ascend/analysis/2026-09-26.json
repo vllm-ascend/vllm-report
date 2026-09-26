@@ -1,0 +1,215 @@
+{
+  "date": "2026-09-26",
+  "repo": "vllm-project/vllm-ascend",
+  "generated_at": "2026-09-27T04:48:48.888041+08:00",
+  "daily_summary": "当日变更围绕 Ascend NPU 算子扩展、EPLB STAIR 系列、稀疏 KV offload 融合算子、EC 传输多模态缓存和 MRV2 修复展开。重点包括：为 Ascend950 新增 scatter_nd_update_sk 自定义算子并修复索引越界语义；将 chunk_fwd_o 重命名为 chunk_fwd_o_vllm 以避免命名冲突；引入 fused_lightning_indexer_manage 与 fused_scatter_copy_sparse_flash_attention 加速 layerwise sparse offload；持续推进 STAIR EPLB 系列（负载统计、副本规划、约束放置）；新增 MemCache-backed 多模态编码器 L1 缓存连接器；修复 MRV2 KV-cache 注册时仅保留第一个 tensor 导致的 PD 传输问题。整体上以性能优化、功能增强和异步/分布式路径修复为主。",
+  "test_impact_summary": "当日多个 commit 引入新算子、新融合路径、新 EPLB 策略和新缓存连接器，测试看护需求显著增加。EPLB STAIR 系列新增大量 CPU 单元测试覆盖负载统计、副本规划和约束放置；稀疏 offload 融合路径新增元数据、MTP 复用、Slot 分配和 PD 连接器生命周期测试；EC 传输新增连接器单元测试并扩展 MemcacheBackend 测试；MRV2 修复新增 KV-cache 初始化 patch 测试。此外，chunk_fwd_o 重命名、scatter_nd_update_sk A5 适配等要求同步更新算子测试和 e2e 测试。总体而言，现有测试需要大幅扩展以覆盖新接口、新内核和新配置路径，尤其需要关注融合算子与图捕获的兼容性、EPLB 异步状态一致性以及多模态缓存的并发/内存安全。",
+  "commits": [
+    {
+      "sha": "4d1412d102c16669af3ec73174fc5f8b359b56d9",
+      "comment": "在多个 Dockerfile 中安装 flash-linear-attention-npu 包，指定版本 26.9.1+deva4a7958 和 SHA256 校验，针对 aarch64/x86_64 及不同 Ascend 型号（A2/A3/A5）使用对应 wheel。属于 CI/构建依赖变更，不修改仓库内运行时代码，但需确保各镜像变体正确安装该依赖，避免因网络或校验失败导致构建中断。",
+      "tags": [
+        "ci",
+        "chore",
+        "low-risk",
+        "docker"
+      ],
+      "test_impact": {
+        "needs_test_update": false,
+        "reason": "变更仅涉及 Docker 镜像的依赖安装步骤，不引入新的 API 或逻辑分支，现有 CI 镜像构建流程会验证安装结果，无需仓库内测试用例变更。",
+        "suggested_test_areas": [
+          "Dockerfile 构建验证"
+        ]
+      },
+      "message": "[CI][Feature] Install flash-linear-attention-npu in Dockerfiles (#17534)\n\n### What this PR does / why we need it?\n\nResubmits the changes from #17503 with the same file content and diff,\nusing the contributor's signed-off commit identity. The Dockerfiles\ninstall flash-linear-attention-npu for the supported image variants, and\nthe scheduled image workflow is updated accordingly.\n\n### Does this PR introduce any user-facing change?\n\nNo direct API change. This updates container image dependencies and\nbuild configuration.\n\n### How was this patch tested?\n\n- Verified the resulting tree matches the original #17503 head exactly.\n- Added Signed-off-by: underfituu <hzhucong@163.com>.\n- git diff --check passed on the unchanged patch content.\n\nSupersedes #17503.\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/ced6857afa0ea7b2e3f0846a62e1394e90f15607\n\nSigned-off-by: underfituu <hzhucong@163.com>"
+    },
+    {
+      "sha": "e3a624c9dce5979cdfd9dafcd3a5f2196700a5bf",
+      "comment": "为 Ascend950 (A5) 支持 npu_scatter_nd_update_sk 自定义算子，移植 arch35 regbase tiling 和 kernel，修复 tiling shape 解析（使用 storage shape 而非 flattened origin shape），并为 arch22 HP 和 LargeIndex kernel 添加负索引越界守卫以对齐 arch35 语义。涉及 MoE 算子内核、tiling 注册和 aclnn 构建列表，需验证 A5 上的正确性及与前一代的兼容性。",
+      "tags": [
+        "feature",
+        "high-risk",
+        "ops",
+        "moe",
+        "kernel"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "新增 Ascend950 算子实现和 arch35 内核，需要 e2e 测试覆盖 A5 上的 scatter_nd_update_sk 行为；现有测试已修改以适配 custom op bootstrap 和设备类型检查。",
+        "suggested_test_areas": [
+          "tests/e2e/nightly/single_node/ops/singlecard_ops/test_scatter_nd_update_sk.py",
+          "csrc/moe/scatter_nd_update_sk"
+        ]
+      },
+      "message": "[Feature][Ascend950] Support scatter_nd_update_sk custom op (#17409)\n\n## What\nSupport the `npu_scatter_nd_update_sk` custom operator on Ascend950\n(A5).\n\n- Port arch35 (regbase) tiling and kernel of `scatter_nd_update` from\nops-nn,\n  dispatched by soc version (`ASCEND950`) in the tiling entry\n- Fix tiling shape resolution: read the storage shape (real view shape)\ninstead\nof the flattened origin shape set by the aclnn launcher, otherwise\nstride\n  computation collapses all updates to row 0\n- Add negative-index out-of-bound guards to arch22 HP and LargeIndex\nkernels,\n  aligning skip-on-invalid-index semantics with arch35\n- Register the op in the ascend950 aclnn build list and adapt the e2e\ntest to\n  bootstrap custom ops (`enable_custom_op` is a no-op on A5)\n\n## Test\n-\n`tests/e2e/nightly/single_node/ops/singlecard_ops/test_scatter_nd_update_sk.py`\npasses all 38 cases on Ascend950 (contiguous / non-contiguous / all\ndtypes /\n  duplicate indices)\n\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/84030bbe3d74d99bad477a3d2e37a973ccd8865c\n\nSigned-off-by: ZT-AIA <1028681969@qq.com>"
+    },
+    {
+      "sha": "bfa9c41ad1d66454c5172adaa18824b1302aeff3",
+      "comment": "将 AscendC 算子 chunk_fwd_o 重命名为 chunk_fwd_o_vllm，避免与上游 Triton 实现命名冲突，并完整更新符号链：OpDef 类、tiling data、l0op 命名空间、aclnn C API、kernel entry、torch binding schema 和注册、Python 调用者以及 e2e 测试。纯重命名重构，影响面广，需确保所有引用同步更新。",
+      "tags": [
+        "refactor",
+        "medium-risk",
+        "ops",
+        "moe"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "torch.ops 注册名从 chunk_fwd_o 变为 chunk_fwd_o_vllm，所有调用点和测试中的 mock 及断言需同步更新，否则将出现运行时找不到算子的错误。",
+        "suggested_test_areas": [
+          "tests/ut/ops/test_gdn_chunk_meta.py",
+          "tests/e2e/nightly/310p/single_node/ops/singlecard_ops/test_chunk_fwd_o_vllm_310.py",
+          ".github/workflows/_selected_tests.yaml"
+        ]
+      },
+      "message": "[Refactor][Misc] Rename chunk_fwd_o operator to chunk_fwd_o_vllm (#17540)\n\n### What this PR does / why we need it?\n\nRename the AscendC `chunk_fwd_o` operator to `chunk_fwd_o_vllm` to avoid\nnaming conflicts with the upstream Triton implementation, following the\nsame naming convention as `causal_conv1d_v310`.\n\n- Rename operator directory `csrc/moe/chunk_fwd_o` ->\n`csrc/moe/chunk_fwd_o_vllm` and internal source files\n- Update full symbol chain: OpDef class (`ChunkFwdO` ->\n`ChunkFwdOVllm`), tiling data, `l0op::ChunkFwdOVllm`,\n`aclnnChunkFwdOVllm*` C API, kernel entry `chunk_fwd_o_vllm`\n- Update torch binding schema and registration\n(`torch.ops._C_ascend.chunk_fwd_o_vllm`) for both vLLM version branches\n- Update `build_aclnn.sh` custom op list, Python callers\n(`vllm_ascend/ops/triton/fla/chunk.py`,\n`vllm_ascend/_310p/ops/fla/chunk_gated_delta_rule.py`), UT mocks, e2e\ntest file and CI op registration check\n\n### Does this PR introduce _any_ user-facing change?\n\nYes. The torch.ops registration name changes from\n`torch.ops._C_ascend.chunk_fwd_o` to\n`torch.ops._C_ascend.chunk_fwd_o_vllm`. All in-repo callers are updated\nin this PR.\n\n### How was this patch tested?\n\n- Verified no remaining old-name references (`chunk_fwd_o` / `ChunkFwdO`\n/ `aclnnChunkFwdO`) except the unrelated Triton-side Python wrapper\n(`vllm_ascend/ops/triton/fla/chunk_o.py::chunk_fwd_o`), which is\nintentionally unchanged\n- `tests/ut/ops/test_gdn_chunk_meta.py` mocks updated to the new op name\n- e2e test renamed to `test_chunk_fwd_o_vllm_310.py` and updated to call\nthe new binding\n\nSigned-off-by: ZT-AIA\n\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/ced6857afa0ea7b2e3f0846a62e1394e90f15607\n\nSigned-off-by: ZT-AIA <1028681969@qq.com>"
+    },
+    {
+      "sha": "1e9e03bc53bdc53f3cc78c7af191794ee7544ad9",
+      "comment": "引入 fused_lightning_indexer_manage 和 fused_scatter_copy_sparse_flash_attention 两个融合算子，将 layerwise sparse offload 的 decode 流程从 LI -> LRU -> Sparse Onload -> SFA 融合为 LIM -> Copy_SFA，提升性能。变更涉及 attention 后端、稀疏 KV offload 元数据、分布式 PD 连接器、MTP 索引复用以及 model runner 的元数据构建，新增大量固定形状缓冲区和原子发布逻辑。需重点关注元数据生命周期、图捕获兼容性以及 PD/Dense 路径的边界条件。",
+      "tags": [
+        "feature",
+        "high-risk",
+        "attention",
+        "kv-offload",
+        "distributed",
+        "spec_decode",
+        "model-runner"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "新融合路径引入大量新接口、元数据字段和连接器协议，需要单元测试和 e2e 测试覆盖元数据几何计算、Slot 分配、MTP 复用、Dense/Tail 拷贝以及图重放。已有多个新增测试文件。",
+        "suggested_test_areas": [
+          "tests/e2e/nightly/single_node/ops/singlecard_ops/test_copy_sfa_offload_metadata.py",
+          "tests/e2e/nightly/single_node/ops/singlecard_ops/test_lim_mtp_index_reuse.py",
+          "tests/ut/kv_offload/test_copy_sfa_topk_slots.py",
+          "tests/ut/distributed/kv_transfer/sparse_kv_offload/test_sparse_kv_offload_manager.py",
+          "tests/ut/kv_offload/test_sfa_pd_rd2h_connector.py",
+          "tests/ut/kv_offload/test_sfa_pd_rd2h_lifecycle.py"
+        ]
+      },
+      "message": "[Feature]Support using fused operators to improve performance of layerwise sparse offload (#17392)\n\n### What this PR does / why we need it?\n\nRelies on PR #16640 for kernels.\n\nThis PR introduces 2 new kernels `fused_lightning_indexer_manage` and\n`fused_scatter_copy_sparse_flash_attention` to accelerate layerwise\nsparse offload in decode phase. Compared to the original workflow:\n\n```\nLI -> LRU selection -> Sparse Onload -> SFA\n```\n\nNow we have:\n\n```\nLIM -> Copy_SFA\n```\n\nOther key changes are:\n\n1. Implement necessary metadata for these two fused operators.\n2. move layerwise connector metadata build to\n`bind_connector_meatadata`. This mainly aligns to vLLM PR\n[#53333](https://github.com/vllm-project/vllm/pull/53333)\n3. Adapt to mtp index share.\n\n### Does this PR introduce _any_ user-facing change?\n\n### How was this patch tested?\n\n\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/ced6857afa0ea7b2e3f0846a62e1394e90f15607\n\n---------\n\nSigned-off-by: Angazenn <supperccell@163.com>\nSigned-off-by: zhangsicheng5 <zhangsicheng5@huawei.com>\nSigned-off-by: yydyzr <liuyuncong1@huawei.com>\nSigned-off-by: yydyzr <yydyzr@163.com>\nCo-authored-by: zhangsicheng5 <zhangsicheng5@huawei.com>\nCo-authored-by: yydyzr <liuyuncong1@huawei.com>\nCo-authored-by: yydyzr <yydyzr@163.com>"
+    },
+    {
+      "sha": "37ca05f46ff51d8e06eaea09c36915d812ac6464",
+      "comment": "EPLB STAIR 系列 PR2，为策略添加时序负载统计准备契约（PreparedLoadStats），支持策略实现 prepare_local_load_stats 来转换固定形状的时序负载样本。在共享时间轴上对齐 rank 本地采样，丢弃上一映射代的样本，将物理专家样本映射到逻辑专家后通过异步 worker 原子发布快照。未实现该钩子的默认策略行为不变。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "eplb",
+        "distributed"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "新增时序统计路径，需要单元测试覆盖跳过样本的时间轴对齐、旧映射代样本丢弃、物理到逻辑映射、空窗口安全和原子发布等行为，已有新增和修改的测试。",
+        "suggested_test_areas": [
+          "tests/ut/distributed/eplb/test_policy_load_stats.py",
+          "tests/ut/distributed/eplb/test_state.py",
+          "vllm_ascend/distributed/eplb/state.py"
+        ]
+      },
+      "message": "[Feature][EPLB] Support policy-prepared temporal load statistics (#17509)\n\n### What this PR does / why we need it?\n\nThis is PR 2 of the STAIR EPLB series described in\nvllm-project/vllm-ascend#17506. It adds a policy-neutral contract for\nbounded temporal load statistics:\n\n- policies may prepare fixed-shape values plus optional sample weights;\n- rank-local phase gaps remain aligned on one shared time axis;\n- samples from a previous mapping generation are discarded;\n- physical-expert samples are mapped to logical experts before\npublication;\n- empty windows become safe no-op cycles; and\n- the complete snapshot is published atomically through the existing\nasync worker lifecycle.\n\nPolicies without `prepare_local_load_stats` retain the upstream/default\npath. This PR contains no STAIR planner and starts from the common\nseries baseline `9f1af00c7fcd7c22cf0c791ab9f6c8d98402ec06`.\n\nRefs vllm-project/vllm-ascend#17506.\nRefs vllm-project/vllm#49702.\n\n### Does this PR introduce _any_ user-facing change?\n\nNo by itself. The new temporal statistics path is activated only by a\npolicy that implements the preparation hook; the default policy remains\nunchanged.\n\n### How was this patch tested?\n\n- `bash format.sh ci`\n- 14 focused CPU unit tests passed.\n- Added tests for skipped samples, stale-generation reset, logical\naggregation, empty windows, atomic publication, and default-path\nbehavior.\n\nThe PR remains draft until repository CI completes.\n\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/ced6857afa0ea7b2e3f0846a62e1394e90f15607\n\n---------\n\nSigned-off-by: freyfwt <freytian1996@gmail.com>"
+    },
+    {
+      "sha": "eb31db4d75622a8043703d2cbb55e9df75e70f98",
+      "comment": "EPLB STAIR 系列 PR5，扩展纯 CPU planner，增加协方差感知的 LPT 放置与有界回溯、基于当前放置的增量副本数变化、每 rank 和每节点的发送/接收迁移预算（支持 -1 无限和 0 禁用跨节点）、拓扑感知源选择与稳定槽位对齐、零冗余物理专家交换，以及均值和 p95 非回归验收与固定形状计划校验。该变更不直接选择或执行 STAIR，仅增强规划器能力。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "eplb"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "新增大量规划器逻辑和配置字段，需要单元测试覆盖确定性放置、协方差、回溯、迁移预算、拓扑偏好、增量副本变化、非回归门控和计划校验。已有大量测试扩展。",
+        "suggested_test_areas": [
+          "tests/ut/distributed/eplb/policy/test_stair.py",
+          "tests/ut/test_ascend_config.py"
+        ]
+      },
+      "message": "[Feature][EPLB] Add constrained STAIR placement (#17512)\n\n### What this PR does / why we need it?\n\nThis is PR 5 of the STAIR EPLB series described in\nvllm-project/vllm-ascend#17506. It extends the pure CPU planner from\n#17511 with constrained, deterministic placement and migration-source\nselection:\n\n- covariance-aware LPT placement with bounded backtracking;\n- incremental replica-count changes from the committed placement;\n- per-rank send/receive budgets and per-node cross-node budgets;\n- `-1` unlimited budgets for high-bandwidth systems and `0` to disable\ncross-node transfers;\n- topology-aware source selection and stable source-slot alignment;\n- zero-redundancy physical expert swaps;\n- mean and p95 non-regression acceptance; and\n- fixed-shape plan validation before execution.\n\nFeasibility results are cached across beam candidates and rank scoring\nis vectorized to bound planner overhead. The branch starts from the same\nseries baseline, `9f1af00c7fcd7c22cf0c791ab9f6c8d98402ec06`, and is\nintentionally stacked on #17511 so the placement code can reuse its\nload, risk, and replica types.\n\nDepends on #17511.\nRefs vllm-project/vllm-ascend#17506.\nRefs vllm-project/vllm#33549.\n\n### Does this PR introduce _any_ user-facing change?\n\nIt adds advanced STAIR transfer-budget controls, but does not select or\nexecute STAIR by itself. Existing EPLB policies remain unchanged.\n\n### How was this patch tested?\n\n- `bash format.sh ci`\n- 62 focused CPU tests passed across STAIR policy and configuration\ncoverage.\n- Tests cover deterministic placement, covariance, bounded backtracking,\nzero-redundancy swaps, rank and node budgets, unlimited budgets,\ntopology preference, incremental replica changes, mean/p95 gates, and\nplan validation.\n\nThe PR remains draft until the RFC and dependent planner interface are\nreviewed. Real NPU integration is exercised by the final integration PR.\n\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/ced6857afa0ea7b2e3f0846a62e1394e90f15607\n\n---------\n\nSigned-off-by: freyfwt <freytian1996@gmail.com>"
+    },
+    {
+      "sha": "bbb5672af80b1972c301852aa505b13374fa6355",
+      "comment": "EPLB STAIR 系列 PR4，添加纯 CPU 负载建模和副本规划：包括带权重的时间序压缩、加权专家均值/方差/协方差、基于可配置正态分位数的风险调整专家负载、加权均值和最近秩 p95 失衡指标、非零负载/相对迟滞/绝对平衡门控，以及确定性的有界 FlashTree 风格副本搜索。新增 StairConfig 配置类并接入 Ascend 配置，但不激活 STAIR 执行。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "eplb"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "新增负载统计、风险计算、失衡指标和副本搜索算法，需要单元测试覆盖压缩等价性、加权矩、单样本零协方差、门控边界、搜索有界性和确定性等。已有新增测试。",
+        "suggested_test_areas": [
+          "tests/ut/distributed/eplb/policy/test_stair.py",
+          "tests/ut/test_ascend_config.py"
+        ]
+      },
+      "message": "[Feature][EPLB] Add STAIR load and replica planning (#17511)\n\n### What this PR does / why we need it?\n\nThis is PR 4 of the STAIR EPLB series described in\nvllm-project/vllm-ascend#17506. It adds the pure CPU load-modeling and\nreplica\nplanning half of STAIR:\n\n- loss-aware chronological compression with exact bin weights;\n- weighted expert mean, sample variance, and covariance;\n- risk-adjusted expert load using a configurable normal quantile;\n- weighted mean and nearest-rank p95 imbalance metrics;\n- nonzero-load, relative-hysteresis, and absolute-balance gates; and\n- deterministic bounded FlashTree-style replica-count search.\n\nSearch controls have validated static bounds and conservative defaults.\nThe\nplanner is independent of model-runner state, device collectives, and\ntransfer\nexecution. This branch starts from the common series baseline\n`9f1af00c7fcd7c22cf0c791ab9f6c8d98402ec06`.\n\nRefs vllm-project/vllm-ascend#17506.\nRefs vllm-project/vllm#33549.\n\n### Does this PR introduce _any_ user-facing change?\n\nIt defines advanced STAIR tuning fields, but does not select or execute\nSTAIR\nby itself. Existing EPLB policies remain unchanged.\n\n### How was this patch tested?\n\n- `bash format.sh ci`\n- 28 focused CPU tests passed.\n- Tests cover weighted compression equivalence, covariance, zero/single\nsamples, quantile and configuration bounds, placement imbalance,\nhysteresis,\ndeterministic search, capacity limits, beam pruning, and invalid inputs.\n\nThe PR remains draft until the RFC and planner interface are reviewed.\n\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/ced6857afa0ea7b2e3f0846a62e1394e90f15607\n\n---------\n\nSigned-off-by: freyfwt <freytian1996@gmail.com>"
+    },
+    {
+      "sha": "5c82ff52c9b89b3075cf7e668450b0bbf92c3e77",
+      "comment": "EPLB STAIR 系列 PR1，优化 MRV2 路由和负载记录：将初始冗余专家分散到 EP ranks，分离图稳定的路由操作与负载记录，直接使用 MoE 算子返回的 compact local expert counts 进行记录，校验算子计数范围而非回退到 token 级重算，并报告 PP-local DeepSeek V4 MTP MoE 层数以支持 EPLB。V1 行为保持不变。",
+      "tags": [
+        "performance",
+        "feature",
+        "medium-risk",
+        "eplb",
+        "fused-moe",
+        "triton"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "路由和负载记录接口重构，算子计数代替 token 重算，需要更新单元测试和 e2e 测试以验证新接口、计数校验和 MTP 层数报告；已有多个测试修改和新增。",
+        "suggested_test_areas": [
+          "tests/ut/ops/test_eplb.py",
+          "tests/ut/ops/test_eplb_v2_recording.py",
+          "tests/e2e/pull_request/one_card/test_eplb_map_to_physical_npu.py",
+          "tests/ut/models/test_deepseek_v4_mtp_eplb.py",
+          "tests/ut/patch/platform/test_initial_expert_layout.py"
+        ]
+      },
+      "message": "[Performance][EPLB] Optimize MRV2 routing and load recording (#17508)\n\n### What this PR does / why we need it?\n\nThis is PR 1 of the STAIR EPLB series described in\nvllm-project/vllm-ascend#17506.\nIt provides the MRV2 data-plane behavior needed by any asynchronous\npolicy:\n\n- spreads initial redundant experts across EP ranks while preserving V1\nand\n  zero-redundancy layouts;\n- keeps the graph-stable routing operation separate from load recording;\n- records compact local expert counts already returned by the MoE\noperator;\n- validates the operator count range instead of silently falling back to\n  token-level recounting; and\n- reports the PP-local DeepSeek V4 MTP MoE layer count to EPLB.\n\nThe branch starts from the shared series baseline\n`9f1af00c7fcd7c22cf0c791ab9f6c8d98402ec06`. It does not add STAIR policy\nor\nplanner code.\n\nRefs vllm-project/vllm-ascend#17506.\nRefs vllm-project/vllm#49702.\nRefs vllm-project/vllm#51005.\n\n### Does this PR introduce _any_ user-facing change?\n\nYes. MRV2 EPLB initializes redundant experts across EP ranks and uses\noperator-provided expert counts. Existing V1 EPLB behavior is unchanged.\n\n### How was this patch tested?\n\n- `bash format.sh ci`\n- Focused CPU unit tests: 23 passed. One existing NPU-event construction\ntest\n  cannot run in the CPU-only environment and remains covered by NPU CI.\n- Added or updated CPU tests for initial layout, mapping, count\nrecording,\n  malformed counts, and PP-local MTP layer count.\n- Updated the one-card NPU mapping/recording test for the split\noperations.\n\nThe PR remains draft until repository CI and NPU coverage complete.\n\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/ced6857afa0ea7b2e3f0846a62e1394e90f15607\n\n---------\n\nSigned-off-by: freyfwt <freytian1996@gmail.com>"
+    },
+    {
+      "sha": "ffc1c7a82bfef1d9b434da1206e08589387fdb28",
+      "comment": "新增 ECMemcacheConnector，基于 MemCache 实现多模态编码器输出的 L1 缓存，使用 mm_hash 作为键，调度侧批量检查缓存命中，worker 侧批量加载到预分配 NPU 缓冲区并直接从 NPU 内存发布。扩展 MemcacheBackend 的 batch_get_into 和 put_from 接口，支持超大值临时缓冲和后台 put 事件同步。通过显式 ec_transfer_config 启用，不影响未配置时的行为。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "distributed",
+        "multimodal",
+        "ec-transfer"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "新增连接器及 MemcacheBackend 的批量加载/直接发布能力，需要单元测试覆盖批量获取、容量拆分、超大值临时缓冲生命周期、索引保持、部分失败和 shutdown 清理等。已有新增和修改的测试。",
+        "suggested_test_areas": [
+          "tests/ut/distributed/test_ec_memcache_connector.py",
+          "tests/ut/distributed/ascend_store/test_backend.py"
+        ]
+      },
+      "message": "[Feature][EC Transfer] Add MemCache-backed L1 encoder cache (#16953)\n\n[Feature][EC Transfer] Add MemCache-backed L1 encoder cache\n### What this PR does / why we need it?\n\nThis PR introduces `ECMemcacheConnector`, a MemCache-backed L1 cache\nfor multimodal encoder outputs. It integrates with vLLM through the\nexisting EC connector framework and uses the multimodal feature\nidentifier (`mm_hash`) as the cache key.\n\nRepeated image or video inputs can reuse previously computed encoder\nembeddings instead of running the multimodal encoder again.\n\n- Add a scheduler-side MemCache client that checks multiple `mm_hash`\n  values in one request and records cache hits and misses.\n- Send per-step load/save metadata from the scheduler to workers:\n  cache hits are loaded from MemCache, while misses run the encoder and\n  publish the resulting embeddings.\n- Load multiple encoder outputs directly into preallocated NPU tensors\n  with `batch_get_into`.\n- Use `KeyInfo.size()` together with the model dtype and encoder hidden\n  dimension to reconstruct each cached tensor as\n  `[num_encoder_tokens, hidden_dim]`.\n- Publish newly computed encoder outputs directly from NPU memory with\n  `put_from`.\n- Record an NPU event before dispatching the put operation to a\nbackground\n  thread, so MemCache waits for encoder computation without blocking the\n  model-runner thread.\n- Save only from TP rank 0 and PCP rank 0. Encoder outputs are identical\nacross TP/PCP ranks, so publishing from every rank would duplicate data\n  and cause concurrent writes to the same `mm_hash`.\n- Keep eviction management inside MemCache. The connector does not add a\n  separate local eviction policy.\n- Track cumulative cache hits, misses, and hit rate for debugging and\n  observability.\n\nThis PR also extends MemcacheBackend with:\n- batch_get_into, for copying multiple values into flat destination\n  buffers.\n- put_from, for publishing one value directly from a device buffer.\n- Optional transfer-direction arguments for the existing get and put\n  wrappers while preserving their previous default directions.\nWhen the connector is not configured, the existing encoder execution and\ncache behavior remain unchanged.\n\nDoes this PR introduce any user-facing change?\nYes, when ECMemcacheConnector is explicitly enabled.\n\nThe connector can be enabled without modifying vLLM:\n\n```bash\nvllm serve <model> \\\n  --ec-transfer-config '{\n     \"ec_connector\": \"ECMemcacheConnector\",\n     \"ec_connector_module_path\": \"vllm_ascend.distributed.ec_transfer.ec_memcache_connector\",\n     \"ec_role\": \"ec_both\",\n  \"ec_connector_extra_config\": {\n     \"recv_buffer_tokens\": 8192\n  }\n}'\n```\n###  Accuracy Test Report\n\n## Summary Overview\n- **Model**: `Qwen3-VL-8B`\n- **Dataset**: mm_bench\n- **Evaluation Result**: Passed (Meets Standard)\n\n---\n\n## Detailed Test Results\nA2 Test Report:\n\nDatasets: mm_bench\nrelated versions:\nvLLM main:\nhttps://github.com/vllm-project/vllm/commit/84030bbe3d74d99bad477a3d2e37a973ccd8865c\nmemcache_hybrid                          1.3.0\nmemfabric_hybrid                         1.3.0\nDRAM=100GB, HBM = 0GB\n| Env | **throughput Improvement**(%) | **TTFT Average Improvement**(%)\n|**TTFT P99 Improvement**(%) |\n| :---: | :---: | :---: | :---: |\n|DP 1 TP1| 19.77% | 22.80% | 5.71% |\n|DP 2 TP1| 28.65% | 25.28% | 13.88% |\n|DP 4 TP2| 30.13% | 26.03% | 30.77% |\n\n### How was this patch tested?\n- Added unit coverage for MemcacheBackend.batch_get_into\n\nvLLM main:\n\nhttps://github.com/vllm-project/vllm/commit/84030bbe3d74d99bad477a3d2e37a973ccd8865c\n\n\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/ced6857afa0ea7b2e3f0846a62e1394e90f15607\n\nSigned-off-by: hanxi-java <634498162@qq.com>\nCo-authored-by: pantszhang <601561479@qq.com>\nCo-authored-by: ZitWNG <1005619111@qq.com>\nCo-authored-by: weijinqian0 <1184188277@qq.com>"
+    },
+    {
+      "sha": "f5cd169280922a48f06637b4ff749f20f9a4b223",
+      "comment": "修复 MRV2 中 kv_caches_dict 仅使用第一个 tensor 的问题，该问题导致 connector 注册时丢失 V/SSM cache，破坏 PD 传输。新增 patch_model_runner.py 覆盖上游 initialize_kv_cache，扁平化 runner 内部 cache 列表但保留完整字典给 model bindings 和 connectors，并复用 Ascend 的 copy_kv_cache_blocks_inplace 实现。MRV1 保持不变。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "patch",
+        "model-runner",
+        "kv-cache"
+      ],
+      "test_impact": {
+        "needs_test_update": true,
+        "reason": "修复 KV cache 注册和初始化逻辑，需要单元测试验证 cache 容器保留、扁平化筛选以及分段 Mamba 存储的块拷贝行为；已有新增测试。",
+        "suggested_test_areas": [
+          "tests/ut/worker/test_model_runner_v2_kv_cache.py",
+          "vllm_ascend/patch/worker/patch_v2/patch_model_runner.py"
+        ]
+      },
+      "message": "[BugFix][MRV2][P/D] Fix MRV2 kv_caches_dict register_kv_caches only use first tensor (#17522)\n\n### What this PR does / why we need it?\nFix MRV2 initialization and KV-cache handling for Ascend’s per-layer K/V\ntuples and Conv/SSM lists. The previous workaround returned only the\nfirst tensor to satisfy upstream device filtering, dropping V/SSM from\nconnector registration and breaking PD transfer.\n\nFlatten only the runner’s internal cache list while preserving the\ncomplete cache dictionary for model bindings and connectors. Reuse the\nexisting Ascend block-copy implementation and adapt MRV2 metadata to the\nexisting Ascend zeroer, leaving MRV1 unchanged.\n\n### Does this PR introduce _any_ user-facing change?\nNo.\n\n### How was this patch tested?\nBy CI.\n\n- vLLM main:\nhttps://github.com/vllm-project/vllm/commit/ced6857afa0ea7b2e3f0846a62e1394e90f15607\n\n---------\n\nSigned-off-by: nwpu-zxr <zhouxuerong2@huawei.com>"
+    }
+  ],
+  "architecture_based_on_sha": "e04f251a5895969d1c1f4ac9a3807177a0c4769c",
+  "architecture_generated_at": "2026-08-01T20:25:03.693997+08:00"
+}

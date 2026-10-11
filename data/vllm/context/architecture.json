@@ -1,1613 +1,1223 @@
 {
-  "metadata": {
+  "meta": {
     "repository": "vllm-project/vllm",
     "branch": "main",
-    "commit": "7867d6c52d4542c1b5da641f8ca79124be497ee3",
-    "analyzed_at": "2026-10-04",
-    "snapshot_role": "baseline",
-    "notes": "Baseline architecture snapshot. All signatures reflect commit 7867d6c5. This is the upstream vLLM repo; the vllm-ascend-specific patch/ directory does not exist here, so patch_catalog is empty by design. ascend_implementations fields record the known vllm-ascend override class names for cross-project impact analysis."
+    "analyzed_commit": "f26d9f432ced7b1087d02d29bffed2249df1a18e",
+    "note": "Baseline snapshot for downstream (vllm-ascend) commit-impact analysis. Interface signatures anchored to this commit.",
+    "generated_for": "vllm-ascend architecture-increment replay"
   },
   "project_overview": {
-    "what": "vLLM is a high-throughput, low-latency LLM inference and serving engine. It provides offline batch inference (LLM class), an OpenAI/Anthropic/Cohere-compatible HTTP server, and a pluggable execution core spanning multiple hardware platforms (CUDA, ROCm, XPU, CPU, TPU, and out-of-tree platforms such as Ascend NPU).",
-    "problem": "Serving large transformer/MoE/multimodal models efficiently requires (1) paged attention over a shared KV cache, (2) continuous batching with prefix caching and preemption, (3) graph capture / torch.compile for kernel launch overhead, (4) tensor/pipeline/data/expert parallelism, (5) speculative decoding and structured outputs, while remaining portable across accelerators.",
-    "architecture_style": "Layered, plugin-based. A stable hardware-agnostic core (V1 engine: Scheduler -> Executor -> Worker -> ModelRunner -> AttentionBackend) is separated from hardware-specific implementation via the Platform abstraction and entry-point plugins. vllm-ascend injects NPU support through a Platform subclass plus monkey-patches and subclassed Worker/ModelRunner/Attention/Communicator.",
-    "top_level_layout": [
-      "vllm/platforms/ - hardware abstraction + plugin detection",
-      "vllm/config/ - pydantic-dataclass configuration objects (VllmConfig aggregate)",
-      "vllm/v1/engine/ - EngineCore, EngineCoreClient, LLMEngine, processors",
-      "vllm/v1/core/ - scheduler, KV cache manager, block pool",
-      "vllm/v1/executor/ - process/ray executors",
-      "vllm/v1/worker/ - WorkerBase, GPU/CPU/XPU workers, GPUModelRunner",
-      "vllm/v1/attention/ - AttentionBackend registry, selector, backends",
-      "vllm/v1/sample/ - Sampler, TopKTopPSampler, RejectionSampler",
-      "vllm/model_executor/ - model registry, layers (attention/moe/quant/rope), custom ops",
-      "vllm/compilation/ - CompilerInterface, VllmBackend, CUDAGraph, passes",
-      "vllm/distributed/ - parallel_state (GroupCoordinator), communicators, kv transfer",
-      "vllm/entrypoints/ - OpenAI/Anthropic/Cohere APIs, CLI, launchers",
-      "vllm/multimodal/, vllm/parser/, vllm/reasoning/, vllm/tool_parsers/, vllm/tokenizers/, vllm/renderers/"
-    ]
+    "what": "vLLM is a high-throughput, memory-efficient LLM inference and serving engine. It implements PagedAttention for KV-cache management, continuous batching, tensor/pipeline/expert parallelism, and an OpenAI-compatible server.",
+    "problems_solved": [
+      "KV-cache memory fragmentation and waste (PagedAttention block management)",
+      "Low GPU utilization from static batching (continuous batching scheduler)",
+      "Hardware portability: a platform abstraction lets out-of-tree (OOT) accelerators plug in",
+      "Compilation overhead: torch.compile + CUDA graph capture with piecewise partitioning",
+      "Distributed inference across devices/nodes (NCCL/custom all-reduce/all2all)",
+      "Model breadth: hundreds of architectures via a lazy registry"
+    ],
+    "architecture_style": "Layered: entrypoints -> engine (front-end LLMEngine + inner EngineCore loop) -> executor -> worker/model_runner -> model_executor layers -> attention backends/kernels. Platform abstraction is a cross-cutting seam; OOT platforms inject via entry points and subclass stable base classes.",
+    "key_design_principle": "v1 split: front-end (EngineCoreClient/LLMEngine) is decoupled from the inner EngineCore loop over ZMQ; Worker executes the model; Scheduler owns KV-cache allocation. Stable base classes are the plugin contract; concrete CUDA/ROCm/XPU implementations are not."
   },
   "core_modules": [
     {
-      "name": "Platform abstraction (vllm/platforms)",
-      "responsibility": "Select and expose the active hardware platform; provide the single extension point where OOT hardware injects worker class, attention backend selection, communicator, punica wrapper, graph wrapper, distributed PG init, config defaults, and capability queries.",
-      "implementation_principle": "current_platform is resolved lazily via module-level __getattr__ to avoid resolving during import (so OOT plugins can import Platform first). resolve_current_platform_cls_qualname() first honors an explicit VLLM_TARGET_DEVICE=cpu, then loads entry points in group 'vllm.platform_plugins', iterates builtin detectors (tpu/cuda/rocm/xpu/cpu) plus OOT plugins, and requires exactly one activated OOT plugin (OOT wins over builtin). Each detector returns a fully-qualified class name or None. The chosen class is imported and instantiated once and cached. Platform subclass overrides classmethods; there is NO get_worker_cls hook - worker class is set as a side effect of check_and_update_config by assigning parallel_config.worker_cls.",
-      "interactions": [
-        "config.VllmConfig",
-        "v1.worker",
-        "v1.attention.selector",
-        "distributed.device_communicators",
-        "compilation"
+      "path": "vllm/platforms/",
+      "responsibility": "Hardware abstraction. Device discovery, capability queries, attention-backend selection, block-size alignment, communicator/compile/punica class resolution, config defaulting.",
+      "implementation_principle": "`Platform` is a duck-typed base (not ABC); unsupported ops raise NotImplementedError. Current platform is detected lazily via `resolve_current_platform_cls_qualname()`, which chains builtin plugins (tpu/cuda/rocm/xpu/cpu) with OOT plugins loaded from the `vllm.platform_plugins` entry-point group. Exactly one OOT plugin may activate. `current_platform` is resolved lazily via module `__getattr__` to avoid import cycles.",
+      "files": [
+        "interface.py",
+        "cuda.py",
+        "rocm.py",
+        "xpu.py",
+        "cpu.py",
+        "tpu.py",
+        "zen_cpu.py",
+        "__init__.py"
       ]
     },
     {
-      "name": "Configuration (vllm/config)",
-      "responsibility": "Centralized typed configuration. VllmConfig aggregates ModelConfig, CacheConfig, ParallelConfig, SchedulerConfig, CompilationConfig, etc. All configs are pydantic dataclasses created via @config (extra='forbid'), each having compute_hash().",
-      "implementation_principle": "ModelConfig loads the HF config in __post_init__, resolves architecture/runner/dtype/max length/multimodal. ParallelConfig derives world_size = pp*tp*pcp (*(dp for external_launcher)) in __post_init__. VllmConfig.__post_init__ performs large validation/normalization and calls current_platform.config hooks. Hashes are recursive SHA-256 over normalized fields and feed the compilation cache key.",
-      "interactions": [
-        "engine.arg_utils",
-        "all subsystems"
+      "path": "vllm/v1/engine/",
+      "responsibility": "Engine front-end (LLMEngine, AsyncLLM) and inner EngineCore loop; EngineCoreClient transports (inproc/sync-mp/async-mp, DP variants); input/output processing.",
+      "implementation_principle": "LLMEngine.step() calls engine_core.get_output(); EngineCore.step() runs scheduler.schedule -> executor.execute_model(non_block) -> scheduler.get_grammar_bitmask -> executor.sample_tokens (if execute_model returned None) -> scheduler.update_from_output. The execute/sample split lets structured-output grammar computation overlap.",
+      "files": [
+        "llm_engine.py",
+        "core.py",
+        "core_client.py",
+        "input_processor.py",
+        "output_processor.py",
+        "detokenizer.py",
+        "__init__.py"
       ]
     },
     {
-      "name": "Engine core & scheduling (vllm/v1/engine, vllm/v1/core)",
-      "responsibility": "Run the continuous-batching loop: admit requests, schedule token budgets and KV blocks, dispatch a model step, collect sampled tokens, update request state, and emit outputs.",
-      "implementation_principle": "EngineCore.step(): (1) Scheduler.schedule() picks running + waiting requests under a token budget and allocates KV via KVCacheManager/KVCacheCoordinator; on OOM it preempts lowest priority. (2) model_executor.execute_model(scheduler_output, non_block=True) returns a Future. (3) Scheduler.get_grammar_bitmask() computes structured-output bitmasks concurrently with the forward. (4) future.result(); if None, model_executor.sample_tokens(grammar_output) is called (deferred sampling). (5) Scheduler.update_from_output() advances tokens, detects stops, frees/preempts, returns EngineCoreOutputs. step_with_batch_queue pipeline-overlaps scheduling with execution when max_concurrent_batches>1. EngineCoreProc runs EngineCore in a separate process with ZMQ input/output socket threads; run_busy_loop cycles _process_input_queue -> _process_engine_step.",
-      "interactions": [
-        "executor",
-        "worker",
-        "kv_cache_manager",
-        "structured_output",
-        "kv_transfer"
+      "path": "vllm/v1/core/sched/",
+      "responsibility": "Scheduling and KV-cache coordination. Decides which requests to run each step, token budgets, preemption, chunked prefill, spec-decode token scheduling.",
+      "implementation_principle": "SchedulerInterface (ABC) -> Scheduler (concrete). schedule() selects requests, allocates blocks via KVCacheManager, returns SchedulerOutput (new cached reqs + token counts). update_from_output() consumes ModelRunnerOutput, advances request state, frees/allocates blocks. AsyncScheduler overrides hooks for async scheduling.",
+      "files": [
+        "scheduler.py",
+        "interface.py",
+        "async_scheduler.py",
+        "output.py",
+        "request_queue.py",
+        "utils.py",
+        "diffusion_scheduler.py"
       ]
     },
     {
-      "name": "KV cache (vllm/v1/core/kv_cache_manager.py, block_pool.py, kv_cache_utils.py)",
-      "responsibility": "Paged KV cache allocation, prefix caching, block hashing, and eviction.",
-      "implementation_principle": "BlockPool owns a list of KVCacheBlock and a FreeKVCacheBlockQueue (LRU). KVCacheManager maps requests to block tables, does longest-prefix-match via get_computed_blocks(), allocates slots per step, caches full blocks under block hashes, and frees on finish. KVCacheCoordinator (per attention type / hybrid layouts) unifies page sizes across FullAttentionSpec, MLAAttentionSpec, MambaSpec, and custom specs. resolve_kv_cache_block_sizes + Platform.update_block_size_for_backend reconcile manager block size with kernel block sizes.",
-      "interactions": [
-        "scheduler",
-        "attention backends",
-        "platform.update_block_size_for_backend",
-        "kv_offload"
+      "path": "vllm/v1/attention/",
+      "responsibility": "Attention backend selection and implementations (FlashAttention, FlashInfer, Triton, FlashMLA, ROCm AITER, CPU, XPU, MLA prefill backends).",
+      "implementation_principle": "Selector (AttentionSelectorConfig -> get_attn_backend) queries `current_platform.get_attn_backend_cls(...)`, which validates candidates against device capability and picks the highest-priority valid backend, returning a class-path string resolved via resolve_obj_by_qualname. Result is cached (`@cache`). Backends declare capabilities via supports_* classmethods and validate_configuration. Registration via AttentionBackendEnum + register_backend.",
+      "files": [
+        "backend.py",
+        "selector.py",
+        "backends/registry.py",
+        "backends/mla/",
+        "backends/*.py",
+        "ops/"
       ]
     },
     {
-      "name": "Executors (vllm/v1/executor)",
-      "responsibility": "Dispatch execute_model/sample_tokens/collective_rpc to one or many workers.",
-      "implementation_principle": "Executor ABC chooses implementation via Executor.get_class(): 'uni' -> UniProcExecutor (in-process WorkerWrapperBase), 'mp' -> MultiprocExecutor (ZMQ broadcast MQ + response MQs, one WorkerProc per rank), 'ray' -> RayDistributedExecutor/ RayExecutorV2 (compiled DAG). Base execute_model delegates to collective_rpc('execute_model'). Supports non_block futures for async scheduling and PP.",
-      "interactions": [
-        "engine.core",
-        "worker_base"
+      "path": "vllm/v1/worker/",
+      "responsibility": "Worker (device control-plane) and ModelRunner (model execution). Device init, memory profiling for KV-cache sizing, weight loading, CUDA graph capture, forward execution, sampling.",
+      "implementation_principle": "WorkerBase declares the override surface; GPU Worker (subclass) implements init_device/determine_available_memory/initialize_from_config/execute_model. GPUModelRunner.execute_model builds attention metadata, runs the model forward, computes logits, stores ExecuteModelState and returns None; sample_tokens() consumes that state to sample. Platform plugins subclass Worker and override `_make_model_runner`; ModelRunner override points are `_model_forward`, `_init_device_properties`, `_sync_device`, `_on_request_state_removed`.",
+      "files": [
+        "worker_base.py",
+        "gpu_worker.py",
+        "gpu_model_runner.py",
+        "cpu_worker.py",
+        "cpu_model_runner.py",
+        "xpu_worker.py",
+        "utils.py"
       ]
     },
     {
-      "name": "Worker & ModelRunner (vllm/v1/worker)",
-      "responsibility": "Own a device, load the model, allocate KV cache, run the forward+sample loop, capture CUDA graphs, and exchange intermediate tensors for PP.",
-      "implementation_principle": "WorkerBase defines lifecycle: init_device, load_model, determine_available_memory (profile_run), initialize_from_config (initialize_kv_cache), compile_or_warm_up_model (kernel_warmup + capture_model), execute_model, sample_tokens. WorkerWrapperBase lazily imports the class named by parallel_config.worker_cls and optionally dynamically injects worker_extension_cls into __bases__. GPUModelRunner (V1) composes LoRA/KV-connector/EC-connector mixins, builds attention metadata per AttentionGroup, runs encoder, model forward, logits (model.compute_logits), then sampling. A V2 runner exists under vllm/v1/worker/gpu/model_runner.py selected by use_v2_model_runner.",
-      "interactions": [
-        "attention backend",
-        "kv_cache",
-        "sample",
-        "spec_decode",
-        "lora",
-        "distributed"
+      "path": "vllm/compilation/",
+      "responsibility": "torch.compile integration: compiler adaptors (Inductor standalone/inductor/eager), custom graph splitting, piecewise compilation, CUDA-graph wrapping, Inductor passes (fusion, noop elimination).",
+      "implementation_principle": "CompilationConfig.init_backend() returns either a stock torch backend string or a VllmBackend instance (VLLM_COMPILE mode). VllmBackend partitions the graph by splitting_ops into submodules (PiecewiseCompileInterpreter), compiles each via CompilerManager -> CompilerInterface, and optionally wraps with AbstractStaticGraphWrapper (CUDA graphs). PostGradPassManager runs registered Inductor passes. Compile cache keyed by config hash + compiler hash + traced-code hash.",
+      "files": [
+        "compiler_interface.py",
+        "backends.py",
+        "passes/pass_manager.py",
+        "passes/vllm_inductor_pass.py",
+        "passes/inductor_pass.py",
+        "cuda_graph.py",
+        "base_static_graph.py",
+        "decorators.py"
       ]
     },
     {
-      "name": "Attention backend abstraction (vllm/v1/attention)",
-      "responsibility": "Define and select pluggable attention implementations (FlashAttention, Triton, MLA, FlashInfer, ROCm AITER, sparse, etc.) with capability negotiation.",
-      "implementation_principle": "AttentionBackend ABC has exactly three abstract static methods (get_name, get_impl_cls, get_builder_cls); everything else is a concrete capability hook (supports_dtype, supports_head_size, supports_block_size, supports_combination, validate_configuration, is_mla, is_sparse, get_supported_kernel_block_sizes, customize_spec, supported_kv_cache_layouts, is_ssm). Registration: register_backend() populates AttentionBackendEnum overrides. Selection: Attention.__init__ -> selector.get_attn_backend() -> @cache _cached_get_attn_backend() -> current_platform.get_attn_backend_cls(selected_backend, attn_selector_config, num_heads). Explicit backend is validated via validate_configuration; otherwise platform ranks candidates by capability. Metadata is built per step by AttentionMetadataBuilder.build()/build_for_cudagraph_capture() into a per-layer dict installed via set_forward_context.",
-      "interactions": [
-        "platform.get_attn_backend_cls",
-        "gpu_model_runner",
-        "kv_cache_interface",
-        "compilation"
+      "path": "vllm/distributed/",
+      "responsibility": "Distributed primitives: world/TP/PP/DP/EP/DCP/PCP group management, device communicators (NCCL, custom all-reduce, all2all), KV/EC transfer connectors, weight transfer.",
+      "implementation_principle": "GroupCoordinator wraps a torch ProcessGroup + optional DeviceCommunicatorBase (resolved via platform.get_device_communicator_cls()). initialize_model_parallel builds groups with rank layout ExternalDP x DP x PP x PCP x TP. All2All backends (DeepEP, MoonEP, FlashInfer, etc.) implement All2AllManagerBase for MoE dispatch/combine.",
+      "files": [
+        "parallel_state.py",
+        "communication_op.py",
+        "device_communicators/",
+        "kv_transfer/",
+        "ec_transfer/",
+        "weight_transfer/"
       ]
     },
     {
-      "name": "Model executor & registry (vllm/model_executor)",
-      "responsibility": "Register and lazily resolve model architectures, provide layers (attention, MoE, quantization, rotary, pooler), custom ops, and weight loaders.",
-      "implementation_principle": "ModelRegistry maps architecture names to lazy module:class loaders via register_model(); resolve_model_cls() normalizes architecture, tries native implementations, transformers-backed implementations, and convert_type fallbacks. CustomOp/PluggableLayer allow OOT replacement of layer classes through op_registry_oot keyed by class name; forward dispatch selects forward_cuda/forward_hip/forward_xpu/forward_cpu/forward_native/forward_oot based on current_platform.",
-      "interactions": [
-        "custom_op",
-        "quantization",
-        "platforms",
-        "config.model"
+      "path": "vllm/model_executor/",
+      "responsibility": "Model definitions, layer implementations (attention/linear/MoE/quantization/rotary), model registry, weight loading.",
+      "implementation_principle": "ModelRegistry lazily resolves arch -> class, caching _ModelInfo. Layers are CustomOp/PluggableLayer subclasses dispatchable per-platform (forward_cuda/hip/xpu/cpu/oot) and OOT-overridable via register_oot. Quantization methods and linear kernels are selected per platform+quant config.",
+      "files": [
+        "models/registry.py",
+        "models/interfaces.py",
+        "layers/",
+        "custom_op.py",
+        "model_loader/"
       ]
     },
     {
-      "name": "Quantization (vllm/model_executor/layers/quantization)",
-      "responsibility": "Support weight/activation quantization schemes (fp8, awq, gptq, compressed-tensors, modelopt, mxfp4/nvfp4/mxfp8, quark, inc, torchao, humming, etc.) via a QuantizationConfig factory.",
-      "implementation_principle": "get_quant_config() resolves the config based on model_config.quantization, verifies platform support, and methods create_weights/apply/process_weights_after_loading. Platform.supported_quantization gates which schemes are allowed. OOT platforms register their own quantization configs in pre_register_and_update.",
-      "interactions": [
-        "config.quantization",
-        "platforms",
-        "model_loader",
-        "linear/moe kernels"
+      "path": "vllm/v1/kv_cache_interface.py + vllm/v1/core/block_pool.py + kv_cache_manager.py + kv_cache_coordinator.py",
+      "responsibility": "KV-cache specification hierarchy and runtime block management.",
+      "implementation_principle": "KVCacheSpec (frozen dataclass) describes per-layer cache geometry; KVCacheManager owns a BlockPool (hash-based prefix caching, free queue) and a KVCacheCoordinator (unitary/hybrid/no-prefix) that maps requests to blocks. Custom specs/managers register via @register_kv_cache_spec.",
+      "files": [
+        "kv_cache_interface.py",
+        "kv_cache_spec_registry.py",
+        "core/block_pool.py",
+        "core/kv_cache_manager.py",
+        "core/kv_cache_coordinator.py",
+        "core/single_type_kv_cache_manager.py"
       ]
     },
     {
-      "name": "Compilation (vllm/compilation)",
-      "responsibility": "Apply torch.compile / CUDA graph capture to reduce kernel-launch overhead, with piecewise graph splitting and a custom pass manager.",
-      "implementation_principle": "Pipeline: torch.compile -> CompilationConfig.init_backend() returns a VllmBackend for VLLM_COMPILE mode -> VllmBackend wraps a CompilerManager -> make_compiler() selects a CompilerInterface (InductorStandaloneAdaptor / InductorAdaptor / EagerAdaptor / platform backend) -> split_graph partitions at splitting_ops -> PiecewiseBackend compiles each Range -> wrap_with_cudagraph_if_needed wraps each piece in current_platform.get_static_graph_wrapper_cls() (default CUDAGraphWrapper) at runtime_mode=PIECEWISE. PostGradPassManager (a torch CustomGraphPass) is installed at current_platform.pass_key and runs InductorPass instances. Caching keyed by VllmConfig.compute_hash().",
-      "interactions": [
-        "config.compilation",
-        "platforms",
-        "worker.compile_or_warm_up_model",
-        "passes/fusion"
+      "path": "vllm/v1/sample/",
+      "responsibility": "Token sampling: logits processors, temperature/top-k/top-p, rejection sampling for speculative decode.",
+      "implementation_principle": "Sampler (nn.Module) computes logprobs, applies logits processors, delegates stochastic sampling to TopKTopPSampler whose `forward` is bound per-platform (cuda/cpu/hip/xpu/native). RejectionSampler implements spec-decode acceptance.",
+      "files": [
+        "sampler.py",
+        "metadata.py",
+        "ops/topk_topp_sampler.py",
+        "rejection_sampler.py",
+        "logits_processor/"
       ]
     },
     {
-      "name": "Distributed (vllm/distributed)",
-      "responsibility": "Initialize torch distributed and model-parallel groups; provide collective ops and device-specific communicators.",
-      "implementation_principle": "parallel_state defines GroupCoordinator wrapping ProcessGroups for world/tp/etp/pp/dp/ep/pcp/dcp/eplb, plus custom vllm.ops all_reduce/reduce_scatter/all_gather. initialize_model_parallel lays out groups in order ExternalDP x DP x PP x PCP x TP. Device communicators (base_device_communicator.DeviceCommunicatorBase, CudaCommunicator, CpuCommunicator, XpuCommunicator) implement all_reduce/all_gather/reduce_scatter and custom (e.g. custom allreduce) paths; All2AllManagerBase handles MoE dispatch/combine.",
-      "interactions": [
-        "platforms.get_device_communicator_cls",
-        "worker",
-        "moe layers",
-        "eplb"
+      "path": "vllm/config/",
+      "responsibility": "Typed configuration dataclasses (pydantic) consumed everywhere.",
+      "implementation_principle": "@config decorator wraps pydantic dataclass; VllmConfig aggregates sub-configs; compute_hash() drives compile cache; Platform.check_and_update_config()/apply_config_platform_defaults() mutate config for a platform.",
+      "files": [
+        "vllm.py",
+        "model.py",
+        "cache.py",
+        "parallel.py",
+        "compilation.py",
+        "attention.py",
+        "kernel.py",
+        "device.py",
+        "scheduler.py",
+        "speculative.py",
+        "lora.py",
+        "load.py",
+        "observability.py",
+        "structured_outputs.py"
       ]
     },
     {
-      "name": "Sampling (vllm/v1/sample)",
-      "responsibility": "Convert logits to token ids with temperature/top-k/top-p/penalties/logits-processors and speculative rejection sampling.",
-      "implementation_principle": "Sampler.forward applies logits processors and penalties, then TopKTopPSampler dispatches to forward_cuda/forward_hip/forward_xpu/forward_cpu/native per platform. RejectionSampler implements speculative rejection sampling (draft probs vs target probs) with Triton kernels.",
-      "interactions": [
-        "gpu_model_runner",
-        "spec_decode",
-        "structured_output"
-      ]
-    },
-    {
-      "name": "Entrypoints (vllm/entrypoints)",
-      "responsibility": "Expose offline LLM API and HTTP servers compatible with OpenAI/Anthropic/Cohere, plus CLI and launchers.",
-      "implementation_principle": "FastAPI routers per endpoint family; app_state holds the engine client; AsyncLLM wraps EngineCoreClient for asyncio. Protocol models define request/response schemas. Plugin entry point group vllm.endpoint_plugins allows OOT endpoint injection.",
-      "interactions": [
-        "engine.async_llm",
-        "renderers",
-        "parser",
-        "reasoning",
-        "tool_parsers"
+      "path": "vllm/entrypoints/",
+      "responsibility": "User-facing APIs: offline LLM class, OpenAI/Anthropic/Cohere-compatible servers, CLI.",
+      "implementation_principle": "LLM composes offline mixins (generate/chat/embed/classify/score/beam_search). Server startup in launchers/api_server builds AsyncLLM from VllmConfig via AsyncEngineArgs.",
+      "files": [
+        "llm.py",
+        "openai/",
+        "anthropic/",
+        "pooling/",
+        "cli/",
+        "launchers/"
       ]
     }
   ],
   "key_abstractions": [
     {
       "name": "Platform",
-      "location": "vllm/platforms/interface.py:135",
-      "inherits_from": "object (plain base; subclasses: CudaPlatformBase, RocmPlatform, CpuPlatform, XPUPlatform, UnspecifiedPlatform)",
+      "file": "vllm/platforms/interface.py:137",
+      "inherits_from": "object (duck-typed base, NOT abc.ABC; unsupported ops raise NotImplementedError)",
       "ascend_implementations": [
         "vllm_ascend.platform.NPUPlatform"
       ],
       "key_methods": [
-        {
-          "sig": "check_and_update_config(cls, vllm_config: VllmConfig) -> None",
-          "desc": "Validate/mutate config; sets parallel_config.worker_cls='auto' resolution target. NPUPlatform sets NPU worker and custom config here.",
-          "line": "interface.py:583"
-        },
-        {
-          "sig": "get_attn_backend_cls(cls, selected_backend: AttentionBackendEnum, attn_selector_config: AttentionSelectorConfig, num_heads: int | None = None) -> str",
-          "desc": "Return qualified attention backend class path. Primary NPU attention injection point.",
-          "line": "interface.py:387"
-        },
-        {
-          "sig": "get_device_communicator_cls(cls) -> str",
-          "desc": "Return device communicator class path.",
-          "line": "interface.py:1120"
-        },
-        {
-          "sig": "get_punica_wrapper(cls) -> str",
-          "desc": "Return LoRA punica wrapper class path.",
-          "line": "interface.py:1100"
-        },
-        {
-          "sig": "get_static_graph_wrapper_cls(cls) -> str",
-          "desc": "Return static-graph wrapper class path (torchair for NPU).",
-          "line": "interface.py:1230"
-        },
-        {
-          "sig": "stateless_init_device_torch_dist_pg(cls, backend, prefix_store, group_rank, group_size, timeout) -> ProcessGroup",
-          "desc": "Initialize platform-specific torch distributed PG (HCCL for NPU).",
-          "line": "interface.py:1235"
-        },
-        {
-          "sig": "support_hybrid_kv_cache(cls) -> bool",
-          "desc": "Whether hybrid attention/mamba KV cache is supported.",
-          "line": "interface.py:1252"
-        },
-        {
-          "sig": "support_static_graph_mode(cls) -> bool",
-          "desc": "Whether platform static graph mode is supported.",
-          "line": "interface.py:1257"
-        },
-        {
-          "sig": "get_compile_backend(cls) -> str",
-          "desc": "Custom torch.compile backend for simple functions.",
-          "line": "interface.py:252"
-        },
-        {
-          "sig": "get_pass_manager_cls(cls) -> str",
-          "desc": "Inductor custom pass manager class path.",
-          "line": "interface.py:245"
-        },
-        {
-          "sig": "pre_register_and_update(cls, parser: FlexibleArgumentParser | None = None) -> None",
-          "desc": "Register OOT quantization/config before CLI parsing.",
-          "line": "interface.py:555"
-        },
-        {
-          "sig": "apply_config_platform_defaults(cls, vllm_config: VllmConfig) -> None",
-          "desc": "Apply platform defaults after CLI parsing.",
-          "line": "interface.py:570"
-        },
-        {
-          "sig": "get_device_capability(cls, device_id: int = 0) -> DeviceCapability | None",
-          "desc": "Stateless device capability.",
-          "line": "interface.py:433"
-        },
-        {
-          "sig": "get_device_name(cls, device_id=0) -> str; get_device_uuid(cls, device_id=0) -> str; get_device_total_memory(cls, device_id=0) -> int",
-          "desc": "Device identity/memory queries.",
-          "line": "interface.py:507/512/517"
-        },
-        {
-          "sig": "set_device(cls, device: torch.device) -> None; manual_seed_all(cls, seed: int) -> None",
-          "desc": "Device selection and RNG seeding.",
-          "line": "interface.py:545/550"
-        },
-        {
-          "sig": "import_kernels(cls) -> None; import_ir_kernels(cls) -> None; register_triton_kernel_overrides(cls) -> None",
-          "desc": "Import platform C kernels / IR kernels / override Triton kernels.",
-          "line": "interface.py:364/257/374"
-        },
-        {
-          "sig": "check_if_supports_dtype(cls, dtype: torch.dtype)",
-          "desc": "Reject unsupported dtypes.",
-          "line": "interface.py:1247"
-        },
-        {
-          "sig": "update_block_size_for_backend(cls, vllm_config: VllmConfig) -> None",
-          "desc": "Reconcile KV cache block size with attention backend (overridable).",
-          "line": "interface.py:666"
-        },
-        {
-          "sig": "register_custom_kv_cache_specs(cls, vllm_config: VllmConfig) -> None",
-          "desc": "Register custom KVCacheSpec classes.",
-          "line": "interface.py:1033"
-        },
-        {
-          "sig": "verify_model_arch(cls, model_arch: str) -> None; verify_quantization(cls, quant: str) -> None",
-          "desc": "Platform support checks.",
-          "line": "interface.py:1038/1049"
-        },
-        {
-          "sig": "get_vit_attn_backend(cls, head_size, dtype, backend=None) -> AttentionBackendEnum; get_supported_vit_attn_backends(cls) -> list[AttentionBackendEnum]",
-          "desc": "ViT attention backend selection.",
-          "line": "interface.py:403/397"
-        }
+        "classmethod get_attn_backend_cls(cls, selected_backend: AttentionBackendEnum, attn_selector_config: AttentionSelectorConfig, num_heads: int | None = None) -> str",
+        "classmethod get_mla_prefill_backend_cls(cls, mla_selector_config: MLAPrefillSelectorConfig) -> type[MLAPrefillBackend]",
+        "classmethod check_and_update_config(cls, vllm_config: VllmConfig) -> None",
+        "classmethod apply_config_platform_defaults(cls, vllm_config: VllmConfig) -> None",
+        "classmethod pre_register_and_update(cls, parser: FlexibleArgumentParser | None = None) -> None",
+        "classmethod update_block_size_for_backend(cls, vllm_config: VllmConfig) -> None",
+        "classmethod register_custom_kv_cache_specs(cls, vllm_config: VllmConfig) -> None",
+        "classmethod verify_model_arch(cls, model_arch: str) -> None",
+        "classmethod verify_quantization(cls, quant: str) -> None",
+        "classmethod get_device_capability(cls, device_id: int = 0) -> DeviceCapability | None",
+        "classmethod has_device_capability(cls, capability: tuple[int, int] | int, device_id: int = 0) -> bool",
+        "classmethod get_device_name(cls, device_id: int = 0) -> str",
+        "classmethod get_device_total_memory(cls, device_id: int = 0) -> int",
+        "classmethod get_device_communicator_cls(cls) -> str",
+        "classmethod get_punica_wrapper(cls) -> str",
+        "classmethod import_kernels(cls) -> None",
+        "classmethod import_ir_kernels(cls) -> None",
+        "classmethod register_triton_kernel_overrides(cls) -> None",
+        "classmethod get_compile_backend(cls) -> str",
+        "classmethod get_pass_manager_cls(cls) -> str",
+        "classmethod get_static_graph_wrapper_cls(cls) -> str",
+        "classmethod set_device(cls, device: torch.device) -> None",
+        "classmethod manual_seed_all(cls, seed: int) -> None",
+        "classmethod get_current_memory_usage(cls, device: torch.types.Device | None = None) -> float",
+        "classmethod inference_mode(cls)",
+        "classmethod supports_fp8(cls) -> bool",
+        "classmethod use_custom_allreduce(cls) -> bool",
+        "classmethod opaque_attention_op(cls) -> bool",
+        "classmethod support_hybrid_kv_cache(cls) -> bool",
+        "classmethod support_static_graph_mode(cls) -> bool",
+        "classmethod validate_request(cls, processed_inputs: EngineInput, params: SamplingParams | PoolingParams) -> None",
+        "classmethod stateless_init_device_torch_dist_pg(cls, backend: str, prefix_store: PrefixStore, group_rank: int, group_size: int, timeout: timedelta) -> ProcessGroup",
+        "classmethod num_compute_units(cls, device_id: int = 0) -> int",
+        "classmethod validate_environ(cls, hard_fail: bool) -> None",
+        "classmethod get_supported_vit_attn_backends(cls) -> list[AttentionBackendEnum]",
+        "classmethod get_vit_attn_backend(cls, head_size: int, dtype: torch.dtype, backend: AttentionBackendEnum | None = None) -> AttentionBackendEnum"
       ],
-      "impact_rules": "Signature or behavioral changes to get_attn_backend_cls, check_and_update_config, get_device_communicator_cls, get_static_graph_wrapper_cls, stateless_init_device_torch_dist_pg, support_hybrid_kv_cache, or the Platform base method set directly break NPUPlatform. Adding new abstract/required methods to Platform forces NPUPlatform updates."
+      "impact_rule": "Any signature change to a hook vllm-ascend overrides (NPUPlatform) is HIGH impact. Adding new hooks is low risk unless abstract. Changing get_attn_backend_cls/get_device_communicator_cls/check_and_update_config return contract breaks NPU platform."
     },
     {
       "name": "WorkerBase",
-      "location": "vllm/v1/worker/worker_base.py:44",
-      "inherits_from": "object (plain interface; Workers subclass it; WorkerWrapperBase does NOT)",
+      "file": "vllm/v1/worker/worker_base.py:44",
+      "inherits_from": "object",
+      "ascend_implementations": [
+        "vllm_ascend.worker.worker.NPUWorker (subclasses vllm.v1.worker.gpu_worker.Worker)"
+      ],
+      "key_methods": [
+        "__init__(self, vllm_config: VllmConfig, local_rank: int, rank: int, distributed_init_method: str, is_driver_worker: bool = False) -> None",
+        "get_kv_cache_spec(self) -> dict[str, KVCacheSpec]  # raises NotImplementedError",
+        "get_supported_kv_cache_layouts(self) -> list[str]",
+        "set_kv_cache_layout(self, kv_cache_layout: str) -> None",
+        "compile_or_warm_up_model(self) -> CompilationTimes  # raises NotImplementedError",
+        "check_health(self) -> None",
+        "synchronize_device(self) -> None",
+        "init_device(self) -> None  # raises NotImplementedError",
+        "get_model(self) -> nn.Module  # raises NotImplementedError",
+        "supports_draft_weight_updates(self) -> bool",
+        "apply_model(self, fn: Callable[[nn.Module], _R]) -> _R",
+        "load_model(self, *, load_dummy_weights: bool = False) -> None  # raises NotImplementedError",
+        "execute_model(self, scheduler_output: SchedulerOutput) -> ModelRunnerOutput | AsyncModelRunnerOutput | None  # raises NotImplementedError",
+        "sample_tokens(self, grammar_output: GrammarOutput) -> ModelRunnerOutput | AsyncModelRunnerOutput  # raises NotImplementedError",
+        "get_cache_block_size_bytes(self) -> int  # raises NotImplementedError",
+        "add_lora/remove_lora/pin_lora/list_loras(...)  # raise NotImplementedError",
+        "vocab_size(self) -> int  # property",
+        "shutdown(self) -> None"
+      ],
+      "impact_rule": "WorkerBase is the core worker contract. vllm-ascend NPUWorker subclasses the concrete GPU Worker; any change to WorkerBase method signatures or to implicit interface methods (initialize_from_config, determine_available_memory, update_max_model_len) requires NPUWorker updates."
+    },
+    {
+      "name": "Worker (GPU)",
+      "file": "vllm/v1/worker/gpu_worker.py:192",
+      "inherits_from": "vllm.v1.worker.worker_base.WorkerBase",
       "ascend_implementations": [
         "vllm_ascend.worker.worker.NPUWorker"
       ],
       "key_methods": [
-        {
-          "sig": "__init__(self, vllm_config, local_rank, rank, distributed_init_method, is_driver_worker=False)",
-          "desc": "Store config, rank fields, set default IR op priority.",
-          "line": "worker_base.py:50"
-        },
-        {
-          "sig": "get_kv_cache_spec(self) -> dict[str, KVCacheSpec]",
-          "desc": "Return KV cache specs from model runner.",
-          "line": "worker_base.py:103"
-        },
-        {
-          "sig": "init_device(self) -> None",
-          "desc": "Initialize device/distributed/model runner.",
-          "line": "worker_base.py:135"
-        },
-        {
-          "sig": "load_model(self, *, load_dummy_weights: bool = False) -> None",
-          "desc": "Load weights onto device.",
-          "line": "worker_base.py:170"
-        },
-        {
-          "sig": "determine_available_memory(self) -> int",
-          "desc": "Profile run to size KV cache.",
-          "line": "not in base; GPUWorker:600"
-        },
-        {
-          "sig": "initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None",
-          "desc": "Allocate KV cache from resolved config.",
-          "line": "not in base; GPUWorker:815"
-        },
-        {
-          "sig": "compile_or_warm_up_model(self) -> CompilationTimes",
-          "desc": "Compile/capture graphs and warm up kernels.",
-          "line": "worker_base.py:116"
-        },
-        {
-          "sig": "execute_model(self, scheduler_output) -> ModelRunnerOutput | AsyncModelRunnerOutput | None",
-          "desc": "Run a model step; None means sample_tokens follows.",
-          "line": "worker_base.py:174"
-        },
-        {
-          "sig": "sample_tokens(self, grammar_output) -> ModelRunnerOutput | AsyncModelRunnerOutput",
-          "desc": "Run sampling after deferred execute_model.",
-          "line": "worker_base.py:185"
-        },
-        {
-          "sig": "get_cache_block_size_bytes(self) -> int",
-          "desc": "KV block size in bytes for spec decode.",
-          "line": "worker_base.py:191"
-        },
-        {
-          "sig": "add_lora/remove_lora/pin_lora/list_loras",
-          "desc": "LoRA management.",
-          "line": "worker_base.py:197-207"
-        },
-        {
-          "sig": "synchronize_device(self) -> None; check_health(self) -> None; shutdown(self) -> None",
-          "desc": "Lifecycle helpers.",
-          "line": "worker_base.py:129/125/214"
-        }
+        "init_device(self) -> None",
+        "_init_workspace_and_model_runner(self) -> None",
+        "_make_model_runner(self) -> GPUModelRunner  # explicitly 'subclasses override this'",
+        "load_model(self, *, load_dummy_weights: bool = False) -> None",
+        "determine_available_memory(self) -> int",
+        "get_kv_cache_spec(self) -> dict[str, KVCacheSpec]",
+        "initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None",
+        "compile_or_warm_up_model(self) -> CompilationTimes",
+        "get_model(self) -> nn.Module",
+        "execute_model(self, scheduler_output: SchedulerOutput) -> ModelRunnerOutput | AsyncModelRunnerOutput | None",
+        "sample_tokens(self, grammar_output: GrammarOutput | None) -> ModelRunnerOutput | AsyncModelRunnerOutput",
+        "get_cache_block_size_bytes(self) -> int",
+        "shutdown(self) -> None"
       ],
-      "impact_rules": "NPUWorker overrides init_device, load_model, determine_available_memory, initialize_from_config, compile_or_warm_up_model, execute_model, sample_tokens. Any change to these signatures or to WorkerWrapperBase.init_worker/worker_cls resolution breaks NPU worker startup. New abstract methods force NPUWorker updates."
+      "impact_rule": "NPUWorker overrides init_device/_make_model_runner/load_model/determine_available_memory/compile_or_warm_up_model. Any change to these signatures or to the PP send/recv flow in execute_model is HIGH impact."
     },
     {
-      "name": "GPUModelRunner (V1)",
-      "location": "vllm/v1/worker/gpu_model_runner.py:479",
+      "name": "GPUModelRunner",
+      "file": "vllm/v1/worker/gpu_model_runner.py:467",
       "inherits_from": "LoRAModelRunnerMixin, KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin",
       "ascend_implementations": [
-        "vllm_ascend.worker.model_runner.NPUModelRunner (subclasses GPUModelRunner)"
+        "vllm_ascend.worker.model_runner.NPUModelRunner"
       ],
       "key_methods": [
-        {
-          "sig": "__init__(self, vllm_config: VllmConfig, device: torch.device)",
-          "desc": "Set up input batch, buffers, attn groups, speculators.",
-          "line": "gpu_model_runner.py:483"
-        },
-        {
-          "sig": "execute_model(self, scheduler_output, intermediate_tensors=None) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors | None",
-          "desc": "Full forward path: update states -> prepare inputs -> build attn metadata -> encoder -> model forward -> compute_logits -> sample.",
-          "line": "gpu_model_runner.py:4120"
-        },
-        {
-          "sig": "_prepare_inputs(self, scheduler_output, num_scheduled_tokens: np.ndarray) -> tuple[torch.Tensor, SpecDecodeMetadata | None, int]",
-          "desc": "Assemble input ids/positions/attn metadata.",
-          "line": "gpu_model_runner.py:1938"
-        },
-        {
-          "sig": "_build_attention_metadata(self, num_tokens, num_reqs, max_query_len, ...) -> tuple[PerLayerAttnMetadata, CommonAttentionMetadata | None]",
-          "desc": "Per-step attention metadata.",
-          "line": "gpu_model_runner.py:2255"
-        },
-        {
-          "sig": "load_model(self, load_dummy_weights: bool = False) -> None",
-          "desc": "Load weights using load_config.",
-          "line": "gpu_model_runner.py:5238"
-        },
-        {
-          "sig": "initialize_kv_cache(self, kv_cache_config, is_profiling=False, kv_cache_allocation_context=None) -> None",
-          "desc": "Build attn groups/builders/tensors and bind caches.",
-          "line": "gpu_model_runner.py:7326"
-        },
-        {
-          "sig": "initialize_attn_backend(self, kv_cache_config, is_profiling=False) -> None",
-          "desc": "Group layers into AttentionGroups by backend/spec/heads.",
-          "line": "gpu_model_runner.py:6952"
-        },
-        {
-          "sig": "profile_run(self, randomize_inputs: bool = False) -> None",
-          "desc": "Dummy run for memory profiling.",
-          "line": "gpu_model_runner.py:6397"
-        },
-        {
-          "sig": "capture_model(self) -> int",
-          "desc": "Capture cudagraphs.",
-          "line": "gpu_model_runner.py:6746"
-        },
-        {
-          "sig": "sample_tokens(self, grammar_output) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors",
-          "desc": "Deferred sampling half.",
-          "line": "gpu_model_runner.py:4501"
-        },
-        {
-          "sig": "get_kv_cache_spec(self) -> dict[str, KVCacheSpec]",
-          "desc": "Collect specs from attention layers.",
-          "line": "gpu_model_runner.py:7415"
-        },
-        {
-          "sig": "_dummy_run(...)",
-          "desc": "Dummy forward for warmup/capture.",
-          "line": "gpu_model_runner.py:5772"
-        },
-        {
-          "sig": "propose_draft_token_ids(...); take_draft_token_ids(...)",
-          "desc": "Speculative decoding hooks.",
-          "line": "gpu_model_runner.py:4945/4824"
-        }
+        "__init__(self, vllm_config: VllmConfig, device: torch.device)",
+        "_init_device_properties(self) -> None  # 'used for model runner override'",
+        "_sync_device(self) -> None  # 'used for model runner override'",
+        "_on_request_state_removed(self, req_id: str, req_state: CachedRequestState | None) -> None  # platform hook",
+        "_update_states(self, scheduler_output: SchedulerOutput) -> Callable | None",
+        "_prepare_inputs(self, scheduler_output: SchedulerOutput, num_scheduled_tokens: np.ndarray) -> tuple[torch.Tensor, SpecDecodeMetadata | None, int]",
+        "_build_attention_metadata(self, num_tokens, num_reqs, max_query_len, ...) -> tuple[PerLayerAttnMetadata, CommonAttentionMetadata | None]",
+        "_preprocess(self, scheduler_output, num_input_tokens, intermediate_tensors=None) -> tuple[...]",
+        "_model_forward(self, input_ids=None, positions=None, intermediate_tensors=None, inputs_embeds=None, **model_kwargs) -> Any  # 'can be overridden'",
+        "_sample(self, logits: torch.Tensor | None, spec_decode_metadata: SpecDecodeMetadata | None) -> SamplerOutput",
+        "execute_model(self, scheduler_output: SchedulerOutput, intermediate_tensors: IntermediateTensors | None = None) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors | None",
+        "sample_tokens(self, grammar_output: GrammarOutput | None) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors",
+        "load_model(self, load_dummy_weights: bool = False, *, model: nn.Module | None = None) -> None",
+        "profile_run(self, randomize_inputs: bool = False) -> None",
+        "capture_model(self) -> int",
+        "initialize_attn_backend(self, kv_cache_config: KVCacheConfig, is_profiling: bool = False) -> None",
+        "initialize_kv_cache(self, kv_cache_config: KVCacheConfig, is_profiling: bool = False, kv_cache_allocation_context=None) -> None",
+        "get_kv_cache_spec(self) -> dict[str, KVCacheSpec]",
+        "get_supported_tasks(self) -> tuple[SupportedTask, ...]"
       ],
-      "impact_rules": "NPUModelRunner relies on overriding execute_model, _prepare_inputs, _build_attention_metadata, initialize_attn_backend, initialize_kv_cache, load_model, profile_run, capture_model. Renames/re-signatures of these or of internal helpers (_update_states, _calc_mrope_positions, _determine_batch_execution_and_padding) directly break NPU execution. Changes to logits computation (currently inline model.compute_logits) or SamplingMetadata construction affect NPU sampling."
+      "impact_rule": "NPUModelRunner overrides execute_model/_prepare_inputs/_model_forward/initialize_kv_cache or relies on them. Signature or behavior changes to _prepare_inputs, _build_attention_metadata, _model_forward, execute_model, capture_model are HIGH impact and must be mirrored."
     },
     {
       "name": "AttentionBackend",
-      "location": "vllm/v1/attention/backend.py:61",
+      "file": "vllm/v1/attention/backend.py:59",
       "inherits_from": "abc.ABC",
       "ascend_implementations": [
         "vllm_ascend.attention.attention_v1.AscendAttentionBackend",
-        "vllm_ascend.attention.mla_v1.AscendMLABackend",
-        "vllm_ascend.attention.sfa_v1.AscendSFABackend",
-        "vllm_ascend.attention.attention_v1.AscendAttentionBackendImpl (impl)"
+        "vllm_ascend.attention.mla_v1.AscendMLABackend"
       ],
       "key_methods": [
-        {
-          "sig": "@staticmethod abstractmethod get_name() -> str",
-          "desc": "Backend identifier string.",
-          "line": "backend.py:80"
-        },
-        {
-          "sig": "@staticmethod abstractmethod get_impl_cls() -> type[AttentionImplBase]",
-          "desc": "Attention implementation class.",
-          "line": "backend.py:85"
-        },
-        {
-          "sig": "@staticmethod abstractmethod get_builder_cls()",
-          "desc": "AttentionMetadataBuilder class.",
-          "line": "backend.py:90"
-        },
-        {
-          "sig": "@staticmethod get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int | MultipleOf]",
-          "desc": "Kernel-supported KV block sizes (default [MultipleOf(1)]).",
-          "line": "backend.py:74"
-        },
-        {
-          "sig": "@classmethod get_supported_head_sizes() -> list[int]; supports_head_size(cls, head_size) -> bool",
-          "desc": "Head-size capability.",
-          "line": "backend.py:99/103"
-        },
-        {
-          "sig": "@classmethod supports_dtype(cls, dtype) -> bool; supports_kv_cache_dtype(cls, kv_cache_dtype) -> bool",
-          "desc": "Dtype capability.",
-          "line": "backend.py:108/112"
-        },
-        {
-          "sig": "@classmethod supports_block_size(cls, block_size) -> bool; get_preferred_block_size(cls, default_block_size) -> int",
-          "desc": "Block-size capability/preference.",
-          "line": "backend.py:120/153"
-        },
-        {
-          "sig": "@classmethod customize_spec(cls, spec: AttentionSpec) -> AttentionSpec",
-          "desc": "Adjust KV spec (e.g. padded page size) for the backend.",
-          "line": "backend.py:139"
-        },
-        {
-          "sig": "@classmethod is_mla() -> bool; is_sparse() -> bool; is_ssm() -> bool",
-          "desc": "Backend family flags (is_ssm concrete, default False).",
-          "line": "backend.py:164/180/376"
-        },
-        {
-          "sig": "@classmethod supports_sink/supports_alibi_sqrt/supports_mm_prefix/supports_per_head_quant_scales/supports_sliding_window/supports_rswa/supports_non_causal/supports_batch_invariance/supports_kv_connector/supports_pcp/supports_dcp/supports_non_causal_dcp(cls) -> bool",
-          "desc": "Capability flags.",
-          "line": "backend.py:168-247"
-        },
-        {
-          "sig": "@classmethod supports_compute_capability(cls, capability: DeviceCapability) -> bool",
-          "desc": "Hardware capability gate.",
-          "line": "backend.py:258"
-        },
-        {
-          "sig": "@classmethod supports_combination(cls, head_size, dtype, kv_cache_dtype, block_size, use_mla, has_sink, use_sparse, use_mm_prefix, device_capability) -> str | None",
-          "desc": "Return reason string if unsupported.",
-          "line": "backend.py:262"
-        },
-        {
-          "sig": "@classmethod validate_configuration(cls, head_size, dtype, kv_cache_dtype, block_size, use_mla, has_sink, use_sparse, use_mm_prefix, use_per_head_quant_scales, device_capability, attn_type, has_sliding_window=False, use_non_causal=False, use_batch_invariant=False, use_kv_connector=False, use_pcp=False, use_adaptive_verification=False, use_dcp=False, use_rswa=False) -> list[str]",
-          "desc": "Aggregate compatibility validation.",
-          "line": "backend.py:277"
-        },
-        {
-          "sig": "@classmethod supported_kv_cache_layouts() -> tuple[KVCacheLayout, ...] | None",
-          "desc": "Supported KV cache memory layouts.",
-          "line": "backend.py:370"
-        },
-        {
-          "sig": "@classmethod full_cls_name(cls) -> tuple[str, str]",
-          "desc": "(module, qualname) identity.",
-          "line": "backend.py:95"
-        }
+        "staticmethod get_name() -> str  # abstract",
+        "staticmethod get_impl_cls() -> type[AttentionImplBase]  # abstract",
+        "staticmethod get_builder_cls()  # abstract (returns AttentionMetadataBuilder subclass)",
+        "staticmethod get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int | MultipleOf]",
+        "classmethod supports_head_size(cls, head_size: int) -> bool",
+        "classmethod supports_dtype(cls, dtype: torch.dtype) -> bool",
+        "classmethod supports_kv_cache_dtype(cls, kv_cache_dtype: CacheDType | None) -> bool",
+        "classmethod supports_block_size(cls, block_size: int | None) -> bool",
+        "classmethod validate_configuration(cls, head_size, dtype, kv_cache_dtype, block_size, use_mla, has_sink, use_sparse, use_mm_prefix, use_per_head_quant_scales, device_capability, attn_type, has_sliding_window=False, ...) -> list[str]",
+        "classmethod is_mla(cls) -> bool",
+        "classmethod is_ssm(cls) -> bool",
+        "classmethod supports_pcp(cls) -> bool / supports_dcp(cls) -> bool",
+        "classmethod uses_slot_mapping / forward_includes_kv_cache_update (attribute)",
+        "classmethod customize_spec(cls, spec: AttentionSpec) -> AttentionSpec",
+        "classmethod get_preferred_block_size(cls, default_block_size: int) -> int"
       ],
-      "impact_rules": "Ascend attention backends implement these hooks. Changes to abstract methods (get_name/get_impl_cls/get_builder_cls) are breaking. Changes to validate_configuration/supports_combination signatures, to get_supported_kernel_block_sizes semantics, or to new capability flags added to the base force Ascend backends to be revisited. The platform dispatch in get_attn_backend_cls must keep returning the Ascend paths for NPU."
+      "impact_rule": "Ascend backends implement get_name/get_impl_cls/get_builder_cls. Adding a new abstract method here breaks all OOT backends. Changing forward_includes_kv_cache_update or validate_configuration signature changes NPU backend behavior."
     },
     {
       "name": "AttentionMetadataBuilder",
-      "location": "vllm/v1/attention/backend.py:599",
+      "file": "vllm/v1/attention/backend.py:591",
       "inherits_from": "abc.ABC, Generic[M]",
       "ascend_implementations": [
         "vllm_ascend.attention.attention_v1.AscendAttentionMetadataBuilder",
         "vllm_ascend.attention.mla_v1.AscendMLAMetadataBuilder"
       ],
       "key_methods": [
-        {
-          "sig": "abstractmethod __init__(self, kv_cache_spec, layer_names, vllm_config, device)",
-          "desc": "Construct builder for a KV cache group.",
-          "line": "backend.py:616"
-        },
-        {
-          "sig": "abstractmethod build(self, common_prefix_len: int, common_attn_metadata: CommonAttentionMetadata, fast_build: bool = False) -> M",
-          "desc": "Build per-step metadata.",
-          "line": "backend.py:693"
-        },
-        {
-          "sig": "set_kernel_block_size(self, kernel_block_size: int) -> None",
-          "desc": "Set kernel block size.",
-          "line": "backend.py:630"
-        },
-        {
-          "sig": "@classmethod get_cudagraph_support(cls, vllm_config, kv_cache_spec) -> AttentionCGSupport",
-          "desc": "Cudagraph capture support level.",
-          "line": "backend.py:633"
-        },
-        {
-          "sig": "@classmethod get_varlen_cudagraph_max_query_len(cls, vllm_config, kv_cache_spec) -> int | None",
-          "desc": "Max query len for varlen cudagraph.",
-          "line": "backend.py:642"
-        },
-        {
-          "sig": "update_block_table(self, metadata: M, blk_table, slot_mapping) -> M",
-          "desc": "Update block table in-place.",
-          "line": "backend.py:713"
-        },
-        {
-          "sig": "build_for_cudagraph_capture(self, common_attn_metadata) -> M",
-          "desc": "Metadata for graph capture.",
-          "line": "backend.py:727"
-        },
-        {
-          "sig": "build_for_drafting(self, common_attn_metadata, draft_index: int) -> M",
-          "desc": "Metadata for spec-decode drafting.",
-          "line": "backend.py:738"
-        },
-        {
-          "sig": "update_draft_decode_metadata(self, metadata: M) -> None",
-          "desc": "Update draft decode metadata.",
-          "line": "backend.py:760"
-        },
-        {
-          "sig": "use_cascade_attention(self, common_prefix_len, query_lens, num_query_heads, num_kv_heads, use_alibi, use_sliding_window, use_local_attention, num_sms, dcp_world_size) -> bool",
-          "desc": "Cascade attention decision.",
-          "line": "backend.py:770"
-        }
+        "__init__(self, kv_cache_spec: KVCacheSpec, layer_names: list[str], vllm_config: VllmConfig, device: torch.device)  # abstract",
+        "build(self, common_prefix_len: int, common_attn_metadata: CommonAttentionMetadata, fast_build: bool = False) -> M  # abstract",
+        "classmethod get_cudagraph_support(cls, vllm_config, kv_cache_spec) -> AttentionCGSupport",
+        "update_block_table(self, metadata: M, blk_table: torch.Tensor, slot_mapping: torch.Tensor) -> M",
+        "build_for_cudagraph_capture(self, common_attn_metadata: CommonAttentionMetadata) -> M",
+        "build_for_drafting(self, common_attn_metadata, draft_index: int) -> M",
+        "use_cascade_attention(self, ...) -> bool"
       ],
-      "impact_rules": "Signature changes to build() or __init__ break all Ascend metadata builders. New abstract methods must be implemented on NPU. Changes to CommonAttentionMetadata fields are high-impact because all builders consume them."
+      "impact_rule": "If __init__ or build signature changes, all OOT builders break at definition/runtime. Cudagraph support flags drive capture behavior."
     },
     {
       "name": "AttentionImpl / MLAAttentionImpl",
-      "location": "vllm/v1/attention/backend.py:910 (AttentionImpl), backend.py:1044 (MLAAttentionImpl)",
-      "inherits_from": "AttentionImplBase(ABC, Generic[T])",
+      "file": "vllm/v1/attention/backend.py:902 (AttentionImpl), :1036 (MLAAttentionImpl)",
+      "inherits_from": "AttentionImplBase[T], Generic[T]",
       "ascend_implementations": [
         "vllm_ascend.attention.attention_v1.AscendAttentionBackendImpl",
-        "vllm_ascend.attention.mla_v1.AscendMLAImpl",
-        "vllm_ascend.attention.sfa_v1.AscendSFAImpl"
+        "vllm_ascend.attention.mla_v1.AscendMLAImpl"
       ],
       "key_methods": [
-        {
-          "sig": "abstractmethod __init__(self, num_heads, head_size, scale, num_kv_heads=None, alibi_slopes=None, sliding_window=None, kv_cache_dtype='auto', logits_soft_cap=None, attn_type=AttentionType.DECODER, kv_sharing_target_layer_name=None)",
-          "desc": "Standard attention impl init.",
-          "line": "backend.py:920"
-        },
-        {
-          "sig": "abstractmethod forward(self, layer, query, key, value, kv_cache, attn_metadata, output, output_scale=None, output_block_scale=None) -> torch.Tensor",
-          "desc": "Attention forward.",
-          "line": "backend.py:936"
-        },
-        {
-          "sig": "process_weights_after_loading(self, act_dtype) -> None; get_impl_variants(self) -> tuple[AttentionImplBase, ...]; prepare_for_batch(self, attn_metadata) -> None",
-          "desc": "Lifecycle hooks.",
-          "line": "backend.py:900/903/906"
-        },
-        {
-          "sig": "MLAAttentionImpl abstractmethod forward_mqa(self, q, kv_c_and_k_pe_cache, attn_metadata, layer) -> tuple[torch.Tensor, torch.Tensor | None]",
-          "desc": "MLA MQA forward.",
-          "line": "backend.py:1090"
-        },
-        {
-          "sig": "MLAAttentionImpl forward_mha(...) (default raises); do_kv_cache_update(...)",
-          "desc": "MLA helpers.",
-          "line": "backend.py:1076/1113"
-        },
-        {
-          "sig": "fused_output_quant_supported / fused_qk_norm_rope_kvcache_supported / fused_qk_norm_mrope_kvcache_supported / fused_rope_kvcache_supported / do_qk_norm_rope_kvcache_update / do_qk_norm_mrope_kvcache_update / do_rope_and_kv_cache_update",
-          "desc": "Fusion hooks (overridable).",
-          "line": "backend.py:951-1041"
-        }
+        "AttentionImpl.__init__(self, num_heads, head_size, scale, num_kv_heads=None, alibi_slopes=None, sliding_window=None, kv_cache_dtype='auto', logits_soft_cap=None, attn_type=AttentionType.DECODER, kv_sharing_target_layer_name=None)  # abstract",
+        "AttentionImpl.forward(self, layer: AttentionLayer, query, key, value, kv_cache, attn_metadata: T, output, output_scale=None, output_block_scale=None) -> torch.Tensor  # abstract",
+        "MLAAttentionImpl.__init__(self, num_heads, head_size, scale, num_kv_heads, alibi_slopes, sliding_window, kv_cache_dtype, logits_soft_cap, attn_type, kv_sharing_target_layer_name, q_lora_rank, kv_lora_rank, qk_nope_head_dim, qk_rope_head_dim, qk_head_dim, v_head_dim, kv_b_proj, indexer=None, q_pad_num_heads=None)  # abstract",
+        "MLAAttentionImpl.forward_mqa(self, q, kv_c_and_k_pe_cache, attn_metadata, layer) -> tuple[torch.Tensor, torch.Tensor | None]  # abstract",
+        "MLAAttentionImpl.forward_mha(self, q, kv_c_normed, k_pe, kv_c_and_k_pe_cache, attn_metadata, k_scale, output, output_scale=None) -> None",
+        "process_weights_after_loading(self, act_dtype: torch.dtype)",
+        "fused_output_quant_supported(self, quant_key: QuantKey) -> bool"
       ],
-      "impact_rules": "Any change to forward signature, AttentionImpl.__init__ args, or the fusion hook set directly impacts Ascend attention impls. New abstract methods require NPU implementations."
+      "impact_rule": "The positional __init__ signature is the strict contract (Attention.__init__ calls it positionally). Any added/removed/reordered arg is a breaking change for OOT impls. forward signature changes break the unified_attention_with_output custom op call."
+    },
+    {
+      "name": "AttentionMetadata / CommonAttentionMetadata",
+      "file": "vllm/v1/attention/backend.py:379 / :386",
+      "inherits_from": "object (marker) / @dataclass",
+      "ascend_implementations": [
+        "vllm_ascend.attention.attention_v1.AscendAttentionMetadata",
+        "vllm_ascend.attention.mla_v1.AscendMLAMetadata"
+      ],
+      "key_methods": [
+        "CommonAttentionMetadata.batch_size(self) -> int",
+        "CommonAttentionMetadata.naive_query_lens(self) -> torch.Tensor",
+        "CommonAttentionMetadata.compute_num_computed_tokens(self) -> torch.Tensor",
+        "CommonAttentionMetadata.token_to_req_indices(self, buffer: torch.Tensor) -> torch.Tensor",
+        "CommonAttentionMetadata.replace(self, **kwargs) -> CommonAttentionMetadata",
+        "CommonAttentionMetadata.unpadded(self, num_actual_tokens, num_actual_reqs) -> CommonAttentionMetadata"
+      ],
+      "impact_rule": "CommonAttentionMetadata field additions are a common upstream change vector; OOT builders must consume new fields. Field/positional changes break all builders."
     },
     {
       "name": "AttentionLayerBase",
-      "location": "vllm/model_executor/layers/attention_layer_base.py:14",
+      "file": "vllm/model_executor/layers/attention_layer_base.py:14",
       "inherits_from": "abc.ABC",
       "ascend_implementations": [
-        "vllm_ascend.attention.attention_v1.AscendAttention (if defined)"
+        "used indirectly by vllm_ascend attention layer patches"
       ],
       "key_methods": [
-        {
-          "sig": "bind_kv_cache(self, kv_cache: torch.Tensor) -> None",
-          "desc": "Bind allocated KV cache to layer.",
-          "line": "attention_layer_base.py:27"
-        },
-        {
-          "sig": "abstractmethod get_attn_backend(self) -> type[AttentionBackend]",
-          "desc": "Backend class for this layer.",
-          "line": "attention_layer_base.py:36"
-        },
-        {
-          "sig": "abstractmethod get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None",
-          "desc": "KV spec for this layer.",
-          "line": "attention_layer_base.py:41"
-        }
+        "bind_kv_cache(self, kv_cache: torch.Tensor) -> None",
+        "abstractmethod get_attn_backend(self) -> type[AttentionBackend]",
+        "abstractmethod get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None"
       ],
-      "impact_rules": "Attention/mamba layer classes must keep these methods; the runner discovers layers via this base. Changing the bind/spec contract affects all backends including Ascend."
+      "impact_rule": "Mamba and Attention both derive from this; changes affect KV spec generation and block-size alignment."
     },
     {
-      "name": "Executor",
-      "location": "vllm/v1/executor/abstract.py:41",
-      "inherits_from": "abc.ABC (UniProcExecutor, MultiprocExecutor, RayDistributedExecutor, ExecutorWithExternalLauncher)",
-      "ascend_implementations": [],
-      "key_methods": [
-        {
-          "sig": "@staticmethod get_class(vllm_config: VllmConfig) -> type[Executor]",
-          "desc": "Select executor implementation from distributed_executor_backend.",
-          "line": "abstract.py:52"
-        },
-        {
-          "sig": "abstractmethod _init_executor(self) -> None",
-          "desc": "Create workers.",
-          "line": "abstract.py:118"
-        },
-        {
-          "sig": "initialize_from_config(self, kv_cache_configs: list[KVCacheConfig]) -> None",
-          "desc": "Forward KV config to workers.",
-          "line": "abstract.py:122"
-        },
-        {
-          "sig": "compile_or_warm_up_model(self) -> None",
-          "desc": "Worker warmup.",
-          "line": "abstract.py:126"
-        },
-        {
-          "sig": "determine_available_memory(self) -> list[int]",
-          "desc": "Per-worker available memory.",
-          "line": "abstract.py:149"
-        },
-        {
-          "sig": "get_kv_cache_specs(self) -> list[dict[str, KVCacheSpec]]",
-          "desc": "Collect specs.",
-          "line": "abstract.py:152"
-        },
-        {
-          "sig": "abstractmethod collective_rpc(self, method, timeout=None, args=(), kwargs=None, non_block=False) -> list[_R] | Future[list[_R]]",
-          "desc": "Dispatch RPC to workers.",
-          "line": "abstract.py:185"
-        },
-        {
-          "sig": "execute_model(self, scheduler_output, non_block=False) -> ModelRunnerOutput | None | Future",
-          "desc": "Forward step; base uses collective_rpc.",
-          "line": "abstract.py:237"
-        },
-        {
-          "sig": "sample_tokens(self, grammar_output, non_block=False)",
-          "desc": "Deferred sampling.",
-          "line": "abstract.py:257"
-        },
-        {
-          "sig": "check_health(self) -> None; shutdown(self) -> None; sleep/wake_up/discard",
-          "desc": "Lifecycle.",
-          "line": "abstract.py:286/292/347"
-        }
-      ],
-      "impact_rules": "vllm-ascend generally reuses Executor (MP/uni) unchanged, but NPUWorker must be compatible with the collective_rpc/execute_model contract. Changes to Executor.get_class or execute_model future semantics affect NPU multi-card execution."
-    },
-    {
-      "name": "SchedulerInterface",
-      "location": "vllm/v1/core/sched/interface.py:38",
-      "inherits_from": "abc.ABC (Scheduler, AsyncScheduler)",
-      "ascend_implementations": [],
-      "key_methods": [
-        {
-          "sig": "abstractmethod __init__(self, vllm_config, kv_cache_config, structured_output_manager, block_size, hash_block_size, mm_registry=MULTIMODAL_REGISTRY, include_finished_set=False, log_stats=False)",
-          "desc": "Construct scheduler.",
-          "line": "interface.py:40"
-        },
-        {
-          "sig": "abstractmethod schedule(self, throttle_prefills: bool = False) -> SchedulerOutput",
-          "desc": "Produce per-step schedule.",
-          "line": "interface.py:54"
-        },
-        {
-          "sig": "abstractmethod get_grammar_bitmask(self, scheduler_output) -> GrammarOutput | None",
-          "desc": "Structured output bitmask.",
-          "line": "interface.py:87"
-        },
-        {
-          "sig": "abstractmethod update_from_output(self, scheduler_output, model_runner_output) -> dict[int, EngineCoreOutputs]",
-          "desc": "Apply model outputs to request state.",
-          "line": "interface.py:93"
-        },
-        {
-          "sig": "abstractmethod update_draft_token_ids(self, draft_token_ids: DraftTokenIds) -> None; update_draft_token_ids_in_output(...)",
-          "desc": "Spec decode draft tokens.",
-          "line": "interface.py:114/125"
-        },
-        {
-          "sig": "abstractmethod add_request(self, request: Request) -> None; finish_requests(self, request_ids, finished_status) -> list[Request]",
-          "desc": "Request lifecycle.",
-          "line": "interface.py:140/150"
-        },
-        {
-          "sig": "abstractmethod get_num_unfinished_requests(self); has_finished_requests(self); get_request_counts(self); make_stats(self); shutdown(self)",
-          "desc": "Stats/lifecycle.",
-          "line": "interface.py:175/185/242/251/259"
-        },
-        {
-          "sig": "property abstractmethod pause_state(self) -> PauseState; set_pause_state(self, pause_state)",
-          "desc": "Pause/resume.",
-          "line": "interface.py:205/211"
-        },
-        {
-          "sig": "abstractmethod reset_prefix_cache(self, reset_running_requests=False, reset_connector=False) -> bool; reset_encoder_cache(self)",
-          "desc": "Cache reset.",
-          "line": "interface.py:215/233"
-        }
-      ],
-      "impact_rules": "vllm-ascend patches Scheduler for NPU-specific scheduling/cudagraph interactions. Signature changes to schedule/update_from_output or new abstract methods affect NPU patches and the ASCEND scheduler subclasses if present."
-    },
-    {
-      "name": "KVCacheSpec hierarchy",
-      "location": "vllm/v1/kv_cache_interface.py",
-      "inherits_from": "KVCacheSpec base (FullAttentionSpec, MLAAttentionSpec, MambaSpec, SlidingWindowSpec, ChunkedLocalAttentionSpec, CrossAttentionSpec, EncoderOnlyAttentionSpec, ...)",
+      "name": "SchedulerInterface / Scheduler",
+      "file": "vllm/v1/core/sched/interface.py:38 / scheduler.py:84",
+      "inherits_from": "abc.ABC / SchedulerInterface",
       "ascend_implementations": [
-        "Potential NPU-specific specs registered via Platform.register_custom_kv_cache_specs"
+        "vllm_ascend.core.scheduler.AscendScheduler (subclasses vllm.v1.core.sched.scheduler.Scheduler)"
       ],
       "key_methods": [
-        {
-          "sig": "page_size_bytes (property)",
-          "desc": "Bytes per page for block-size unification.",
-          "line": "kv_cache_interface.py"
-        },
-        {
-          "sig": "max_num_blocks_per_req(...); copy_with_new_block_size(...)",
-          "desc": "Block math helpers used by the runner/builders.",
-          "line": "kv_cache_interface.py"
-        },
-        {
-          "sig": "get_kv_quant_mode(cache_dtype)",
-          "desc": "KV quantization mode resolution.",
-          "line": "kv_cache_interface.py"
-        }
+        "abstractmethod __init__(self, vllm_config, kv_cache_config, structured_output_manager, block_size, hash_block_size, mm_registry=MULTIMODAL_REGISTRY, include_finished_set=False, log_stats=False)",
+        "abstractmethod schedule(self, throttle_prefills: bool = False) -> SchedulerOutput",
+        "abstractmethod get_grammar_bitmask(self, scheduler_output: SchedulerOutput) -> GrammarOutput | None",
+        "abstractmethod update_from_output(self, scheduler_output: SchedulerOutput, model_runner_output: ModelRunnerOutput) -> dict[int, EngineCoreOutputs]",
+        "abstractmethod update_draft_token_ids(self, draft_token_ids: DraftTokenIds) -> None",
+        "abstractmethod update_draft_token_ids_in_output(self, draft_token_ids, scheduler_output) -> None",
+        "abstractmethod add_request(self, request: Request) -> None",
+        "abstractmethod finish_requests(self, request_ids, finished_status: RequestStatus) -> list[Request]",
+        "abstractmethod get_num_unfinished_requests(self) -> int",
+        "abstractmethod has_finished_requests(self) -> bool",
+        "abstractmethod reset_prefix_cache(self, reset_running_requests=False, reset_connector=False) -> bool",
+        "abstractmethod make_stats(self, ...) -> SchedulerStats | None",
+        "abstractmethod shutdown(self) -> None",
+        "hook _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None",
+        "hook _update_request_with_output(self, request, new_token_ids, is_stale=False)"
       ],
-      "impact_rules": "Changes to page_size_bytes semantics or spec fields break KV block-size alignment and Ascend attention metadata builders. New spec types require Ascend support if NPU uses hybrid layouts."
+      "impact_rule": "AscendScheduler overrides schedule / _update_after_schedule / gets constructed via SchedulerConfig.get_scheduler_cls(). New abstract methods or changed schedule/update_from_output signatures are HIGH impact."
     },
     {
-      "name": "DeviceCommunicatorBase / All2AllManagerBase",
-      "location": "vllm/distributed/device_communicators/base_device_communicator.py",
-      "inherits_from": "object (CudaCommunicator, CpuCommunicator, XpuCommunicator, RayCommunicator)",
+      "name": "Executor (v1)",
+      "file": "vllm/v1/executor/abstract.py:54",
+      "inherits_from": "abc.ABC",
       "ascend_implementations": [
-        "vllm_ascend.distributed.device_communicators.npu_communicator.NPUCommunicator"
+        "vllm_ascend uses upstream executors (UniProcExecutor/MPExecutor); custom via worker_cls"
       ],
       "key_methods": [
-        {
-          "sig": "all_reduce(self, input_: torch.Tensor) -> torch.Tensor",
-          "desc": "All-reduce.",
-          "line": "base_device_communicator.py"
-        },
-        {
-          "sig": "all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor",
-          "desc": "All-gather.",
-          "line": "base_device_communicator.py"
-        },
-        {
-          "sig": "reduce_scatter(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor",
-          "desc": "Reduce-scatter.",
-          "line": "base_device_communicator.py"
-        },
-        {
-          "sig": "send(self, tensor, dst); recv(self, size, dtype, src)",
-          "desc": "P2P.",
-          "line": "base_device_communicator.py"
-        },
-        {
-          "sig": "All2AllManagerBase.__init__(self, cpu_group, tcp_store_group=None); dispatch(...); combine(...); dispatch_router_logits(...)",
-          "desc": "MoE all-to-all EP.",
-          "line": "base_device_communicator.py:38/95/80"
-        }
+        "staticmethod get_class(vllm_config: VllmConfig) -> type[Executor]",
+        "__init__(self, vllm_config: VllmConfig) -> None",
+        "abstractmethod _init_executor(self) -> None",
+        "abstractmethod collective_rpc(self, method, timeout=None, args=(), kwargs=None, non_block=False) -> list | Future",
+        "abstractmethod check_health(self) -> None",
+        "execute_model(self, scheduler_output, non_block=False) -> ModelRunnerOutput | None | Future",
+        "sample_tokens(self, grammar_output: GrammarOutput | None, non_block=False)",
+        "initialize_from_config(self, kv_cache_configs: list[KVCacheConfig]) -> None",
+        "compile_or_warm_up_model(self) -> None",
+        "determine_available_memory(self) -> list[int]",
+        "get_kv_cache_specs(self) -> list[dict[str, KVCacheSpec]]",
+        "supports_async_scheduling(cls) -> bool"
       ],
-      "impact_rules": "NPUCommunicator overrides these; changes to signatures or to GroupCoordinator collective interfaces break Ascend multi-card and MoE EP communication."
+      "impact_rule": "Executors dispatch to workers via collective_rpc; changing the execute_model/sample_tokens contract affects async scheduling (DP/elastic)."
     },
     {
-      "name": "CustomOp / PluggableLayer",
-      "location": "vllm/model_executor/custom_op.py:102 (CustomOp), :32 (PluggableLayer)",
-      "inherits_from": "torch.nn.Module",
+      "name": "LLMEngine / EngineCore / EngineCoreClient",
+      "file": "vllm/v1/engine/llm_engine.py:54 / core.py:112 / core_client.py:80",
+      "inherits_from": "object / object / abc.ABC",
       "ascend_implementations": [
-        "vllm_ascend.ops.* (registered via register_oot) e.g. AscendRMSNorm, AscendSiluAndMul, AscendRotaryEmbedding, AscendLinearMethod, AscendFusedMoE"
+        "none directly; consumed by runners"
       ],
       "key_methods": [
-        {
-          "sig": "__new__(cls, *args, **kwargs)",
-          "desc": "OOT class substitution via op_registry_oot keyed by class name.",
-          "line": "custom_op.py:107"
-        },
-        {
-          "sig": "__init__(self, *, enforce_enable=False, compile_native=False)",
-          "desc": "Select forward dispatch based on compilation mode.",
-          "line": "custom_op.py:128"
-        },
-        {
-          "sig": "forward_native/forward_cuda/forward_hip/forward_xpu/forward_cpu/forward_tpu/forward_oot(self, *args, **kwargs)",
-          "desc": "Per-platform forward dispatch (forward_oot for OOT platforms like Ascend).",
-          "line": "custom_op.py:136-170"
-        },
-        {
-          "sig": "@classmethod register_oot(cls, _decorated_layer_cls=None, name=None)",
-          "desc": "Register OOT replacement for a layer class.",
-          "line": "custom_op.py:83"
-        }
+        "LLMEngine.__init__(self, vllm_config, executor_class, log_stats, aggregate_engine_logging=False, usage_context=UsageContext.ENGINE_CONTEXT, stat_loggers=None, mm_registry=MULTIMODAL_REGISTRY, multiprocess_mode=False)",
+        "LLMEngine.step(self) -> list[RequestOutput | PoolingRequestOutput]",
+        "LLMEngine.add_request(self, request_id, prompt, params, arrival_time=None, lora_request=None, ...) -> str",
+        "EngineCore.__init__(self, vllm_config, executor_class, log_stats, executor_fail_callback=None, include_finished_set=False)",
+        "EngineCore.step(self) -> tuple[dict[int, EngineCoreOutputs], bool]",
+        "EngineCore.step_with_batch_queue(self) -> tuple[dict[int, EngineCoreOutputs] | None, bool]",
+        "EngineCore.add_request(self, request: Request, request_wave: int = 0)",
+        "EngineCore.abort_requests(self, request_ids: list[str])",
+        "EngineCore.collective_rpc(self, method, timeout=None, args=(), kwargs=None) -> list[_R]",
+        "EngineCoreClient.make_client(multiprocess_mode, asyncio_mode, vllm_config, executor_class, log_stats, renderer=None) -> EngineCoreClient",
+        "EngineCoreClient.abstractmethod shutdown(self, timeout=None) -> None",
+        "EngineCoreClient.get_output(self) -> EngineCoreOutputs"
       ],
-      "impact_rules": "vllm-ascend replaces many core layers via register_oot(name=...). Renaming a class, changing its __init__/forward signature, or changing op_registry_oot lookup semantics silently breaks NPU ops. forward_oot dispatch default depends on current_platform."
+      "impact_rule": "The schedule->execute->update loop is central. Changing EngineCore.step / step_fn or EngineCoreClient transport methods affects all platform integrations."
     },
     {
-      "name": "CompilerInterface / AbstractStaticGraphWrapper",
-      "location": "vllm/compilation/compiler_interface.py:29; vllm/compilation/base_static_graph.py:10",
-      "inherits_from": "object / typing.Protocol",
+      "name": "KVCacheSpec",
+      "file": "vllm/v1/kv_cache_interface.py:164",
+      "inherits_from": "@dataclass(frozen=True) (no base)",
       "ascend_implementations": [
-        "vllm_ascend.compilation.torchair_compiler or vllm_ascend.torchair.* (NPU static graph wrapper registered via Platform.get_static_graph_wrapper_cls)"
+        "vllm_ascend may register custom specs via register_kv_cache_spec (platform.register_custom_kv_cache_specs)"
       ],
       "key_methods": [
-        {
-          "sig": "CompilerInterface.compile(self, graph, example_inputs, compiler_config, compile_range, key=None) -> tuple[Callable | None, Any | None]",
-          "desc": "Compile an FX graph.",
-          "line": "compiler_interface.py:64"
-        },
-        {
-          "sig": "CompilerInterface.load(self, handle, graph, example_inputs, graph_index, compile_range) -> Callable",
-          "desc": "Load cached graph.",
-          "line": "compiler_interface.py:97"
-        },
-        {
-          "sig": "CompilerInterface.initialize_cache(self, cache_dir, disable_cache=False, prefix='') -> None; compute_hash(self, vllm_config) -> str",
-          "desc": "Cache management.",
-          "line": "compiler_interface.py:36/53"
-        },
-        {
-          "sig": "AbstractStaticGraphWrapper.__init__(self, runnable, vllm_config, runtime_mode: CUDAGraphMode, **kwargs)",
-          "desc": "Wrap compiled piece for graph replay (torchair on NPU).",
-          "line": "base_static_graph.py:15"
-        },
-        {
-          "sig": "AbstractStaticGraphWrapper.__call__(self, *args, **kwargs) -> Any",
-          "desc": "Replay.",
-          "line": "base_static_graph.py:40"
-        }
+        "abstract property num_heads(self) -> int",
+        "abstract property tokens_per_state(self) -> int | Fraction",
+        "abstract property state_content_size_bytes(self) -> int",
+        "abstract property page_size_bytes(self) -> int",
+        "abstract method max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int",
+        "classmethod merge(cls, specs: list[Self]) -> Self",
+        "copy_with_new_block_size(self, block_size: int) -> Self",
+        "is_uniform_with_collection(self, kv_cache_specs: dict[str, KVCacheSpec]) -> bool",
+        "get_num_kernel_states(self, kernel_block_size: int) -> int",
+        "max_num_blocks_per_req(self, vllm_config: VllmConfig, max_len: int) -> int"
       ],
-      "impact_rules": "NPU graph mode depends on CompilationConfig.init_backend + get_static_graph_wrapper_cls returning a torchair-compatible wrapper. Signature changes to compile/load or to CUDAGraphMode force Ascend compilation updates."
+      "impact_rule": "Adding a required abstract property breaks custom spec subclasses. Changes to page_size_bytes semantics affect block sizing and memory accounting for NPU."
     },
     {
-      "name": "ModelRegistry",
-      "location": "vllm/model_executor/models/registry.py:1113",
-      "inherits_from": "_ModelRegistry dataclass",
+      "name": "KVCacheManager / BlockPool / KVCacheCoordinator",
+      "file": "vllm/v1/core/kv_cache_manager.py:131 / block_pool.py:136 / kv_cache_coordinator.py:89",
+      "inherits_from": "object / object / abc.ABC",
       "ascend_implementations": [
-        "vllm_ascend.models.* registered at import time into ModelRegistry via register_model"
+        "vllm_ascend uses upstream managers; custom single-type managers registerable"
       ],
       "key_methods": [
-        {
-          "sig": "register_model(self, model_arch: str, model_cls: type[nn.Module] | str) -> None",
-          "desc": "Register architecture -> class or 'module:class' lazy loader.",
-          "line": "registry.py:1121"
-        },
-        {
-          "sig": "resolve_model_cls(self, architectures: str | list[str], model_config: ModelConfig) -> tuple[type[nn.Module], str]",
-          "desc": "Resolve arch to model class.",
-          "line": "registry.py:1365"
-        },
-        {
-          "sig": "get_supported_archs(self) -> Set[str]",
-          "desc": "All registered archs.",
-          "line": "registry.py:1118"
-        },
-        {
-          "sig": "is_text_generation_model(self, architectures, model_config) -> bool; is_pooling_model(...)",
-          "desc": "Task classification.",
-          "line": "registry.py:1419/1427"
-        }
+        "KVCacheManager.__init__(self, kv_cache_config, max_model_len, scheduler_block_size, hash_block_size, max_in_flight_tokens=None, enable_caching=True, use_eagle=False, num_prefill_lookahead=0, log_stats=False, enable_kv_cache_events=False, dcp_world_size=1, pcp_world_size=1, metrics_collector=None, watermark=0.0, enable_mamba_shared_prefix_checkpoint=False)",
+        "KVCacheManager.get_computed_blocks(request) -> tuple[KVCacheBlocks, int, int]",
+        "KVCacheManager.allocate_slots(request, num_new_tokens, ...) -> KVCacheBlocks | None",
+        "KVCacheManager.free(request) -> None / cache_blocks(request, num_computed_tokens) -> None",
+        "BlockPool.__init__(self, num_gpu_blocks, enable_caching, hash_block_size, enable_kv_cache_events=False, metrics_collector=None, medium='gpu')",
+        "BlockPool.get_new_blocks(self, num_blocks: int) -> list[KVCacheBlock]",
+        "BlockPool.free_blocks(self, ordered_blocks) -> None / reset_prefix_cache(self) -> bool",
+        "KVCacheCoordinator.abstractmethod find_longest_cache_hit(self, block_hashes: list[BlockHash], max_cache_hit_length: int) -> tuple[tuple[list[KVCacheBlock], ...], int, int]"
       ],
-      "impact_rules": "vllm-ascend registers NPU model overrides by architecture name (overwriting upstream). Changes to registry lookup order or to register_model semantics can cause NPU overrides to be bypassed or conflict."
+      "impact_rule": "KV manager is engine-internal but signature changes ripple to any scheduler override. BlockPool is a stable ABI used by all backends."
+    },
+    {
+      "name": "SingleTypeKVCacheManager + register_kv_cache_spec",
+      "file": "vllm/v1/core/single_type_kv_cache_manager.py / vllm/v1/kv_cache_spec_registry.py:186",
+      "inherits_from": "object / decorator",
+      "ascend_implementations": [
+        "vllm_ascend.register_custom_kv_cache_specs"
+      ],
+      "key_methods": [
+        "register_kv_cache_spec(manager_class=None, uniform_type_base_spec=None) -> decorator",
+        "KVCacheSpecRegistry.register(kvcache_spec_cls, manager_class=None, uniform_type_base_spec=None) -> None",
+        "KVCacheSpecRegistry.register_role_manager(role, manager_class) -> None",
+        "KVCacheSpecRegistry.get_manager_class(kvcache_spec, role=None)"
+      ],
+      "impact_rule": "Registration API is the sanctioned extension point for platform-specific KV layouts."
+    },
+    {
+      "name": "GroupCoordinator",
+      "file": "vllm/distributed/parallel_state.py:426",
+      "inherits_from": "object",
+      "ascend_implementations": [
+        "used by vllm_ascend with NPU device communicator; groups created via upstream factories"
+      ],
+      "key_methods": [
+        "__init__(self, group_ranks: list[list[int]], local_rank: int, torch_distributed_backend: str | Backend, use_device_communicator: bool, use_message_queue_broadcaster=False, group_name=None, use_all2all=False)",
+        "all_reduce(self, input_: torch.Tensor) -> torch.Tensor",
+        "all_gather(self, input_, dim=-1) -> torch.Tensor",
+        "reduce_scatter(self, input_, dim=-1) -> torch.Tensor",
+        "all_gatherv(self, input_, dim=0, sizes=None)",
+        "reduce_scatterv(self, input_, dim=-1, sizes=None)",
+        "broadcast(self, input_, src=0) / broadcast_object(self, obj=None, src=0)",
+        "broadcast_tensor_dict(self, tensor_dict=None, src=0, group=None, metadata_group=None)",
+        "send_tensor_dict / isend_tensor_dict / recv_tensor_dict / irecv_tensor_dict(...)",
+        "dispatch_router_logits(self, hidden_states, router_logits, is_sequence_parallel=False, extra_tensors=None)",
+        "dispatch(self, hidden_states, topk_weights, topk_ids, is_sequence_parallel=False, extra_tensors=None)",
+        "combine(self, hidden_states, is_sequence_parallel=False) -> torch.Tensor",
+        "barrier(self) / destroy(self)"
+      ],
+      "impact_rule": "Signature changes to dispatch/combine/all_gatherv affect NPU MoE and sequence-parallel paths."
+    },
+    {
+      "name": "DeviceCommunicatorBase",
+      "file": "vllm/distributed/device_communicators/base_device_communicator.py:192",
+      "inherits_from": "object (duck-typed base)",
+      "ascend_implementations": [
+        "vllm_ascend's device communicator (resolved via NPUPlatform.get_device_communicator_cls)"
+      ],
+      "key_methods": [
+        "__init__(self, cpu_group: ProcessGroup, device: torch.device | None = None, device_group: ProcessGroup | None = None, unique_name: str = '', global_ranks=None, global_world_size=None, use_all2all=False)",
+        "all_reduce(self, input_: torch.Tensor) -> torch.Tensor",
+        "all_gather(self, input_, dim=-1) -> torch.Tensor",
+        "all_gatherv(self, input_, dim=0, sizes=None)  # raises NotImplementedError",
+        "reduce_scatter(self, input_, dim=-1) -> torch.Tensor",
+        "reduce_scatterv(self, input_, dim=-1, sizes=None)  # raises NotImplementedError",
+        "batch_isend_irecv(self, p2p_ops)  # raises NotImplementedError",
+        "dispatch_router_logits / dispatch / combine(...)",
+        "get_symmetric_memory_buffer(self, role, shape, dtype, device)",
+        "destroy(self)"
+      ],
+      "impact_rule": "This is THE device-collective contract for OOT hardware. Any new required (NotImplementedError) method must be implemented by the NPU communicator."
     },
     {
       "name": "Sampler / TopKTopPSampler",
-      "location": "vllm/v1/sample/sampler.py:22; vllm/v1/sample/ops/topk_topp_sampler.py:202",
-      "inherits_from": "torch.nn.Module",
+      "file": "vllm/v1/sample/sampler.py:22 / ops/topk_topp_sampler.py:202",
+      "inherits_from": "torch.nn.Module / torch.nn.Module",
       "ascend_implementations": [
-        "vllm_ascend.sample.* patched samplers (monkey-patch)"
+        "vllm_ascend patches/overrides TopKTopPSampler for NPU (worker patch), no separate Sampler subclass"
       ],
       "key_methods": [
-        {
-          "sig": "Sampler.forward(self, logits, sampling_metadata, predict_bonus_token=False, logprobs_mode_override=None) -> SamplerOutput",
-          "desc": "Main sampling entry.",
-          "line": "sampler.py:73"
-        },
-        {
-          "sig": "Sampler.sample(self, logits, sampling_metadata, logprobs_mode_override=None) -> tuple[torch.Tensor, torch.Tensor | None]",
-          "desc": "Core sample step.",
-          "line": "sampler.py:247"
-        },
-        {
-          "sig": "TopKTopPSampler.forward_native/forward_cuda/forward_hip/forward_xpu/forward_cpu(...)",
-          "desc": "Per-platform top-k/top-p sampling dispatch.",
-          "line": "topk_topp_sampler.py:263/286/371/433/315"
-        }
+        "Sampler.__init__(self, logprobs_mode='raw_logprobs', use_fp64_gumbel=False)",
+        "Sampler.forward(self, logits, sampling_metadata: SamplingMetadata, predict_bonus_token=False, logprobs_mode_override=None) -> SamplerOutput",
+        "Sampler.sample(self, logits, sampling_metadata, logprobs_mode_override=None) -> tuple[torch.Tensor, torch.Tensor | None]",
+        "Sampler.apply_logits_processors(self, logits, sampling_metadata, predict_bonus_token) -> torch.Tensor",
+        "TopKTopPSampler.__init__(self, logprobs_mode='raw_logprobs', use_fp64_gumbel=False)",
+        "forward_native/forward_cuda/forward_cpu/forward_hip/forward_xpu(self, logits, generators, k, p) -> tuple[torch.Tensor, torch.Tensor | None]",
+        "TopKTopPSampler.forward selected by platform in __init__"
       ],
-      "impact_rules": "vllm-ascend patches TopKTopPSampler/forward_native because there is no NPU dispatch. Changes to dispatch conditions or method names require patch updates; SamplingMetadata field changes break patches."
+      "impact_rule": "vllm-ascend typically monkey-patches TopKTopPSampler.forward (platform dispatch has no `forward_npu`), so changes to Sampler.sample/forward or TopKTopPSampler signature are HIGH impact."
+    },
+    {
+      "name": "LogitsProcessor (ABC)",
+      "file": "vllm/v1/sample/logits_processor/interface.py:60",
+      "inherits_from": "abc.ABC",
+      "ascend_implementations": [
+        "custom logits processors registerable via vllm.logits_processors entry point"
+      ],
+      "key_methods": [
+        "classmethod validate_params(cls, sampling_params: SamplingParams)",
+        "abstractmethod __init__(self, vllm_config: VllmConfig, device: torch.device, is_pin_memory: bool)",
+        "abstractmethod apply(self, logits: torch.Tensor) -> torch.Tensor",
+        "abstractmethod is_argmax_invariant(self) -> bool",
+        "abstractmethod update_state(self, batch_update: BatchUpdate | None) -> None"
+      ],
+      "impact_rule": "Plugins implementing logits processors must track this ABC."
+    },
+    {
+      "name": "ModelRegistry (_ModelRegistry)",
+      "file": "vllm/model_executor/models/registry.py:1120 / singleton at :1524",
+      "inherits_from": "@dataclass (no base)",
+      "ascend_implementations": [
+        "vllm_ascend registers NPU-specific model classes via register_model"
+      ],
+      "key_methods": [
+        "get_supported_archs(self) -> Set[str]",
+        "register_model(self, model_arch: str, model_cls: type[nn.Module] | str) -> None",
+        "inspect_model_cls(self, architectures, model_config) -> tuple[_ModelInfo, str]",
+        "resolve_model_cls(self, architectures, model_config) -> tuple[type[nn.Module], str]",
+        "is_text_generation_model / is_pooling_model / is_multimodal_model / is_pp_supported_model / is_hybrid_model(...) -> bool"
+      ],
+      "impact_rule": "register_model is stable; _ModelInfo field additions propagate from model interfaces and can affect platform model gating."
+    },
+    {
+      "name": "CustomOp / PluggableLayer",
+      "file": "vllm/model_executor/custom_op.py:102 / :32",
+      "inherits_from": "torch.nn.Module",
+      "ascend_implementations": [
+        "vllm_ascend overrides many ops via register_oot and forward_oot"
+      ],
+      "key_methods": [
+        "__new__(cls, *args, **kwargs)  # OOT class substitution from op_registry_oot",
+        "__init__(self, *, enforce_enable=False, compile_native=False)",
+        "forward_native(self, *args, **kwargs)  # raises NotImplementedError",
+        "forward_cuda / forward_hip / forward_xpu / forward_cpu / forward_tpu(self, *args, **kwargs)",
+        "forward_oot(self, *args, **kwargs)",
+        "dispatch_forward(self, compile_native: bool)",
+        "classmethod register(cls, name: str, dynamic_arg_dims=None)",
+        "classmethod register_oot(cls, _decorated_op_cls=None, name=None)"
+      ],
+      "impact_rule": "vllm-ascend relies on op_registry_oot substitution and forward_oot. Changing dispatch_forward or __new__ substitution logic breaks all NPU op overrides."
+    },
+    {
+      "name": "BaseModelLoader",
+      "file": "vllm/model_executor/model_loader/base_loader.py:27",
+      "inherits_from": "abc.ABC",
+      "ascend_implementations": [
+        "vllm_ascend uses upstream loaders, may register custom loader"
+      ],
+      "key_methods": [
+        "__init__(self, load_config: LoadConfig)",
+        "get_external_weight_memory(self, vllm_config: VllmConfig) -> int",
+        "abstractmethod download_model(self, model_config: ModelConfig) -> None",
+        "abstractmethod load_weights(self, model: nn.Module, model_config: ModelConfig) -> None",
+        "create_model(self, vllm_config, model_config, prefix='') -> nn.Module",
+        "load_model(self, vllm_config, model_config, prefix='') -> nn.Module"
+      ],
+      "impact_rule": "get_model_loader(load_config) resolves via registry; platform uses register_model_loader for custom formats."
+    },
+    {
+      "name": "CompilerInterface",
+      "file": "vllm/compilation/compiler_interface.py:29",
+      "inherits_from": "object (duck-typed base, no abc)",
+      "ascend_implementations": [
+        "vllm_ascend compilation backend via NPUPlatform.get_compile_backend() (returns a CompilerInterface subclass qualname)"
+      ],
+      "key_methods": [
+        "name: str (class attr)",
+        "initialize_cache(self, cache_dir: str, disable_cache: bool = False, prefix: str = '') -> None",
+        "compute_hash(self, vllm_config: VllmConfig) -> str",
+        "compile(self, graph: fx.GraphModule, example_inputs: list[Any], compiler_config: dict[str, Any], compile_range: Range, key: str | None = None) -> tuple[Callable[..., Any] | None, Any | None]",
+        "load(self, handle, graph, example_inputs, graph_index: int, compile_range: Range) -> Callable[..., Any]  # default raises"
+      ],
+      "impact_rule": "OOT compile backends must implement compile(); load() required if caching. Signature changes break Ascend compilation."
+    },
+    {
+      "name": "InductorPass / VllmInductorPass / PostGradPassManager",
+      "file": "vllm/compilation/passes/inductor_pass.py:66 / vllm_inductor_pass.py:37 / pass_manager.py:88",
+      "inherits_from": "torch._inductor.custom_graph_pass.CustomGraphPass",
+      "ascend_implementations": [
+        "vllm_ascend custom pass manager/backends via get_pass_manager_cls"
+      ],
+      "key_methods": [
+        "InductorPass.uuid(self) -> str",
+        "InductorPass.hash_source(*srcs) -> str / hash_dict(dict_) -> str",
+        "InductorPass.is_applicable_for_range(self, compile_range: Range) -> bool",
+        "VllmInductorPass.__init__(self, config: VllmConfig)",
+        "PostGradPassManager.__init__(self) / configure(self, config: VllmConfig) / add(self, pass_) / __call__(self, graph: fx.Graph) / uuid(self)"
+      ],
+      "impact_rule": "vllm-ascend supplies a pass manager via Platform.get_pass_manager_cls returning a qualname; must expose configure/add/uuid/__call__."
+    },
+    {
+      "name": "Config classes (VllmConfig, ModelConfig, CacheConfig, ParallelConfig, CompilationConfig, ...)",
+      "file": "vllm/config/vllm.py:341, model.py:151, cache.py:69, parallel.py:136, compilation.py:383",
+      "inherits_from": "@config (pydantic dataclass)",
+      "ascend_implementations": [
+        "vllm-ascend subclasses/extend paths via vllm_ascend.platform + additional_config; patches config defaults"
+      ],
+      "key_methods": [
+        "VllmConfig.compute_hash(self, include_version=True) -> str",
+        "VllmConfig.__post_init__(self)",
+        "ModelConfig.compute_hash(self) -> str",
+        "CacheConfig.compute_hash(self) -> str",
+        "ParallelConfig.compute_hash(self) -> str",
+        "CompilationConfig.init_backend(self, vllm_config, prefix='', is_encoder=False) -> str | Callable",
+        "CompilationConfig.__post_init__(self)",
+        "SchedulerConfig.get_scheduler_cls(self) -> ..."
+      ],
+      "impact_rule": "New config fields are usually additive (low risk). Renamed/removed fields or changed compute_hash inputs invalidate compile cache and break NPU config patches."
+    },
+    {
+      "name": "LLM (offline entrypoint)",
+      "file": "vllm/entrypoints/llm.py:63",
+      "inherits_from": "BeamSearchOfflineMixin, PoolingOfflineMixin, RLOfflineMixin, OfflineInferenceMixin",
+      "ascend_implementations": [
+        "not subclassed; used as-is"
+      ],
+      "key_methods": [
+        "__init__(self, model: str, *, runner='auto', convert='auto', tokenizer=None, tensor_parallel_size=1, dtype='auto', quantization=None, enforce_eager=False, compilation_config=None, ...)",
+        "generate(self, prompts, sampling_params=None, *, use_tqdm=True, lora_request=None, priority=None, ...) -> list[RequestOutput]",
+        "chat(self, messages, sampling_params=None, ...) -> list[RequestOutput]",
+        "encode(self, prompts, pooling_params=None, ...) -> list[PoolingRequestOutput]",
+        "embed(self, prompts, ...) -> list[EmbeddingRequestOutput]",
+        "classify(self, prompts, ...) -> list[ClassificationRequestOutput]",
+        "score(self, data_1, data_2, /, ...) -> list[ScoringRequestOutput]",
+        "collective_rpc(self, method, timeout=None, args=(), kwargs=None) -> list[_R]",
+        "apply_model(self, func) -> list[_R]",
+        "sleep(self, level=1, mode='abort') / wake_up(self, tags=None) -> bool",
+        "start_profile(self, profile_prefix=None, *, delay_iterations=None, max_iterations=None) / stop_profile(self)"
+      ],
+      "impact_rule": "Stable public API; changes here affect all downstream tooling but not typically NPU internals."
     }
   ],
-  "implementation_principles": {
-    "engine_core_scheduling_loop": "EngineCoreProc.run_busy_loop repeatedly: _process_input_queue (dispatch ADD/ABORT/UTILITY from ZMQ) -> _process_engine_step. EngineCore.step() calls Scheduler.schedule() to build SchedulerOutput, then Executor.execute_model(scheduler_output, non_block=True) returns a future, computes grammar bitmask concurrently, joins the future (or calls sample_tokens if execute_model returned None), processes aborts, and calls Scheduler.update_from_output() to build EngineCoreOutputs. Outputs are serialized (msgpack) and pushed over ZMQ to the client; the frontend OutputProcessor detokenizes into RequestOutput. AsyncScheduler uses output placeholders to schedule the next step before prior samples are known.",
-    "gpu_model_runner_forward": "GPUModelRunner.execute_model(scheduler_output, intermediate_tensors): (1) _update_states syncs request state from scheduler output; (2) _prepare_inputs builds input_ids/positions and computes num_scheduled_tokens; (3) _build_attention_metadata builds CommonAttentionMetadata and per-AttentionGroup metadata via builder.build/build_for_cudagraph_capture; (4) encoder (multimodal) runs if applicable; (5) set_forward_context installs attn metadata, then model forward; (6) hidden_states[logits_indices] -> self.model.compute_logits; (7) sampling (Sampler) or deferral to sample_tokens. Overridable seams: _prepare_inputs, _model_forward, _build_attention_metadata, initialize_attn_backend/kv_cache, _compute logits path, _sample.",
-    "platform_plugin_loading": "vllm.platforms uses a module-level __getattr__ to lazily resolve current_platform on first access. resolve_current_platform_cls_qualname() loads entry points under 'vllm.platform_plugins' via load_plugins_by_group, evaluates builtin detectors plus OOT detectors, requires exactly one OOT activation (which takes precedence), else exactly one builtin, else UnspecifiedPlatform. A detector is a zero-arg callable returning a qualname or None. vllm-ascend exposes NPUPlatform through this entry point.",
-    "attention_backend_registration_and_selection": "register_backend() stores class-path overrides keyed by AttentionBackendEnum. At layer construction, Attention.__init__ calls selector.get_attn_backend(...) which builds AttentionSelectorConfig and calls @cache _cached_get_attn_backend -> current_platform.get_attn_backend_cls(selected_backend, config, num_heads). Explicit user backend is validated through AttentionBackend.validate_configuration; otherwise the platform returns its preferred class (CUDA/ROCm/XPU/NPU each rank candidates). The runner then regroups layers into AttentionGroups and instantiates builders via get_builder_cls().",
-    "torch_compile_integration": "For CompilationMode.VLLM_COMPILE, torch.compile uses VllmBackend as backend. VllmBackend builds a CompilerManager -> make_compiler picks CompilerInterface (InductorStandaloneAdaptor/InductorAdaptor/EagerAdaptor/platform). The FX graph is split at splitting_ops; each piece becomes a PiecewiseBackend compiled per Range. Pieces are optionally wrapped by the platform static graph wrapper (CUDAGraphWrapper default, torchair for NPU) at runtime_mode PIECEWISE. PostGradPassManager (CustomGraphPass) applies InductorPass fusion passes. Cache key = VllmConfig.compute_hash().",
-    "kv_cache_management": "CacheConfig.block_size is reconciled with attention kernel block sizes by Platform.update_block_size_for_backend (LCM across backends, hybrid/mamba page padding, quantized skip-layer alignment). The runner asks Worker get_kv_cache_spec, the engine resolves a KVCacheConfig, and KVCacheManager allocates blocks per request each step from BlockPool (FreeKVCacheBlockQueue LRU + block-hash prefix cache). Attention backends consume block tables/slot mappings via CommonAttentionMetadata and bind allocated tensors with AttentionLayerBase.bind_kv_cache."
-  },
-  "module_dependencies": [
-    "engine.core -> executor (get_class) -> worker (WorkerWrapperBase -> WorkerBase) -> model_runner (GPUModelRunner) -> attention backend + sampler + kv_cache",
-    "engine.core -> core.sched.Scheduler -> core.kv_cache_manager.KVCacheManager -> core.block_pool.BlockPool",
-    "worker <-> distributed.parallel_state.GroupCoordinator and device_communicators (via platform.get_device_communicator_cls)",
-    "model_runner -> model_executor.models.ModelRegistry.resolve_model_cls -> model classes -> layers (attention/moe/quant/rope) -> CustomOp/PluggableLayer",
-    "platform -> everything: config defaults, worker_cls, attn backend cls, communicator cls, graph wrapper, kernels",
-    "compilation -> config.CompilationConfig + platform.get_compile_backend/get_pass_manager_cls/get_static_graph_wrapper_cls + worker.compile_or_warm_up_model",
-    "entrypoints.async_llm/llm -> engine.core_client -> engine.core",
-    "vllm-ascend: platform.NPUPlatform -> NPUWorker -> NPUModelRunner -> Ascend attention backends + NPUCommunicator + torchair graph wrapper + custom ops/quantization, plus patches into upstream Scheduler/Worker/Sampler/VocabParallelEmbedding/ParallelLMHead"
+  "implementation_principles": [
+    {
+      "topic": "Platform plugin loading mechanism",
+      "detail": "`vllm/platforms/__init__.py` loads the `vllm.platform_plugins` entry-point group via `load_plugins_by_group`. Each entry point is a factory returning either a platform class qualname or None. Builtins (tpu/cuda/rocm/xpu/cpu) are chained with OOT plugins; exactly one OOT may activate, else RuntimeError. `current_platform` is resolved lazily through module-level `__getattr__` (avoids import cycles because OOT plugins import `Platform` from vllm.platforms). vllm-ascend registers a `vllm.platform_plugins` entry point returning `vllm_ascend.platform.NPUPlatform`."
+    },
+    {
+      "topic": "EngineCore scheduling loop",
+      "detail": "LLMEngine.step() -> EngineCoreClient.get_output() -> (InprocClient) EngineCore.step_fn() where step_fn is step or step_with_batch_queue. EngineCore.step: scheduler.schedule(throttle) -> SchedulerOutput; executor.execute_model(scheduler_output, non_block=True) -> future; scheduler.get_grammar_bitmask(scheduler_output) computed in parallel; future.result() -> ModelRunnerOutput or None; if None, executor.sample_tokens(grammar_output); _process_aborts_queue(); scheduler.update_from_output(scheduler_output, model_output) -> per-engine EngineCoreOutputs; returns (outputs, model_executed)."
+    },
+    {
+      "topic": "GPUModelRunner forward pass",
+      "detail": "execute_model returns None after doing all model work (this is the async-scheduling seam). Steps: validate execute_model_state empty -> handle KV-connector preemptions -> _update_states (persistent batch) -> early-return for EC/empty -> _prepare_inputs (logits_indices, spec-decode metadata) -> determine batch execution/padding & cudagraph mode -> _get_slot_mappings -> _build_attention_metadata -> _preprocess (input_ids/positions/model_kwargs) -> _model_forward under set_forward_context -> postprocess (PP intermediate, pooling, or compute logits) -> store ExecuteModelState -> return None. Then sample_tokens() unpacks state, applies grammar bitmask, samples, updates states, proposes draft tokens, returns ModelRunnerOutput. Override points: _model_forward, _init_device_properties, _sync_device, _on_request_state_removed; Worker._make_model_runner selects the runner class."
+    },
+    {
+      "topic": "AttentionBackend registration and selection",
+      "detail": "Attention.__init__ (or layer) calls selector.get_attn_backend(...), which builds an AttentionSelectorConfig, applies attention_config.backend_per_kind overrides, and calls the cached _cached_get_attn_backend. That delegates to current_platform.get_attn_backend_cls(selected_backend, attn_selector_config, num_heads), which returns a class-path string. CUDA's implementation validates each candidate via backend_cls.validate_configuration(device_capability=..., **selector._asdict()) and picks the highest-priority valid backend, logging invalid reasons. The string is resolved via resolve_obj_by_qualname. OOT platforms override get_attn_backend_cls to return their own backend; backends can also be registered/overridden via AttentionBackendEnum.register() / register_backend()."
+    },
+    {
+      "topic": "torch.compile integration pipeline",
+      "detail": "CompilationConfig.init_backend() returns a stock backend string for STOCK_TORCH_COMPILE/DYNAMO_TRACE_ONCE, or a VllmBackend instance for VLLM_COMPILE. VllmBackend splits the fx graph on splitting_ops into piecewise submodules (PiecewiseCompileInterpreter), compiles each via CompilerManager -> CompilerInterface.compile (InductorAdaptor / InductorStandaloneAdaptor / platform backend), and optionally wraps pieces with AbstractStaticGraphWrapper for CUDA graphs. PostGradPassManager runs custom Inductor passes (fusion, noop elimination) and is installed under Platform.pass_key ('post_grad_custom_post_pass'). Compile cache key = VllmConfig hash + compiler hash + traced-code hash."
+    },
+    {
+      "topic": "KV cache management data flow",
+      "detail": "At startup, each attention layer reports get_kv_cache_spec(); specs are grouped into KVCacheGroups (KVCacheConfig). KVCacheManager builds a BlockPool (all blocks, free queue, hash->block map) and a KVCacheCoordinator (unitary/hybrid/no-prefix). During schedule(), allocate_slots() maps a request's tokens to blocks (with prefix-cache hash matching), and the scheduler records block_ids in ScheduledNewReqs/CachedReqs. The worker initializes physical KV tensors (initialize_kv_cache) and attention metadata builders consume block tables. Prefix caching is hash-based at hash_block_size granularity."
+    },
+    {
+      "topic": "Distributed execution",
+      "detail": "init_distributed_environment creates the world group; initialize_model_parallel builds TP/PP/DP/EP/DCP/PCP/EPLB groups (rank order ExternalDP x DP x PP x PCP x TP). GroupCoordinator wraps each ProcessGroup and lazily constructs a DeviceCommunicatorBase resolved from current_platform.get_device_communicator_cls(). MoE all2all uses All2AllManagerBase implementations selected by all2all_backend. Weight/KV/EC transfer use dedicated connectors."
+    },
+    {
+      "topic": "Hardware differences handling",
+      "detail": "Platform-specific behavior is centralized in Platform subclasses (cuda/rocm/xpu/cpu/tpu/zen_cpu + OOT). Examples: CUDA selects attention via device capability priorities and enables custom all-reduce + opaque attention op; ROCm overrides attention/quantization and uses AITER; XPU provides custom sampler/attention; CPU disables cudagraph and custom all-reduce. Common platform-agnostic seams: get_attn_backend_cls, get_device_communicator_cls, get_punica_wrapper, import_kernels, register_triton_kernel_overrides, compile backend/pass manager, supported_dtypes, supported_quantization."
+    }
   ],
+  "module_dependencies": {
+    "entrypoints": [
+      "engine",
+      "config",
+      "inputs",
+      "multimodal",
+      "renderers",
+      "parser",
+      "sampling_params"
+    ],
+    "engine.v1.LLMEngine": [
+      "engine.v1.EngineCoreClient",
+      "engine.v1.InputProcessor",
+      "engine.v1.OutputProcessor"
+    ],
+    "engine.v1.EngineCore": [
+      "core.sched.Scheduler",
+      "v1.executor.Executor",
+      "v1.structured_output"
+    ],
+    "v1.executor": [
+      "v1.worker.Worker (via WorkerWrapperBase)",
+      "distributed.parallel_state"
+    ],
+    "v1.worker": [
+      "v1.model_runner (GPUModelRunner)",
+      "v1.attention",
+      "v1.core.kv_cache",
+      "distributed",
+      "compilation",
+      "config"
+    ],
+    "v1.attention": [
+      "platforms.get_attn_backend_cls",
+      "v1.kv_cache_interface"
+    ],
+    "v1.core.sched": [
+      "v1.core.kv_cache_manager",
+      "v1.core.block_pool",
+      "v1.request",
+      "v1.outputs"
+    ],
+    "model_executor": [
+      "platforms",
+      "config",
+      "distributed",
+      "compilation",
+      "v1.attention"
+    ],
+    "compilation": [
+      "platforms",
+      "config",
+      "model_executor.models.registry"
+    ],
+    "distributed": [
+      "platforms",
+      "config"
+    ],
+    "platforms": [
+      "config (TYPE_CHECKING)",
+      "v1.attention.backends.registry",
+      "device_allocator"
+    ],
+    "v1.kv_cache_interface": [
+      "config",
+      "utils"
+    ]
+  },
   "hardware_abstraction": {
     "platform_agnostic_interfaces": [
-      "vllm/platforms/interface.py::Platform",
-      "vllm/v1/worker/worker_base.py::WorkerBase / WorkerWrapperBase",
-      "vllm/v1/executor/abstract.py::Executor",
-      "vllm/v1/core/sched/interface.py::SchedulerInterface",
-      "vllm/v1/attention/backend.py::AttentionBackend / AttentionMetadataBuilder / AttentionImpl / MLAAttentionImpl",
-      "vllm/model_executor/layers/attention_layer_base.py::AttentionLayerBase",
-      "vllm/model_executor/custom_op.py::CustomOp / PluggableLayer",
-      "vllm/distributed/device_communicators/base_device_communicator.py::DeviceCommunicatorBase / All2AllManagerBase",
-      "vllm/compilation/compiler_interface.py::CompilerInterface",
-      "vllm/compilation/base_static_graph.py::AbstractStaticGraphWrapper",
-      "vllm/v1/kv_cache_interface.py::KVCacheSpec"
+      "Platform (vllm/platforms/interface.py)",
+      "WorkerBase (vllm/v1/worker/worker_base.py)",
+      "AttentionBackend / AttentionMetadataBuilder / AttentionImpl / MLAAttentionImpl (vllm/v1/attention/backend.py)",
+      "SchedulerInterface (vllm/v1/core/sched/interface.py)",
+      "Executor (vllm/v1/executor/abstract.py)",
+      "KVCacheSpec (vllm/v1/kv_cache_interface.py)",
+      "DeviceCommunicatorBase (vllm/distributed/device_communicators/base_device_communicator.py)",
+      "CompilerInterface / InductorPass (vllm/compilation/)",
+      "BaseModelLoader (vllm/model_executor/model_loader/base_loader.py)",
+      "CustomOp / PluggableLayer (vllm/model_executor/custom_op.py)"
     ],
     "platform_specific_implementations": [
-      "vllm/platforms/cuda.py (CudaPlatformBase/NvmlCudaPlatform/NonNvmlCudaPlatform)",
-      "vllm/platforms/rocm.py (RocmPlatform, AITER backends)",
-      "vllm/platforms/cpu.py + zen_cpu.py",
-      "vllm/platforms/xpu.py",
-      "vllm/platforms/tpu.py (delegates to tpu_inference)",
-      "vllm/v1/worker/gpu_model_runner.py (GPU), cpu_model_runner.py, xpu_model_runner.py",
-      "vllm/v1/attention/backends/flash_attn.py, triton_attn.py, flashinfer.py, rocm_aiter_fa.py, rocm_attn.py, mla/flashmla*.py",
-      "vllm/distributed/device_communicators/cuda_communicator.py, cpu_communicator.py, xpu_communicator.py",
-      "vllm/compilation/cuda_graph.py (CUDAGraphWrapper)"
+      "vllm/platforms/cuda.py (CudaPlatform, NvmlCudaPlatform, NonNvmlCudaPlatform)",
+      "vllm/platforms/rocm.py (RocmPlatform, AITER)",
+      "vllm/platforms/xpu.py (XPUPlatform)",
+      "vllm/platforms/cpu.py / zen_cpu.py (CpuPlatform, ZenCpuPlatform)",
+      "vllm/platforms/tpu.py (TpuPlatform)",
+      "vllm/v1/attention/backends/* (FlashAttention, FlashInfer, Triton, FlashMLA, ROCm AITER, CPU, XPU)",
+      "vllm/distributed/device_communicators/cuda_communicator.py / xpu_communicator.py / cpu_communicator.py",
+      "vllm/model_executor/layers/** forward_cuda/forward_hip/forward_xpu/forward_cpu/forward_tpu",
+      "vllm/v1/worker/gpu_worker.py, cpu_worker.py, xpu_worker.py"
     ],
-    "oot_extension_points": [
-      "entry point group 'vllm.platform_plugins' returning a Platform subclass qualname",
-      "entry point group 'vllm.general_plugins' for general plugin registration",
-      "entry point group 'vllm.io_processor_plugins', 'vllm.stat_logger_plugins', 'vllm.endpoint_plugins'",
-      "CustomOp.register_oot / PluggableLayer.register_oot for layer replacement",
-      "AttentionBackendEnum overrides via register_backend",
-      "ModelRegistry.register_model for architecture override",
-      "Platform methods: check_and_update_config, get_attn_backend_cls, get_device_communicator_cls, get_punica_wrapper, get_static_graph_wrapper_cls, stateless_init_device_torch_dist_pg, register_custom_kv_cache_specs, pre_register_and_update, apply_config_platform_defaults"
-    ]
+    "oot_injection": "vllm.platform_plugins entry point -> factory returns platform class qualname. Platform then supplies worker_cls, communicator, compile backend, pass manager, attention backends, punica wrapper, kernels."
   },
-  "interface_surface": {
-    "extended_by_ascend": [
-      {
-        "interface": "Platform",
-        "base_location": "vllm/platforms/interface.py:135",
-        "ascend_class": "vllm_ascend.platform.NPUPlatform",
-        "reason": "Registers the Ascend platform; sets NPU worker, attention backend, communicator, graph wrapper, config defaults.",
-        "key_methods": [
-          "check_and_update_config(cls, vllm_config)",
-          "get_attn_backend_cls(cls, selected_backend, attn_selector_config, num_heads=None)",
-          "get_device_communicator_cls(cls)",
-          "get_punica_wrapper(cls)",
-          "get_static_graph_wrapper_cls(cls)",
-          "stateless_init_device_torch_dist_pg(cls, backend, prefix_store, group_rank, group_size, timeout)",
-          "support_hybrid_kv_cache(cls)",
-          "get_compile_backend(cls)",
-          "pre_register_and_update(cls, parser=None)",
-          "apply_config_platform_defaults(cls, vllm_config)"
-        ],
-        "impact": "Any signature/behavior change to these methods or addition of required Platform methods breaks NPU support."
-      },
-      {
-        "interface": "WorkerBase",
-        "base_location": "vllm/v1/worker/worker_base.py:44",
-        "ascend_class": "vllm_ascend.worker.worker.NPUWorker",
-        "reason": "Owns the NPU device lifecycle and constructs NPUModelRunner.",
-        "key_methods": [
-          "init_device(self)",
-          "load_model(self, *, load_dummy_weights=False)",
-          "determine_available_memory(self)",
-          "initialize_from_config(self, kv_cache_config)",
-          "compile_or_warm_up_model(self)",
-          "execute_model(self, scheduler_output)",
-          "sample_tokens(self, grammar_output)",
-          "get_kv_cache_spec(self)"
-        ],
-        "impact": "Signature or contract changes to these lifecycle methods break NPU worker initialization/execution."
-      },
-      {
-        "interface": "GPUModelRunner",
-        "base_location": "vllm/v1/worker/gpu_model_runner.py:479",
-        "ascend_class": "vllm_ascend.worker.model_runner.NPUModelRunner",
-        "reason": "Adapts the forward/attention/KV-cache paths to NPU and Ascend attention.",
-        "key_methods": [
-          "__init__(self, vllm_config, device)",
-          "execute_model(self, scheduler_output, intermediate_tensors=None)",
-          "_prepare_inputs(self, scheduler_output, num_scheduled_tokens)",
-          "_build_attention_metadata(self, num_tokens, num_reqs, max_query_len, ...)",
-          "initialize_attn_backend(self, kv_cache_config, is_profiling=False)",
-          "initialize_kv_cache(self, kv_cache_config, is_profiling=False, kv_cache_allocation_context=None)",
-          "load_model(self, load_dummy_weights=False)",
-          "profile_run(self, randomize_inputs=False)",
-          "capture_model(self)",
-          "sample_tokens(self, grammar_output)"
-        ],
-        "impact": "High. Method renames/signature changes and internal-helper changes directly break NPU execution and graph capture."
-      },
-      {
-        "interface": "AttentionBackend",
-        "base_location": "vllm/v1/attention/backend.py:61",
-        "ascend_class": "vllm_ascend.attention.attention_v1.AscendAttentionBackend / mla_v1.AscendMLABackend / sfa_v1.AscendSFABackend",
-        "reason": "Implements Ascend paged attention / MLA / sparse for NPU.",
-        "key_methods": [
-          "get_name()",
-          "get_impl_cls()",
-          "get_builder_cls()",
-          "get_supported_kernel_block_sizes(kv_cache_spec=None)",
-          "supports_head_size(head_size)",
-          "supports_block_size(block_size)",
-          "supports_compute_capability(capability)",
-          "supports_combination(...)",
-          "validate_configuration(...)",
-          "customize_spec(spec)",
-          "supported_kv_cache_layouts()"
-        ],
-        "impact": "Abstract-method changes are breaking; capability signature changes require NPU updates; platform get_attn_backend_cls must keep resolving Ascend classes."
-      },
-      {
-        "interface": "AttentionMetadataBuilder",
-        "base_location": "vllm/v1/attention/backend.py:599",
-        "ascend_class": "vllm_ascend.attention.attention_v1.AscendAttentionMetadataBuilder",
-        "reason": "Builds Ascend per-step attention metadata.",
-        "key_methods": [
-          "__init__(self, kv_cache_spec, layer_names, vllm_config, device)",
-          "build(self, common_prefix_len, common_attn_metadata, fast_build=False)",
-          "build_for_cudagraph_capture(self, common_attn_metadata)",
-          "update_block_table(self, metadata, blk_table, slot_mapping)",
-          "get_cudagraph_support(cls, vllm_config, kv_cache_spec)"
-        ],
-        "impact": "Changes to build signature or CommonAttentionMetadata fields break Ascend metadata construction."
-      },
-      {
-        "interface": "AttentionImpl / MLAAttentionImpl",
-        "base_location": "vllm/v1/attention/backend.py:910 / :1044",
-        "ascend_class": "vllm_ascend.attention.attention_v1.AscendAttentionBackendImpl / mla_v1.AscendMLAImpl",
-        "reason": "Executes Ascend attention kernels.",
-        "key_methods": [
-          "forward(self, layer, query, key, value, kv_cache, attn_metadata, output, output_scale=None, output_block_scale=None)",
-          "forward_mqa(self, q, kv_c_and_k_pe_cache, attn_metadata, layer)",
-          "process_weights_after_loading(self, act_dtype)",
-          "do_kv_cache_update(...)",
-          "fused_*_supported hooks"
-        ],
-        "impact": "Forward signature and fusion-hook changes directly break Ascend attention."
-      },
-      {
-        "interface": "AttentionLayerBase",
-        "base_location": "vllm/model_executor/layers/attention_layer_base.py:14",
-        "ascend_class": "NPU attention layer wrappers (as applicable)",
-        "reason": "KV cache binding and layer discovery.",
-        "key_methods": [
-          "bind_kv_cache(self, kv_cache)",
-          "get_attn_backend(self)",
-          "get_kv_cache_spec(self, vllm_config)"
-        ],
-        "impact": "Changes affect KV binding for NPU attention layers."
-      },
-      {
-        "interface": "DeviceCommunicatorBase / All2AllManagerBase",
-        "base_location": "vllm/distributed/device_communicators/base_device_communicator.py:38",
-        "ascend_class": "vllm_ascend.distributed.device_communicators.npu_communicator.NPUCommunicator",
-        "reason": "HCCL-based collectives and MoE EP all-to-all on NPU.",
-        "key_methods": [
-          "all_reduce(self, input_)",
-          "all_gather(self, input_, dim=-1)",
-          "reduce_scatter(self, input_, dim=-1)",
-          "send/recv",
-          "dispatch/combine/dispatch_router_logits"
-        ],
-        "impact": "Signature changes break NPU distributed collectives and MoE EP."
-      },
-      {
-        "interface": "CustomOp / PluggableLayer",
-        "base_location": "vllm/model_executor/custom_op.py:102 / :32",
-        "ascend_class": "vllm_ascend.ops.* registered through register_oot (RMSNorm, SiluAndMul, RotaryEmbedding, LinearMethod, FusedMoE, etc.)",
-        "reason": "Replaces core ops/layers with NPU kernels.",
-        "key_methods": [
-          "__new__(cls, *args, **kwargs)",
-          "register_oot(_decorated_layer_cls=None, name=None)",
-          "forward_oot(self, *args, **kwargs)"
-        ],
-        "impact": "Class renames/signature changes of replaced layers silently break NPU op substitution."
-      },
-      {
-        "interface": "CompilerInterface / AbstractStaticGraphWrapper",
-        "base_location": "vllm/compilation/compiler_interface.py:29 / base_static_graph.py:10",
-        "ascend_class": "vllm_ascend torchair graph wrapper (registered via Platform.get_static_graph_wrapper_cls) and ascend compile backend",
-        "reason": "NPU graph mode (torchair) capture/replay.",
-        "key_methods": [
-          "compile(self, graph, example_inputs, compiler_config, compile_range, key=None)",
-          "load(...)",
-          "initialize_cache(...)",
-          "__call__(self, *args, **kwargs)"
-        ],
-        "impact": "Changes to compile/load signature or CUDAGraphMode flow break NPU graph capture."
-      },
-      {
-        "interface": "ModelRegistry",
-        "base_location": "vllm/model_executor/models/registry.py:1113",
-        "ascend_class": "vllm_ascend.models.* registered via register_model",
-        "reason": "NPU model overrides by architecture.",
-        "key_methods": [
-          "register_model(self, model_arch, model_cls)",
-          "resolve_model_cls(self, architectures, model_config)"
-        ],
-        "impact": "Lookup-order changes can bypass NPU overrides; register_model API changes break NPU model registration."
-      },
-      {
-        "interface": "Sampler / TopKTopPSampler",
-        "base_location": "vllm/v1/sample/sampler.py:22 / ops/topk_topp_sampler.py:202",
-        "ascend_class": "vllm_ascend.sample.* (patched)",
-        "reason": "No NPU dispatch in TopKTopPSampler; patched for NPU sampling.",
-        "key_methods": [
-          "Sampler.forward(self, logits, sampling_metadata, predict_bonus_token=False, logprobs_mode_override=None)",
-          "TopKTopPSampler.forward_native(...)"
-        ],
-        "impact": "Dispatch changes or SamplingMetadata field changes break NPU sampling patches."
-      }
-    ],
-    "used_but_not_extended": [
-      "vllm/v1/engine/core.py::EngineCore / EngineCoreProc (used by all platforms)",
-      "vllm/v1/engine/core_client.py::EngineCoreClient and subclasses",
-      "vllm/v1/engine/output_processor.py::OutputProcessor",
-      "vllm/v1/engine/input_processor.py::InputProcessor",
-      "vllm/v1/executor/* (Executor reuse; worker_cls is swapped)",
-      "vllm/v1/core/sched/scheduler.py::Scheduler (patched, not subclassed typically)",
-      "vllm/distributed/parallel_state.py::GroupCoordinator",
-      "vllm/config/vllm.py::VllmConfig and sub-configs",
-      "vllm/entrypoints/*"
-    ]
-  },
+  "interface_surface": [
+    {
+      "interface": "Platform",
+      "base_location": "vllm/platforms/interface.py:137",
+      "ascend_impl": "vllm_ascend.platform.NPUPlatform",
+      "critical_methods": [
+        "get_attn_backend_cls(selected_backend, attn_selector_config, num_heads=None) -> str",
+        "get_mla_prefill_backend_cls(mla_selector_config) -> type[MLAPrefillBackend]",
+        "check_and_update_config(vllm_config) -> None",
+        "apply_config_platform_defaults(vllm_config) -> None",
+        "pre_register_and_update(parser=None) -> None",
+        "update_block_size_for_backend(vllm_config) -> None",
+        "register_custom_kv_cache_specs(vllm_config) -> None",
+        "verify_model_arch(model_arch) -> None",
+        "verify_quantization(quant) -> None",
+        "get_device_capability(device_id=0) -> DeviceCapability | None",
+        "get_device_name / get_device_total_memory / get_device_uuid(device_id=0)",
+        "get_device_communicator_cls() -> str",
+        "get_punica_wrapper() -> str",
+        "import_kernels() / import_ir_kernels()",
+        "get_compile_backend() -> str / get_pass_manager_cls() -> str / get_static_graph_wrapper_cls() -> str",
+        "set_device(device) / manual_seed_all(seed) / get_current_memory_usage(device=None)",
+        "get_all_gpu_pci_bus_ids() / num_compute_units(device_id=0)",
+        "stateless_init_device_torch_dist_pg(backend, prefix_store, group_rank, group_size, timeout) -> ProcessGroup",
+        "validate_request(processed_inputs, params) / validate_environ(hard_fail)"
+      ],
+      "change_consequences": "HIGH if a method NPUPlatform overrides changes signature/semantics; MEDIUM if a new hook is added (additive); LOW if only CUDA-specific methods change. The lazy current_platform resolution contract must be preserved."
+    },
+    {
+      "interface": "WorkerBase / Worker",
+      "base_location": "vllm/v1/worker/worker_base.py:44 / gpu_worker.py:192",
+      "ascend_impl": "vllm_ascend.worker.worker.NPUWorker",
+      "critical_methods": [
+        "init_device()",
+        "_make_model_runner() -> GPUModelRunner",
+        "load_model(*, load_dummy_weights=False)",
+        "determine_available_memory() -> int",
+        "initialize_from_config(kv_cache_config) -> None",
+        "compile_or_warm_up_model() -> CompilationTimes",
+        "execute_model(scheduler_output) -> ModelRunnerOutput | AsyncModelRunnerOutput | None",
+        "sample_tokens(grammar_output) -> ModelRunnerOutput | AsyncModelRunnerOutput",
+        "get_kv_cache_spec() -> dict[str, KVCacheSpec]",
+        "get_cache_block_size_bytes() -> int",
+        "check_health() / synchronize_device() / shutdown()"
+      ],
+      "change_consequences": "HIGH. NPUWorker centrally overrides device init, runner construction, memory profiling, warmup, and forward. Any change to these signatures, to WorkerWrapperBase.init_worker worker_cls contract, or to the execute_model/sample_tokens split breaks NPU."
+    },
+    {
+      "interface": "GPUModelRunner",
+      "base_location": "vllm/v1/worker/gpu_model_runner.py:467",
+      "ascend_impl": "vllm_ascend.worker.model_runner.NPUModelRunner",
+      "critical_methods": [
+        "__init__(vllm_config, device)",
+        "execute_model(scheduler_output, intermediate_tensors=None)",
+        "sample_tokens(grammar_output)",
+        "_prepare_inputs(scheduler_output, num_scheduled_tokens)",
+        "_build_attention_metadata(...)",
+        "_model_forward(input_ids=None, positions=None, ...)",
+        "_init_device_properties() / _sync_device() / _on_request_state_removed(...)",
+        "load_model(load_dummy_weights=False, *, model=None)",
+        "profile_run(randomize_inputs=False) / capture_model()",
+        "initialize_attn_backend(...) / initialize_kv_cache(...) / get_kv_cache_spec()"
+      ],
+      "change_consequences": "HIGH. NPUModelRunner reimplements parts of the forward pipeline; changes to _prepare_inputs/_build_attention_metadata/_model_forward/execute_model/capture_model require mirror edits."
+    },
+    {
+      "interface": "AttentionBackend / AttentionMetadataBuilder / AttentionImpl / MLAAttentionImpl / AttentionMetadata",
+      "base_location": "vllm/v1/attention/backend.py",
+      "ascend_impl": [
+        "vllm_ascend.attention.attention_v1.AscendAttentionBackend",
+        "vllm_ascend.attention.attention_v1.AscendAttentionMetadataBuilder",
+        "vllm_ascend.attention.attention_v1.AscendAttentionBackendImpl",
+        "vllm_ascend.attention.mla_v1.AscendMLABackend",
+        "vllm_ascend.attention.mla_v1.AscendMLAMetadataBuilder",
+        "vllm_ascend.attention.mla_v1.AscendMLAImpl"
+      ],
+      "critical_methods": [
+        "AttentionBackend.get_name / get_impl_cls / get_builder_cls",
+        "AttentionBackend.validate_configuration(...)",
+        "AttentionMetadataBuilder.__init__(kv_cache_spec, layer_names, vllm_config, device) / build(common_prefix_len, common_attn_metadata, fast_build=False)",
+        "AttentionImpl.__init__(num_heads, head_size, scale, ...) / forward(layer, query, key, value, kv_cache, attn_metadata, output, ...)",
+        "MLAAttentionImpl.__init__(..., q_lora_rank, kv_lora_rank, qk_nope_head_dim, qk_rope_head_dim, qk_head_dim, v_head_dim, kv_b_proj, ...) / forward_mqa(q, kv_c_and_k_pe_cache, attn_metadata, layer)"
+      ],
+      "change_consequences": "HIGH. Positional __init__ signatures are strict; new abstract methods/template methods in AttentionBackend/Impl break all OOT backends. forward signature must match the unified_attention_with_output custom op."
+    },
+    {
+      "interface": "SchedulerInterface / Scheduler",
+      "base_location": "vllm/v1/core/sched/interface.py:38 / scheduler.py:84",
+      "ascend_impl": "vllm_ascend.core.scheduler.AscendScheduler",
+      "critical_methods": [
+        "schedule(throttle_prefills=False) -> SchedulerOutput",
+        "update_from_output(scheduler_output, model_runner_output) -> dict[int, EngineCoreOutputs]",
+        "get_grammar_bitmask(scheduler_output) -> GrammarOutput | None",
+        "add_request(request) / finish_requests(request_ids, finished_status)",
+        "_update_after_schedule(scheduler_output) / _update_request_with_output(...)",
+        "reset_prefix_cache(...) / make_stats(...) / shutdown()"
+      ],
+      "change_consequences": "HIGH. AscendScheduler overrides scheduling hooks; new abstract methods in SchedulerInterface break it."
+    },
+    {
+      "interface": "KVCacheSpec and registry",
+      "base_location": "vllm/v1/kv_cache_interface.py:164 / kv_cache_spec_registry.py:186",
+      "ascend_impl": "registered via NPUPlatform.register_custom_kv_cache_specs + @register_kv_cache_spec",
+      "critical_methods": [
+        "num_heads / tokens_per_state / state_content_size_bytes / page_size_bytes (abstract properties)",
+        "max_memory_usage_bytes(vllm_config) -> int (abstract)",
+        "merge(specs) / copy_with_new_block_size(block_size) / is_uniform_with_collection(...)",
+        "register_kv_cache_spec(manager_class=None, uniform_type_base_spec=None)"
+      ],
+      "change_consequences": "HIGH if a new abstract property/method is added or page-size semantics change; MEDIUM otherwise."
+    },
+    {
+      "interface": "DeviceCommunicatorBase / GroupCoordinator",
+      "base_location": "vllm/distributed/device_communicators/base_device_communicator.py:192 / parallel_state.py:426",
+      "ascend_impl": "NPU device communicator via NPUPlatform.get_device_communicator_cls()",
+      "critical_methods": [
+        "DeviceCommunicatorBase.__init__(cpu_group, device=None, device_group=None, unique_name='', global_ranks=None, global_world_size=None, use_all2all=False)",
+        "all_reduce / all_gather / reduce_scatter / all_gatherv / reduce_scatterv / batch_isend_irecv",
+        "dispatch_router_logits / dispatch / combine",
+        "GroupCoordinator.dispatch / combine / all_gatherv / broadcast_tensor_dict / send/isend/recv/irecv_tensor_dict"
+      ],
+      "change_consequences": "HIGH. OOT hardware must implement the device communicator; new required methods or changed dispatch/combine signatures break NPU MoE/parallelism."
+    },
+    {
+      "interface": "Executor",
+      "base_location": "vllm/v1/executor/abstract.py:54",
+      "ascend_impl": "not subclassed; executors instantiate NPUWorker via worker_cls",
+      "critical_methods": [
+        "_init_executor() (abstract) / collective_rpc(...) (abstract) / check_health() (abstract)",
+        "execute_model(scheduler_output, non_block=False) / sample_tokens(grammar_output, non_block=False)",
+        "initialize_from_config / compile_or_warm_up_model / determine_available_memory / get_kv_cache_specs",
+        "get_class(vllm_config) / supports_async_scheduling()"
+      ],
+      "change_consequences": "MEDIUM. Contract used by engine loop; async scheduling variants sensitive to execute/sample split."
+    },
+    {
+      "interface": "CompilerInterface / InductorPass / PostGradPassManager",
+      "base_location": "vllm/compilation/compiler_interface.py:29 / passes/inductor_pass.py:66 / passes/pass_manager.py:88",
+      "ascend_impl": "NPU compile backend + pass manager via Platform.get_compile_backend / get_pass_manager_cls",
+      "critical_methods": [
+        "CompilerInterface.compile(graph, example_inputs, compiler_config, compile_range, key=None) -> (callable, handle)",
+        "CompilerInterface.load(handle, graph, example_inputs, graph_index, compile_range)",
+        "CompilerInterface.compute_hash(vllm_config) / initialize_cache(cache_dir, disable_cache=False, prefix='')",
+        "PostGradPassManager.configure(config) / add(pass_) / uuid() / __call__(graph)"
+      ],
+      "change_consequences": "MEDIUM-HIGH. Ascend compilation relies on these; signature/hash-input changes can invalidate caches or break compiles."
+    },
+    {
+      "interface": "Sampler / TopKTopPSampler",
+      "base_location": "vllm/v1/sample/sampler.py:22 / ops/topk_topp_sampler.py:202",
+      "ascend_impl": "monkey-patched via vllm_ascend worker patch (no forward_npu dispatch)",
+      "critical_methods": [
+        "Sampler.forward(logits, sampling_metadata, predict_bonus_token=False, logprobs_mode_override=None)",
+        "Sampler.sample(logits, sampling_metadata, logprobs_mode_override=None)",
+        "TopKTopPSampler.__init__(logprobs_mode='raw_logprobs', use_fp64_gumbel=False)",
+        "TopKTopPSampler.forward_native/forward_cuda/forward_cpu/forward_hip/forward_xpu(logits, generators, k, p)"
+      ],
+      "change_consequences": "HIGH because NPU support is via patch rather than a platform dispatch method; internal method renames break patches."
+    },
+    {
+      "interface": "CustomOp / PluggableLayer",
+      "base_location": "vllm/model_executor/custom_op.py:102 / :32",
+      "ascend_impl": "vllm_ascend op overrides via register_oot and forward_oot",
+      "critical_methods": [
+        "__new__(cls, *args, **kwargs) (OOT substitution)",
+        "__init__(self, *, enforce_enable=False, compile_native=False) / dispatch_forward(compile_native)",
+        "forward_native/forward_cuda/forward_hip/forward_xpu/forward_cpu/forward_tpu/forward_oot",
+        "register(name, dynamic_arg_dims=None) / register_oot(...)"
+      ],
+      "change_consequences": "HIGH. The OOT substitution mechanism and forward dispatch are the basis of NPU kernel overrides."
+    },
+    {
+      "interface": "Config classes",
+      "base_location": "vllm/config/*.py (vllm.py:341, model.py:151, cache.py:69, parallel.py:136, compilation.py:383, attention.py:37, kernel.py:270, scheduler.py:25)",
+      "ascend_impl": "vllm-ascend patches defaults/validation and uses additional_config",
+      "critical_methods": [
+        "VllmConfig.compute_hash(include_version=True) / __post_init__",
+        "ModelConfig.compute_hash / CacheConfig.compute_hash / ParallelConfig.compute_hash",
+        "CompilationConfig.init_backend(vllm_config, prefix='', is_encoder=False) / __post_init__",
+        "SchedulerConfig.get_scheduler_cls()"
+      ],
+      "change_consequences": "MEDIUM. Field additions low risk; renames/removals or compute_hash input changes are HIGH (cache + NPU patches)."
+    },
+    {
+      "interface": "ModelRegistry",
+      "base_location": "vllm/model_executor/models/registry.py:1120",
+      "ascend_impl": "vllm_ascend registers NPU model variants via ModelRegistry.register_model",
+      "critical_methods": [
+        "register_model(model_arch, model_cls)",
+        "resolve_model_cls(architectures, model_config) -> (type[nn.Module], str)",
+        "get_supported_archs()"
+      ],
+      "change_consequences": "LOW-MEDIUM. Stable registration API."
+    }
+  ],
   "cross_project_relationship": {
     "vllm_to_ascend_map": {
-      "vllm.platforms.interface.Platform": "vllm_ascend.platform.NPUPlatform (vllm_ascend/platform.py:86)",
-      "vllm.platforms.__init__.py (platform resolution)": "vllm_ascend.platform.NPUPlatform (registered as 'npu' via vllm_ascend.platform)",
-      "vllm.v1.worker.worker_base.WorkerBase": "vllm_ascend.worker.worker.NPUWorker (worker.py:121); vllm_ascend._310p.worker_310p.NPUWorker310; vllm_ascend.xlite.xlite_worker.XliteWorker",
-      "vllm.v1.worker.gpu_model_runner.GPUModelRunner (v1)": "vllm_ascend.worker.model_runner_v1.NPUModelRunner (model_runner_v1.py:353); vllm_ascend._310p.model_runner_310p.NPUModelRunner310",
-      "vllm.v1.worker.gpu.model_runner.GPUModelRunner (v2/MRv2)": "vllm_ascend.worker.v2.model_runner.NPUModelRunner (v2/model_runner.py:97); vllm_ascend._310p.worker.v2.model_runner.NPUModelRunner310V2",
-      "vllm.v1.attention.backend.AttentionBackend": "vllm_ascend.attention.attention_v1.AscendAttentionBackend; mla_v1.AscendMLABackend; sfa_v1.AscendSFABackend; dsa_v1.AscendDSABackend (+ C4/C128/SWA/State variants); fa3_v1.AscendFABackend; indexer.AscendSFAIndexerBackend; _310p.attention.attention_v1.AscendAttentionBackend310",
-      "vllm.v1.attention.backend.AttentionImpl / MLAAttentionImpl / AttentionImplBase": "vllm_ascend.attention.attention_v1.AscendAttentionBackendImpl / AscendC8AttentionBackendImpl / AscendFAImpl; mla_v1.AscendMLAImpl; sfa_v1.AscendSFAImpl; dsa_v1.AscendDSAImpl",
-      "vllm.v1.attention.backend.AttentionMetadataBuilder / vllm.model_executor.layers.attention.mla_attention.MLACommonMetadataBuilder": "vllm_ascend.attention.attention_v1.AscendAttentionMetadataBuilder; mla_v1.AscendMLAMetadataBuilder; sfa_v1.AscendSFAMetadataBuilder; dsa_v1.AscendDSAMetadataBuilder; indexer.AscendSFAIndexerMetadataBuilder; _310p...AscendAttentionMetadataBuilder310; DCP/PCP/DSA-CP builders",
-      "vllm.model_executor.layers.attention_layer_base.AttentionLayerBase": "vllm_ascend NPU attention layer wrappers (AscendAttention layer classes); no single named override exposed in summary (partial)",
-      "vllm.v1.attention.backends.mla.common.get_mla_prefill_backend / MLAPrefillBackend": "vllm_ascend no-op AscendMLAPrefillBackend registered by vllm_ascend.patch.platform.patch_mla_prefill_backend",
-      "vllm.v1.attention.backends.mla.index_group.SparseMLAIndexGroupBuilder": "patched via vllm_ascend.patch.worker.patch_deepseek_v2 (used by Ascend DeepSeek SFA)",
-      "vllm.v1.attention.backends.registry (AttentionBackendRegistry)": "vllm_ascend.attention.* backends resolved through NPUPlatform.get_attn_backend_cls",
-      "vllm.v1.kv_cache_interface.FullAttentionSpec / MLAAttentionSpec / SlidingWindowSpec / SlidingWindowMLASpec / MambaSpec / KVCacheSpecRegistry": "vllm_ascend AscendMLAAttentionSpec, AscendSFAIndexerCacheSpec, AscendSlidingWindowMLASpec, AscendIndexerKPoolTailSpec (registered by register_ascend_kv_cache_specs)",
-      "vllm.distributed.device_communicators.base_device_communicator.DeviceCommunicatorBase": "vllm_ascend.distributed.device_communicators.npu_communicator.NPUCommunicator",
-      "vllm.distributed.device_communicators.base_device_communicator.All2AllManagerBase": "vllm_ascend MoE all-to-all managers (NPUCommunicator dispatch/combine/dispatch_router_logits path)",
-      "vllm.distributed.kv_transfer.kv_connector.v1.base.KVConnectorBase_V1 (+ SupportsHMA / MultiConnector)": "vllm_ascend.distributed.kv_transfer.*: MooncakeConnector, MooncakeHybridConnector, MooncakeLayerwiseConnector, SfaRemoteD2HConnector, AscendStoreConnector, UCMConnectorV1, AscendMultiConnector, AscendSimpleCPUOffloadConnector, AscendOffloadingConnector, PreemptOffloadConnectorV1",
-      "vllm.distributed.eplb.eplb_state.EplbState / EplbLayerState": "vllm_ascend.distributed.eplb.state.AscendEplbState / AscendEplbLayerState; AscendGlooEplbCommunicator; StairEplbPolicy; patched by patch_eplb.py",
-      "vllm.model_executor.layers.linear.LinearMethodBase": "vllm_ascend.quantization.method_adapters.AscendLinearMethod",
-      "vllm.model_executor.layers.fused_moe.FusedMoEMethodBase / FusedMoEFactory": "vllm_ascend.quantization.method_adapters.AscendFusedMoEMethod; AscendMoERunner (FusedMoEFactory redirected by patch_fused_moe.py)",
-      "vllm.model_executor.layers.quantization.kv_cache.BaseKVCacheMethod": "vllm_ascend.quantization.method_adapters.AscendKVCacheMethod",
-      "vllm.model_executor.layers.quantization.base_config.QuantizationConfig": "vllm_ascend.quantization.configs.*: AscendModelSlimConfig, AscendCompressedTensorsConfig, AscendFp8Config, AscendDeepseekV4FP8Config, AscendModelOptMxFp8Config, AscendModelSlimConfig310",
-      "vllm.model_executor.layers.quantization (embedding)": "vllm_ascend.quantization.method_adapters.AscendEmbeddingMethod",
-      "vllm.model_executor.custom_op.CustomOp / PluggableLayer": "vllm_ascend.ops.* registered through CustomOp.register_oot (AscendRMSNorm, AscendSiluAndMul, AscendRotaryEmbedding, AscendLinearMethod, AscendFusedMoE, ...)",
-      "vllm.compilation.compiler_interface.CompilerInterface": "vllm_ascend.compilation.compiler_interface.AscendCompiler",
-      "vllm.compilation.base_static_graph.AbstractStaticGraphWrapper": "vllm_ascend.compilation.acl_graph.ACLGraphWrapper (returned by NPUPlatform.get_static_graph_wrapper_cls)",
-      "vllm.compilation.cuda_graph.CUDAGraphWrapper": "vllm_ascend.compilation.acl_graph.ACLGraphWrapper (standalone analogue, NOT a subclass)",
-      "vllm.compilation.breakable_cudagraph.BreakableCUDAGraphWrapper": "vllm_ascend.compilation.breakable_aclgraph.BreakableACLGraphWrapper (subclass)",
-      "vllm.compilation.passes.pass_manager.PostGradPassManager": "vllm_ascend.compilation.graph_fusion_pass_manager.GraphFusionPassManager (counterpart, not subclass; COMPILATION_PASS_KEY='graph_fusion_manager')",
-      "vllm.compilation.passes.vllm_inductor_pass.VllmInductorPass": "vllm_ascend.compilation.passes: MulsAddFusionPass, AddRMSNormQuantFusionPass, QKNormRopeFusionPass, AllGatherChunkNoOpCleanupPass, NoOpEliminationPass",
-      "vllm.v1.sample.sampler.Sampler": "vllm_ascend.sample.sampler.AscendSampler / AscendSampler310",
-      "vllm.v1.sample.rejection_sampler.RejectionSampler": "vllm_ascend.sample.rejection_sampler.AscendRejectionSampler / AscendRejectionSampler310 (+ patched by patch_rejection_sampler.py)",
-      "vllm.v1.sample.ops.topk_topp_sampler.TopKTopPSampler": "vllm_ascend.sample.sampler.AscendTopKTopPSampler",
-      "vllm.v1.spec_decode.llm_base_proposer.SpecDecodeBaseProposer": "vllm_ascend.spec_decode.llm_base_proposer.AscendSpecDecodeBaseProposer (+ AscendDraftModelProposer, AscendEagleProposer, AscendDflashProposer, AscendDSparkProposer, AscendDflash2Proposer, AscendNgramProposer, AscendMedusaProposer, AscendGemma4Proposer, AscendStep3p5MTPProposer, AscendMultiKVCacheGroupMTPProposer, AscendSuffixDecodingProposer; _310p.llm_base_proposer_310.AscendSpecDecodeBaseProposer310)",
-      "vllm.v1.core.sched.scheduler.Scheduler": "vllm_ascend.core: BatchJobAwareScheduler, DyntraLBScheduler, RecomputeScheduler, ShortRequestFirstAsyncScheduler, ProfilingChunkScheduler (+ Async variants); patched by patch_balance_schedule.py, patch_mamba_block_aligned_split.py, patch_pp_mtp.py",
-      "vllm.v1.core.sched.async_scheduler.AsyncScheduler": "vllm_ascend.core.*AsyncScheduler (BatchJobAwareAsyncScheduler, ShortRequestFirstAsyncScheduler, ProfilingChunkAsyncScheduler)",
-      "vllm.v1.core.sched.interface.SchedulerInterface": null,
-      "vllm.v1.kv_cache_interface.KVCacheSpec hierarchy": "vllm_ascend Ascend* KV cache specs registered via Platform.register_custom_kv_cache_specs",
-      "vllm.v1.core.single_type_kv_cache_manager.MambaManager": "patched to AscendMambaManager by vllm_ascend.patch.platform.patch_mamba_manager",
-      "vllm.v1.core.kv_cache_coordinator.HybridKVCacheCoordinator": "patched by vllm_ascend.patch.platform.patch_kv_cache_coordinator",
-      "vllm.model_executor.models.registry.ModelRegistry": "vllm_ascend.models.register_model() (NPU-native archs: glm5next, deepseek_v4/v41, minimax_m3, ...); registry also patched by patch_minimax_m2_config.py and patch_glm5next_config.py",
-      "vllm.transformers_utils.config._CONFIG_REGISTRY": "patched by patch_glm5next_config.py (Glm5Next* configs)",
-      "vllm.transformers_utils.model_arch_config_convertor.MODEL_ARCH_CONFIG_CONVERTORS": "patched by patch_deepseek_v4_vision.py",
-      "vllm.v1.worker.gpu.input_batch.InputBatch / InputBuffers": "vllm_ascend.worker.v2.AscendInputBatch / AscendInputBuffers (patched by patch_v2/patch_input_batch.py)",
-      "vllm.v1.worker.gpu.block_table.BlockTables": "vllm_ascend.worker.v2.AscendBlockTables (patched by patch_v2/patch_block_table.py)",
-      "vllm.v1.worker.gpu.states.RequestState / UvaBuffer": "vllm_ascend.worker.v2.AscendRequestState; UvaBuffer replaced by dummy (patch_v2/patch_uva.py)",
-      "vllm.v1.worker.gpu.model_states.* (ModelState, MambaHybridModelState)": "vllm_ascend.worker.v2.AscendModelState / AscendMambaHybridModelState (patch_v2/patch_model_state.py)",
-      "vllm.v1.worker.gpu.cudagraph_utils.ModelCudaGraphManager": "vllm_ascend.worker.v2: ModelAclGraphManager, AutoRegressiveAclGraphManager, DFlashAclGraphManager",
-      "vllm.v1.worker.gpu.pcp_manager.PCPManager": "vllm_ascend.worker.v2.AscendPCPManager",
-      "vllm.v1.worker.gpu.spec_decode.* (autoregressive/dflash/dspark speculators)": "vllm_ascend.worker.v2.AscendAutoRegressiveSpeculator / AscendEagleSpeculator / AscendMTPSpeculator / AscendDFlashSpeculator / AscendDFlash2Speculator / AscendDSparkSpeculator (patched by patch_v2/patch_*_speculator.py, patch_v2/patch_dspark.py)",
-      "vllm.v1.worker.gpu.attn_utils.get_kv_cache_spec": "patched by vllm_ascend.patch.worker.patch_v2.patch_attn_utils (AscendMLAAttentionSpec / AscendSFAIndexerBackend)",
-      "vllm.v1.worker.utils.bind_kv_cache": "patched by vllm_ascend.patch.worker.patch_bind_kv_cache",
-      "vllm.v1.worker.mamba_utils.*": "patched by vllm_ascend.patch.worker.patch_mamba_utils",
-      "vllm.v1.executor.abstract.Executor (UniProc/Multiproc/Ray/ExternalLauncher)": "not subclassed; vllm_ascend swaps worker_cls and patches MultiprocExecutor (patch_multiproc_executor.py)",
-      "vllm.v1.engine.core.EngineCore / EngineCoreProc / DPEngineCoreProc": "patched by vllm_ascend.patch.platform.patch_engine_core / patch_balance_schedule / patch_dyntra_lb_core / patch_profiling_chunk / patch_pp_mtp",
-      "vllm.v1.engine.core_client.EngineCoreClient": null,
-      "vllm.v1.engine.output_processor.OutputProcessor": null,
-      "vllm.v1.engine.input_processor.InputProcessor": null,
-      "vllm.distributed.parallel_state.GroupCoordinator": "patched by vllm_ascend.patch.worker.patch_distributed (NPUCommunicator / HCCL PG registry)",
-      "vllm.distributed.parallel_state.get_pp_group": "used directly; patched through GroupCoordinator patch",
-      "vllm.config.vllm.VllmConfig": "patched by patch_use_v2_model_runner.py / worker patch_use_v2_model_runner.py; sub-configs patched by patch_parallel_config / patch_speculative_config / patch_glm5next_config / patch_indexer_kv_dtype / patch_minimax_m2_config / patch_engram_config",
-      "vllm.config.parallel.ParallelConfig": "patched by patch_parallel_config.py and patch_eplb.py (current_platform)",
-      "vllm.config.model.ModelConfig": "patched by patch_glm5next_config.py, patch_minimax_m2_config.py, patch_pp_mtp.py, patch_speculative_config.py",
-      "vllm.config.speculative.SpeculativeConfig": "patched by patch_speculative_config.py, patch_minimax_m2_config.py",
-      "vllm.config.attention.AttentionConfig.indexer_kv_dtype / IndexerKVDType": "patched by patch_indexer_kv_dtype.py",
-      "vllm.config.engram.EngramConfig": "patched by patch_engram_config.py",
-      "vllm.config.cache (CacheConfig / register_kv_cache_dtype)": "used by worker/patch_kv_cache_dtype.py; vllm_ascend.core.kv_cache_dtype_handlers",
-      "vllm.sampling_params.SamplingParams._validate_structured_outputs": "patched by patch_structured_output.py",
-      "vllm.v1.structured_output.StructuredOutputManager / backend_outlines.OutlinesGrammar": "patched by patch_structured_output.py",
-      "vllm.v1.cudagraph_dispatcher.CudagraphDispatcher": "patched by worker/patch_cudagraph.py",
-      "vllm.v1.outputs.ModelRunnerOutput / EMPTY_MODEL_RUNNER_OUTPUT": "patched by patch_pp_mtp.py (adds spec_token_ids)",
-      "vllm.v1.core.dp_utils.get_physical_gpu_ids_for_local_dp_rank": "patched by patch_dp_device_ids.py",
-      "vllm.v1.core.kv_cache_utils.resolve_kv_cache_block_sizes": "patched by patch_kv_cache_utils.py",
-      "vllm.utils.torch_utils.STR_DTYPE_TO_TORCH_DTYPE / memory APIs": "patched by worker/patch_kv_cache_dtype.py and platform/patch_torch_accelerator.py",
-      "vllm.entrypoints.openai.chat_completion.protocol": "patched by platform/patch_tool_choice_none_content.py",
-      "vllm.model_executor.models.vision.FusedInputNorm": "patched by platform/patch_vision.py",
-      "vllm.model_executor.layers.fused_moe.routed_experts_capturer.RoutedExpertsCapturer": "patched by worker/patch_routed_experts_capture.py",
-      "vllm.third_party.flash_linear_attention.ops (kda/fused_recurrent)": "patched by worker/patch_triton.py (NPU Triton KDA) and worker/patch_idex_310.py",
-      "vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn.QwenGatedDeltaNetAttention": "patched by worker/patch_qwen3_5.py, worker/patch_idex_310.py; vllm_ascend.ops.gdn.AscendGatedDeltaNetAttention",
-      "vllm.v1.worker.gpu.sample.* (gumbel/penalties/logprob/metrics.logits/thinking_budget/output.SamplingMaskTensors)": "patched by worker/patch_triton.py and worker/patch_v2/patch_triton.py",
-      "vllm.v1.worker.gpu.spec_decode.adaptive_verification.*": "patched by worker/patch_v2/patch_adaptive_verification.py",
-      "vllm.model_executor.layers.attention.mla_attention (MLACommonMetadataBuilder)": "Ascend*MLAMetadataBuilder (subclass path)",
-      "csrc/cuda/, csrc/rocm/, vllm/_C extension": "replaced by vllm_ascend.vllm_ascend_C / _C_ascend and vllm_ascend._cann_ops_custom"
+      "vllm.platforms.Platform (vllm/platforms/interface.py)": "vllm_ascend/platform.py::NPUPlatform",
+      "vllm/platforms/__init__.py (current_platform resolution)": "vllm_ascend/__init__.py::register -> vllm_ascend.platform.NPUPlatform",
+      "vllm.v1.worker.worker_base.WorkerBase (vllm/v1/worker/worker_base.py)": "vllm_ascend/worker/worker.py::NPUWorker; vllm_ascend/_310p/worker_310p.py::NPUWorker310",
+      "vllm.v1.worker.gpu_worker.Worker (vllm/v1/worker/gpu_worker.py)": "vllm_ascend/worker/worker.py::NPUWorker",
+      "vllm.v1.worker.gpu_model_runner.GPUModelRunner (vllm/v1/worker/gpu_model_runner.py)": "vllm_ascend/worker/model_runner_v1.py::NPUModelRunner (MRV1); vllm_ascend/worker/v2/model_runner.py::NPUModelRunner (MRV2)",
+      "vllm.v1.attention.backend.AttentionBackend": "vllm_ascend/attention/attention_v1.py::AscendAttentionBackend; vllm_ascend/attention/mla_v1.py::AscendMLABackend; AscendSFABackend; AscendDSABackend; AscendFABackend; AscendAttentionBackend310",
+      "vllm.v1.attention.backend.AttentionMetadataBuilder": "vllm_ascend/attention/attention_v1.py::AscendAttentionMetadataBuilder; MLA/SFA/DSA builders",
+      "vllm.v1.attention.backend.AttentionImpl": "vllm_ascend/attention/attention_v1.py::AscendAttentionBackendImpl",
+      "vllm.v1.attention.backend.MLAAttentionImpl": "vllm_ascend/attention/mla_v1.py::AscendMLAImpl; AscendSFAImpl; AscendDSAImpl; AscendFAImpl",
+      "vllm.v1.attention.backend.AttentionMetadata": "vllm_ascend/attention/attention_v1.py::AscendMetadata",
+      "vllm.v1.attention.backend.CommonAttentionMetadata": "vllm_ascend/attention/attention_v1.py::AscendCommonAttentionMetadata",
+      "vllm.attention.layer.AttentionLayerBase": null,
+      "vllm.v1.core.sched.interface.SchedulerInterface (vllm/v1/core/sched/interface.py)": "vllm_ascend/core/scheduler.py::AscendScheduler",
+      "vllm.v1.core.sched.scheduler.Scheduler (vllm/v1/core/sched/scheduler.py)": "vllm_ascend/core/scheduler.py::AscendScheduler",
+      "vllm.v1.executor.abstract.Executor (vllm/v1/executor/abstract.py)": null,
+      "vllm.v1.kv_cache_interface.KVCacheSpec (+MLAAttentionSpec/SlidingWindowMLASpec/CircularBufferSpec/SlidingWindowSpec)": "vllm_ascend/core/kv_cache_interface.py::Ascend* specs (register_ascend_kv_cache_specs)",
+      "vllm.v1.kv_cache_spec_registry (register_kv_cache_spec)": "vllm_ascend.core.kv_cache_interface.register_ascend_kv_cache_specs; NPUPlatform.register_custom_kv_cache_specs",
+      "vllm.v1.core.kv_cache_manager.KVCacheManager / BlockPool / KVCacheCoordinator": null,
+      "vllm.distributed.parallel_state.GroupCoordinator (vllm/distributed/parallel_state.py)": null,
+      "vllm.distributed.device_communicators.base_device_communicator.DeviceCommunicatorBase": "vllm_ascend/distributed/device_communicators/npu_communicator.py::NPUCommunicator",
+      "vllm.v1.sample.sampler.Sampler (vllm/v1/sample/sampler.py)": "vllm_ascend sample patches::AscendSampler (subclass/patch)",
+      "vllm.v1.sample.ops.topk_topp_sampler.TopKTopPSampler": "vllm_ascend::AscendTopKTopPSampler (forward_native override / worker patch)",
+      "vllm.v1.sample.rejection_sampler.RejectionSampler": "vllm_ascend::AscendRejectionSampler",
+      "vllm.v1.spec_decode.SpecDecodeBaseProposer": "vllm_ascend/spec_decode/llm_base_proposer.py::AscendSpecDecodeBaseProposer",
+      "vllm.model_executor.layers.logits_processor.LogitsProcessor": null,
+      "vllm.model_executor.models.registry.ModelRegistry": null,
+      "vllm.model_executor.custom_op.CustomOp / PluggableLayer (vllm/model_executor/custom_op.py)": "vllm_ascend/ops (register_oot / forward_oot overrides)",
+      "vllm.model_executor.model_loader.BaseModelLoader": null,
+      "vllm.compilation.compiler_interface.CompilerInterface": "vllm_ascend/compilation/compiler_interface.py::AscendCompiler",
+      "vllm.compilation.cuda_graph.CUDAGraphWrapper (vllm/compilation/cuda_graph.py)": "vllm_ascend/compilation/acl_graph.py::ACLGraphWrapper; BreakableACLGraphWrapper",
+      "vllm.compilation.passes.pass_manager.PostGradPassManager / VllmInductorPass": "vllm_ascend/compilation GraphFusionPassManager",
+      "vllm.config.* (ModelConfig/CacheConfig/ParallelConfig/SpeculativeConfig/AttentionConfig/VllmConfig)": "vllm_ascend/patch/platform/patch_*_config.py (patched, not subclassed)",
+      "vllm.distributed.kv_transfer.kv_connector.v1.base.KVConnectorBase_V1": "vllm_ascend/distributed/kv_transfer/* (mooncake, ascend_store, ucm, sfa_pd_rd2h, sparse offload)",
+      "vllm.entrypoints.llm.LLM": null
     },
     "ascend_only_components": [
-      "vllm_ascend.compilation.acl_graph.ACLGraphWrapper (standalone functional analogue of vllm.compilation.cuda_graph.CUDAGraphWrapper, not a subclass)",
-      "vllm_ascend.compilation.updatable_graph.UpdatableGraph (extends torch.npu.NPUGraph; no vLLM base)",
-      "vllm_ascend.compilation.graph_fusion_pass_manager.GraphFusionPassManager (object counterpart of PostGradPassManager, not a subclass)",
-      "vllm_ascend.device_allocator.camem.CaMemAllocator (NPU analogue of CUDAPluggableAllocator; singleton, no vLLM base)",
-      "vllm_ascend.worker.v2.ACL graph managers: ModelAclGraphManager, AutoRegressiveAclGraphManager, DFlashAclGraphManager",
-      "vllm_ascend.distributed.device_communicators.npu_communicator helper machinery (HcclPgRegistry, HcclPgKey, make_hccl_pg_key)",
-      "vllm_ascend.distributed.eplb: AscendGlooEplbCommunicator (TorchDistGlooStagedEplbCommunicator), StairEplbPolicy, EPLB adaptors",
-      "vllm_ascend.ops.* NPU custom operators (AscendRMSNorm, AscendSiluAndMul, AscendRotaryEmbedding, AscendMoERunner, AscendGatedDeltaNetAttention) registered via register_oot",
-      "vllm_ascend._cann_ops_custom (CANN custom op bindings, replaces vllm._C CUDA entry points)",
-      "vllm_ascend._310p.* (310P-specific attention, fused_moe, ops, quantization, sample, spec_decode, worker overrides)",
-      "vllm_ascend.xlite.* (XliteWorker, xlite execution path)",
-      "vllm_ascend.models.* NPU-native/maintained architectures (deepseek_v4, deepseek_v41, glm5next, minimax_m3, common, layer)",
-      "vllm_ascend.device.hardware_profile (HardwareCapability / hardware profile selection)",
-      "vllm_ascend.model_loader.netloader and rfork (custom weight loading paths)",
-      "vllm_ascend.weight_switch (runtime weight switching)",
-      "vllm_ascend.ec_manager and vllm_ascend.distributed.ec_transfer (encoder-cache transfer)",
-      "vllm_ascend.profiler and vllm_ascend.observability",
-      "vllm_ascend.core ProfilingChunkManager and ascend-specific scheduling policies",
-      "vllm_ascend.model_executor.offloader and vllm_ascend.model_executor.warmup",
-      "vllm_ascend.patch.* patch framework (platform/ and worker/ patch modules)",
-      "vllm_ascend.torchair / compilation graph-mode integration (registered via Platform.get_static_graph_wrapper_cls)"
+      "vllm_ascend/compilation/acl_graph.py::ACLGraphWrapper (API-compatible with CUDAGraphWrapper, uses torch.npu.NPUGraph, no vLLM base class)",
+      "vllm_ascend/compilation/acl_graph.py::BreakableACLGraphWrapper",
+      "CaMemAllocator (torch.npu.NPUPluggableAllocator based; only conceptual counterpart vllm/device_allocator/cumem.py)",
+      "BaseDeviceAdaptor / DeviceOperator (plugin-local abstraction over torch_npu ops)",
+      "Ascend hardware profile (HardwareProfile / get_hardware_profile / get_current_hardware_profile)",
+      "AscendConfig (plugin-local config singleton; init_ascend_config / get_ascend_config)",
+      "init_ascend_model_parallel / destroy_ascend_model_parallel and Ascend-specific process groups (get_mc2_group, get_mlp_tp_group, get_otp_group, get_lmhead_tp_group, get_embed_tp_group, get_replicated_group, get_p_tp_group, get_dynamic_eplb_group, get_kvpp_group)",
+      "vllm_ascend/_310p/worker_310p.py::NPUWorker310 (310P-specific worker variant)",
+      "Ascend-only attention backends/variants: AscendSFABackend, AscendDSABackend, AscendFABackend, AscendAttentionBackend310",
+      "Ascend-specific KV transfer connectors (mooncake, ascend_store, ucm, sfa_pd_rd2h, sparse offload)",
+      "worker/patch_v2/patch_*_speculator.py (Ascend graph managers replacing vllm.v1.worker.gpu.* CUDA graph managers)"
     ],
     "impact_judgment_rules": {
       "definitely_affected_paths": [
-        "vllm/platforms/interface.py",
-        "NPUPlatform inherits Platform directly; any method addition/rename/signature change (check_and_update_config, get_attn_backend_cls, get_device_communicator_cls, get_static_graph_wrapper_cls, register_custom_kv_cache_specs, ...) breaks NPU registration/dispatch.",
-        "vllm/platforms/__init__.py",
-        "Platform resolution for the 'npu' plugin is driven here; changes to resolution/priority break which platform class is loaded.",
-        "vllm/v1/worker/worker_base.py",
-        "NPUWorker subclasses WorkerBase and overrides init_device/load_model/execute_model/sample_tokens/initialize_from_config/get_kv_cache_spec; signature changes break construction and RPC dispatch.",
+        "vllm/platforms/interface.py, vllm/platforms/__init__.py",
+        "理由：NPUPlatform 直接继承 Platform 并注册为 OOT 平台；任何方法签名/语义变更（尤其 get_attn_backend_cls 的 attn_selector_config、set_additional_forward_context）必然要求同步修改，且 current_platform 延迟解析契约必须保持。",
+        "vllm/v1/worker/worker_base.py, vllm/v1/worker/gpu_worker.py",
+        "理由：NPUWorker 继承 WorkerBase/Worker，集中覆写 init_device/_make_model_runner/load_model/determine_available_memory/execute_model/sample_tokens；签名或返回类型（MemorySnapshot、CompilationTimes、AsyncIntermediateTensors）变更必然破坏 NPU。",
         "vllm/v1/worker/gpu_model_runner.py",
-        "NPUModelRunner (v1) subclasses GPUModelRunner and overrides execute_model/_prepare_inputs/_build_attention_metadata/_dummy_run/initialize_kv_cache/initialize_attn_backend; internal-helper and signature changes break NPU execution and graph capture.",
-        "vllm/v1/worker/gpu/** (model_runner.py, input_batch.py, block_table.py, states.py, model_states/**, spec_decode/**, cudagraph_utils.py, pcp_manager.py)",
-        "NPUModelRunner (v2) and Ascend* modular components subclass these; high-churn area with many compensating patch_v2/* modules.",
+        "理由：NPUModelRunner(MRV1/MRV2) 依赖上游私有 helper（_prepare_inputs/_build_attention_metadata/_dummy_run/_allocate_kv_cache_tensors/_reshape_kv_cache_tensors/_determine_batch_execution_and_padding/capture_model）；重命名或签名变更必然破坏输入准备、KV 分配与图调度。",
         "vllm/v1/attention/backend.py",
-        "All Ascend attention backends/impls/builders subclass AttentionBackend/AttentionImpl/MLAAttentionImpl/AttentionMetadataBuilder (abstract member changes are import-breaking).",
-        "vllm/model_executor/layers/attention/mla_attention.py",
-        "Ascend MLA/SFA metadata builders inherit MLACommonMetadataBuilder; changes break MLA/SFA paths.",
-        "vllm/v1/attention/backends/mla/common.py (get_mla_prefill_backend)",
-        "Ascend monkey-patches this; changes can reintroduce FlashAttn prefill crash on NPU.",
-        "vllm/compilation/compiler_interface.py",
-        "AscendCompiler subclasses CompilerInterface; ABC/signature changes break NPU compilation.",
-        "vllm/compilation/base_static_graph.py",
-        "NPU static-graph wrapper is returned through AbstractStaticGraphWrapper contract.",
-        "vllm/compilation/breakable_cudagraph.py",
-        "BreakableACLGraphWrapper subclasses BreakableCUDAGraphWrapper and depends on _capture/_replay internals.",
-        "vllm/compilation/passes/vllm_inductor_pass.py",
-        "All Ascend fusion passes (MulsAddFusionPass, AddRMSNormQuantFusionPass, QKNormRopeFusionPass, ...) subclass VllmInductorPass.",
+        "理由：AttentionBackend/AttentionMetadataBuilder/AttentionImpl/MLAAttentionImpl 的位置参数 __init__ 与 forward 严格匹配 Ascend 全部 attention kernel；新增抽象方法或 forward 参数变更必然破坏所有 OOT backend。",
+        "vllm/v1/core/sched/interface.py, vllm/v1/core/sched/scheduler.py",
+        "理由：AscendScheduler 继承 Scheduler 并覆写调度 hook（schedule/update_from_output/_update_after_schedule/_update_request_with_output）；新增抽象方法必然破坏。",
+        "vllm/v1/kv_cache_interface.py, vllm/v1/kv_cache_spec_registry.py",
+        "理由：Ascend* KV spec 通过 register_kv_cache_spec 注册并覆写 page_size_bytes/merge/max_memory_usage_bytes/is_uniform_with_collection；新增抽象属性或 page-size 语义变更必然破坏 KV 分配。",
         "vllm/distributed/device_communicators/base_device_communicator.py",
-        "NPUCommunicator subclasses DeviceCommunicatorBase; new required attributes/collectives break NPU distributed and MoE EP.",
-        "vllm/distributed/kv_transfer/kv_connector/v1/base.py",
-        "All Ascend KV connectors (Mooncake/UCM/AscendStore/...) subclass KVConnectorBase_V1.",
-        "vllm/distributed/eplb/eplb_state.py",
-        "AscendEplbState/EplbLayerState subclass EplbState; EPLB control-plane changes break NPU EPLB.",
-        "vllm/v1/core/sched/scheduler.py and vllm/v1/core/sched/async_scheduler.py",
-        "Ascend schedulers subclass Scheduler/AsyncScheduler and copy schedule() bodies; internal changes silently break them.",
-        "vllm/v1/kv_cache_interface.py and vllm/v1/kv_cache_spec_registry.py",
-        "Ascend KV specs and register_ascend_kv_cache_specs depend on spec fields and registry API.",
-        "vllm/model_executor/models/registry.py",
-        "vllm_ascend.models.register_model() registers NPU archs here; lookup-order/API changes bypass NPU overrides.",
-        "vllm/model_executor/layers/linear.py",
-        "AscendLinearMethod subclasses LinearMethodBase (create_weights/apply/process_weights_after_loading).",
-        "vllm/model_executor/layers/fused_moe/__init__.py (FusedMoEMethodBase/FusedMoEFactory)",
-        "AscendFusedMoEMethod subclass and platform patch_fused_moe redirect the factory; contract changes break MoE.",
-        "vllm/model_executor/layers/quantization/kv_cache.py",
-        "AscendKVCacheMethod subclasses BaseKVCacheMethod.",
-        "vllm/model_executor/layers/quantization/base_config.py",
-        "All Ascend quantization configs subclass QuantizationConfig; get_quant_method signature changes break them.",
-        "vllm/model_executor/custom_op.py",
-        "CustomOp/PluggableLayer.__new__ and register_oot/forward_oot are the OOT substitution contract for all Ascend ops.",
-        "vllm/v1/sample/sampler.py, vllm/v1/sample/rejection_sampler.py, vllm/v1/sample/ops/topk_topp_sampler.py",
-        "Ascend samplers subclass these; dispatch and SamplingMetadata changes break NPU sampling patches.",
-        "vllm/v1/spec_decode/llm_base_proposer.py",
-        "AscendSpecDecodeBaseProposer and all Ascend*Proposer classes subclass this.",
-        "vllm/v1/worker/worker_base.py (worker_cls resolution)",
-        "worker_cls='auto' must keep resolving NPUWorker; resolution changes break NPU worker construction.",
-        "vllm/v1/attention/backends/registry.py (attention backend registry)",
-        "NPUPlatform.get_attn_backend_cls must keep resolving Ascend classes; registry contract changes break attention injection.",
-        "vllm/v1/worker/utils.py (bind_kv_cache)",
-        "Ascend monkey-patches bind_kv_cache because it raises for NPU; changes can re-break KV binding.",
-        "vllm/v1/worker/mamba_utils.py",
-        "Ascend patches batch_memcpy_kernel/batch_memcpy/preprocess_mamba; changes alter NPU Mamba paths.",
-        "vllm/v1/cudagraph_dispatcher.py",
-        "Ascend patches _create_padded_batch_descriptor for FULL graph mode; changes can re-break capture.",
-        "vllm/v1/outputs.py (ModelRunnerOutput/EMPTY_MODEL_RUNNER_OUTPUT)",
-        "Ascend PP+MTP patch adds spec_token_ids; upstream changes break PP+MTP on NPU.",
-        "vllm/v1/core/kv_cache_utils.py and vllm/v1/core/kv_cache_coordinator.py",
-        "Ascend patches resolve_kv_cache_block_sizes and HybridKVCacheCoordinator for hybrid+DCP/PD; changes break hybrid KV cache on NPU.",
-        "vllm/v1/core/single_type_kv_cache_manager.py (MambaManager)",
-        "Ascend replaces MambaManager (AscendMambaManager) for hybrid prefix cache + external hit accounting.",
-        "vllm/model_executor/models/config.py (HybridAttentionMambaModelConfig)",
-        "Ascend patches block-size logic to 128; upstream default 16 is unsupported on NPU.",
+        "理由：NPUCommunicator 继承 DeviceCommunicatorBase；构造函数与方法签名变更必然破坏 HCCL 集合通信与 MoE dispatch/combine。",
         "vllm/distributed/parallel_state.py",
-        "Ascend patches GroupCoordinator/all_reduce/broadcast and registers HCCL process groups.",
-        "vllm/config/vllm.py, vllm/config/parallel.py, vllm/config/model.py, vllm/config/speculative.py, vllm/config/attention.py, vllm/config/engram.py",
-        "Ascend monkey-patches validators/properties (use_v2_model_runner, PCP+DP, MoE-SP, is_deepseek_mla, indexer_kv_dtype, MTP hf_config_override, MiniMax quantization, Engram CUDA checks); changes can re-break config construction.",
-        "vllm/sampling_params.py and vllm/v1/structured_output/**",
-        "Ascend patches structured-output backend consistency and outlines accept_tokens; changes break structured decoding on NPU.",
-        "vllm/entrypoints/openai/chat_completion/protocol.py",
-        "Ascend patches empty tool_calls serialization; upstream changes can reintroduce client incompatibility."
+        "理由：init_ascend_model_parallel 及各 Ascend 专用 group 基于上游 group 工厂；GroupCoordinator 构造/接口变更必然影响。",
+        "vllm/compilation/compiler_interface.py",
+        "理由：AscendCompiler 继承 CompilerInterface；compute_hash/compile/load/initialize_cache 契约变更必然破坏图编译与缓存。",
+        "vllm/compilation/cuda_graph.py",
+        "理由：ACLGraphWrapper 与 CUDAGraphWrapper API 对齐；CUDAGraphOptions/BatchDescriptor/CUDAGraphMode 语义变更必然要求 ACL 同步。",
+        "vllm/model_executor/custom_op.py",
+        "理由：Ascend 大量算子通过 register_oot/forward_oot 覆写；__new__ OOT 替换与 dispatch_forward 机制变更必然破坏 NPU kernel 覆盖。",
+        "vllm/v1/sample/sampler.py, vllm/v1/sample/ops/topk_topp_sampler.py, vllm/v1/sample/rejection_sampler.py",
+        "理由：AscendSampler/AscendTopKTopPSampler/AscendRejectionSampler 依赖这些签名（部分通过 patch）；内部方法重命名会同时破坏子类与 monkey-patch。",
+        "vllm/v1/spec_decode/ (SpecDecodeBaseProposer/EagleProposer/MedusaProposer/NgramProposer)",
+        "理由：AscendSpecDecodeBaseProposer 覆写 __init__/load_model/dummy_run/_propose/prepare_inputs/set_inputs_first_pass 等生命周期方法，基类变更必然破坏。",
+        "vllm/distributed/kv_transfer/kv_connector/v1/base.py",
+        "理由：Ascend 各 KV connector 继承 KVConnectorBase_V1；handshake metadata 与 start_load_kv/save_kv_layer 契约变更必然破坏 PD 分离与 KV 传输。",
+        "vllm/config/*.py (model.py, cache.py, parallel.py, speculative.py, vllm.py, attention.py)",
+        "理由：这些 config 被 vllm-ascend 以 patch 而非子类方式修改；任何字段重命名/新增/移除都会强制 patch 更新，是插件最版本敏感部分。"
       ],
       "potentially_affected_paths": [
-        "vllm/v1/engine/core.py",
-        "Affects Ascend when its platform patches (balance scheduling, dyntra-lb, profiling chunk, pp-mtp, engine-core run wrapper) are active or when EngineCore internals the wrappers assume change.",
-        "vllm/v1/executor/multiproc_executor.py",
-        "Affects NPU only when EPLB is used (daemon=True incompatible with EPLB child processes); patch sets daemon=False.",
-        "vllm/v1/core/dp_utils.py",
-        "Affects NPU only for application-level DP with sharded ASCEND_RT_VISIBLE_DEVICES.",
-        "vllm/transformers_utils/config.py and vllm/transformers_utils/model_arch_config_convertor.py",
-        "Affects NPU when GLM-5.x / DeepSeek-V4 / MiniMax configs must be registered or remapped for NPU-native models.",
-        "vllm/model_executor/models/* (deepseek_v2, qwen3_5, qwen3_next, qwen3_dflash, qwen3_vl, qwen3_vl_moe, qwen3, qwen3_moe, minimax_m2, step3p5, kimi_k25_vit, llama_eagle3)",
-        "Affects NPU only for the specific model archs whose forward/load_weights/attention are monkey-patched; unrelated model changes are harmless.",
-        "vllm/model_executor/layers/mamba/**",
-        "Affects NPU when Mamba/hybrid paths, causal_conv1d, or GDN layers are used (patched by patch_triton/patch_mamba_utils/patch_idex_310).",
-        "vllm/utils/torch_utils.py",
-        "Affects NPU when kv-cache dtype resolution (fp8 -> float8_e4m3fn) or torch.accelerator memory APIs are involved.",
-        "vllm/v1/worker/gpu/sample/**",
-        "Affects NPU v2 only when sampling/triton paths (gumbel, penalties, logprob, metrics.logits, thinking_budget, SamplingMaskTensors) are exercised and patched.",
-        "vllm/platforms/cpu.py / other platform bases",
-        "Can affect NPU indirectly if shared Platform base-class behavior used by NPUPlatform changes, even though the concrete CUDA/ROCm platforms are unused.",
-        "vllm/attention/** (legacy v0 attention path)",
-        "Affects NPU only if a path reuses legacy attention abstractions; most NPU attention is on vllm/v1/attention.",
-        "vllm/model_executor/layers/quantization/compressed_tensors/**",
-        "Config-level reuse only on NPU (AscendCompressedTensorsConfig); GPU kernel changes do not apply, but config-interface changes can.",
-        "vllm/entrypoints/** (non-chat-completion protocols)",
-        "Affects NPU only when the changed surface is exercised by NPU serving and aligns with platform patches (e.g. structured output, tool-call serialization).",
-        "vllm/v1/worker/gpu/states.py (UvaBuffer/UVA paths)",
-        "Affects NPU v2 because NPU lacks UVA and replaces UvaBuffer with a dummy; changes to that interface re-break the shim."
+        "vllm/v1/engine/core.py, vllm/v1/engine/llm_engine.py",
+        "条件：vllm-ascend 不直接子类化，但通过 runner/scheduler 消费；当 step/step_with_batch_queue 的执行顺序、EngineCoreOutputs 结构、collective_rpc 契约变化，或 async-scheduling 的 execute/sample 拆分改变时会影响。",
+        "vllm/v1/executor/abstract.py 及 executor 实现",
+        "条件：vllm-ascend 不子类化 Executor，仅通过 worker_cls 注入 NPUWorker；当 execute_model/sample_tokens non_block 语义、future 返回类型或 get_class 选择逻辑变化时会影响。",
+        "vllm/model_executor/models/registry.py",
+        "条件：vllm-ascend 通过 register_model 注册 NPU 模型变体；仅当 register_model/resolve_model_cls 签名或 arch 解析语义变化时影响（API 较稳定，一般低风险）。",
+        "vllm/v1/core/kv_cache_manager.py, vllm/v1/core/block_pool.py",
+        "条件：vllm-ascend 复用上游 manager，仅自定义 single-type manager 通过 registry 注入；当 allocate_slots/get_computed_blocks/BlockPool 分配语义或 watermark 行为变化时影响。",
+        "vllm/attention/layer.py (AttentionLayerBase)",
+        "条件：Ascend attention layer patch 间接触发 bind_kv_cache/get_kv_cache_spec；当其契约变化且插件 patch 依赖内部字段时影响。",
+        "vllm/model_executor/layers/logits_processor.py 及 logits_processors 入口",
+        "条件：仅当 Ascend 注册的自定义 logits processor 依赖 validate_params/apply/update_state 契约时影响。",
+        "vllm/model_executor/model_loader/*",
+        "条件：vllm-ascend 默认复用上游 loader；仅当注册自定义 loader 或 LoadConfig 契约变化时影响。",
+        "vllm/v1/worker/gpu/* CUDA graph managers",
+        "条件：Ascend 用 worker/patch_v2/patch_*_speculator.py 替换这些 manager；仅当被 patch 的内部符号重命名/签名变化时影响。"
       ],
       "never_affected_paths": [
         "vllm/platforms/cuda.py",
-        "CUDA-only platform implementation; NPUPlatform uses Platform base, not CudaPlatformBase behavior.",
+        "理由：CUDA 平台实现，Ascend 用 NPUPlatform 取代，从不导入实现。",
         "vllm/platforms/rocm.py",
-        "ROCm-only platform implementation; not loaded on NPU.",
-        "vllm/platforms/xpu.py, vllm/platforms/cpu.py, vllm/platforms/tpu.py, vllm/platforms/openvino.py, vllm/platforms/neuron.py, vllm/platforms/zen.py",
-        "Non-Ascend platform implementations explicitly listed as unused by vllm-ascend.",
-        "vllm/distributed/device_communicators/cuda_communicator.py, nccl.py, custom_all_reduce.py, flashinfer_all_reduce.py",
-        "NVIDIA-specific communication backends; NPU uses NPUCommunicator/HCCL.",
-        "vllm/v1/attention/backends/flash_attn.py, flashinfer.py, cutlass_mla.py, mla/flashmla.py",
-        "GPU attention backends replaced by Ascend attention backends; not referenced on NPU.",
-        "vllm/attention/backends/flash_attn.py, vllm/attention/backends/flashinfer.py",
-        "Legacy GPU attention backends; not used on NPU.",
-        "vllm/model_executor/layers/fused_moe/cutlass_moe.py, flashinfer_cutlass_moe.py, deep_gemm_moe.py",
-        "GPU-only MoE kernels; Ascend uses AscendMoERunner/AscendFusedMoEMethod.",
-        "vllm/third_party/flashinfer/",
-        "NVIDIA FlashInfer dependency unavailable/unused on NPU.",
-        "vllm/model_executor/layers/quantization/gguf.py, bitsandbytes.py, torchao.py, awq.py, gptq.py, marlin.py, fp8.py (GPU cutlass path)",
-        "GPU quantization kernels; Ascend overrides with AscendModelSlim/CompressedTensors/Fp8 configs and NPU kernels.",
-        "csrc/cuda/, csrc/rocm/",
-        "CUDA/ROCm C++/CUDA sources; NPU uses vllm_ascend.vllm_ascend_C and CANN custom ops.",
-        "vllm/_C CUDA extension entry points",
-        "Replaced by _C_ascend / vllm_ascend_C on Ascend.",
-        "vllm/model_executor/models/vision.py (except FusedInputNorm)",
-        "Only the FusedInputNorm.forward shim is relevant; other vision changes are GPU-generic and not on the NPU override path."
+        "理由：ROCm 平台实现，与 NPU 无关。",
+        "vllm/platforms/tpu.py / xpu.py / openvino.py / cpu.py",
+        "理由：其它加速器/CPU 平台实现，vllm-ascend 仅间接引用，从不实现。",
+        "vllm/v1/attention/backends/flash_attn*.py, flashinfer*.py",
+        "理由：FlashAttention/FlashInfer CUDA 后端与 cutlass kernel，NPU 用 CANN/自研算子替代。",
+        "CUDA quantization kernels (Marlin, GPTQ CUDA, AWQ CUDA, bitsandbytes CUDA)",
+        "理由：CUDA 专用量化 kernel，Ascend 走 torch_npu 量化路径。",
+        "torch.cuda 相关内部实现 / CUDA IPC / NCCL-based communicators",
+        "理由：Ascend 使用 torch.npu、ACL graph、HCCL 通信替代。",
+        "Triton CUDA libdevice 路径",
+        "理由：Ascend patch 到 CANN 等价实现，CUDA libdevice 变更无影响。",
+        "vllm/v1/worker/gpu/* CUDA graph managers (未被 patch 的部分)",
+        "理由：Ascend 通过 worker patch 用自身 graph manager 替换，未被 patch 的 CUDA 实现不参与 NPU 执行。"
       ]
     },
     "patch_impact_map": {
-      "vllm.v1.core.sched.scheduler.Scheduler": "vllm_ascend/patch/platform/patch_balance_schedule.py, patch_mamba_block_aligned_split.py, patch_pp_mtp.py",
-      "vllm.v1.engine.core.DPEngineCoreProc": "vllm_ascend/patch/platform/patch_balance_schedule.py, patch_dyntra_lb_core.py",
-      "vllm.v1.engine.core.EngineCoreProc.run_engine_core": "vllm_ascend/patch/platform/patch_engine_core.py",
-      "vllm.v1.engine.core.EngineCore.post_step / EngineCore.__init__": "vllm_ascend/patch/platform/patch_engine_core.py, patch_pp_mtp.py, patch_profiling_chunk.py",
-      "vllm.transformers_utils.model_arch_config_convertor.MODEL_ARCH_CONFIG_CONVERTORS": "vllm_ascend/patch/platform/patch_deepseek_v4_vision.py",
-      "torch.distributed.all_reduce / torch.distributed.broadcast": "vllm_ascend/patch/platform/patch_distributed.py",
-      "vllm.v1.core.dp_utils.get_physical_gpu_ids_for_local_dp_rank": "vllm_ascend/patch/platform/patch_dp_device_ids.py",
-      "vllm.config.engram.EngramConfig.verify_model_config": "vllm_ascend/patch/platform/patch_engram_config.py",
-      "vllm.config.parallel.current_platform": "vllm_ascend/patch/platform/patch_eplb.py",
-      "vllm.distributed.eplb.eplb_state._move_to_workspace": "vllm_ascend/patch/platform/patch_eplb.py",
-      "vllm.model_executor.layers.fused_moe.FusedMoEFactory": "vllm_ascend/patch/platform/patch_fused_moe.py, vllm_ascend/patch/worker/patch_fused_moe.py",
-      "vllm.transformers_utils.config._CONFIG_REGISTRY": "vllm_ascend/patch/platform/patch_glm5next_config.py",
-      "vllm.config.model.ModelConfig.is_deepseek_mla": "vllm_ascend/patch/platform/patch_glm5next_config.py",
-      "vllm.v1.core.kv_cache_coordinator.HybridKVCacheCoordinator": "vllm_ascend/patch/platform/patch_kv_cache_coordinator.py",
-      "vllm.v1.core.kv_cache_utils.get_kv_cache_config_from_groups / resolve_kv_cache_block_sizes": "vllm_ascend/patch/platform/patch_kv_cache_coordinator.py, patch_kv_cache_utils.py",
-      "vllm.v1.engine.core.resolve_kv_cache_block_sizes": "vllm_ascend/patch/platform/patch_kv_cache_utils.py",
-      "vllm.model_executor.models.config.HybridAttentionMambaModelConfig.verify_and_update_config": "vllm_ascend/patch/platform/patch_mamba_config.py, patch_mamba_config_310.py",
-      "vllm.v1.core.single_type_kv_cache_manager.MambaManager": "vllm_ascend/patch/platform/patch_mamba_manager.py",
-      "vllm.config.model.ModelConfig._verify_quantization / _verify_cuda_graph": "vllm_ascend/patch/platform/patch_minimax_m2_config.py",
-      "vllm.config.speculative.SpeculativeConfig._verify_args": "vllm_ascend/patch/platform/patch_minimax_m2_config.py",
-      "vllm.model_executor.models.registry (spec-decode aliases)": "vllm_ascend/patch/platform/patch_minimax_m2_config.py",
-      "vllm.v1.attention.backends.mla.common.get_mla_prefill_backend": "vllm_ascend/patch/platform/patch_mla_prefill_backend.py",
-      "vllm.v1.executor.multiproc_executor.MultiprocExecutor": "vllm_ascend/patch/platform/patch_multiproc_executor.py",
-      "vllm.v1.outputs.ModelRunnerOutput / EMPTY_MODEL_RUNNER_OUTPUT": "vllm_ascend/patch/platform/patch_pp_mtp.py",
-      "vllm.config.model.ModelConfig.verify_with_parallel_config": "vllm_ascend/patch/platform/patch_pp_mtp.py, patch_speculative_config.py",
-      "vllm.v1.core.sched.scheduler.Scheduler._update_after_schedule / update_from_output / _make_cached_request_data": "vllm_ascend/patch/platform/patch_pp_mtp.py",
-      "vllm.sampling_params.SamplingParams._validate_structured_outputs": "vllm_ascend/patch/platform/patch_structured_output.py",
-      "vllm.v1.structured_output.StructuredOutputManager.grammar_init": "vllm_ascend/patch/platform/patch_structured_output.py",
-      "vllm.v1.structured_output.backend_outlines.OutlinesGrammar.accept_tokens": "vllm_ascend/patch/platform/patch_structured_output.py",
-      "torch.accelerator.memory_stats / memory_reserved / reset_peak_memory_stats / get_memory_info / empty_cache": "vllm_ascend/patch/platform/patch_torch_accelerator.py",
-      "vllm.entrypoints.openai.chat_completion.protocol (ChatCompletionResponse / ChatCompletionStreamResponse)": "vllm_ascend/patch/platform/patch_tool_choice_none_content.py",
-      "vllm.config.vllm.VllmConfig.use_v2_model_runner": "vllm_ascend/patch/platform/patch_use_v2_model_runner.py, vllm_ascend/patch/worker/patch_v2/patch_use_v2_model_runner.py",
-      "vllm.config.attention.AttentionConfig.indexer_kv_dtype / IndexerKVDType": "vllm_ascend/patch/platform/patch_indexer_kv_dtype.py",
-      "vllm.config.parallel.ParallelConfig._validate_parallel_config / use_sequence_parallel_moe": "vllm_ascend/patch/platform/patch_parallel_config.py",
-      "vllm.model_executor.models.vision.FusedInputNorm.forward": "vllm_ascend/patch/platform/patch_vision.py",
-      "vllm.config.speculative.SpeculativeConfig.hf_config_override / __post_init__": "vllm_ascend/patch/platform/patch_speculative_config.py",
-      "vllm.utils.torch_utils.STR_DTYPE_TO_TORCH_DTYPE": "vllm_ascend/patch/worker/patch_kv_cache_dtype.py",
-      "vllm.v1.cudagraph_dispatcher.CudagraphDispatcher._create_padded_batch_descriptor": "vllm_ascend/patch/worker/patch_cudagraph.py",
-      "vllm.model_executor.models.deepseek_v2.DeepseekV2MLAAttention.__init__": "vllm_ascend/patch/worker/patch_deepseek_v2.py",
-      "vllm.model_executor.models.llama_eagle3 / deepseek_v2 Eagle3 draft models": "vllm_ascend/patch/worker/patch_eagle3_init.py",
-      "vllm.model_executor.models Eagle3 target inner models (DeepseekV2Model, EagleModelMixin)": "vllm_ascend/patch/worker/patch_eagle3_pp_aux.py",
-      "vllm.model_executor.layers.fla.ops.index.prepare_chunk_indices / prepare_chunk_offsets": "vllm_ascend/patch/worker/patch_idex_310.py",
-      "vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn.QwenGatedDeltaNetAttention": "vllm_ascend/patch/worker/patch_idex_310.py, patch_qwen3_5.py",
-      "vllm.model_executor.models.qwen3_vl.Qwen3_VisionTransformer.rot_pos_emb": "vllm_ascend/patch/worker/patch_idex_310.py",
-      "vllm.model_executor.models.kimi_k25_vit.Learnable2DInterpPosEmbDivided_fixed.forward": "vllm_ascend/patch/worker/patch_kimi_k25.py",
-      "vllm.v1.worker.mamba_utils.batch_memcpy_kernel / batch_memcpy / preprocess_mamba": "vllm_ascend/patch/worker/patch_mamba_utils.py",
-      "vllm.model_executor.models.minimax_m2.MiniMaxM2MoE.forward / MiniMaxM2Attention.forward / MiniMaxM2Model.load_weights": "vllm_ascend/patch/worker/patch_minimax_m2.py",
-      "vllm.model_executor.models.qwen3_5.Qwen3_5GatedDeltaNet._forward_core": "vllm_ascend/patch/worker/patch_qwen3_5.py",
-      "vllm.model_executor.models.qwen3_dflash.DFlashQwen3Model.precompute_and_store_context_kv": "vllm_ascend/patch/worker/patch_qwen3_dflash.py",
-      "vllm.v1.worker.utils.bind_kv_cache": "vllm_ascend/patch/worker/patch_bind_kv_cache.py",
-      "vllm.model_executor.models.qwen3_vl / qwen3_vl_moe / qwen3 / qwen3_moe attention/PP boundaries": "vllm_ascend/patch/worker/patch_qwen3vl.py",
-      "vllm.v1.sample.rejection_sampler": "vllm_ascend/patch/worker/patch_rejection_sampler.py",
-      "vllm.model_executor.layers.fused_moe.routed_experts_capturer.RoutedExpertsCapturer.capture": "vllm_ascend/patch/worker/patch_routed_experts_capture.py",
-      "vllm.model_executor.models.step3p5.*": "vllm_ascend/patch/worker/patch_step3p5.py",
-      "vllm.model_executor.layers.mamba.ops / vllm.third_party.flash_linear_attention.ops / vllm.v1.worker.gpu.sample.gumbel.gumbel_sample": "vllm_ascend/patch/worker/patch_triton.py",
-      "vllm.v1.worker.gpu.attn_utils.get_kv_cache_spec": "vllm_ascend/patch/worker/patch_v2/patch_attn_utils.py",
-      "DeepseekV32IndexerCache.get_attn_backend": "vllm_ascend/patch/worker/patch_v2/patch_attn_utils.py",
-      "vllm.v1.worker.gpu.block_table.BlockTables": "vllm_ascend/patch/worker/patch_v2/patch_block_table.py",
-      "vllm.v1.worker.gpu.spec_decode.dflash.speculator.DFlashCudaGraphManager": "vllm_ascend/patch/worker/patch_v2/patch_dflash_speculator.py",
-      "vllm.v1.worker.gpu.spec_decode.autoregressive.speculator.SpeculatorCudaGraphManager": "vllm_ascend/patch/worker/patch_v2/patch_eagle_speculator.py",
-      "vllm.v1.worker.gpu.input_batch.InputBatch": "vllm_ascend/patch/worker/patch_v2/patch_input_batch.py",
-      "vllm.v1.worker.gpu.model_states.default.init_model_state": "vllm_ascend/patch/worker/patch_v2/patch_model_state.py",
-      "vllm PPHandler sampled-token broadcast methods": "vllm_ascend/patch/worker/patch_v2/patch_spec_pp.py",
-      "vllm.v1.worker.gpu.sample.* (logprob, penalties.apply_penalties, gumbel.gumbel_sample, metrics.logits.libdevice, thinking_budget, output.SamplingMaskTensors)": "vllm_ascend/patch/worker/patch_v2/patch_triton.py",
-      "vllm.v1.worker.gpu.states.UvaBuffer": "vllm_ascend/patch/worker/patch_v2/patch_uva.py",
-      "vllm.v1.worker.gpu.spec_decode.dspark.utils/speculator.load_dspark_model": "vllm_ascend/patch/worker/patch_v2/patch_dspark.py",
-      "vllm.v1.worker.gpu.spec_decode.adaptive_verification._assign_draft_token_budget_compiled": "vllm_ascend/patch/worker/patch_v2/patch_adaptive_verification.py",
-      "vllm.v1.worker.gpu.model_runner.initialize_kv_cache / copy_kv_cache_blocks_inplace": "vllm_ascend/patch/worker/patch_v2/patch_model_runner.py"
+      "vllm/config/model.py (ModelConfig.verify_with_parallel_config)": "vllm_ascend/patch/platform/patch_model_config.py",
+      "vllm/config/cache.py (CacheConfig)": "vllm_ascend/patch/platform/patch_cache_config.py",
+      "vllm/config/parallel.py (ParallelConfig.use_sequence_parallel_moe)": "vllm_ascend/patch/platform/patch_parallel_config.py",
+      "vllm/config/speculative.py (SpeculativeConfig.hf_config_override)": "vllm_ascend/patch/platform/patch_speculative_config.py",
+      "vllm/config/vllm.py (VllmConfig.use_v2_model_runner)": "vllm_ascend/patch/platform/patch_use_v2_model_runner.py",
+      "vllm/config/attention.py (AttentionConfig)": "vllm_ascend/patch/platform/patch_*_config.py",
+      "vllm/v1/sample/ops/topk_topp_sampler.py (TopKTopPSampler)": "vllm_ascend/worker patch (AscendTopKTopPSampler override)",
+      "vllm/v1/worker/gpu/* (CUDA graph managers/speculator)": "vllm_ascend/worker/patch_v2/patch_*_speculator.py",
+      "vllm/platforms/__init__.py (current_platform)": "vllm_ascend/__init__.py::register",
+      "vllm/v1/worker/gpu_worker.py (worker_cls selection)": "vllm_ascend/platform.py::NPUPlatform.check_and_update_config (sets worker_cls=NPUWorker)"
     }
   },
-  "not_used_by_ascend": [
-    "vllm/platforms/cuda.py",
-    "vllm/platforms/rocm.py",
-    "vllm/platforms/cpu.py",
-    "vllm/platforms/zen_cpu.py",
-    "vllm/platforms/xpu.py",
-    "vllm/platforms/tpu.py",
-    "vllm/v1/attention/backends/flash_attn.py",
-    "vllm/v1/attention/backends/flashinfer.py",
-    "vllm/v1/attention/backends/triton_attn.py",
-    "vllm/v1/attention/backends/triton_flash_attn.py",
-    "vllm/v1/attention/backends/triton_flashinfer.py",
-    "vllm/v1/attention/backends/rocm_aiter_fa.py",
-    "vllm/v1/attention/backends/rocm_attn.py",
-    "vllm/v1/attention/backends/rocm_aiter_unified_attn.py",
-    "vllm/v1/attention/backends/mla/flashmla.py",
-    "vllm/v1/attention/backends/mla/flashmla_sparse.py",
-    "vllm/v1/attention/backends/mla/flashinfer_mla.py",
-    "vllm/v1/attention/backends/cpu_attn.py",
-    "vllm/v1/attention/backends/zentorch_sdpa.py",
-    "vllm/v1/attention/backends/flex_attention.py",
-    "vllm/v1/attention/backends/turboquant_attn.py",
-    "vllm/distributed/device_communicators/cuda_communicator.py",
-    "vllm/distributed/device_communicators/cpu_communicator.py",
-    "vllm/distributed/device_communicators/xpu_communicator.py",
-    "vllm/distributed/device_communicators/flashinfer_all_reduce.py",
-    "vllm/distributed/device_communicators/flashinfer_pcie_ipc_all_reduce.py",
-    "vllm/distributed/device_communicators/quick_all_reduce.py",
-    "vllm/distributed/device_communicators/custom_all_reduce.py",
-    "vllm/distributed/device_communicators/pynccl.py",
-    "vllm/distributed/device_communicators/pynccl_wrapper.py",
-    "vllm/distributed/device_communicators/aiter_custom_all_reduce.py",
-    "vllm/compilation/cuda_graph.py",
-    "vllm/compilation/breakable_cudagraph.py",
-    "vllm/compilation/cudagraph_pool.py",
-    "vllm/v1/worker/cpu_model_runner.py",
-    "vllm/v1/worker/cpu_worker.py",
-    "vllm/v1/worker/xpu_model_runner.py",
-    "vllm/v1/worker/xpu_worker.py",
-    "vllm/v1/worker/gpu/model_runner.py",
-    "vllm/model_executor/layers/quantization/humming.py",
-    "vllm/model_executor/layers/quantization/fbgemm_fp8.py",
-    "vllm/model_executor/layers/quantization/qutlass_utils.py",
-    "vllm/model_executor/layers/quantization/turboquant/",
-    "vllm/model_executor/layers/quantization/utils/marlin_utils.py",
-    "vllm/model_executor/layers/quantization/utils/marlin_utils_fp4.py",
-    "vllm/model_executor/layers/quantization/utils/marlin_utils_fp8.py",
-    "vllm/model_executor/layers/quantization/utils/marlin_utils_test.py",
-    "vllm/model_executor/layers/quantization/utils/flashinfer_fp4_moe.py",
-    "vllm/model_executor/layers/quantization/utils/flashinfer_mxint4_moe.py",
-    "vllm/model_executor/layers/quantization/utils/flashinfer_utils.py",
-    "vllm/model_executor/layers/quantization/utils/machete_utils.py",
-    "vllm/model_executor/layers/quantization/utils/w8a8_utils.py",
-    "vllm/model_executor/layers/quantization/utils/b12x_moe.py",
-    "vllm/model_executor/layers/fused_moe/configs/",
-    "vllm/model_executor/layers/fused_moe/experts/cutlass_moe.py",
-    "vllm/model_executor/layers/fused_moe/experts/deep_gemm_moe.py",
-    "vllm/model_executor/layers/fused_moe/experts/flashinfer_*.py",
-    "vllm/model_executor/layers/fused_moe/experts/marlin_moe.py",
-    "vllm/model_executor/layers/fused_moe/experts/trtllm_*.py",
-    "vllm/model_executor/layers/fused_moe/experts/fused_batched_moe.py",
-    "vllm/model_executor/layers/fused_moe/experts/moonep_experts.py",
-    "vllm/model_executor/layers/fused_moe/oracle/",
-    "vllm/model_executor/kernels/linear/cute_dsl/",
-    "vllm/model_executor/kernels/linear/mixed_precision/",
-    "vllm/model_executor/kernels/linear/mxfp4/",
-    "vllm/model_executor/kernels/linear/mxfp6/",
-    "vllm/model_executor/kernels/linear/mxfp8/",
-    "vllm/model_executor/kernels/linear/nvfp4/",
-    "vllm/model_executor/kernels/linear/scaled_mm/",
-    "vllm/model_executor/kernels/attention/dsa/",
-    "vllm/model_executor/kernels/mhc/",
-    "vllm/kernels/triton/",
-    "vllm/kernels/helion/",
-    "vllm/kernels/aiter_ops.py",
-    "vllm/kernels/oink_ops.py",
-    "vllm/kernels/vllm_c.py",
-    "vllm/third_party/",
-    "vllm/cute_utils/",
-    "vllm/vllm_flash_attn/",
-    "vllm/flash_attn_interface.py (top-level re-export)",
-    "vllm/_aiter_ops.py",
-    "vllm/_xpu_ops.py",
-    "vllm/model_executor/layers/quantization/inc/",
-    "vllm/model_executor/layers/quantization/quark/",
-    "vllm/model_executor/warmup/b12x_warmup.py",
-    "vllm/model_executor/warmup/cutedsl_warmup.py",
-    "vllm/model_executor/warmup/deep_gemm_warmup.py",
-    "vllm/model_executor/warmup/flashinfer_autotune_cache.py",
-    "vllm/model_executor/warmup/flashinfer_sparse_mla_warmup.py"
-  ],
   "knowledge_base": {
     "patch_catalog": {
-      "note": "This is the upstream vllm-project/vllm repository at commit 7867d6c5. There is no vllm/patch/ directory (patch/ exists only in vllm-ascend). Therefore no patch catalog can be extracted from this snapshot. vllm-ascend patches target the definitely_affected_paths listed above and are documented in vllm_ascend/patch/__init__.py in the vllm-ascend repo.",
-      "patches": []
+      "available": false,
+      "reason": "This repository is vllm-project/vllm; there is no vllm/patch/ directory and no vllm_ascend package at this commit. patch_catalog applies only to vllm-ascend (vllm_ascend/patch/__init__.py), which is not present here.",
+      "expected_location_for_ascend": "vllm-ascend: vllm_ascend/patch/__init__.py",
+      "expected_schema": {
+        "targets": "list of fully-qualified upstream classes/functions monkey-patched",
+        "why": "motivation for the patch",
+        "how": "mechanism (e.g., replacing a method, wrapping forward)",
+        "related_pr": "upstream/downstream PR reference",
+        "future_plan": "plan to remove the patch once supported upstream"
+      }
     },
     "development_workflows": {
       "vllm": [
@@ -1710,12 +1320,12 @@
     }
   },
   "repo": "vllm-project/vllm",
-  "commit_sha": "7867d6c52d4542c1b5da641f8ca79124be497ee3",
-  "generated_at": "2026-10-05T05:51:03.463307+08:00",
+  "commit_sha": "f26d9f432ced7b1087d02d29bffed2249df1a18e",
+  "generated_at": "2026-10-12T06:16:11.453660+08:00",
   "architecture_history": [
     {
-      "commit_sha": "7867d6c52d4542c1b5da641f8ca79124be497ee3",
-      "generated_at": "2026-10-05T05:43:41.155323+08:00"
+      "commit_sha": "f26d9f432ced7b1087d02d29bffed2249df1a18e",
+      "generated_at": "2026-10-12T06:13:43.216707+08:00"
     }
   ]
 }

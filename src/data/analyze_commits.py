@@ -216,41 +216,101 @@ def load_context(data_dir, repo):
     return context
 
 
+_CONTEXT_FALLBACK = '（未找到架构上下文文件，请基于 commit 内容和 diff 进行分析，对不确定的内容标注"不确定"）'
+
+
+def _as_text(value, limit=400):
+    """Render an arbitrary context field to prompt-friendly text.
+
+    Guards against schema drift (e.g. module_dependencies arriving as a dict
+    instead of a string).
+    """
+    if isinstance(value, str):
+        return value
+    try:
+        text = json.dumps(value, ensure_ascii=False)
+    except (TypeError, ValueError):
+        text = str(value)
+    return text if len(text) <= limit else text[:limit] + "…"
+
+
+def _coerce_method(method):
+    """Render a key_methods/critical_methods element.
+
+    Usually a str, but drifted data has produced {"sig": ..., "desc": ...}
+    dicts (2026-10-05 commit d67d23d), which crashed the plain join.
+    """
+    if isinstance(method, str):
+        return method
+    if isinstance(method, dict):
+        sig = method.get("sig") or method.get("signature") or ""
+        desc = method.get("desc") or method.get("description") or ""
+        if sig and desc:
+            return f"{sig} ({desc})"
+        return sig or desc or _as_text(method)
+    return str(method)
+
+
 def build_context_section(context, data_dir=None, repo_short=None, deltas_up_to_sha=None):
     if context is None:
-        return '（未找到架构上下文文件，请基于 commit 内容和 diff 进行分析，对不确定的内容标注"不确定"）'
+        return _CONTEXT_FALLBACK
+    try:
+        return _render_context_section(context, data_dir, repo_short, deltas_up_to_sha)
+    except Exception as e:
+        # The context file is LLM-generated weekly and its shape has drifted
+        # before; a bad file must degrade the prompt, not kill the daily run.
+        print(f"Warning: architecture context render failed, falling back: {type(e).__name__}: {e}")
+        return _CONTEXT_FALLBACK + "\n（架构上下文文件格式异常，已忽略其内容）"
 
+
+def _render_context_section(context, data_dir=None, repo_short=None, deltas_up_to_sha=None):
     parts = []
     if context.get("overview"):
         parts.append(f"项目概述：{context['overview']}")
+    elif isinstance(context.get("project_overview"), dict):
+        po_lines = [f"  {k}: {_as_text(v)}" for k, v in context["project_overview"].items()]
+        if po_lines:
+            parts.append("项目概述（project_overview）：\n" + "\n".join(po_lines))
 
-    if context.get("modules"):
-        modules_list = context["modules"]
-        if isinstance(modules_list, list):
-            modules_text = "\n".join(
-                f"  - {m.get('path', '')} ({m.get('name', '')}): {m.get('description', '')}"
-                for m in modules_list
-            )
+    modules_list = context.get("modules")
+    if not isinstance(modules_list, list) and isinstance(context.get("core_modules"), list):
+        modules_list = context["core_modules"]
+    if modules_list:
+        modules_text = "\n".join(
+            f"  - {m.get('path', '')} ({m.get('name', '') or m.get('responsibility', '')}): "
+            f"{m.get('description', '') or m.get('implementation_principle', '')}"
+            for m in modules_list
+            if isinstance(m, dict)
+        )
+        if modules_text:
             parts.append(f"核心模块：\n{modules_text}")
 
     if context.get("key_abstractions"):
         abs_lines = []
         for a in context["key_abstractions"]:
-            line = f"  - {a.get('name', '')} ({a.get('location', '')})"
+            if not isinstance(a, dict):
+                continue
+            line = f"  - {a.get('name', '')} ({a.get('location') or a.get('file', '')})"
             if a.get("inherits_from"):
                 line += f" extends {a['inherits_from']}"
             line += f": {a.get('description', '')}"
             if a.get("key_methods"):
-                methods = "; ".join(a["key_methods"])
+                methods = "; ".join(_coerce_method(m) for m in a["key_methods"])
                 line += f"\n    关键方法: {methods}"
             if a.get("ascend_implementations"):
-                line += f"\n    Ascend 实现: {', '.join(a['ascend_implementations'])}"
+                line += f"\n    Ascend 实现: {_as_text(a['ascend_implementations'])}"
             abs_lines.append(line)
-        parts.append(f"关键抽象：\n" + "\n".join(abs_lines))
+        if abs_lines:
+            parts.append(f"关键抽象：\n" + "\n".join(abs_lines))
 
     if context.get("implementation_principles"):
         principles_lines = []
         for p in context["implementation_principles"]:
+            if not isinstance(p, dict):
+                continue
+            if "topic" in p or "detail" in p:
+                principles_lines.append(f"  [{p.get('topic', '')}]\n    {p.get('detail', '')}")
+                continue
             lines = [
                 f"  [{p.get('module', '')}]",
                 f"    问题: {p.get('problem', '')}",
@@ -260,54 +320,95 @@ def build_context_section(context, data_dir=None, repo_short=None, deltas_up_to_
             if p.get("platform_differences"):
                 lines.append(f"    平台差异: {p['platform_differences']}")
             principles_lines.append("\n".join(lines))
-        parts.append(f"实现原理：\n" + "\n".join(principles_lines))
+        if principles_lines:
+            parts.append(f"实现原理：\n" + "\n".join(principles_lines))
 
     if context.get("module_dependencies"):
-        parts.append(f"模块依赖：{context['module_dependencies']}")
+        parts.append(f"模块依赖：{_as_text(context['module_dependencies'])}")
 
     if context.get("hardware_abstraction"):
         ha = context["hardware_abstraction"]
-        parts.append(f"硬件适配层：{ha.get('description', '')}")
-        if ha.get("platform_independent"):
-            parts.append(f"  平台无关接口：{', '.join(ha['platform_independent'])}")
-        if ha.get("platform_specific"):
-            parts.append(f"  平台特定实现：{', '.join(ha['platform_specific'])}")
+        if not isinstance(ha, dict):
+            parts.append(f"硬件适配层：{_as_text(ha)}")
+        else:
+            parts.append(f"硬件适配层：{ha.get('description', '')}")
+            if ha.get("platform_independent"):
+                parts.append(f"  平台无关接口：{_as_text(ha['platform_independent'])}")
+            if ha.get("platform_specific"):
+                parts.append(f"  平台特定实现：{_as_text(ha['platform_specific'])}")
+            extra = [
+                f"  {k}: {_as_text(v)}"
+                for k, v in ha.items()
+                if k not in ("description", "platform_independent", "platform_specific")
+            ]
+            if extra:
+                parts.append("\n".join(extra))
 
     if context.get("interface_surface"):
         iface = context["interface_surface"]
-        if iface.get("description"):
-            parts.append(f"接口面：{iface['description']}")
-        if iface.get("inheritable_interfaces"):
+        if isinstance(iface, list):
+            # Drifted shape (2026-09-28 1cbf711 / 2026-10-12 bfd6b4e): the
+            # interface list sits at the top level, not under
+            # inheritable_interfaces.
             iface_lines = []
-            for ii in iface["inheritable_interfaces"]:
+            for ii in iface:
+                if not isinstance(ii, dict):
+                    continue
                 line = f"  - {ii.get('interface', '')} → Ascend: {ii.get('ascend_impl', '')}"
+                if ii.get("base_location"):
+                    line += f"\n    位置: {ii['base_location']}"
+                if ii.get("critical_methods"):
+                    methods = "; ".join(_coerce_method(m) for m in ii["critical_methods"])
+                    line += f"\n    关键方法: {methods}"
+                if ii.get("change_consequences"):
+                    line += f"\n    变更影响: {_as_text(ii['change_consequences'])}"
                 if ii.get("impact_rule"):
                     line += f"\n    影响规则: {ii['impact_rule']}"
-                if ii.get("key_methods"):
-                    line += f"\n    关键方法: {'; '.join(ii['key_methods'])}"
                 iface_lines.append(line)
-            parts.append(f"可继承接口：\n" + "\n".join(iface_lines))
-        if iface.get("not_used_by_ascend"):
-            parts.append(f"不被 Ascend 使用的路径：{', '.join(iface['not_used_by_ascend'])}")
+            if iface_lines:
+                parts.append(f"可继承接口：\n" + "\n".join(iface_lines))
+        elif isinstance(iface, dict):
+            if iface.get("description"):
+                parts.append(f"接口面：{iface['description']}")
+            if iface.get("inheritable_interfaces"):
+                iface_lines = []
+                for ii in iface["inheritable_interfaces"]:
+                    if not isinstance(ii, dict):
+                        continue
+                    line = f"  - {ii.get('interface', '')} → Ascend: {ii.get('ascend_impl', '')}"
+                    if ii.get("impact_rule"):
+                        line += f"\n    影响规则: {ii['impact_rule']}"
+                    if ii.get("key_methods"):
+                        methods = "; ".join(_coerce_method(m) for m in ii["key_methods"])
+                        line += f"\n    关键方法: {methods}"
+                    iface_lines.append(line)
+                if iface_lines:
+                    parts.append(f"可继承接口：\n" + "\n".join(iface_lines))
+            if iface.get("not_used_by_ascend"):
+                not_used = iface["not_used_by_ascend"]
+                if isinstance(not_used, list):
+                    parts.append(f"不被 Ascend 使用的路径：{_as_text(not_used)}")
 
     if context.get("cross_project_relationship"):
         cpr = context["cross_project_relationship"]
-        if cpr.get("impact_judgment_rules"):
-            rules = cpr["impact_judgment_rules"]
-            parts.append("跨项目影响判断规则：")
-            if rules.get("definitely_affected_paths"):
-                parts.append(f"  必然影响: {'; '.join(rules['definitely_affected_paths'])}")
-            if rules.get("potentially_affected_paths"):
-                parts.append(f"  可能影响: {'; '.join(rules['potentially_affected_paths'])}")
-            if rules.get("never_affected_paths"):
-                parts.append(f"  绝不影哬: {'; '.join(rules['never_affected_paths'])}")
-        if cpr.get("patch_impact_map"):
-            patch_lines = [f"  {k} → {v}" for k, v in cpr["patch_impact_map"].items()]
-            parts.append(f"Patch 影响映射：\n" + "\n".join(patch_lines))
+        if isinstance(cpr, dict):
+            if isinstance(cpr.get("impact_judgment_rules"), dict):
+                rules = cpr["impact_judgment_rules"]
+                parts.append("跨项目影响判断规则：")
+                if rules.get("definitely_affected_paths"):
+                    parts.append(f"  必然影响: {_as_text(rules['definitely_affected_paths'])}")
+                if rules.get("potentially_affected_paths"):
+                    parts.append(f"  可能影响: {_as_text(rules['potentially_affected_paths'])}")
+                if rules.get("never_affected_paths"):
+                    parts.append(f"  绝不影响: {_as_text(rules['never_affected_paths'])}")
+            if isinstance(cpr.get("patch_impact_map"), dict):
+                patch_lines = [f"  {k} → {v}" for k, v in cpr["patch_impact_map"].items()]
+                parts.append(f"Patch 影响映射：\n" + "\n".join(patch_lines))
 
     if context.get("test_structure"):
         ts = context["test_structure"]
-        parts.append(f"测试结构：{ts.get('path', '')} - {ts.get('description', '')}")
+        if isinstance(ts, dict):
+            parts.append(f"测试结构：{ts.get('path', '')} - {ts.get('description', '')}")
 
     # Append architecture delta chain if available
     if data_dir and repo_short and deltas_up_to_sha:
@@ -387,8 +488,12 @@ def _load_not_used_by_ascend(data_dir):
         return _not_used_by_ascend_cache
 
     iface = context.get("interface_surface", {})
-    not_used = iface.get("not_used_by_ascend", [])
-    _not_used_by_ascend_cache = set(not_used)
+    not_used = iface.get("not_used_by_ascend", []) if isinstance(iface, dict) else []
+    _not_used_by_ascend_cache = (
+        {p for p in not_used if isinstance(p, str) and p}
+        if isinstance(not_used, list)
+        else set()
+    )
     return _not_used_by_ascend_cache
 
 

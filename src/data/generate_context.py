@@ -319,6 +319,62 @@ def _build_cross_ref_schema():
     }
 
 
+_RETRY_SUFFIX = (
+    "\n\nIMPORTANT: Your previous answer did NOT match the required JSON Schema."
+    " Validation errors:\n{errors}\n"
+    "Fix the structure and output the complete corrected JSON object"
+    " in a single ```json code fence. Output ONLY that code fence."
+)
+
+
+def _schema_errors(data, schema, max_errors=5):
+    """Return "" if data conforms to schema, else a compact error summary."""
+    try:
+        import jsonschema
+    except ImportError:
+        print("Warning: jsonschema not installed; skipping schema validation")
+        return ""
+    validator = jsonschema.validators.validator_for(schema)(schema)
+    errors = list(validator.iter_errors(data))
+    if not errors:
+        return ""
+    lines = []
+    for e in errors[:max_errors]:
+        path = "/".join(str(p) for p in e.absolute_path) or "<root>"
+        lines.append(f"{path}: {e.message}")
+    if len(errors) > max_errors:
+        lines.append(f"... and {len(errors) - max_errors} more")
+    return "\n".join(lines)
+
+
+def _call_opencode_validated(prompt, schema, add_dirs, label, attempts=2):
+    """Call opencode and enforce the JSON schema on its response.
+
+    The schema handed to opencode is only a prompt-level hint, so the model
+    can (and twice did) return a drifted structure. An unvalidated response
+    gets committed and then crashes the daily pipeline downstream, so the
+    response is validated here and, on failure, retried once with the
+    validation errors fed back. Returns None if no attempt conforms.
+    """
+    errors = ""
+    for attempt in range(1, attempts + 1):
+        attempt_prompt = prompt if not errors else prompt + _RETRY_SUFFIX.format(errors=errors)
+        result = call_opencode(prompt=attempt_prompt, json_schema=schema, add_dirs=add_dirs)
+        if result is None:
+            print(f"Failed to get {label} from opencode")
+            return None
+        if not isinstance(result, dict):
+            errors = f"expected a JSON object, got {type(result).__name__}"
+        else:
+            errors = _schema_errors(result, schema)
+        if not errors:
+            return result
+        print(f"  [{label}] schema validation failed (attempt {attempt}/{attempts}):")
+        print("    " + errors.replace("\n", "\n    ")[:800])
+    print(f"  [{label}] rejecting response after {attempts} attempts")
+    return None
+
+
 CONTEXT_PROMPT_TEMPLATE = """你是一个资深代码架构分析师。请根据以下项目源码结构目录树和关键接口文件内容，生成一份结构化的项目知识摘要。
 
 ## 仓库信息
@@ -584,17 +640,10 @@ def generate_context(repo, data_dir, force, local_repo=None, checkout_sha=None):
         arch_schema = _build_architecture_schema()
 
         print("Calling opencode (agent mode) to synthesize architecture summary...")
-        context = call_opencode(
-            prompt=prompt,
-            json_schema=arch_schema,
-            add_dirs=[local_repo],
+        context = _call_opencode_validated(
+            prompt, arch_schema, [local_repo], "architecture context"
         )
         if context is None:
-            print("Failed to get response from opencode")
-            return False
-
-        if not isinstance(context, dict):
-            print(f"Unexpected response type: {type(context)}")
             return False
 
         context["repo"] = repo
@@ -694,13 +743,13 @@ def generate_cross_reference(data_dir, force, vllm_local=None, ascend_local=None
     cross_ref_schema = _build_cross_ref_schema()
 
     print("Calling opencode (agent mode) for cross-reference...")
-    cross_ref = call_opencode(
-        prompt=prompt,
-        json_schema=cross_ref_schema,
-        add_dirs=[d for d in [vllm_local, ascend_local] if d],
+    cross_ref = _call_opencode_validated(
+        prompt,
+        cross_ref_schema,
+        [d for d in [vllm_local, ascend_local] if d],
+        "cross-reference",
     )
     if cross_ref is None:
-        print("Failed to get cross-reference from opencode")
         return False
 
     # Write cross_project_relationship into both architecture files

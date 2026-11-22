@@ -1,0 +1,337 @@
+{
+  "date": "2026-11-22",
+  "repo": "vllm-project/vllm",
+  "generated_at": "2026-11-23T07:14:00.258420+08:00",
+  "daily_summary": "当日变更以 KV Offload 子系统的性能与正确性改进为主（FS 线程池避免空闲 worker 被任务完成唤醒、ARC 策略保留运行中请求复用的前缀、新增 access_mode read|write|readwrite 方向控制、CPU 层在容量不足时部分存储并支持 keys_to_retry），并集中修复了一批多模态处理器兼容性问题（视频处理器帧上限透传、vLLM 自有 HF 处理器接受 torch.Tensor 视频、OpenCUA 图像 kwargs 透传、Muse Spark Open 接受 NumPy/PIL 输入）。其余为 docs/training 目录重组、Inkling2-Mini SM120 小 M GEMM 与 TMA split-K 性能优化、NVIDIA Rubin cu135 nightly 构建流程调整以及 Hy4-flash 权重加载重构清理。",
+  "ascend_impact_summary": "当日全部 commit 均未命中 vllm-ascend 的必然影响接口面（Platform/Worker/AttentionBackend/Scheduler/KVCacheSpec/Communicator/Compilation/Sampler/Config/CustomOp 等）。KV Offload 的 access_mode 与 keys_to_retry 均为向后兼容的 additive 变更，且 vllm-ascend 未对该 offloading 子系统做 patch 或子类化；多模态处理器改动属于前端处理器与模型代码，与 NPU 平台接口无关；Inkling2/SM120、Rubin CI 等属于 NVIDIA 平台特定或构建代码。vllm-ascend 无需同步修改代码或测试。",
+  "commits": [
+    {
+      "sha": "186882d9e865ccfabc9f75146a708c4a68524c8e",
+      "comment": "纯 recipe 配置更新：Kimi-K3.1-Pro 的 GB300 AgentX presets 从 InferenceX#5069 迁移到 #5109，更新镜像 digest、Dynamo 版本、DSpark draft 从 preview 变为正式版并加上 revision 固定；调整并发点（c44/c104、c256/c448、c960）、draft token 数（5/4）、prefix-match-unit（如 1408/512/768）、EPLB 配置以及一堆 K31_* 调优开关。属于部署配方层面的经验参数同步，不涉及 vLLM 运行时代码。风险在于配方与镜像版本强绑定，但文件本身只是 mooonshotai/Kimi-K3.1-Pro.yaml 的 YAML 数据和 runbook。",
+      "tags": [
+        "chore",
+        "low-risk",
+        "recipes"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Recipe] Kimi-K3.1-Pro: move the GB300 AgentX presets to the released DSpark draft, align with InferenceX#5109 (#69182)\n\nSigned-off-by: Mi Sun Park <misunp@nvidia.com>\nCo-authored-by: Claude Opus 5.5 <noreply@anthropic.com>"
+    },
+    {
+      "sha": "118d12f728c4f0bff4f088eb197a1404a7302038",
+      "comment": "纯文档重组：docs/training/weight_transfer/ 迁移为 docs/training/weight_updates/（README、direct_reload、layerwise、weight_checker 及 engines/{base,ipc,m2n,modelexpress,nccl,sharded_rdt}），docs/training/{routed_experts,sampling_mask,prompt_token_id_logprobs}.md 迁移为 docs/training/rollout_artifacts/，删除 docs/training/rlhf.md，其内容（开源 RL 库列表、weight transfer 指引）并入新增的 docs/training/README.md 路由指南。同步更新 mkdocs.yaml 的 redirect_mappings，为全部旧路径建立到新路径的重定向（含 training/rlhf.md → training/README.md），并修正 docs/configuration/optimization.md、docs/features/quantization/online.md、docs/serving/*、docs/usage/README.md 等交叉链接。代码侧仅更新 vllm/distributed/weight_transfer/sharded_rdt_{engine,trainer}.py 的模块 docstring 与 vllm/sampling_params.py 的字段 docstring 中的文档路径，无运行逻辑变化。风险很低；唯一需注意的是 mkdocs redirect 依赖旧路径重定向完整，以及 migration 后仍有少量硬编码路径引用的可能性（已在本次一并修正）。",
+      "tags": [
+        "docs",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Doc] Reorganize docs/training/ into weight_updates and rollout_artifacts (#69248)\n\nSigned-off-by: aoshen524 <aoshen524@gmail.com>\nCo-authored-by: aoshen524 <aoshen524@gmail.com>"
+    },
+    {
+      "sha": "b976fff86af82c559b19aa676f52ea193eb0c188",
+      "comment": "修复视频加载时未应用 HF video processor 帧上限的问题。原 MediaConnector.fetch_video/fetch_video_async 仅用 self.media_io_kwargs['video'] 构造 VideoMediaIO，模型 HF 处理器中声明的 max_frames/min_frames 完全被忽略，导致实际加载帧数与预处理假设不一致。改动：1) BaseProcessingInfo 新增 get_video_frame_limits()，只在 supported_mm_limits 含 video 时才构造 HF processor（避免无视频请求触发 image processor 加载失败），读取 video_processor.max_frames/min_frames；2) BaseMultiModalItemTracker 新增 cached_property video_io_defaults，非多模态模型返回空 dict，从而“仅在请求带视频时”读取限制；3) MediaConnector.fetch_video/_async 增加可选 video_io_defaults 参数，合并顺序为 {**defaults, **media_io_kwargs['video']}，保证用户显式 media_io_kwargs 覆盖模型默认；4) 同步/异步 content_parser 透传该参数。测试新增 connector 默认值让位于 media_io_kwargs、processing get_video_frame_limits 的两条路径（有 video / 无 video 且不构建 HF processor）、chat_utils 中无视频不构建 HF processor、视频请求只读取一次帧上限并传给两次 fetch。整体是低风险 additive 修复，唯一潜在风险是部分模型在 frontend 无法构建 HF processor 时的健壮性，已由“仅视频请求读取”与测试覆盖。",
+      "tags": [
+        "bugfix",
+        "multimodal",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Bugfix] Apply the video processor frame caps when loading videos (#68802)\n\nSigned-off-by: paulpak58 <52512091+paulpak58@users.noreply.github.com>\nCo-authored-by: mergify[bot] <37929162+mergify[bot]@users.noreply.github.com>"
+    },
+    {
+      "sha": "17323e0b1ca54296cc3016b72d481ecffc17e69b",
+      "comment": "KV Offload FS tier 线程池性能优化：DualQueueThreadPool 在原有 _condition 之外引入共享同一把锁的 _idle Condition，wait_idle 改为在 _idle 上等待 _stop 或 inflight==0；任务完成时仅在 _inflight_jobs 归零时 notify_all _idle，避免每个任务完成都唤醒正在寻找任务的空闲 worker。shutdown 中移除将 _inflight_jobs 置零的逻辑（由 _stop 条件驱动 wait_idle 退出），并在 _condition 上 notify_all。同步更新了 test_wait_idle_blocks_until_tasks_complete，用 MagicMock(wraps=notify_all) 断言 worker_notify_all 未被调用。属于 KV offload 内部实现的锁拆分优化。",
+      "tags": [
+        "performance",
+        "low-risk",
+        "kv-offload"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Perf][KV Offload] Avoid waking idle FS workers on job completion (#68451)\n\nSigned-off-by: waizuichougou <2082431897@qq.com>\nCo-authored-by: vllm-agent <claw@inferact.ai>"
+    },
+    {
+      "sha": "e29c741da8d11e2ae7ba381bb78b6f703812cae1",
+      "comment": "KV Offload ARC 策略 bugfix：为 ARCCachePolicy 新增 on_request_access 钩子，当运行中请求复用已存在于 T1 的前缀时，把这些 key 也登记进该请求的 _RunningT1Keys 并附上 offload key position，使它们随新插入的后缀一起老化，从而在 running-request eviction 场景下不被错误驱逐；频率提升仍只在 request finish 时发生。测试将 test_unfinished_lru_reused_prefix_outlives_new_tail 参数化为 lru/arc 并补充 set_offload_key_position。属于缓存策略内部正确性修复。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "kv-offload"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Bugfix][KV Offload] Preserve reused ARC prefixes during running-request eviction (#69110)\n\nSigned-off-by: waizuichougou <2082431897@qq.com>\nCo-authored-by: vllm-agent <claw@inferact.ai>"
+    },
+    {
+      "sha": "443b51e52fad36bbbd7960fd272c8baf23f14dbb",
+      "message": "[Rust Frontend] Support allowed_tools tool_choice (#68408)\n\nSigned-off-by: Bugen Zhao <i@bugenzhao.com>\nCo-authored-by: Claude Opus 5.5 <noreply@anthropic.com>\nCo-authored-by: vllm-agent <claw@inferact.ai>",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "feature",
+        "low-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "9ae9c15c569176e52783dd2ef8f4fedf8aadc70a",
+      "comment": "KV Offload 新增 access_mode（read|write|readwrite）方向控制：新增 OffloadAccessMode 枚举（含 from_config 规范化、can_read/can_write），OffloadingSpec.__init__ 从 extra_config 解析 access_mode；OffloadingConnectorScheduler 在不能读时跳过 lookup 返回 0 hit、在不能写时跳过所有 store handler；SecondaryTierManager 增加 access_mode 类属性与构造参数，fs/obj/p2p/kvcr/example 各级 tier 透传，TieringOffloadingManager._should_store_to_tier、lookup 路径分别按 can_write/can_read 过滤；fs tier 在 read-only 模式不再创建 config 文件/目录。同时更新文档与测试（新增 tier/spec/scheduler 侧用例）。这是 additive 特性，默认 readwrite 与旧行为一致。",
+      "tags": [
+        "feature",
+        "medium-risk",
+        "kv-offload"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[KV Offload] Add access_mode (read|write|readwrite) (#67961)\n\nSigned-off-by: Effi Ofer <effi.ofer@gmail.com>\nCo-authored-by: vllm-agent <claw@inferact.ai>\nCo-authored-by: mergify[bot] <37929162+mergify[bot]@users.noreply.github.com>"
+    },
+    {
+      "sha": "cb19fedd85f55e4c09ce76ab95b3a70fe4b5872a",
+      "comment": "OpenCUA 多模态处理器 bugfix：OpenCUAProcessor.__call__ 改为通过 _merge_kwargs(Qwen2VLProcessorKwargs, tokenizer_init_kwargs=..., **kwargs) 得到 images_kwargs，再与 return_tensors 合并后传给 image_processor，从而让 max_pixels/min_pixels 等图片尺寸参数真正生效；HYV4 之外的模型类新增 supports_mm_device_do_normalize = False。新增 processing 与 generation 两个测试文件验证与 HF processor 一致、312 token 的网格结果。属于模型特定处理器逻辑修正。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "multimodal",
+        "model"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Bugfix][Multimodal] Pass image kwargs through the OpenCUA processor (#68317)\n\nSigned-off-by: subhash polisetti <subhashr161347@gmail.com>"
+    },
+    {
+      "sha": "d4cc8ec42efa7e1b41dfc5462d189004d5c5cb19",
+      "comment": "离线 LLM API 错误分类：vllm/entrypoints/llm.py 中把 kv_transfer_config 解析失败、以及单进程 data_parallel_size 不支持的 ValueError 改为 VLLMValidationError（带 parameter/value），把 generate/enqueue/chat/enqueue_chat 在非 generate runner 下抛出的 ValueError 改为 RuntimeError。属于入口层异常语义收紧，便于调用方区分用户输入校验错误与运行时状态错误。可能影响依赖具体异常类型的下游测试/用户代码。",
+      "tags": [
+        "refactor",
+        "low-risk",
+        "entrypoints"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响（vllm-ascend 不子类化 LLM 入口，仅通过 LLM 使用；异常类型变化不涉及平台接口）",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Frontend] Classify errors in offline LLM APIs (#68667)\n\nSigned-off-by: 李绍飞 <73046195+Remarkable911@users.noreply.github.com>"
+    },
+    {
+      "sha": "e72fc9ae50c221180c4b8f4a94c5009714a4b199",
+      "comment": "KV Offload CPU tier 部分存储 bugfix：PrepareStoreOutput 新增 keys_to_retry（默认空列表），CPUOffloadingManager._prepare_store 增加 allow_partial 路径，按 offload key position 排序后只存能装下的最低位置 keys，并按 group 计算 cut，把 cut 之后（含已 resident）的 keys 放入 keys_to_retry，返回时保证 keys_to_store 与 keys_to_retry 不交；OnComputeStoreHandler 根据 keys_to_retry 截断各 group 的 store range，使后续 step 继续存储剩余 chunk；OnHandoffStoreHandler 对手递（不可重试）的 keys_to_retry 记 ALLOCATION_FAILURE；scheduler 抽出 record_allocation_failure；TieringOffloadingManager 将 keys_to_retry 也视为 deferred 以避免重复 cascade。测试覆盖部分存储、按位置裁剪、finished 请求未存 chunk 上报、handoff 丢失上报等。属于 KV offload 正确性修复，additive 字段兼容旧 manager。",
+      "tags": [
+        "bugfix",
+        "medium-risk",
+        "kv-offload"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Bugfix][KV Offload] Store the chunks that fit when a request exceeds the CPU tier (#66719)\n\nSigned-off-by: Zerui Wu <zeruiwu@uw.edu>\nCo-authored-by: Zerui Wu <zeruiwu@uw.edu>\nCo-authored-by: Claude Fable 5.2 <noreply@anthropic.com>\nCo-authored-by: vllm-agent <claw@inferact.ai>\nCo-authored-by: mergify[bot] <37929162+mergify[bot]@users.noreply.github.com>"
+    },
+    {
+      "sha": "647a76866b4559a74e27d1c6b55fbffe85c07ce4",
+      "comment": "vLLM 自实现 HF 处理器兼容 torch.Tensor 视频：在 internvl.video_to_pixel_values_internvl、nano_nemotron_vl.video_to_pixel_values、ovis2_5.Ovis2_5Processor 中，进入 numpy 处理前统一做 isinstance(video, torch.Tensor) 则 video.cpu().numpy() 的降级转换，修复调用方（如多模态数据管线）传入 tensor 视频时崩溃。三个文件各增加 2 行防御性转换，未改变公开接口。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "multimodal"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Bugfix][Multimodal] Accept torch.Tensor videos in vLLM's own HF processors (#69052)\n\nSigned-off-by: yarikama <amaki30226@gmail.com>"
+    },
+    {
+      "sha": "cb85c4e9efc27be9644bb90d8eed5fb521a77f44",
+      "comment": "Muse Spark Open 处理器增强：preprocess_image 接受 PIL.Image/np.ndarray/torch.Tensor 并通过 transformers.image_transforms.to_pil_image 统一转为 PIL；_preprocess_single_video 在 frames 为 PIL.Image 列表时 np.stack(np.asarray(_to_rgb(frame)))，支持 PIL 帧视频。属于模型特定多模态预处理健壮性修复，仅 1 个文件、5 增 2 减。",
+      "tags": [
+        "bugfix",
+        "low-risk",
+        "multimodal"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Bugfix][Multimodal] Accept NumPy images and PIL frame videos in Muse Spark Open (#69099)\n\nSigned-off-by: yarikama <amaki30226@gmail.com>"
+    },
+    {
+      "sha": "2e738227cb06edfc3a0325ff295dfda8a7d0d27b",
+      "message": "[CI] Decouple LoRA layer tests from GLM model imports (#68867)\n\nSigned-off-by: Tony Lin <tony.lin@intel.com>\nCo-authored-by: vllm-agent <claw@inferact.ai>\nCo-authored-by: Jee Jee Li <pandaleefree@gmail.com>",
+      "comment": "（自动判定）仅涉及 tests / docs / CI / 平台特化代码变更，不影响 vllm-ascend。",
+      "tags": [
+        "chore"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      }
+    },
+    {
+      "sha": "8c17e4692a7cf393e3d1dacf6404fa4d48d993a1",
+      "comment": "Inkling2-Mini 小 M GEMM 优化（SM120/SM121）：删除旧的 ops/gemv.py，新增 ops/ll_gemm_sm120.py，提供 sm12x_bf16_ll_gemm（支持 2D [M,K]@[N,K]^T 和 3D batched 形式，窄输出时确定性 split-K，gdc_wait/gdc_launch_dependents + PDL 启动）与 qkv_bmm（一次 launch 完成 q/k/v 三段 linear，按列边界选取输入），use_sm12x_bf16_ll_gemm/use_qkv_bmm 做能力判断并限制在 device capability family 120。attention.py、linear.py、loop.py、model.py、sconv.py 改为调用新接口。纯 NVIDIA SM120 平台特定 kernel 路径。",
+      "tags": [
+        "performance",
+        "low-risk",
+        "cuda-kernels",
+        "model"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响（NVIDIA SM120 专用 kernel 实现）",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Perf][Inkling2-Mini] Improve small M GEMM on 5090 (sm120) (#69168)"
+    },
+    {
+      "sha": "c32251b5d192f0f72f9ca8c5595d1d43f1dd37b8",
+      "comment": "Inkling2 k_group_partials TMA 路径在 SM12x 上启用：去掉 sm120 的排除条件，让 tokens>=TMA_MIN_TOKENS 时也走 TensorDescriptor TMA kernel；针对 SM12x 约 99KiB 共享内存限制将 block_n 限制为 64、num_stages 设为 2（非 sm120 保持原 64/128 block 与 4/3 stages 逻辑）。1 个文件、4 增 3 减的 NVIDIA 平台特定性能微调。",
+      "tags": [
+        "performance",
+        "low-risk",
+        "cuda-kernels",
+        "model"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响（SM120 特定 kernel 参数调整）",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Perf][Model] Inkling 2: keep the TMA k_group_partials path on SM12x (#69021)\n\nSigned-off-by: Chenglun Hu <chenglunhu@gmail.com>"
+    },
+    {
+      "sha": "25d7765e632beca1edd0ce3e6a6dc8186e9d9bb3",
+      "comment": "NVIDIA Rubin CI/Build 调整：release-pipeline 与 Dockerfile 移除自建 Triton 的 build arg/构建阶段/安装脚本（删除 tools/build_triton_from_source.sh、tools/install_triton_from_source.sh），改为使用 PyTorch cu135 nightly（含 triton==3.9.0+gitbddcf86）并把 BUILD_BASE_IMAGE 升级到 cuda13.5；requirements/rubin-prerelease.txt 更新 torch=cu135、torchvision/torchaudio=cu134 同日期 nightly；文档记录 ptxas 13.5.37 对 sm_107a 的误编译及 TRITON_PTXAS_BLACKWELL_PATH 13.4 规避方式。纯 CI/构建/安装文档变更。",
+      "tags": [
+        "ci",
+        "chore",
+        "low-risk",
+        "build"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[CI/Build][NVIDIA] Use PyTorch's cu135 nightly for Rubin and document the ptxas 13.5.37 SM107 workaround (#68036)\n\nSigned-off-by: Shang Wang <samshang.wang@mail.utoronto.ca>\nCo-authored-by: Claude Opus 5.5 <noreply@anthropic.com>\nCo-authored-by: Tyler Michael Smith <tlrmchlsmth@gmail.com>"
+    },
+    {
+      "sha": "1bdc437402d6eee29d3ca543c91574f8acc72c8d",
+      "comment": "Hy4-flash 清理与去重：新增 vllm/models/hy_v4/weight_utils.py，抽出 HYV4_WEIGHTS_MAPPER（e_score_correction_bias/router.gate/hc_fn/hc_head_fn 后缀映射）与 HYV4_MLP_MAPPER（mlp.gate/up、shared_experts.gate/up 的 stacked 映射），nvidia/amd 的 HYV4Model.load_weights 改为先经 HYV4_WEIGHTS_MAPPER.apply 再处理 fused/split expert（抽出 fused_mapping），并删除各文件内重复的字符串 replace 与 _should_skip_missing_param 内联逻辑；删除 AMD 侧 process_weights_after_loading 中仅针对 ROCm Triton 的 contiguous 处理；HYV4Flash 将运行时校验（量化/KV/LoRA/spec/dtype）从 validate_runtime 迁移到 configs.py 的 validate_flash_config（新增 index_topk 对齐与 engram 需要 iHC 的检查），并把 FlashEngram/FlashEmbedding 的 load_weight 封装为符合 AutoWeightsLoader 协议的 load_weights；HYV4FlashModel 的 expert 加载改用 get_expert_mapping 的字典，engram 通过模块 load_weights 加载。属于模型代码重构，接口基本持平。",
+      "tags": [
+        "refactor",
+        "medium-risk",
+        "model"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响（Hy4/Flash 模型特定加载逻辑，vllm-ascend 未注册该模型变体）",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Model] Hy4-flash Cleanup (#69013)\n\nSigned-off-by: Jee Jee Li <jeejeelee@inferact.ai>"
+    },
+    {
+      "sha": "7e792e6e105e3e83c0fc2ebecb0fccc0a49b0290",
+      "comment": "修复 Whisper 提示词条件化（prompt conditioning）的两处偏差。原实现一方面用错误的 `<|prev|>` 前缀（Whisper tokenizer 的正确特殊 token 是 `<|startofprev|>`），另一方面通过 EncDecMultiModalProcessor.skip_decoder_start_token=True 让整个处理器无条件跳过 decoder start token，导致无 prompt 的请求也缺失 `<|startoftranscript|>`。改动：1) build_enc_dec_input 的 skip_decoder_start_token 参数从 bool 扩展为 bool | Callable[[list[int]], bool]，在 decoder prompt token ids 规范化后调用谓词；2) EncDecMultiModalProcessor 新增 should_skip_decoder_start_token(decoder_prompt_token_ids)，默认返回类属性 skip_decoder_start_token，保持旧语义并向后兼容；3) BaseRenderer._get_skip_decoder_start_token() 改为 _should_skip_decoder_start_token(decoder_prompt_token_ids)，同步/异步 enc-dec 路径都把该方法（callable）传给 build_enc_dec_input；4) WhisperMultiModalProcessor 覆盖谓词：仅当 decoder prompt 首 token 为 `<|startofprev|>` 时才跳过 SOT；5) Whisper get_generation_prompt 改为 `<|startofprev|> {prompt.strip()}` + SOT 序列。测试覆盖 renderer 层的空 prompt/显式空 ids/无 SOT/含 SOT 四种 layout（同步与异步）以及 e2e generate 的 prompt_token_ids 断言。风险点：BaseRenderer 私有方法改名改签名，若外部有子类覆盖 _get_skip_decoder_start_token 将失效；EncDec 处理器扩展点变化但保留 skip_decoder_start_token 类属性的兼容路径，属中等风险的行为修复。",
+      "tags": [
+        "bugfix",
+        "multimodal",
+        "medium-risk"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Bugfix] Whisper prompt conditioning: use the real `<|startofprev|>` token (#53207)\n\nSigned-off-by: Andy Chen <87085682+andynoodles@users.noreply.github.com>\nCo-authored-by: Claude Opus 5.5 <noreply@anthropic.com>"
+    },
+    {
+      "sha": "ab18334a4f60da74db7de89fe95594e5ed0cda36",
+      "comment": "新增 Inkling 2 Mini（inkling2_loop）模型支持，这是本日最大变更（54 文件）。核心实现：1) 新增 vllm/models/inkling2/nvidia/loop.py 的 Inkling2LoopModel，按“prelude → num_passes 次 core 层 → coda”执行，每次 core pass 拥有独立 KV cache（Inkling2AttentionPassCache 注册到 static_forward_context）与 conv_state，loop_share_cache 时可让后续 pass 复用同一 KV cache；新增 Inkling2MessageController 门控低秩控制器，用 pair_rms_norm/blend_rms_norm 两个 Triton kernel 把上一 pass 的 AttnRes 消息混合进当前 sublayer 输入。2) configs.py 扩展 Inkling2ModelConfig（loop_config/loop_num_passes/loop_share_cache、loop_core_layers、num_loop_passes、num_layer_visits、layer_visit_ids、check_loop_options），新增 Inkling2LoopMMConfig（model_type=inkling2_loop、arch 校验），DSpark 的 target_layer_ids 改为按 layer visit 计。3) Kernel 泛化：csrc/inkling2/allreduce_conv_mix.cu 与 conv_mix.cu 将 TokenThreads/RowVecs 模板化支持 hidden 2304 与 4608，norm_weight 变为 optional 并在缺省时输出 fp32 rawOut；seq_parallel.cu 的 reduce-scatter 行宽改为运行时 rowVecs；attn_res/conv_mix 支持 norm_weight=None 直接返回 fp32 mix；trtllm_bmm 新增 operand() 保证每个 GEMM operand/输出至少有 128KiB backing（TMA OOB 地址生成要求）。4) SM120/SM12x 路径：新增 ops/moe_sm120.py（Triton NVFP4 dot_scaled 与反量化 MXFP8 专家 GEMM）、ops/moe_humming.py（Humming NVFP4）、ops/gemv.py（低 M BF16 GEMV）、Inkling2LogitsProcessor（低 M head 保留 gather/softcap）、attention_sm90.py 的 FP8 KV 反量化加载、sconv 在大 batch 时把 q/r 拆分为独立 launch，以及 linear.py/conv_mix.py 的 SM12 分支。5) 共享面改动：routed_experts_capturer 用 hf_text_config.num_layer_visits（fallback 到原有层数）决定 row 数，Inkling2MoE 增加 routing_captures；ModelRegistry/ModelConfig/SpeculativeConfig/transformers config registry/renderer/rust 侧均加入 inkling2_loop；VllmConfig 允许 SM12 Inkling2 在 BF16 模型下使用 float16 KV（无投机解码）。风险较高：a) 每 pass 独立 KV cache 会增加 KV cache 规格数量与显存占用，block/kv_cache 配置需正确；b) CUDA kernel 模板化与 norm-weight-optional 改动同时影响既有 4608 路径，需保证数值一致（测试已给出 reference 对照）；c) 大量新 Triton/CUDA kernel 和 SM120 分支需在对应设备上验证。测试新增覆盖 allreduce/seq_parallel 两种 dim、attn_res 无 norm 返回 fp32、loop controller 参考、conv_mix/attention prologue 低精度 KV、SM12x GEMV/linear fallback、routed experts 按 visit 记录、tiny looped 模型 prefill/decode 一致性与共享 cache 等。",
+      "tags": [
+        "feature",
+        "high-risk",
+        "model-executor",
+        "attention",
+        "kv-cache",
+        "quantization"
+      ],
+      "ascend_impact": {
+        "ascend_affected": false,
+        "functionality": "无影响",
+        "testing": "无影响",
+        "needs_test_update": false,
+        "suggested_test_areas": []
+      },
+      "message": "[Model] Add Inkling 2 Mini (#69028)\n\nSigned-off-by: Woosuk Kwon <woosuk@inferact.ai>\nCo-authored-by: Kate Cheng <yunhsuanc@nvidia.com>\nCo-authored-by: Eric Tang <46737979+erictang000@users.noreply.github.com>\nCo-authored-by: Claude Opus 5.5 <noreply@anthropic.com>\nCo-authored-by: vllm-agent <claw@inferact.ai>"
+    }
+  ],
+  "architecture_based_on_sha": "f26d9f432ced7b1087d02d29bffed2249df1a18e",
+  "architecture_generated_at": "2026-10-12T06:16:11.453660+08:00"
+}
